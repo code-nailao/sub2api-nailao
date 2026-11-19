@@ -10,9 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
+	"go.uber.org/zap"
 )
 
 const deepSeekInternalTurn = "sources.deepseek.internal_turn"
@@ -498,23 +500,40 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 	if key == nil || key.Group == nil {
 		return nil, false, nil
 	}
+	// A group without the feature is served exactly as if the feature did not
+	// exist, including requests that carry a web_search or web_fetch tool.
+	if !key.Group.DeepSeekTools.Enabled {
+		return nil, false, nil
+	}
 	if protocol == "chat" && !gjson.GetBytes(body, "messages").Exists() && gjson.GetBytes(body, "input").Exists() {
 		protocol = "responses"
 	}
 	if !deepSeekWantsTools(body, key.DeepSeekToolsAutoInject()) {
 		return nil, false, nil
 	}
+	// Tools the gateway adds on its own are an extra the client never asked
+	// for. When they cannot be set up, nothing has been sent or reserved yet,
+	// so the request is forwarded as the client sent it instead of failing.
+	// A request that names a server tool itself still gets the error.
+	unavailable := func(cause error) (*OpenAIForwardResult, bool, error) {
+		if deepSeekWantsTools(body, false) {
+			return nil, true, cause
+		}
+		logger.L().Warn("deepseek tools: optional tools unavailable, forwarding without them",
+			zap.Int64("account_id", account.ID), zap.Int64("group_id", key.Group.ID), zap.Error(cause))
+		return nil, false, nil
+	}
 	if gjson.GetBytes(body, "background").Bool() {
-		return nil, true, errors.New("built-in DeepSeek tools do not support background requests")
+		return unavailable(errors.New("built-in DeepSeek tools do not support background requests"))
 	}
 	supplier, release, err := s.deepSeekToolAccount(ctx, key, account)
 	if err != nil {
-		return nil, true, err
+		return unavailable(err)
 	}
 	defer release()
 	snapshot, err := deepSeekToolSnapshot(key, supplier)
 	if err != nil {
-		return nil, true, err
+		return unavailable(err)
 	}
 	if deepSeekCanUseNative(account, supplier, body, protocol) {
 		out, e := s.forwardDeepSeekNative(ctx, c, account, body, key, snapshot)
@@ -522,13 +541,13 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 	}
 	req, _, err := prepareDeepSeekHosted(body, protocol, key.DeepSeekToolsAutoInject())
 	if err != nil {
-		return nil, true, err
+		return unavailable(err)
 	}
 	started := time.Now()
 	stream := gjson.GetBytes(body, "stream").Bool()
 	result := &OpenAIForwardResult{RequestID: "deepseek-tools:" + uuid.NewString(), Model: gjson.GetBytes(body, "model").String(), Stream: stream, DeepSeekTools: snapshot}
 	if err = s.beginDeepSeekHostedUsage(ctx, c, key, account, result); err != nil {
-		return nil, true, err
+		return unavailable(err)
 	}
 	c.Header("X-Sources-Request-Id", result.RequestID)
 	defer func() { result.Duration = time.Since(started) }()
