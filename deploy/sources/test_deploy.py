@@ -31,6 +31,9 @@ class FakeOps(deploy.Ops):
         self.nginx_dump = FIXED_NGINX
         self.nginx_test_rc = 0
         self.check_fails = False
+        # The real binary refuses to start against a database with pending
+        # migrations until -migrate-only has applied them.
+        self.migrated = False
         self.unready_ports: set[int] = set()
         self.memory: dict[str, int] = {}
         self.memory_after_switch: int | None = None
@@ -87,8 +90,11 @@ class FakeOps(deploy.Ops):
                 self.oneoffs.append(cmd)
                 if cmd[0] == "-list-pending-migrations":
                     out = f"INFO log line\n{deploy.PENDING_PREFIX} {self.pending}\n"
+                elif cmd[0] == "-migrate-only":
+                    self.migrated = True
                 elif cmd[0] == "-check-startup":
-                    out, rc = (("", 1) if self.check_fails else (f"{deploy.CHECK_PREFIX} {{}}\n", 0))
+                    refuses = self.check_fails or (bool(self.pending) and not self.migrated)
+                    out, rc = (("", 1) if refuses else (f"{deploy.CHECK_PREFIX} {{}}\n", 0))
                 elif cmd[0] == "-export-web-assets":
                     out = f"{deploy.ASSETS_PREFIX} 3\n"
             else:
@@ -457,6 +463,29 @@ class DeployTest(unittest.TestCase):
         self.assertNotIn(["-migrate-only", "001_add.sql"], self.ops.oneoffs)
         self.assertEqual("legacy", self.state()["current"]["slot"])
         self.assertTrue(self.ops.containers["old-bg"]["State"]["Running"])
+
+    def test_dry_run_with_pending_migrations_skips_startup_check(self):
+        self.ops.dry_run = True
+        self.deploy()
+        self.assertNotIn(["-check-startup"], self.ops.oneoffs)
+        self.assertTrue(any("001_add.sql" in line and "skipped" in line and "dry run" in line
+                            for line in self.ops.logs), self.ops.logs)
+        self.assertTrue(any("did NOT verify" in line for line in self.ops.logs), self.ops.logs)
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+
+    def test_dry_run_without_pending_migrations_runs_startup_check(self):
+        self.ops.dry_run = True
+        self.ops.pending = ""
+        self.deploy()
+        self.assertEqual(2, self.ops.oneoffs.count(["-check-startup"]))
+        self.assertFalse(any("did NOT verify" in line for line in self.ops.logs))
+
+    def test_dry_run_without_pending_migrations_reports_startup_check_failure(self):
+        self.ops.dry_run = True
+        self.ops.pending = ""
+        self.ops.check_fails = True
+        with self.assertRaises(deploy.DeployError):
+            self.deploy()
 
     def test_release_lock_is_exclusive(self):
         with deploy.release_lock(self.cfg.lock_file):
