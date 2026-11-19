@@ -1,5 +1,11 @@
 # Changes
 
+## Unreleased
+
+- Record the upstream response status and request identifiers (`X-Client-Request-ID`, `X-Request-ID`, `CF-Ray` and the header named by the account's `upstream_request_id_header`) in the content-rejection ledger for holds that end unknown or are released without charge, in addition to charged rejections, and keep them through the deadline release, so a hold can be matched to one supplier bill line. The recorded status is the one the response carried, never one the gateway made up for an error. They are evidence for reconciliation and never decide a charge. No migration; commands with nothing observed keep their earlier fingerprints.
+- A response header can no longer make a rejection settlement fail: a request id with bytes PostgreSQL cannot store (a control character, invalid UTF-8) is dropped instead of failing the write. Before, such a value in the account's request-id header left a charged rejection uncaptured until its hold was released.
+- Add the setting `upstream_rejection_deadline_release_paused`: `true` pauses the deadline release of content-rejection holds and keeps them frozen; a missing key or `false` keeps the 0.2.79 behaviour; any other value, an empty one included, pauses. It is read before every release, so setting it also stops a run that is under way. The release log line reports the longest overdue time of a run.
+
 ## Main / background 0.2.79 — 2026-11-19
 
 - Sync official Sub2API v0.2.23: GPT-6.2 Sol and Astra (aliases, Codex model metadata, catalogue prices and long-context rates), an optional Ultra Fast multiplier on channel price cards (migration 252 is idempotent with the existing column), cache-creation tokens derived from the 5m/1h breakdown when the total is missing, an OpenAI pre-output idle failover, and the related upstream fixes and tests.

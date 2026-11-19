@@ -239,7 +239,7 @@ func (s *OpenAIGatewayService) ReconcileGrokVideoRejection(ctx context.Context, 
 		if state == "failed" || state == "expired" {
 			_, err = repo.FinalizeUpstreamRejection(ctx, &UpstreamRejectionFinalizeCommand{
 				RequestID: r.RequestID, APIKeyID: r.APIKeyID, Outcome: UpstreamRejectionUnknown,
-				Evidence: UpstreamRejectionBillingEvidence{OriginalStatus: resp.StatusCode, UpstreamRequestID: upstreamID, ResponseDigest: HashUsageRequestPayload(body)},
+				Evidence: UpstreamRejectionBillingEvidence{OriginalStatus: resp.StatusCode, UpstreamRequestID: storableUpstreamRequestID(upstreamID), ResponseDigest: HashUsageRequestPayload(body)},
 			})
 			return false, err
 		}
