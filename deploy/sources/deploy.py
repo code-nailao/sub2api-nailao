@@ -49,6 +49,10 @@ PENDING_PREFIX = "SOURCES_PENDING_MIGRATIONS"
 CHECK_PREFIX = "SOURCES_STARTUP_CHECK_OK"
 ASSETS_PREFIX = "SOURCES_WEB_ASSETS_EXPORTED"
 GIB = 1 << 30
+# Sent on every request. Some edge protection in front of a public endpoint
+# rejects the default urllib client identity, which would fail the public
+# health check for reasons unrelated to the release.
+USER_AGENT = "sources-deploy"
 
 
 class DeployError(Exception):
@@ -228,6 +232,7 @@ class Ops:
                   body: dict[str, Any] | None = None, timeout: float = 5) -> tuple[int, Any]:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("User-Agent", USER_AGENT)
         if token:
             req.add_header("Authorization", f"Bearer {token}")
         if data is not None:
@@ -558,7 +563,8 @@ class Deployer:
         self.install_upstreams(render_upstreams(ports["serving"], ports["standby"], ports["background"]))
 
     # steps ------------------------------------------------------------------
-    def preflight(self, state: dict[str, Any], target: Target, reuse: bool) -> list[str]:
+    def preflight(self, state: dict[str, Any], target: Target, reuse: bool,
+                  allow_public_health_failure: bool = False) -> list[str]:
         problems = nginx_ready_for_fixed_upstreams(
             self.ops.run([self.cfg.nginx_bin, "-T"], mutate=False, timeout=60).stdout)
         current = state.get("current")
@@ -578,6 +584,17 @@ class Deployer:
                     problems.append(f"{name} (previous release in slot {target.slot}) is still running/draining")
             if not running:
                 problems += port_problems(self.ops, [target.ports[r] for r in ROLES])
+        # The same request the guard makes after the switch: if it fails now,
+        # the guard would fail too and roll back a healthy release.
+        status, _ = self.ops.http_json(self.cfg.public_health_url, timeout=10)
+        if status != 200:
+            seen = f"public health check returned status {status} (0 means no response)"
+            if allow_public_health_failure:
+                self.log(f"   WARNING: {seen}; continuing because of --allow-public-health-failure; "
+                         "the guard still requires 200 after the switch")
+            else:
+                problems.append(f"{seen}; the guard after the switch would fail the same way and roll back; "
+                                "pass --allow-public-health-failure to deploy anyway")
         if problems:
             raise DeployError("preflight failed, nothing changed:\n  - " + "\n  - ".join(problems))
         pending = self.result_line(self.one_off(target.image, "background", ["-list-pending-migrations"]), PENDING_PREFIX)
@@ -645,6 +662,7 @@ class Deployer:
         new_ports = {str(target.ports[r]) for r in SERVING_ROLES}
         samples: list[tuple[float, int]] = []
         public_failures = 0
+        public_status = 200
         deadline = self.ops.monotonic() + self.cfg.guard_seconds
         while True:
             reason = None
@@ -666,10 +684,10 @@ class Deployer:
                 elif memory - min(m for _, m in samples) > self.cfg.guard_memory_jump_gib * GIB:
                     reason = f"memory grew more than {self.cfg.guard_memory_jump_gib}GiB within 30s"
             if reason is None:
-                status, _ = self.ops.http_json(self.cfg.public_health_url, timeout=10)
-                public_failures = public_failures + 1 if status != 200 else 0
+                public_status, _ = self.ops.http_json(self.cfg.public_health_url, timeout=10)
+                public_failures = public_failures + 1 if public_status != 200 else 0
                 if public_failures >= 3:
-                    reason = "public health failed 3 times in a row"
+                    reason = f"public health failed 3 times in a row (last status {public_status})"
             if reason is None:
                 errors = self.connect_errors(self.ops.read_from(self.cfg.nginx_error_log, log_offset), new_ports)
                 if errors >= self.cfg.guard_connect_errors:
@@ -740,7 +758,8 @@ class Deployer:
             self.ops.run(["docker", "kill", "--signal=TERM", name], mutate=True)
 
     # entrypoints --------------------------------------------------------------
-    def deploy(self, image: str, allow_contract: bool = False) -> None:
+    def deploy(self, image: str, allow_contract: bool = False,
+               allow_public_health_failure: bool = False) -> None:
         state = load_state(self.cfg)
         if state.get("in_progress"):
             raise DeployError(f"a previous deploy did not finish: {json.dumps(state['in_progress'])}; "
@@ -755,7 +774,8 @@ class Deployer:
                 if present.returncode != 0:
                     self.ops.run(["docker", "pull", image], mutate=False, timeout=1800)
             with self.step("preflight"):
-                pending = self.preflight(state, target, reuse=False)
+                pending = self.preflight(state, target, reuse=False,
+                                         allow_public_health_failure=allow_public_health_failure)
                 contract = [p for p in pending if "contract" in p]
                 if contract and not allow_contract:
                     raise DeployError(f"contract migrations need --allow-contract: {contract}; nothing changed")
@@ -800,7 +820,9 @@ class Deployer:
         except DeployError as err:
             record.update(result="failed", error=str(err), steps=self.timings, finished_at=now())
             self._abort(state, target, err)
-            append_history(self.cfg, record)
+            # A failed dry run changed nothing; a record would read like a failed release.
+            if not self.ops.dry_run:
+                append_history(self.cfg, record)
             raise
 
     def rollback(self) -> None:
@@ -825,7 +847,8 @@ class Deployer:
             self._finish_switch(state, current, target, record, create_background=False)
         except DeployError as err:
             record.update(result="failed", error=str(err), steps=self.timings, finished_at=now())
-            append_history(self.cfg, record)
+            if not self.ops.dry_run:
+                append_history(self.cfg, record)
             raise
 
     def _finish_switch(self, state: dict[str, Any], current: dict[str, Any], target: Target,
@@ -1066,6 +1089,9 @@ def main(argv: list[str] | None = None) -> int:
     p_main = sub.add_parser("main", help="deploy an image to Main serving and background")
     p_main.add_argument("image", help="image reference, preferably pinned by digest")
     p_main.add_argument("--allow-contract", action="store_true", help="allow pending migrations marked 'contract'")
+    p_main.add_argument("--allow-public-health-failure", action="store_true",
+                        help="warn instead of stopping when the public health check fails before the switch "
+                             "(the guard still requires 200 after it)")
     sub.add_parser("rollback", help="switch back to the previous slot")
     sub.add_parser("status", help="show current and previous release")
     sub.add_parser("watch", help="resident sampler; one JSON line per alert")
@@ -1097,7 +1123,8 @@ def main(argv: list[str] | None = None) -> int:
         with release_lock(cfg.lock_file):
             deployer = Deployer(cfg, ops)
             if args.command == "main":
-                deployer.deploy(args.image, allow_contract=args.allow_contract)
+                deployer.deploy(args.image, allow_contract=args.allow_contract,
+                                allow_public_health_failure=args.allow_public_health_failure)
             elif args.command == "rollback":
                 deployer.rollback()
         return 0

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import deploy  # noqa: E402
@@ -42,6 +43,11 @@ class FakeOps(deploy.Ops):
         self.oneoffs: list[list[str]] = []
         self.local_images: set[str] = set()
         self.busy_ports: set[int] = set()
+        # Status of the public health URL; when set, the second value replaces
+        # it at the next Nginx reload (i.e. once traffic switches).
+        self.public_status = 200
+        self.public_status_after_reload: int | None = None
+        self.public_requests = 0
         self.files["/proc/sys/net/ipv4/ip_local_port_range"] = "10240\t65535\n"
         self.files["/proc/sys/net/ipv4/ip_local_reserved_ports"] = "9400-9404,9410-9414,9500\n"
 
@@ -117,6 +123,8 @@ class FakeOps(deploy.Ops):
             rc = self.nginx_test_rc
         elif args[1:] == ["-s", "reload"]:
             self.switched = True
+            if self.public_status_after_reload is not None:
+                self.public_status, self.public_status_after_reload = self.public_status_after_reload, None
         if check and rc != 0:
             raise deploy.DeployError(f"command failed: {args[:3]}")
         return subprocess.CompletedProcess(args, rc, out, "")
@@ -130,7 +138,8 @@ class FakeOps(deploy.Ops):
 
     def http_json(self, url, token=None, method="GET", body=None, timeout=5):
         if url.startswith("https://"):
-            return 200, "ok"
+            self.public_requests += 1
+            return self.public_status, ("ok" if self.public_status == 200 else None)
         port = int(url.split(":")[2].split("/")[0])
         c = self.by_port(port)
         if not c or not c["State"]["Running"]:
@@ -486,6 +495,103 @@ class DeployTest(unittest.TestCase):
         self.ops.check_fails = True
         with self.assertRaises(deploy.DeployError):
             self.deploy()
+
+    def test_http_json_sends_an_explicit_user_agent(self):
+        seen = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b"ok"
+
+        def urlopen(req, timeout):
+            seen.append(req)
+            return Response()
+
+        with mock.patch.object(deploy.urllib.request, "urlopen", urlopen):
+            status, body = deploy.Ops().http_json("https://example.com/health", timeout=10)
+        self.assertEqual((200, "ok"), (status, body))
+        self.assertEqual(deploy.USER_AGENT, seen[0].get_header("User-agent"))
+        self.assertNotIn("urllib", seen[0].get_header("User-agent"))
+
+    def assert_public_health_stops_before_any_change(self, status):
+        state_before = Path(self.cfg.state_file).read_text()
+        with self.assertRaises(deploy.DeployError) as ctx:
+            self.deploy()
+        message = str(ctx.exception)
+        self.assertIn("preflight failed, nothing changed", message)
+        self.assertIn(f"returned status {status}", message)
+        self.assertIn("--allow-public-health-failure", message)
+        self.assertEqual([], self.created())
+        self.assertFalse(any("-migrate-only" in " ".join(c) for c in self.ops.commands))
+        self.assertNotIn(["-migrate-only", "001_add.sql"], self.ops.oneoffs)
+        self.assertFalse(self.ops.switched)
+        self.assertEqual(state_before, Path(self.cfg.state_file).read_text())
+
+    def test_preflight_stops_when_public_health_fails(self):
+        for status in (403, 0):
+            with self.subTest(status=status):
+                self.ops.commands.clear()
+                self.ops.public_status = status
+                self.assert_public_health_stops_before_any_change(status)
+        self.assertEqual(["failed", "failed"], [r["result"] for r in self.history()])
+
+    def test_dry_run_stops_when_public_health_fails_and_records_nothing(self):
+        self.ops.dry_run = True
+        self.ops.public_status = 403
+        self.assert_public_health_stops_before_any_change(403)
+        self.assertEqual([], self.history())
+
+    def test_failed_dry_run_records_no_history(self):
+        self.ops.dry_run = True
+        self.ops.pending = ""
+        self.ops.check_fails = True
+        with self.assertRaises(deploy.DeployError):
+            self.deploy()
+        self.assertEqual([], self.history())
+
+    def test_allow_public_health_failure_warns_and_deploys(self):
+        self.ops.public_status = 503
+        self.ops.public_status_after_reload = 200
+        self.deploy(allow_public_health_failure=True)
+        self.assertTrue(any("WARNING" in line and "status 503" in line and "--allow-public-health-failure" in line
+                            for line in self.ops.logs), self.ops.logs)
+        self.assertEqual("a", self.state()["current"]["slot"])
+        self.assertEqual("ok", self.history()[-1]["result"])
+
+    def test_allowed_public_health_failure_is_still_guarded_after_the_switch(self):
+        self.ops.public_status = 503
+        with self.assertRaises(deploy.DeployError) as ctx:
+            self.deploy(allow_public_health_failure=True)
+        self.assertIn("public health failed 3 times in a row (last status 503)", str(ctx.exception))
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+
+    def test_guard_failure_reports_last_public_status(self):
+        self.ops.public_status_after_reload = 403
+        with self.assertRaises(deploy.DeployError) as ctx:
+            self.deploy()
+        self.assertIn("guard failed (public health failed 3 times in a row (last status 403))", str(ctx.exception))
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+        self.assertIn("127.0.0.1:9426 max_fails", self.ops.files[self.cfg.upstream_file])
+
+    def test_rollback_is_not_blocked_by_a_failing_public_health_check(self):
+        self.deploy()
+        # The current release is broken in public; rollback must not pre-check it.
+        self.ops.public_status = 502
+        self.ops.public_status_after_reload = 200
+        requests_before = self.ops.public_requests
+        deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+        self.assertEqual("rollback", self.history()[-1]["action"])
+        self.assertEqual("ok", self.history()[-1]["result"])
+        self.assertTrue(self.ops.public_requests > requests_before, "the guard still checks after the switch")
 
     def test_release_lock_is_exclusive(self):
         with deploy.release_lock(self.cfg.lock_file):
