@@ -502,15 +502,17 @@ func deepSeekOCRBillablePages(data []byte) int {
 	return int(min(count.Int(), deepSeekOCRMaxPages))
 }
 
-// deepSeekASRBillableSeconds is duration_ms rounded up to whole seconds, for a
-// result with recognized text. The duration the client's file declared is not
-// trusted here; the request's size-derived bound caps an absurd answer.
+// deepSeekASRBillableSeconds is duration_ms rounded up to whole seconds for a
+// recognition result. Audio is charged by its length, so silence (an empty
+// text) is charged as well; a result without a text string is not a result.
+// The duration the client's file declared is not trusted here; the request's
+// size-derived bound caps an absurd answer.
 func deepSeekASRBillableSeconds(data []byte) int {
 	if gjson.GetBytes(data, "error").Exists() {
 		return 0
 	}
 	text, duration := gjson.GetBytes(data, "text"), gjson.GetBytes(data, "duration_ms")
-	if text.Type != gjson.String || strings.TrimSpace(text.String()) == "" || duration.Type != gjson.Number || duration.Float() <= 0 || math.IsInf(duration.Float(), 0) {
+	if text.Type != gjson.String || duration.Type != gjson.Number || duration.Float() <= 0 || math.IsInf(duration.Float(), 0) {
 		return 0
 	}
 	return int(min(math.Ceil(duration.Float()/1000), math.MaxInt32))

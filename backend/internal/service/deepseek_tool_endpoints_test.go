@@ -206,7 +206,7 @@ func TestDeepSeekStandaloneSearchKeepsItsBillingAndShape(t *testing.T) {
 	h := newDeepSeekToolsHarness(t, []Account{deepSeekToolsTestAccount(11, true)}, func(call deepSeekToolsCall) (*http.Response, error) {
 		require.Equal(t, "/v1/tools/search", call.path)
 		require.JSONEq(t, `{"query":"Python","count":3}`, string(call.body))
-		return deepSeekJSONResponse(200, `{"results":[{"title":"A","url":"https://example.com/a"}]}`), nil
+		return deepSeekJSONResponse(200, `{"results":[{"title":"A","site_name":"Example","authority":"high","rerank_score":0.9,"date":"2026-01-01","url":"https://example.com/a","summary":"s","snippet":"x"}]}`), nil
 	})
 	key := deepSeekToolsTestKey(deepSeekToolsAllPrices(), 10)
 	rec := httptest.NewRecorder()
@@ -255,7 +255,7 @@ func TestDeepSeekOCRForwardsHeartbeatsAndChargesConfirmedPages(t *testing.T) {
 				_ = pw.CloseWithError(errors.New("heartbeat was not forwarded"))
 				return
 			}
-			_, _ = pw.Write([]byte(" \n{\"pages\":[{\"text\":\"one\"},{\"text\":\"two\"},{\"text\":\"\"}],\"page_count\":3}"))
+			_, _ = pw.Write([]byte(" \n{\"id\":\"ocr-1\",\"object\":\"ocr.result\",\"purpose\":\"text_recognition\",\"page_count\":3,\"pages\":[{\"index\":0,\"text\":\"one\",\"finish_reason\":\"stop\"},{\"index\":1,\"text\":\"two\",\"finish_reason\":\"stop\"},{\"index\":2,\"text\":\"\",\"finish_reason\":\"stop\"}],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}"))
 			_ = pw.Close()
 		}()
 		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: pr}, nil
@@ -346,7 +346,7 @@ func TestDeepSeekASRChargesStartedSecondsPerHour(t *testing.T) {
 		t.Run(fmt.Sprint(tc.durationMS), func(t *testing.T) {
 			h := newDeepSeekToolsHarness(t, []Account{deepSeekToolsTestAccount(11, true)}, func(call deepSeekToolsCall) (*http.Response, error) {
 				require.Equal(t, "/v1/tools/asr", call.path)
-				return deepSeekJSONResponse(200, fmt.Sprintf(`{"text":"hello","duration_ms":%v}`, tc.durationMS)), nil
+				return deepSeekJSONResponse(200, fmt.Sprintf(`{"request_id":"rid-1","duration_ms":%v,"text":"hello"}`, tc.durationMS)), nil
 			})
 			rec := httptest.NewRecorder()
 			contentType, body := deepSeekMultipart(t, nil, "speech.wav", deepSeekWAV(2))
@@ -360,15 +360,34 @@ func TestDeepSeekASRChargesStartedSecondsPerHour(t *testing.T) {
 	}
 }
 
-func TestDeepSeekASRWithoutTextIsNotCharged(t *testing.T) {
-	h := newDeepSeekToolsHarness(t, []Account{deepSeekToolsTestAccount(11, true)}, func(deepSeekToolsCall) (*http.Response, error) {
-		return deepSeekJSONResponse(200, `{"text":"","duration_ms":3000}`), nil
-	})
-	rec := httptest.NewRecorder()
-	contentType, body := deepSeekMultipart(t, nil, "speech.ogg", deepSeekOggOpus(3))
-	h.serve(t, context.Background(), rec, deepSeekToolsTestKey(deepSeekToolsAllPrices(), 10), DeepSeekToolASR, contentType, body)
-	require.Zero(t, h.journal.settled(t).Command.BalanceCost)
-	h.requireReservationReleased(t)
+// Recognition is charged by the audio's length: silence that yields an empty
+// text is charged too. An answer without a text string, or without a positive
+// duration, is not a result and is not charged.
+func TestDeepSeekASRChargesSilenceByDuration(t *testing.T) {
+	for _, tc := range []struct {
+		name, answer string
+		seconds      int
+	}{
+		{"empty_text", `{"text":"","duration_ms":2000,"request_id":"rid-1"}`, 2},
+		{"text_missing", `{"duration_ms":2000}`, 0},
+		{"text_not_a_string", `{"text":null,"duration_ms":2000}`, 0},
+		{"no_duration", `{"text":"hello"}`, 0},
+		{"error_envelope", `{"error":{"message":"bad audio","type":"invalid_request_error"},"text":"","duration_ms":2000}`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newDeepSeekToolsHarness(t, []Account{deepSeekToolsTestAccount(11, true)}, func(deepSeekToolsCall) (*http.Response, error) {
+				return deepSeekJSONResponse(200, tc.answer), nil
+			})
+			rec := httptest.NewRecorder()
+			contentType, body := deepSeekMultipart(t, nil, "silence.wav", deepSeekWAV(2))
+			h.serve(t, context.Background(), rec, deepSeekToolsTestKey(deepSeekToolsAllPrices(), 10), DeepSeekToolASR, contentType, body)
+			require.Equal(t, http.StatusOK, rec.Code)
+			settled := h.journal.settled(t)
+			require.Equal(t, tc.seconds, settled.Usage.BillingSnapshot.DeepSeekTools.ASRSeconds)
+			require.InDelta(t, float64(tc.seconds)*0.36/3600, settled.Command.BalanceCost, 1e-12)
+			h.requireReservationReleased(t)
+		})
+	}
 }
 
 func TestDeepSeekTTSStreamsAudioAndCountsHanCharactersTwice(t *testing.T) {
@@ -497,7 +516,7 @@ func TestDeepSeekToolsNeverReplayAnUnknownOutcome(t *testing.T) {
 
 func TestDeepSeekToolsSupplierInputRejectionIsNotFailedOver(t *testing.T) {
 	h := newDeepSeekToolsHarness(t, []Account{deepSeekToolsTestAccount(11, true), deepSeekToolsTestAccount(12, true)}, func(deepSeekToolsCall) (*http.Response, error) {
-		return deepSeekJSONResponse(http.StatusBadRequest, `{"error":{"message":"document has too many pages"}}`), nil
+		return deepSeekJSONResponse(http.StatusBadRequest, `{"error":{"message":"document has too many pages","type":"invalid_request_error","code":"invalid_value","param":"file"}}`), nil
 	})
 	rec := httptest.NewRecorder()
 	contentType, body := deepSeekMultipart(t, map[string]string{"purpose": "text_recognition"}, "a.pdf", []byte("%PDF-1.4 /Type /Pages"))
