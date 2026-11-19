@@ -2438,6 +2438,22 @@
       ]
     },
     {
+      "path": "backend/internal/service/deepseek_forced_tool_choice.go",
+      "features": [
+        "deepseek_tool_compat"
+      ],
+      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged.",
+      "sha256": "53723816192ca1cfc2276de73effea3d65bf7637cd73c7e6d83507a750d18038"
+    },
+    {
+      "path": "backend/internal/service/deepseek_forced_tool_choice_test.go",
+      "features": [
+        "deepseek_tool_compat"
+      ],
+      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. Tests for this behaviour.",
+      "sha256": "6198937316ad5697ba417065789fa284b75582f515c14a647eaeb7bc2ed6c5d9"
+    },
+    {
       "path": "backend/internal/service/deepseek_stream_timing_test.go",
       "features": [
         "deepseek_builtin_tools"
@@ -2502,6 +2518,14 @@
       "sha256": "2dcca8519d75cd27cd53a4333205b4af5821823bcedafabc0f8e98b1fd3bd2ac"
     },
     {
+      "path": "backend/internal/service/deepseek_tools_fail_open_test.go",
+      "features": [
+        "deepseek_tool_compat"
+      ],
+      "reason": "Serves a DeepSeek request on the ordinary path when the group has the web tools off, or when tools the gateway adds on its own cannot be set up, instead of failing the request; a request that names a server tool itself still gets the error. Tests for this behaviour.",
+      "sha256": "d5e4a9451a12054cf6350156f3800cd8aec1ec9034af25486eb76633b5d2b8b0"
+    },
+    {
       "path": "backend/internal/service/deepseek_tools_failures_test.go",
       "features": [
         "deepseek_builtin_tools"
@@ -2512,10 +2536,11 @@
     {
       "path": "backend/internal/service/deepseek_tools_hosted.go",
       "features": [
-        "deepseek_builtin_tools"
+        "deepseek_builtin_tools",
+        "deepseek_tool_compat"
       ],
-      "sha256": "2a075b8f0e8d30b06ce9e3f84643585cfed89c188f2628cee1be81ce75c4d8f3",
-      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks."
+      "sha256": "872972113030c04ab1eb14fc3ae81f87361ca3b7203b91cae36fc622453b7483",
+      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Serves a DeepSeek request on the ordinary path when the group has the web tools off, or when tools the gateway adds on its own cannot be set up, instead of failing the request; a request that names a server tool itself still gets the error."
     },
     {
       "path": "backend/internal/service/deepseek_tools_incremental.go",
@@ -2813,6 +2838,14 @@
       ],
       "sha256": "c6a2d9cef4d74524bc7cff48514b0cdfdc456bf44e90d57c8dab444bf3461abd",
       "reason": "Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling."
+    },
+    {
+      "path": "backend/internal/service/openai_gateway_cc_pipeline.go",
+      "features": [
+        "deepseek_tool_compat"
+      ],
+      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point.",
+      "sha256": "ed7b6dfd7be5f3b4ab129f752f5ec22f93a0b97407c151467515cec40a766d80"
     },
     {
       "path": "backend/internal/service/openai_gateway_chat_completions.go",
