@@ -45,4 +45,31 @@ describe('historical billing evidence', () => {
     expect(wrapper.get('[data-testid="rejection-charge"]').text()).toContain('usage.snapshotNotRecorded')
     expect(wrapper.text()).not.toContain('0.10')
   })
+  it('keeps the Search and Fetch rows of a DeepSeek web tool receipt', () => {
+    const wrapper = mount(UsageBillingSnapshotDetails, { props: { snapshot: { version: 1, charge_kind: 'deepseek_tools', deepseek_tools: {
+      search_count: 2, fetch_count: 0, search_price_per_call: 0.006, fetch_price_per_call: 0.006,
+    } } } })
+    expect(wrapper.get('[data-testid="deepseek-tool-search"]').text()).toContain('0.012000u')
+    expect(wrapper.get('[data-testid="deepseek-tool-fetch"]').text()).toContain('0.000000u')
+    expect(wrapper.find('[data-testid="deepseek-tool-ocr"]').exists()).toBe(false)
+  })
+  it.each([
+    ['ocr', { ocr_pages: 3, ocr_price_per_1k_pages: 3 }, 'deepseekTools.ocr × 3 deepseekTools.ocrUnit', '0.009000u'],
+    ['asr', { asr_seconds: 62, asr_price_per_hour: 0.36 }, 'deepseekTools.asr × 62 deepseekTools.asrUnit', '0.006200u'],
+    ['tts', { tts_characters: 8, tts_price_per_10k_chars: 2 }, 'deepseekTools.tts × 8 deepseekTools.ttsUnit', '0.001600u'],
+  ])('shows the confirmed units of a standalone %s receipt', (tool, fields, label, amount) => {
+    const wrapper = mount(UsageBillingSnapshotDetails, { props: { snapshot: { version: 1, charge_kind: 'deepseek_tools', deepseek_tools: {
+      search_count: 0, fetch_count: 0, search_price_per_call: 0.006, fetch_price_per_call: 0.006, standalone: true, ...fields,
+    } } } })
+    const row = wrapper.get(`[data-testid="deepseek-tool-${tool}"]`).text()
+    expect(row).toContain(label)
+    expect(row).toContain(amount)
+    expect(wrapper.find('[data-testid="deepseek-tool-search"]').exists()).toBe(false)
+  })
+  it('shows an uncharged standalone receipt as zero units', () => {
+    const wrapper = mount(UsageBillingSnapshotDetails, { props: { snapshot: { version: 1, charge_kind: 'deepseek_tools', deepseek_tools: {
+      search_count: 0, fetch_count: 0, search_price_per_call: 0.006, fetch_price_per_call: 0.006, standalone: true, tts_price_per_10k_chars: 2,
+    } } } })
+    expect(wrapper.get('[data-testid="deepseek-tool-tts"]').text()).toContain('0.000000u')
+  })
 })

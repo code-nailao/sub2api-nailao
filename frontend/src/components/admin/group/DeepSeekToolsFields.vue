@@ -8,6 +8,10 @@
         <label class="input-label">{{ t('deepseekTools.searchPrice') }}<input v-model.number="searchPerCall" class="input mt-1" type="number" min="0" step="0.001" required /></label>
         <label class="input-label">{{ t('deepseekTools.fetchPrice') }}<input v-model.number="fetchPerCall" class="input mt-1" type="number" min="0" step="0.001" required /></label>
       </div>
+      <p class="text-xs text-gray-500">{{ t('deepseekTools.mediaPriceHint') }}</p>
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <label v-for="item in deepSeekMediaTools" :key="item.tool" class="input-label">{{ t(`deepseekTools.${item.tool}Price`) }}<input v-model.number="mediaPrices[item.tool].value" class="input mt-1" type="number" min="0" step="0.01" :placeholder="t('deepseekTools.notOffered')" /></label>
+      </div>
       <label class="input-label">{{ t('deepseekTools.account') }}
         <select v-model="config.account_id" class="input mt-1">
           <option :value="null">{{ t('deepseekTools.followAccount') }}</option>
@@ -26,12 +30,19 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { list } from '@/api/admin/accounts'
 import type { DeepSeekToolsConfig } from '@/types'
+import { deepSeekMediaTools } from '@/utils/deepseekTools'
 const { t } = useI18n()
 const props = defineProps<{ eligible: boolean }>()
 const config = defineModel<DeepSeekToolsConfig>({ required: true })
 const searchPrice = defineModel<number | null>('searchPrice', { required: true })
 const searchPerCall = computed({ get: () => searchPrice.value == null ? null : searchPrice.value / 1000, set: v => { searchPrice.value = typeof v === 'number' ? v * 1000 : null } })
 const fetchPerCall = computed({ get: () => config.value.fetch_price_per_1k == null ? null : config.value.fetch_price_per_1k / 1000, set: v => { config.value = { ...config.value, fetch_price_per_1k: typeof v === 'number' ? v * 1000 : null } } })
+// Empty means the group does not offer the tool; 0 is free.
+const mediaPrice = (key: typeof deepSeekMediaTools[number]['price']) => computed({
+  get: () => config.value[key] ?? null,
+  set: v => { config.value = { ...config.value, [key]: typeof v === 'number' && Number.isFinite(v) ? v : null } }
+})
+const mediaPrices = Object.fromEntries(deepSeekMediaTools.map(item => [item.tool, mediaPrice(item.price)])) as Record<typeof deepSeekMediaTools[number]['tool'], ReturnType<typeof mediaPrice>>
 watch(() => config.value.enabled, enabled => {
   if (!enabled) return
   if (searchPrice.value == null) searchPrice.value = 6

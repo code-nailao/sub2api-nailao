@@ -4129,10 +4129,11 @@
     {
       "path": "frontend/src/components/account/DeepSeekToolAccountFields.vue",
       "features": [
-        "deepseek_builtin_tools"
+        "deepseek_builtin_tools",
+        "deepseek_tool_endpoints"
       ],
-      "sha256": "899f1e580d7db53ea3ce41929b2aee276778d067571a578f3c4e7dc06fff58cd",
-      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks."
+      "sha256": "90012bfd6b2e2cf807315a51b63775cf36fcd5fff35969cdb6602bbe50ef7c29",
+      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields."
     },
     {
       "path": "frontend/src/components/account/EditAccountModal.vue",
@@ -4164,6 +4165,14 @@
       ],
       "sha256": "ec7dd07c7b9a119cf9752cf88fba5da6cf9fd036c58e847d6e94109a40f2e6d3",
       "reason": "Adds request-speed tier controls to the key, group and account editors and their API clients, keeping upstream entries such as Use Key and the CC Switch import. Tests for this behaviour."
+    },
+    {
+      "path": "frontend/src/components/account/__tests__/DeepSeekToolAccountFields.spec.ts",
+      "features": [
+        "deepseek_tool_endpoints"
+      ],
+      "sha256": "74ae5fcb01429eb627177ff4bf5d0a9ee93df8398228c8b42a47fa296d847d8c",
+      "reason": "Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields. Tests for this behaviour."
     },
     {
       "path": "frontend/src/components/account/__tests__/EditAccountModal.grokUpstream.spec.ts",
@@ -4205,10 +4214,11 @@
     {
       "path": "frontend/src/components/admin/group/DeepSeekToolsFields.vue",
       "features": [
-        "deepseek_builtin_tools"
+        "deepseek_builtin_tools",
+        "deepseek_tool_endpoints"
       ],
-      "sha256": "3feab70c59cd23a6aac57933e753d3c764540f35ffca8cd4828c631509f3cc04",
-      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks."
+      "sha256": "7111b99feb5b830b8b34bd0be560d0ddf08ad174fd7838a4a31788ee786e8d80",
+      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields."
     },
     {
       "path": "frontend/src/components/admin/group/RequestSpeedGroupFields.vue",
@@ -4230,10 +4240,11 @@
     {
       "path": "frontend/src/components/admin/group/__tests__/DeepSeekToolsFields.spec.ts",
       "features": [
-        "deepseek_builtin_tools"
+        "deepseek_builtin_tools",
+        "deepseek_tool_endpoints"
       ],
-      "sha256": "fb402e48d127e2472290962dd4bd17707aad30ecef26e8dcb4a6c5d8cf2fa84a",
-      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Tests for this behaviour."
+      "sha256": "060d9ea292b0145f00197c3a33eb7666ec36f2dfe5c7944001a2bfe0cf78c8af",
+      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields. Tests for this behaviour."
     },
     {
       "path": "frontend/src/components/admin/group/__tests__/UpstreamRejectionBillingFields.spec.ts",
@@ -4323,10 +4334,11 @@
         "group_service_tier_pricing",
         "grok_content_rejection_billing",
         "content_rejection_public_disclosure",
-        "deepseek_builtin_tools"
+        "deepseek_builtin_tools",
+        "deepseek_tool_endpoints"
       ],
-      "sha256": "bc903164b1de0732997ac211f58cf3bdfd5232e849fb5b3aa552f0ee5badff5c",
-      "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Shows customers only a neutral description and the fixed amount of a content-rejection charge in pricing, usage and billing views, while administrators keep the internal evidence; ordinary usage snapshots stay compatible. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks."
+      "sha256": "526daf0d7e7d20ac9c05f4781c4911b7236f9602aec6d437901ea5e5b3613e87",
+      "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Shows customers only a neutral description and the fixed amount of a content-rejection charge in pricing, usage and billing views, while administrators keep the internal evidence; ordinary usage snapshots stay compatible. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields."
     },
     {
       "path": "frontend/src/components/common/__tests__/PendingChargesNotice.spec.ts",
@@ -4351,10 +4363,11 @@
       "features": [
         "group_service_tier_pricing",
         "grok_content_rejection_billing",
-        "content_rejection_public_disclosure"
+        "content_rejection_public_disclosure",
+        "deepseek_tool_endpoints"
       ],
-      "sha256": "ab99b21131d96ec9590344c649005fcf6451243166efefb2316bd4565383ea76",
-      "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Shows customers only a neutral description and the fixed amount of a content-rejection charge in pricing, usage and billing views, while administrators keep the internal evidence; ordinary usage snapshots stay compatible. Tests for this behaviour."
+      "sha256": "bf4c76d9a4a236c6ddc2cf686625e5e8a258e13ca6033377ae00c7639fd45171",
+      "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Shows customers only a neutral description and the fixed amount of a content-rejection charge in pricing, usage and billing views, while administrators keep the internal evidence; ordinary usage snapshots stay compatible. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields. Tests for this behaviour."
     },
     {
       "path": "frontend/src/components/icons/Icon.vue",
@@ -4866,10 +4879,11 @@
     {
       "path": "frontend/src/i18n/locales/en/deepseekTools.ts",
       "features": [
-        "deepseek_builtin_tools"
+        "deepseek_builtin_tools",
+        "deepseek_tool_endpoints"
       ],
-      "sha256": "5d24e8f0c85d0d4970cce859d96349580828e69a4d107d4afe51c8793d282e2d",
-      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Locale strings."
+      "sha256": "da20fdf7db2209c188d7771f8a64d93fb3fef6fa412fac4cd878a7506de71d61",
+      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields. Locale strings."
     },
     {
       "path": "frontend/src/i18n/locales/en/index.ts",
@@ -4982,10 +4996,11 @@
     {
       "path": "frontend/src/i18n/locales/zh/deepseekTools.ts",
       "features": [
-        "deepseek_builtin_tools"
+        "deepseek_builtin_tools",
+        "deepseek_tool_endpoints"
       ],
-      "sha256": "7a788f2801b9fd1def7fa8a5fefddc320bc005e4e05bad74c0e3642cbc9bbe08",
-      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Locale strings."
+      "sha256": "9e3570480a9ad3267dd8a08e3c658d108404f3c06d14c0496f70b05ca1469907",
+      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields. Locale strings."
     },
     {
       "path": "frontend/src/i18n/locales/zh/index.ts",
@@ -5066,10 +5081,11 @@
         "grok_content_rejection_billing",
         "content_rejection_public_disclosure",
         "deepseek_builtin_tools",
-        "upstream_022_request_speed_frontend"
+        "upstream_022_request_speed_frontend",
+        "deepseek_tool_endpoints"
       ],
-      "sha256": "268a8471f6c88c00e6102f16a6403b95b14271a21d81e99b224c2986e8526f8d",
-      "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Shows customers only a neutral description and the fixed amount of a content-rejection charge in pricing, usage and billing views, while administrators keep the internal evidence; ordinary usage snapshots stay compatible. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds request-speed tier controls to the key, group and account editors and their API clients, keeping upstream entries such as Use Key and the CC Switch import."
+      "sha256": "29422f42dab219cc17ce1facd9009e880eb0292a67a66e1b09099b9b9c7c79a5",
+      "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Shows customers only a neutral description and the fixed amount of a content-rejection charge in pricing, usage and billing views, while administrators keep the internal evidence; ordinary usage snapshots stay compatible. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds request-speed tier controls to the key, group and account editors and their API clients, keeping upstream entries such as Use Key and the CC Switch import. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields."
     },
     {
       "path": "frontend/src/types/payment.ts",
@@ -5091,10 +5107,11 @@
     {
       "path": "frontend/src/utils/__tests__/deepseekTools.spec.ts",
       "features": [
-        "deepseek_builtin_tools"
+        "deepseek_builtin_tools",
+        "deepseek_tool_endpoints"
       ],
-      "sha256": "02a87677a2416584a656023f3f5ae6088c91d6545af23290c725c5c9590bb0fc",
-      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Tests for this behaviour."
+      "sha256": "87a3feebba6073f1fc3f5a49d7d762022a8c99993e4e86e1d647b1415e973362",
+      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields. Tests for this behaviour."
     },
     {
       "path": "frontend/src/utils/__tests__/embedded-session.spec.ts",
@@ -5132,10 +5149,11 @@
     {
       "path": "frontend/src/utils/deepseekTools.ts",
       "features": [
-        "deepseek_builtin_tools"
+        "deepseek_builtin_tools",
+        "deepseek_tool_endpoints"
       ],
-      "sha256": "c6165bfb1e1640f843c4ed8427138bb4c1dacba798211a013583b417ab72838a",
-      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks."
+      "sha256": "a39df52fe706c11ec74aa4c2f82f16ec088f233362e37b201110150d830d2d45",
+      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields."
     },
     {
       "path": "frontend/src/utils/embedded-session.ts",
