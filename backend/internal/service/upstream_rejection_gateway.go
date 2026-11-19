@@ -1,7 +1,9 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -148,6 +150,18 @@ func (e *UpstreamRejectionError) Error() string {
 		return "upstream content rejection"
 	}
 	return fmt.Sprintf("upstream content rejection (%s, HTTP %d)", e.Evidence.RuleID, e.Evidence.HTTPStatus)
+}
+
+// errUpstreamRejectionHeldImageInput reports image input that could only be
+// served by sending further upstream requests under a hold. It is a local
+// refusal: nothing was sent, so the hold is released without charge.
+var errUpstreamRejectionHeldImageInput = errors.New("image input needs more upstream requests than a rejection-fee hold allows")
+
+// upstreamRejectionHoldInContext reports whether the request carries a
+// rejection-fee hold. A hold covers exactly one upstream request.
+func upstreamRejectionHoldInContext(ctx context.Context) bool {
+	attempt, _ := ctx.Value(upstreamRejectionAttemptContextKey{}).(*UpstreamRejectionBillingAttempt)
+	return attempt != nil
 }
 
 func observeUpstreamRejectionBody(account *Account, status int, body []byte) *UpstreamRejectionEvidence {

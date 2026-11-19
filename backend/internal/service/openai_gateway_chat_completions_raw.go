@@ -156,6 +156,10 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	if account.Platform == PlatformGrok {
 		bridgedBody, usage, bridged, bridgeErr := s.bridgeGrokComposerImageInputs(ctx, c, account, upstreamBody, token)
 		if bridgeErr != nil {
+			if errors.Is(bridgeErr, errUpstreamRejectionHeldImageInput) {
+				writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", "This model does not support image input in this group")
+				return nil, bridgeErr
+			}
 			var failoverErr *UpstreamFailoverError
 			if !errors.As(bridgeErr, &failoverErr) && c != nil && c.Writer != nil && !c.Writer.Written() {
 				writeChatCompletionsError(c, http.StatusBadGateway, "upstream_error", bridgeErr.Error())

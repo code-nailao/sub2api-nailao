@@ -3,12 +3,14 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/processrole"
+	"go.uber.org/zap"
 )
 
 const rejectionRecoveryInterval = 30 * time.Second
@@ -319,7 +321,7 @@ func (w *UpstreamRejectionRecovery) releaseDueReservations(ctx context.Context) 
 	defer func() {
 		// One line per run with work; never payloads, URLs or credentials.
 		if listed > 0 {
-			logger.LegacyPrintf("service.rejection_recovery", "deadline release: listed=%d released=%d amount=%.8f lost_races=%d failed=%d max_overdue_s=%.0f", listed, released, amount, lost, failed, maxOverdue.Seconds())
+			logDeadlineRelease(failed > 0, "deadline release: listed=%d released=%d amount=%.8f lost_races=%d failed=%d max_overdue_s=%.0f", listed, released, amount, lost, failed, maxOverdue.Seconds())
 		}
 	}()
 	for listed < rejectionDeadlineReleaseMaxPerRun && ctx.Err() == nil {
@@ -377,6 +379,22 @@ func (w *UpstreamRejectionRecovery) releaseDueReservations(ctx context.Context) 
 	}
 }
 
+// logDeadlineRelease writes what an operator must be able to see about the
+// deadline release: the summary of a run that gave money back, and every change
+// of the pause switch. These are warnings, so they survive a deployment that
+// logs at warn and above; a run in which a release failed is an error. The level
+// is set here because the legacy bridge infers one from the text: it read the
+// "failed" counter of every summary as an error and left the pause switch at
+// info, where such a deployment drops it.
+func logDeadlineRelease(failed bool, format string, args ...any) {
+	l := logger.L().With(zap.String("component", "service.rejection_recovery"))
+	if failed {
+		l.Error(fmt.Sprintf(format, args...))
+		return
+	}
+	l.Warn(fmt.Sprintf(format, args...))
+}
+
 // rejectionPauseSettingReader is the settings store behind the pause switch,
 // or nil when the gateway has none; a nil reader never pauses.
 func rejectionPauseSettingReader(gateway *OpenAIGatewayService) rejectionSettingReader {
@@ -403,7 +421,7 @@ func (w *UpstreamRejectionRecovery) deadlineReleasePaused(ctx context.Context) b
 	case errors.Is(err, ErrSettingNotFound):
 		paused = false
 	case err != nil:
-		logger.LegacyPrintf("service.rejection_recovery", "deadline release skipped: pause switch unreadable; holds retained")
+		logDeadlineRelease(false, "deadline release skipped: pause switch unreadable; holds retained")
 		return true
 	default:
 		paused = strings.TrimSpace(raw) != "false"
@@ -411,9 +429,9 @@ func (w *UpstreamRejectionRecovery) deadlineReleasePaused(ctx context.Context) b
 	if paused != w.releasePaused {
 		w.releasePaused = paused
 		if paused {
-			logger.LegacyPrintf("service.rejection_recovery", "deadline release paused by setting %s; due holds retained", SettingKeyUpstreamRejectionDeadlineReleasePaused)
+			logDeadlineRelease(false, "deadline release paused by setting %s; due holds retained", SettingKeyUpstreamRejectionDeadlineReleasePaused)
 		} else {
-			logger.LegacyPrintf("service.rejection_recovery", "deadline release resumed")
+			logDeadlineRelease(false, "deadline release resumed")
 		}
 	}
 	return paused

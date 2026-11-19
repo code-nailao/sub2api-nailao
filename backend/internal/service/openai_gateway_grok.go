@@ -1317,6 +1317,11 @@ func (s *OpenAIGatewayService) bridgeGrokComposerImageInputs(
 	if len(imageURLs) == 0 {
 		return body, OpenAIUsage{}, false, nil
 	}
+	// A rejection-fee hold covers exactly one upstream request. Describing the
+	// images would send more under the same hold, so nothing is sent at all.
+	if upstreamRejectionHoldInContext(ctx) {
+		return body, OpenAIUsage{}, false, errUpstreamRejectionHeldImageInput
+	}
 
 	descriptions := make([]string, 0, len(imageURLs))
 	var bridgeUsage OpenAIUsage
