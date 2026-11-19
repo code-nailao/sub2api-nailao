@@ -21,7 +21,10 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 			return response, err
 		}
 	}
-	return s.httpUpstream.Do(request, proxyURL, account.ID, account.Concurrency)
+	response, err := s.httpUpstream.Do(request, proxyURL, account.ID, account.Concurrency)
+	// Supplier-side identifiers of the request that carries a rejection-fee hold.
+	observeUpstreamRejectionResponse(request.Context(), response)
+	return response, err
 }
 
 // doOpenAIAccountTestUpstream 让 OpenAI OAuth 账号测试与真实转发使用同一插件路径。

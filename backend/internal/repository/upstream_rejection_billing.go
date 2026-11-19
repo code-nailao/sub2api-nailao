@@ -495,8 +495,8 @@ func (r *usageBillingRepository) FinalizeUpstreamRejection(ctx context.Context, 
 		}
 	} else if row.ReleasedAtDeadline() {
 		// The site already absorbed this request. A rejection that arrives late
-		// is kept for supplier reconciliation and never captures money; other
-		// observations carry no new information.
+		// is kept for supplier reconciliation and never captures money; any
+		// other late observation changes nothing and is not kept.
 		if cmd.Outcome != service.UpstreamRejectionRejected {
 			return nil, service.ErrUpstreamRejectionWaived
 		}
@@ -576,6 +576,9 @@ func (r *usageBillingRepository) FinalizeUpstreamRejection(ctx context.Context, 
 		// Decided here from the locked row, never by the caller: a release from
 		// sent still owes a later ordinary bill, one from unknown does not.
 		stored.ReleasedFrom = row.State
+		// Keep what the upstream answered before the outcome became unknown, so
+		// the released row still identifies the request on the supplier's side.
+		stored = stored.WithUpstreamObservation(row.Evidence)
 	}
 	evidence, err := json.Marshal(stored)
 	if err != nil {

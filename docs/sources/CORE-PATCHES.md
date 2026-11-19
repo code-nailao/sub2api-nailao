@@ -96,7 +96,12 @@ GPT-6.2 价卡的 Ultrafast 倍率留空时，按本仓库既有售价固定为 
 
 标签：`grok_content_rejection_billing`、`content_rejection_public_disclosure`、`grok_canonical_model_catalog`。
 
-可选的固定内容拒绝费：请求前预留余额和 Key 额度，每个请求只结算一次，未确定的保留待核对；面向用户的说明不暴露供应商细节。导入规范的 Grok 模型名。
+可选的固定内容拒绝费：请求前预留余额和 Key 额度，每个请求只结算一次；已发送的同步请求结果未知时，按持久化的截止时间由后台释放，绑定任务的请求由任务终态结算；面向用户的说明不暴露供应商细节。导入规范的 Grok 模型名。
+
+- `openai_plugin_transport.go`、`grok_media.go`：在实际发出请求的位置各加一行，记下上游响应的状态码和请求标识（`X-Client-Request-ID`、`X-Request-ID`、`CF-Ray` 及账号的 `upstream_request_id_header`）。
+- `upstream_rejection_trace.go`、`openai_gateway_rejection_billing.go`：把这些标识写入账本证据。结果未知、免费释放和收取固定费的预留都带上；超时释放时保留释放前记下的标识。记录的状态码是上游响应实际携带的，网关自己合成的错误码不写入。它们只用于与供应商账单逐笔核对，不参与任何扣费判断。
+- 三个固定标识只保留可见 ASCII、最长 128 字节，不符合的整个丢弃。账号声明的请求号在所有结算路径上（含 `grok_media_rejection.go` 的视频任务核对）先确认数据库能存：含控制字符或非法 UTF-8 时丢弃，超过用量表列宽时按用量行的方式截断。响应头的内容不会让任何一次结算失败。
+- `upstream_rejection_recovery.go`：设置项 `upstream_rejection_deadline_release_paused` 为 `true` 时跳过超时释放并保留预留；不存在或为 `false` 时照常执行；其他取值（含空值）或读不到时按暂停处理。每次释放前都重新读取，设置后正在进行的一轮也立即停下。
 
 ### DeepSeek 联网工具
 
