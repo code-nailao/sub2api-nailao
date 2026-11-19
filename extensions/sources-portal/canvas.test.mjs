@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { createCanvasFixture as fixture } from './canvas.fixture.mjs';
+import { createCanvasFixture as fixture, CUSTOM_ID } from './canvas.fixture.mjs';
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 test('Canvas hides repeated title/helper chrome from first paint and reveals one compact connection row after ACK', async () => {
@@ -125,4 +125,74 @@ test('Canvas layout is isolated, responsive and keeps native controls instead of
   assert.match(html, /id="canvas-open"[^>]+hidden/); assert.match(css, /body\[data-surface="canvas"\]>iframe\{flex:1/);
   assert.match(css, /@media\(max-width:560px\)/); assert.match(css, /prefers-reduced-motion:reduce/);
   assert.equal(html.includes('普通、可见、可撤销'), false);
+});
+
+const connections = (f) => f.calls.filter((call) => call.path.endsWith('/connection'));
+
+test('a saved own-key connection is one more entry of the group menu', async () => {
+  const f = await fixture({ custom: 'configured' }); f.host(); f.loaded(); await f.ack();
+  assert.deepEqual(f.select.children.map((option) => option.value), [26, 27, CUSTOM_ID]);
+  assert.equal(f.elements['#canvas-custom'].hidden, false);
+  assert.equal(f.elements['#canvas-manage'].hidden, true);
+  f.select.value = String(CUSTOM_ID); await f.select.onchange();
+  assert.equal(connections(f).at(-1).options.body.group_id, CUSTOM_ID);
+  assert.equal(f.last('sub2api:media-studio-config').payload.selectedConnectionId, `group-${CUSTOM_ID}`);
+  await f.ack();
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.document.body.dataset.state, 'ready');
+});
+
+test('saving an own-key connection from the empty state connects to it', async () => {
+  const f = await fixture({ groups: [], custom: 'available' });
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.match(f.elements['#message'].textContent, /使用我的密钥/);
+  assert.equal(f.elements['#canvas-own-key'].hidden, false);
+  assert.equal(connections(f).length, 0);
+  f.elements['#canvas-own-key'].onclick();
+  assert.equal(f.settings.at(-1).kind, 'custom');
+  f.state.custom = 'configured';
+  f.settings.at(-1).onSaved(true);
+  await flush(); await flush();
+  assert.equal(connections(f).length, 1);
+  assert.equal(connections(f)[0].options.body.group_id, CUSTOM_ID);
+  f.loaded(); await f.ack();
+  assert.equal(f.frame.hidden, false);
+  // Removing it leaves nothing to connect to, and no second authorization.
+  f.state.custom = 'available';
+  f.settings.at(-1).onSaved(false);
+  await flush(); await flush();
+  assert.equal(f.select.children.length, 0);
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(connections(f).length, 1);
+});
+
+test('group settings refresh the menu without reconnecting the selected group', async () => {
+  const f = await fixture({ admin: true }); f.host(); f.loaded(); await f.ack();
+  assert.equal(f.elements['#canvas-manage'].hidden, false);
+  f.elements['#canvas-connection-menu'].open = true;
+  f.elements['#canvas-manage'].onclick();
+  assert.equal(f.settings.at(-1).kind, 'manage');
+  assert.equal(f.elements['#canvas-connection-menu'].open, false);
+  const before = connections(f).length;
+  f.state.groups = [...f.state.groups, { id: 28, name: 'Added' }];
+  f.settings.at(-1).onSaved();
+  await flush(); await flush();
+  assert.deepEqual(f.select.children.map((option) => option.value), [26, 27, 28]);
+  assert.equal(f.select.value, '26');
+  assert.equal(connections(f).length, before);
+  assert.equal(f.frame.hidden, false);
+  // Removing the selected group moves to the first one that is left.
+  f.state.groups = [{ id: 27, name: 'Grok' }];
+  f.settings.at(-1).onSaved();
+  await flush(); await flush();
+  assert.equal(f.select.value, '27');
+  assert.equal(connections(f).at(-1).options.body.group_id, 27);
+
+  const user = await fixture();
+  assert.equal(user.elements['#canvas-manage'].hidden, true);
+  assert.equal(user.elements['#canvas-custom'].hidden, true);
+  user.window.dispatchEvent(new Event('sources:locked'));
+  user.elements['#canvas-custom'].onclick();
+  user.elements['#canvas-manage'].onclick();
+  assert.equal(user.settings.length, 0);
 });

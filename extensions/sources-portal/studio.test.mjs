@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createStudioFixture as fixture } from './studio.fixture.mjs';
+import { createStudioFixture as fixture, CUSTOM_ID, SETUP_ID, MANAGE_ID } from './studio.fixture.mjs';
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -251,4 +251,99 @@ test('theme changes preserve the integrated view and update recovery colors', as
   assert.equal(f.loadingPanel.hidden, true);
   assert.equal(f.connectionBar.hidden, true);
   assert.equal(f.frameSets, 1);
+});
+
+const select = (groupId, revision, requestId) => ({ type: 'sub2api:image-studio-select-group', version: 1, requestId, revision, groupId });
+const connections = (f) => f.calls.filter((call) => call.path.endsWith('/connection')).length;
+// Messages are built in the page's realm; copy the IDs before comparing them.
+const ids = (groups) => Array.from(groups, (group) => group.id);
+
+test('settings entries follow the groups and open a dialog instead of connecting', async () => {
+  const f = await fixture({ custom: 'available', admin: true });
+  const shell = await f.integrate();
+  assert.deepEqual(ids(shell.groups), [26, 27, SETUP_ID, MANAGE_ID]);
+  assert.equal(shell.groups.at(-2).name, '＋ 自定义连接（用我的密钥）…');
+  const before = connections(f);
+  f.send(select(SETUP_ID, shell.revision, 'settings-request-0001'));
+  await flush();
+  const result = f.last('sub2api:image-studio-select-group-result');
+  assert.equal(result.requestId, 'settings-request-0001');
+  assert.equal(result.status, 'error');
+  assert.equal(result.message, '');
+  assert.equal(result.reconnectRequired, false);
+  assert.equal(f.settings.length, 1);
+  assert.equal(f.settings[0].kind, 'custom');
+  assert.equal(connections(f), before);
+  assert.equal(f.last('sub2api:image-studio-config-applied'), undefined);
+  // A repeated message is one request, not a second dialog.
+  f.send(select(SETUP_ID, shell.revision, 'settings-request-0001'));
+  await flush();
+  assert.equal(f.settings.length, 1);
+  // Saving starts the page again on the saved connection; removing forgets it.
+  f.settings[0].onSaved(true);
+  assert.equal(f.values.get('sources:studio:last-group:9'), String(CUSTOM_ID));
+  assert.equal(f.state.reloads, 1);
+  f.settings[0].onSaved(false);
+  assert.equal(f.values.has('sources:studio:last-group:9'), false);
+  assert.equal(f.state.reloads, 2);
+});
+
+test('group settings are an administrator entry and saving republishes the groups', async () => {
+  const f = await fixture({ admin: true });
+  const shell = await f.integrate();
+  assert.deepEqual(ids(shell.groups), [26, 27, MANAGE_ID]);
+  f.send(select(MANAGE_ID, shell.revision, 'manage-request-00001'));
+  await flush();
+  assert.equal(f.settings.at(-1).kind, 'manage');
+  f.state.groupList = [...f.state.groupList, { id: 28, name: 'Added' }];
+  f.settings.at(-1).onSaved();
+  await flush();
+  assert.deepEqual(ids(f.last('sub2api:image-studio-shell-config').groups), [26, 27, 28, MANAGE_ID]);
+  assert.equal(f.state.reloads, 0);
+
+  const user = await fixture();
+  const plain = await user.integrate();
+  assert.deepEqual(ids(plain.groups), [26, 27]);
+  for (const id of [MANAGE_ID, SETUP_ID, CUSTOM_ID]) {
+    user.send(select(id, plain.revision, `forged-request-${id}`));
+    await flush();
+    assert.equal(user.last('sub2api:image-studio-select-group-result').message, '分组信息已更新，请重新选择。');
+  }
+  assert.equal(user.settings.length, 0);
+  assert.equal(connections(user), 1);
+});
+
+test('a saved own-key connection is offered and connected like a group', async () => {
+  const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID) });
+  assert.equal(f.calls.find((call) => call.path.endsWith('/connection')).options.body.group_id, CUSTOM_ID);
+  const shell = await f.integrate();
+  assert.deepEqual(ids(shell.groups), [26, 27, CUSTOM_ID, SETUP_ID]);
+  assert.equal(shell.groups.at(-1).name, '修改自定义连接…');
+  assert.equal(shell.selectedGroupId, CUSTOM_ID);
+  assert.equal(f.document.body.dataset.integrated, 'true');
+  f.send(select(26, shell.revision, 'switch-back-request-01'));
+  await flush();
+  assert.equal(f.calls.at(-1).options.body.group_id, 26);
+});
+
+test('an account without registered groups is offered its own key, and a lock withdraws the offer', async () => {
+  const f = await fixture({ groupList: [], custom: 'available' });
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.match(f.message.textContent, /使用我的密钥/);
+  assert.equal(f.ownKeyButton.hidden, false);
+  assert.equal(f.customButton.hidden, false);
+  assert.equal(f.manageButton.hidden, true);
+  assert.equal(f.manageRecoveryButton.hidden, true);
+  f.connectionMenu.open = true;
+  f.ownKeyButton.onclick();
+  assert.equal(f.settings.at(-1).kind, 'custom');
+  assert.equal(f.connectionMenu.open, false);
+  f.window.dispatchEvent(new Event('sources:locked'));
+  assert.equal(f.ownKeyButton.hidden, true);
+  f.ownKeyButton.onclick();
+  assert.equal(f.settings.length, 1);
+
+  const off = await fixture({ groupList: [] });
+  assert.match(off.message.textContent, /请联系管理员/);
+  assert.equal(off.ownKeyButton.hidden, true);
 });
