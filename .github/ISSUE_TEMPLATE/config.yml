@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞
+    url: https://github.com/code-nailao/sub2api-nailao/security/advisories/new
+    about: 不要开公开 issue。请使用私密漏洞报告，只有维护者能看到。
+  - name: 上游 sub2api 的问题
+    url: https://github.com/Wei-Shaw/sub2api/issues
+    about: 与上游共有的问题请优先反馈给上游。

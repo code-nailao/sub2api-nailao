@@ -71,6 +71,34 @@ jobs:
       - name: Links resolve and no host details are committed
         run: python3 scripts/sources_extensions/check_public_tree.py
 
+  issue-link:
+    # Every pull request names the issue it closes, or says why it has none.
+    # It does not wait for `changes`: the rule holds whatever the files are. A
+    # push to main and a manual run have no description, so they skip it.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # It takes seconds; the limit only bounds a description built to be slow.
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: The description links an issue or says why there is none
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        # The description is read as it is now rather than taken from the event,
+        # which a re-run would replay unchanged: after editing the description,
+        # re-running this job is enough. It reaches the script only as an
+        # environment variable and is never part of a command.
+        run: |
+          set -euo pipefail
+          PR_BODY=$(gh api "repos/$REPO/pulls/$PR" --jq '.body // ""')
+          export PR_BODY
+          python3 scripts/sources_extensions/check_pr_issue.py
+
   unit:
     needs: changes
     if: needs.changes.outputs.backend == 'true'
@@ -274,6 +302,7 @@ jobs:
         working-directory: extensions/sources-media-engine
       - run: python3 scripts/sources_extensions/core_parity.py
       - run: python3 scripts/sources_extensions/check_boundaries.py
+      - run: python3 -m unittest discover -s scripts/sources_extensions -p 'test_*.py'
       - run: python3 -m unittest discover -s scripts/sources_release -p 'test_*.py'
       - run: python3 -m unittest discover -s deploy/sources -p 'test_*.py'
       - name: Migrations only expand the schema
@@ -299,7 +328,7 @@ jobs:
     # The one check to require on main. A job that `changes` skipped counts as
     # passed; a failed or cancelled job does not.
     if: always()
-    needs: [changes, tree, unit, integration, golangci-lint, frontend, shell, release-helpers, sources-extensions]
+    needs: [changes, tree, issue-link, unit, integration, golangci-lint, frontend, shell, release-helpers, sources-extensions]
     runs-on: ubuntu-latest
     steps:
       - name: Every job passed or was skipped on purpose

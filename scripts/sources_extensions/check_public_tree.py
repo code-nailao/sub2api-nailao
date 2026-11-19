@@ -24,7 +24,8 @@ ROOT = Path(__file__).resolve().parents[2]
 FORK_OWNED = (
     'AGENTS.md', 'SOURCES.md', 'DEV_GUIDE.md', 'CHANGELOG.md', 'NOTICE',
     '.sources-identity.json', '.github/README.md', '.github/workflows/',
-    '.github/release-tools/', 'docs/sources/', 'scripts/', 'deploy/sources/',
+    '.github/release-tools/', '.github/ISSUE_TEMPLATE/', '.github/pull_request_template.md',
+    'docs/sources/', 'scripts/', 'deploy/sources/',
     'deploy/clean/', 'extensions/',
 )
 # Generated or third-party content inside the fork-owned areas.

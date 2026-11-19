@@ -4,7 +4,7 @@
 
 ## 开始前
 
-读 [AGENTS](AGENTS.md) 和 [二开差异总表](SOURCES.md)。从最新 `main` 按类型创建短期分支（新功能 `feature/<主题>`、修复 `fix/<主题>` 等），规范见[工作区规范](docs/sources/WORKSPACE.md)。不要直接合并上游 `main`：上游同步是单独任务，需要更新固定基线、检查二开差异并做回归。
+读 [AGENTS](AGENTS.md) 和 [二开差异总表](SOURCES.md)。从最新 `main` 按类型创建短期分支（新功能 `feature/<主题>`、修复 `fix/<主题>` 等），规范见[工作区规范](docs/sources/WORKSPACE.md)。改动先有 issue，PR 正文关联它或写明为什么没有，写法见同一文档的“Issue 与 PR”。不要直接合并上游 `main`：上游同步是单独任务，需要更新固定基线、检查二开差异并做回归。
 
 ## 工具链以仓库文件为准
 
@@ -29,7 +29,7 @@
 | `extensions/sources-portal` | 首页与编辑器、上游余额、工作台授权、智商检测等独立服务 |
 | `extensions/sources-media-engine` | 媒体引擎（持久图片任务引擎） |
 | `extensions/sources-monitor-*` | 渠道状态页的本地预览，不进入生产构建 |
-| `scripts/sources_extensions` | 基线获取、核心差异和扩展边界检查 |
+| `scripts/sources_extensions` | 基线获取、核心差异和扩展边界检查，公开目录与 PR 正文检查 |
 | `scripts/sources_release` | 固定源码构建、CI 结果核对、镜像发布 |
 | `deploy/sources` | 固定槽位部署工具和迁移检查，见[发布与部署](docs/sources/DEPLOY.md) |
 | `docs/sources` | 二开设计文档，见[索引](docs/sources/README.md) |
@@ -82,6 +82,8 @@ python3 scripts/sources_extensions/check_boundaries.py   # 扩展不依赖 Sub �
 python3 deploy/sources/migration_lint.py --base origin/main  # 新迁移只扩展结构
 python3 -m unittest discover -s deploy/sources -p 'test_*.py'
 python3 -m unittest discover -s scripts/sources_release -p 'test_*.py'
+python3 -m unittest discover -s scripts/sources_extensions -p 'test_*.py'
+PR_BODY="$(cat <正文文件>)" python3 scripts/sources_extensions/check_pr_issue.py  # 开 PR 前检查正文是否关联了 issue
 ```
 
 - 对照 [SOURCES](SOURCES.md) 找到受影响的能力；原版已支持的能力优先沿用原实现。

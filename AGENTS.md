@@ -15,6 +15,10 @@
 - 不建立常驻 `dev`、`develop`、`hotfix` 或 `release` 分支。紧急修复同样用 `fix/`。
 - 不直接合并上游 `main`。上游同步是单独任务，见下文“核心保持原版”。
 - 提交信息使用 `type: summary`（`feat:`、`fix:`、`docs:` 等）。不用 reset、clean 或自动 stash 处理冲突，先弄清改动归属。
+- **先有 issue，再开 PR。** 不是马上就做的事（顺手发现的缺陷、推迟的后续工作、想法）当场开 issue，不留在聊天记录、TODO 或代码注释里。
+- 每个 PR 的正文要么关联 issue：`Closes #N` 或 `Fixes #N`（合并后自动关闭），只关联不关闭用 `Refs #N`；要么写一行 `No issue: <原因>`。两者都没有时 CI 不通过。
+- 可以不开 issue 的只有四类：错别字、纯文档小改、依赖或 CI 的机械维护、发版准备 PR。
+- issue 和代码一样是公开的，遵守下文“公开仓库的边界”：只描述代码层面的缺陷和修复目标，运维、事故和资金细节不进 issue。
 
 详细规范见 [工作区规范](docs/sources/WORKSPACE.md)。
 

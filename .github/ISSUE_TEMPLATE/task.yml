@@ -1,0 +1,29 @@
+name: 任务
+description: 工程维护、文档、重构、性能，或推迟的后续工作
+labels: [chore]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **这个仓库是公开的。** 只描述代码和文档层面的工作。不要写主机地址、真实域名、服务器路径、端口、容器名、金额或数量、上游供应商或渠道名称、用户数据、密钥；示例使用占位值。运维、事故和资金细节不写在这里。
+
+        默认标签是 `chore`；纯文档任务请改为 `docs`。
+  - type: textarea
+    id: goal
+    attributes:
+      label: 要做什么
+      description: 目标和范围。来自某个 PR 或 issue 的后续工作，写上它的编号。
+    validations:
+      required: true
+  - type: textarea
+    id: reason
+    attributes:
+      label: 为什么
+      description: 不做会怎样，或者为什么当时推迟。
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 满足哪些可以检查的条件就算完成。
+    validations:
+      required: true
