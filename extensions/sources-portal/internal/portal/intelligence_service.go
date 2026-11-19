@@ -28,19 +28,10 @@ func NewIntelligenceService(store *IntelligenceStore, mainOrigin, providerOrigin
 // NewIntelligenceServiceWithAPIOrigins builds the worker. providerOrigin is the
 // detection service (INTELLIGENCE_PROVIDER_ORIGIN) and is required.
 func NewIntelligenceServiceWithAPIOrigins(store *IntelligenceStore, mainOrigin, providerOrigin, rawOverrides string) (*IntelligenceService, error) {
-	origin, err := CanonicalOrigin(mainOrigin)
+	s, err := CheckIntelligenceService(store, mainOrigin, providerOrigin, rawOverrides)
 	if err != nil {
 		return nil, err
 	}
-	provider, err := newIntelligenceProvider(providerOrigin)
-	if err != nil {
-		return nil, err
-	}
-	origins, err := intelligenceAPIOrigins(rawOverrides)
-	if err != nil {
-		return nil, err
-	}
-	s := &IntelligenceService{Store: store, provider: provider, baseURL: origin + "/v1", apiBaseURLs: origins, now: func() time.Time { return time.Now().UTC() }}
 	// The old owner has released portal.lock. An interrupted POST without a
 	// durable remote ID is indeterminate, not a queue item that can be retried.
 	hasInterrupted := false
@@ -64,6 +55,26 @@ func NewIntelligenceServiceWithAPIOrigins(store *IntelligenceStore, mainOrigin, 
 		})
 	}
 	return s, err
+}
+
+// CheckIntelligenceService validates the worker configuration exactly as
+// NewIntelligenceServiceWithAPIOrigins does, but does not rewrite interrupted
+// submissions: while the old owner still runs, a "submitting" run may be live.
+// The result is never started; it holds no goroutine and makes no request.
+func CheckIntelligenceService(store *IntelligenceStore, mainOrigin, providerOrigin, rawOverrides string) (*IntelligenceService, error) {
+	origin, err := CanonicalOrigin(mainOrigin)
+	if err != nil {
+		return nil, err
+	}
+	provider, err := newIntelligenceProvider(providerOrigin)
+	if err != nil {
+		return nil, err
+	}
+	origins, err := intelligenceAPIOrigins(rawOverrides)
+	if err != nil {
+		return nil, err
+	}
+	return &IntelligenceService{Store: store, provider: provider, baseURL: origin + "/v1", apiBaseURLs: origins, now: func() time.Time { return time.Now().UTC() }}, nil
 }
 
 func intelligenceRequestHash(plan, benchmark, request string) string {

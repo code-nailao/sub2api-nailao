@@ -114,6 +114,20 @@ studio.json是外部能力登记，不授予分组权限；每次仍交原版判
 
 已有登记或 Studio 客户端在使用早期引擎值的部署，必须为 Portal 与 Main 设置同一个私有变量 `SOURCES_MEDIA_ENGINE_LEGACY_NAME=<旧引擎名>`（`^[a-z0-9]{2,32}$`，不能是 `sub2api`）。设置后登记中旧值与 `media` 都被接受，返回给 Studio 客户端的 `engine` 始终是旧值，客户端不需改动；未设置时只接受并返回 `media`，登记里的旧值会让 Portal 启动失败。该值只放在服务器私有配置里，不写入本仓库。
 
+### 启动前检查 `-check-config`
+
+Portal 的状态目录由进程锁保证单写者，新进程要等旧进程退出后才能启动，配置错误（例如缺少必填变量）原本要到旧进程停掉之后才暴露。部署工具应在停止旧进程之前，用新镜像和真实配置（同样的环境变量、状态目录和密钥文件挂载）运行：
+
+```sh
+/app/sources-portal -check-config
+```
+
+- 按正常启动的顺序执行全部校验，失败信息与正常启动相同：各环境变量、master.key 与钱包桥密钥文件的权限和格式、`PORTAL_HOME_DIR/index.html`、`STUDIO_CONFIG_FILE`，以及正常启动会读取的状态文件——`sources.json`（含用当前密钥解密每条来源）、`account-bindings.json`、`intelligence/state.json`（含解密监测 Key）、设置 `PORTAL_HOME_DIR` 时的 `home.json`、设置 `STUDIO_CONFIG_FILE` 时的 `studio-bindings.json`、`studio-registry.json`、`studio-custom.json`。不存在的状态文件按正常启动的方式视为空状态。
+- `PORTAL_DATA_DIR` 必须是已存在的目录（空目录可以）；不存在说明挂载错了，正常启动会在那里静默建一份空状态。
+- `PORTAL_LISTEN` 只检查 `host:port` 格式，端口能否绑定只有真正监听才知道。
+- 刻意不做：不取也不等待进程锁，不建目录，不写、改名、改权限或删除任何文件（启动迁移和中断任务的改写只校验输入、不落盘），不监听端口，不启动 worker，不访问网络。状态目录和密钥文件只读挂载时也能运行。旧进程运行中原子替换文件，检查期间读取是安全的。
+- 成功时 stdout 只输出一行 `SOURCES_PORTAL_CONFIG_OK`，退出码 0；失败时 stderr 输出一行与正常启动相同的错误信息（不含密钥或变量值），退出码 1；其他参数输出用法并以退出码 2 结束，不启动服务。
+
 ## 权限和会话边界
 
 - 主站JWT不进URL日志。原版iframe的token查询参数立即清除；代理日志使用不带查询串的 `$uri`。

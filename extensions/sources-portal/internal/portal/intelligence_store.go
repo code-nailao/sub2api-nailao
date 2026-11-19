@@ -149,60 +149,108 @@ func OpenIntelligenceStore(owner *Store) (*IntelligenceStore, error) {
 	if owner == nil || owner.lock == nil {
 		return nil, errors.New("portal_store_owner_required")
 	}
-	dir := filepath.Join(filepath.Dir(owner.path), "intelligence")
-	if err := os.MkdirAll(filepath.Join(dir, "results"), 0700); err != nil {
+	s := newIntelligenceStore(owner)
+	if err := os.MkdirAll(filepath.Join(s.dir, "results"), 0700); err != nil {
 		return nil, err
 	}
-	s := &IntelligenceStore{dir: dir, path: filepath.Join(dir, "state.json"), aead: owner.aead, writer: writeJSONAtomic}
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	if intelligenceViewerMigrationNeeded(s.state) {
+		if err := s.change(migrateIntelligenceViewer); err != nil {
+			return nil, err
+		}
+	}
+	return s, nil
+}
+
+// CheckIntelligenceStore reads and validates the state OpenIntelligenceStore
+// would load, without creating directories or writing the viewer migration.
+// The migration cannot reject a state that passed validation; it is applied to
+// a discarded copy so the check exercises the same code. The returned store
+// refuses every write.
+func CheckIntelligenceStore(owner *Store) (*IntelligenceStore, error) {
+	if owner == nil {
+		return nil, errors.New("portal_store_owner_required")
+	}
+	s := newIntelligenceStore(owner)
+	for _, dir := range []string{s.dir, filepath.Join(s.dir, "results")} {
+		if err := checkCreatable(dir, true); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	if intelligenceViewerMigrationNeeded(s.state) {
+		next := cloneIntelligenceState(s.state)
+		if err := migrateIntelligenceViewer(&next); err != nil {
+			return nil, err
+		}
+	}
+	s.failed = errReadOnlyCheck
+	s.writer = func(string, any) error { return errReadOnlyCheck }
+	return s, nil
+}
+
+func newIntelligenceStore(owner *Store) *IntelligenceStore {
+	dir := filepath.Join(filepath.Dir(owner.path), "intelligence")
+	return &IntelligenceStore{dir: dir, path: filepath.Join(dir, "state.json"), aead: owner.aead, writer: writeJSONAtomic}
+}
+
+// load is the read, decode and validate step shared by OpenIntelligenceStore
+// and CheckIntelligenceStore. A missing file yields the empty initial state.
+func (s *IntelligenceStore) load() error {
 	s.state = intelligenceState{Version: 1, AdminOnly: true, Plans: map[string]intelligencePlanRecord{}, Runs: map[string]intelligenceRunRecord{}, Requests: map[string]intelligenceRequest{}}
 	raw, err := os.ReadFile(s.path)
 	if err == nil {
 		if json.Unmarshal(raw, &s.state) != nil || s.state.Version != 1 || s.state.Plans == nil || s.state.Runs == nil || s.state.Requests == nil {
-			return nil, errors.New("invalid_intelligence_store")
+			return errors.New("invalid_intelligence_store")
 		}
 		for id, p := range s.state.Plans {
 			if !intelligenceID.MatchString(id) || p.Plan.ID != id {
-				return nil, errors.New("invalid_intelligence_plan")
+				return errors.New("invalid_intelligence_plan")
 			}
 			if p.Secret != "" {
 				if _, err := s.decrypt(p); err != nil {
-					return nil, errors.New("intelligence_key_mismatch")
+					return errors.New("intelligence_key_mismatch")
 				}
 			}
 		}
 		for id, r := range s.state.Runs {
 			if !intelligenceID.MatchString(id) || r.Run.ID != id {
-				return nil, errors.New("invalid_intelligence_run")
+				return errors.New("invalid_intelligence_run")
 			}
 		}
 	} else if !os.IsNotExist(err) {
-		return nil, err
+		return err
 	}
 	if s.state.ViewerPolicy != nil && s.state.ViewerPolicy.Version != 1 {
-		return nil, errors.New("invalid_intelligence_viewer_policy")
+		return errors.New("invalid_intelligence_viewer_policy")
 	}
-	if s.state.ViewerPolicy == nil || !s.state.AdminOnly || s.state.ViewerAccess != "admin" {
-		if err := s.change(func(st *intelligenceState) error {
-			if st.ViewerPolicy == nil {
-				access := "admin"
-				if st.ViewerAccess == "authenticated" {
-					access = "authenticated"
-				}
-				st.ViewerPolicy = &intelligenceViewerPolicy{Version: 1, Access: access}
-				for id, row := range st.Plans {
-					// Preserve shared042 plans; after a legacy writer drops unknown policy
-					// fields, its private access keeps every plan private on the next upgrade.
-					row.Plan.Visibility = access
-					st.Plans[id] = row
-				}
-			}
-			st.AdminOnly, st.ViewerAccess = true, "admin"
-			return nil
-		}); err != nil {
-			return nil, err
+	return nil
+}
+
+func intelligenceViewerMigrationNeeded(st intelligenceState) bool {
+	return st.ViewerPolicy == nil || !st.AdminOnly || st.ViewerAccess != "admin"
+}
+
+func migrateIntelligenceViewer(st *intelligenceState) error {
+	if st.ViewerPolicy == nil {
+		access := "admin"
+		if st.ViewerAccess == "authenticated" {
+			access = "authenticated"
+		}
+		st.ViewerPolicy = &intelligenceViewerPolicy{Version: 1, Access: access}
+		for id, row := range st.Plans {
+			// Preserve shared042 plans; after a legacy writer drops unknown policy
+			// fields, its private access keeps every plan private on the next upgrade.
+			row.Plan.Visibility = access
+			st.Plans[id] = row
 		}
 	}
-	return s, nil
+	st.AdminOnly, st.ViewerAccess = true, "admin"
+	return nil
 }
 
 func cloneIntelligenceState(v intelligenceState) intelligenceState {
