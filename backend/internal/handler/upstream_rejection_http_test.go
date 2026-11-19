@@ -81,6 +81,69 @@ func TestUpstreamRejectionHTTPHandlersPlatformQuotaRejectedBeforeUpstream(t *tes
 	}
 }
 
+// rejectionRecordingLedger reserves like the real ledger and keeps how the
+// hold ended. It is used from the request goroutine only.
+type rejectionRecordingLedger struct {
+	service.UsageBillingRepository
+	service.UpstreamRejectionBillingRepository
+	row       *service.UpstreamRejectionReservation
+	sent      int
+	finalized []service.UpstreamRejectionFinalizeCommand
+}
+
+func (l *rejectionRecordingLedger) ReserveUpstreamRejection(_ context.Context, c *service.UpstreamRejectionReserveCommand) (*service.UpstreamRejectionBillingResult, error) {
+	l.row = &service.UpstreamRejectionReservation{UpstreamRejectionReserveCommand: *c, State: service.UpstreamRejectionReserved}
+	return &service.UpstreamRejectionBillingResult{Applied: true, Reservation: l.row}, nil
+}
+
+func (l *rejectionRecordingLedger) MarkUpstreamRejectionSent(context.Context, string, int64) (*service.UpstreamRejectionBillingResult, error) {
+	l.sent++
+	l.row.State = service.UpstreamRejectionSent
+	return &service.UpstreamRejectionBillingResult{Applied: true, Reservation: l.row}, nil
+}
+
+func (l *rejectionRecordingLedger) FinalizeUpstreamRejection(_ context.Context, c *service.UpstreamRejectionFinalizeCommand) (*service.UpstreamRejectionBillingResult, error) {
+	l.finalized = append(l.finalized, *c)
+	l.row.State = c.Outcome
+	return &service.UpstreamRejectionBillingResult{Applied: true, Reservation: l.row}, nil
+}
+
+const rejectionComposerImageRequest = `{"model":"grok-composer-2.5-fast","messages":[{"role":"user","content":[{"type":"text","text":"What is shown?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]}],"stream":false}`
+
+// A hold covers one upstream request and describing images would send more, so
+// a composer request with image input is refused with a clear 400: nothing is
+// sent to the supplier and the hold is released at once without charge.
+func TestUpstreamRejectionChatRefusesComposerImageInputAndReleasesTheHold(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ledger := &rejectionRecordingLedger{}
+	h, upstream, key := newRejectionHTTPTestHandler(t, true, ledger)
+	rec := serveRejectionHTTPBody(t, h, key, "chat/completions", rejectionComposerImageRequest)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	require.JSONEq(t, `{"error":{"type":"invalid_request_error","message":"This model does not support image input in this group"}}`, rec.Body.String())
+	require.Zero(t, upstream.calls.Load(), "nothing may reach the supplier")
+	require.NotNil(t, ledger.row, "the fixed fee was reserved for this request")
+	require.Zero(t, ledger.sent, "the hold was never marked as sent")
+	require.Equal(t, []service.UpstreamRejectionFinalizeCommand{{
+		RequestID: ledger.row.RequestID, APIKeyID: key.ID,
+		Outcome: service.UpstreamRejectionReleased, ConfirmedNoCharge: true,
+	}}, ledger.finalized, "released once, as a request that was never sent")
+}
+
+// A group that does not charge the fee carries no hold: the same request still
+// sends the image-description call first. The fixture's upstream answers every
+// call with a 403, so the description fails and the composer request does not
+// follow.
+func TestUpstreamRejectionChatWithoutTheFeeStillDescribesComposerImages(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h, upstream, key := newRejectionHTTPTestHandler(t, false)
+	rec := serveRejectionHTTPBody(t, h, key, "chat/completions", rejectionComposerImageRequest)
+
+	require.EqualValues(t, 1, upstream.calls.Load(), "the description call is sent")
+	require.Equal(t, http.StatusBadGateway, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "grok composer image bridge upstream error")
+}
+
 func TestUpstreamRejectionWebSocketRejectedBeforeUpgrade(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	h, upstream, key := newRejectionHTTPTestHandler(t, true)
@@ -118,7 +181,7 @@ func newRejectionHTTPTestHandler(t *testing.T, enabled bool, ledgers ...service.
 		Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true,
 		Credentials: map[string]any{
 			"api_key": "test-not-a-real-key", "base_url": "https://provider.example.test",
-			"model_mapping": map[string]any{"grok-4.5": "grok-4.5"},
+			"model_mapping": map[string]any{"grok-4.5": "grok-4.5", "grok-composer-2.5-fast": "grok-composer-2.5-fast"},
 			"pool_mode":     true, "pool_mode_retry_count": float64(10),
 			"pool_mode_retry_status_codes": []any{float64(400), float64(403)},
 		},
@@ -168,6 +231,11 @@ func serveRejectionHTTPTest(t *testing.T, h *OpenAIGatewayHandler, key *service.
 	if endpoint != "responses" {
 		body = `{"model":"grok-4.5","messages":[{"role":"user","content":"hello"}],"max_tokens":32,"stream":false}`
 	}
+	return serveRejectionHTTPBody(t, h, key, endpoint, body)
+}
+
+func serveRejectionHTTPBody(t *testing.T, h *OpenAIGatewayHandler, key *service.APIKey, endpoint, body string) *httptest.ResponseRecorder {
+	t.Helper()
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/"+endpoint, strings.NewReader(body))

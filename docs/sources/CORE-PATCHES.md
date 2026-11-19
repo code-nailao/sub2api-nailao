@@ -102,6 +102,7 @@ GPT-6.2 价卡的 Ultrafast 倍率留空时，按本仓库既有售价固定为 
 - `upstream_rejection_trace.go`、`openai_gateway_rejection_billing.go`：把这些标识写入账本证据。结果未知、免费释放和收取固定费的预留都带上；超时释放时保留释放前记下的标识。记录的状态码是上游响应实际携带的，网关自己合成的错误码不写入。它们只用于与供应商账单逐笔核对，不参与任何扣费判断。
 - 三个固定标识只保留可见 ASCII、最长 128 字节，不符合的整个丢弃。账号声明的请求号在所有结算路径上（含 `grok_media_rejection.go` 的视频任务核对）先确认数据库能存：含控制字符或非法 UTF-8 时丢弃，超过用量表列宽时按用量行的方式截断。响应头的内容不会让任何一次结算失败。
 - `upstream_rejection_recovery.go`：设置项 `upstream_rejection_deadline_release_paused` 为 `true` 时跳过超时释放并保留预留；不存在或为 `false` 时照常执行；其他取值（含空值）或读不到时按暂停处理。每次释放前都重新读取，设置后正在进行的一轮也立即停下。
+- `openai_gateway_grok.go`、`openai_gateway_chat_completions_raw.go`：原版为 composer 模型的每张输入图片先发一次描述请求，再发正式请求。一次预留只覆盖一个上游请求，所以请求带着预留时，桥接在发出第一个描述请求之前返回，直转入口据此回 400（该分组下此模型不支持图片输入）。此时没有任何上游请求，预留按“未发送”立即释放、不收费。没有预留的请求（未开启该策略的分组）桥接行为不变。判断与错误定义在 `upstream_rejection_gateway.go`。
 
 ### DeepSeek 联网工具
 
