@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"go.uber.org/zap"
 )
 
@@ -52,14 +53,24 @@ func deepSeekWantsTools(body []byte, auto bool) bool {
 	return false
 }
 
+// deepSeekExplicitTool maps the web tool types the gateway executes itself:
+// the OpenAI/Anthropic style (web_search*, web_fetch*) and the provider's own
+// (deepseek_web_search, deepseek_read_url).
 func deepSeekExplicitTool(typ string) string {
-	if typ == "web_search" || typ == "web_search_preview" || strings.HasPrefix(typ, "web_search_20") {
+	if typ == "web_search" || typ == "web_search_preview" || strings.HasPrefix(typ, "web_search_20") || typ == "deepseek_web_search" {
 		return "search"
 	}
-	if typ == "web_fetch" || strings.HasPrefix(typ, "web_fetch_20") {
+	if typ == "web_fetch" || strings.HasPrefix(typ, "web_fetch_20") || typ == "deepseek_read_url" {
 		return "fetch"
 	}
 	return ""
+}
+
+// deepSeekProviderTool reports the provider's own web tool types. Unlike
+// web_search*, nothing on the ordinary path handles them: forwarded as they
+// are, the provider would run paid tool calls the gateway never bills.
+func deepSeekProviderTool(typ string) bool {
+	return typ == "deepseek_web_search" || typ == "deepseek_read_url"
 }
 
 func prepareDeepSeekHosted(body []byte, protocol string, auto bool) (*deepSeekHostedRequest, bool, error) {
@@ -217,59 +228,32 @@ func prepareDeepSeekHosted(body []byte, protocol string, auto bool) (*deepSeekHo
 }
 
 // deepSeekCapture buffers non-streaming turns or delegates SSE to the hosted
-// incremental writer. Native mode tees exact bytes and only observes usage.
+// incremental writer; nothing reaches the client directly.
 type deepSeekCapture struct {
 	incremental        *deepSeekIncrementalTurn
 	rejectedHTTPStatus int
 	gin.ResponseWriter
-	header                    http.Header
-	body                      bytes.Buffer
-	status                    int
-	tee                       bool
-	overflow                  bool
-	nativeLine                []byte
-	nativeSearch, nativeFetch int
-	nativeObserved            bool
-	nativeUsage               OpenAIUsage
-	nativeUsageObserved       bool
+	header   http.Header
+	body     bytes.Buffer
+	status   int
+	overflow bool
 }
 
-func newDeepSeekCapture(w gin.ResponseWriter, tee bool) *deepSeekCapture {
-	return &deepSeekCapture{ResponseWriter: w, header: make(http.Header), status: 200, tee: tee}
+func newDeepSeekCapture(w gin.ResponseWriter) *deepSeekCapture {
+	return &deepSeekCapture{ResponseWriter: w, header: make(http.Header), status: 200}
 }
-func (w *deepSeekCapture) Header() http.Header {
-	if w.tee {
-		return w.ResponseWriter.Header()
-	}
-	return w.header
-}
-func (w *deepSeekCapture) WriteHeader(n int) {
-	w.status = n
-	if w.tee {
-		w.ResponseWriter.WriteHeader(n)
-	}
-}
-func (w *deepSeekCapture) WriteHeaderNow() {
-	if w.tee {
-		w.ResponseWriter.WriteHeaderNow()
-	}
-}
+func (w *deepSeekCapture) Header() http.Header { return w.header }
+func (w *deepSeekCapture) WriteHeader(n int)   { w.status = n }
+func (w *deepSeekCapture) WriteHeaderNow()     {}
 func (w *deepSeekCapture) Write(b []byte) (int, error) {
 	if w.incremental != nil {
 		return w.incremental.write(b)
 	}
-	w.observeNative(b)
 	if w.body.Len()+len(b) > deepSeekToolResponseLimit {
 		w.overflow = true
-		if !w.tee {
-			return 0, errors.New("DeepSeek model response exceeds buffer limit")
-		}
-	} else {
-		_, _ = w.body.Write(b)
+		return 0, errors.New("DeepSeek model response exceeds buffer limit")
 	}
-	if w.tee {
-		return w.ResponseWriter.Write(b)
-	}
+	_, _ = w.body.Write(b)
 	return len(b), nil
 }
 func (w *deepSeekCapture) WriteString(v string) (int, error) { return w.Write([]byte(v)) }
@@ -281,13 +265,9 @@ func (w *deepSeekCapture) Size() int {
 	return w.body.Len()
 }
 func (w *deepSeekCapture) Written() bool { return w.Size() > 0 }
-func (w *deepSeekCapture) Flush() {
-	if w.tee {
-		w.ResponseWriter.Flush()
-	}
-}
+func (w *deepSeekCapture) Flush()        {}
 
-func (s *OpenAIGatewayService) deepSeekModelTurn(ctx context.Context, c *gin.Context, account *Account, body []byte, protocol, defaultModel string, tee bool) (*OpenAIForwardResult, *deepSeekCapture, error) {
+func (s *OpenAIGatewayService) deepSeekModelTurn(ctx context.Context, c *gin.Context, account *Account, body []byte, protocol, defaultModel string) (*OpenAIForwardResult, *deepSeekCapture, error) {
 	heartbeatValue, _ := c.Get("sources.deepseek.heartbeat")
 	heartbeat, _ := heartbeatValue.(*deepSeekHeartbeat)
 	if heartbeat != nil {
@@ -298,8 +278,8 @@ func (s *OpenAIGatewayService) deepSeekModelTurn(ctx context.Context, c *gin.Con
 		heartbeat.mu.Unlock()
 	}
 	child.Request = c.Request.WithContext(ctx)
-	capture := newDeepSeekCapture(c.Writer, tee)
-	if value, ok := c.Get(deepSeekIncrementalKey); ok && !tee {
+	capture := newDeepSeekCapture(c.Writer)
+	if value, ok := c.Get(deepSeekIncrementalKey); ok {
 		if output, valid := value.(*deepSeekIncremental); valid {
 			capture.incremental = output.turn(protocol)
 		}
@@ -327,7 +307,7 @@ func (s *OpenAIGatewayService) deepSeekModelTurn(ctx context.Context, c *gin.Con
 			}
 		}
 	}
-	// Preserve the native, sanitized diagnostics across the private turn context.
+	// Preserve the forwarder's sanitized diagnostics across the private turn context.
 	for _, name := range []string{OpsUpstreamStatusCodeKey, OpsUpstreamErrorMessageKey, OpsUpstreamErrorDetailKey, OpsUpstreamErrorsKey, OpsUpstreamModelKey} {
 		if value, ok := child.Get(name); ok {
 			c.Set(name, value)
@@ -347,7 +327,7 @@ func (s *OpenAIGatewayService) deepSeekModelTurn(ctx context.Context, c *gin.Con
 			_, _ = capture.body.Write(wire)
 		}
 	}
-	if capture.overflow && !tee && err == nil {
+	if capture.overflow && err == nil {
 		err = errors.New("DeepSeek model response exceeds buffer limit")
 	}
 	return result, capture, err
@@ -491,37 +471,60 @@ func (r *deepSeekHostedRequest) removeExhaustedTools() {
 	}
 }
 
-func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *gin.Context, account *Account, body []byte, protocol, defaultModel string) (out *OpenAIForwardResult, handled bool, forwardErr error) {
+// deepSeekBodyWithout removes the web tool entries match selects for the
+// ordinary path, adding the unavailable notice when notice is set. A body that
+// cannot be edited is forwarded unchanged.
+func (s *OpenAIGatewayService) deepSeekBodyWithout(body []byte, protocol string, match func(typ string) bool, notice bool, key *APIKey, account *Account) []byte {
+	next, removed, err := withoutDeepSeekWebTools(body, protocol, match, notice)
+	if err != nil {
+		logger.L().Warn("deepseek tools: could not remove web tools", zap.Int64("account_id", account.ID), zap.Int64("group_id", key.Group.ID), zap.Error(err))
+		return body
+	}
+	if removed {
+		logger.L().Info("deepseek tools: removed web tools the ordinary path must not forward", zap.Int64("account_id", account.ID), zap.Int64("group_id", key.Group.ID), zap.Bool("notice", notice))
+	}
+	return next
+}
+
+// tryForwardDeepSeekTools runs the hosted web tool loop when the request is
+// its to serve (handled). Otherwise it returns the body to forward on the
+// ordinary path, which may differ from the one passed in: web tool entries the
+// ordinary path must not carry are removed there.
+func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *gin.Context, account *Account, body []byte, protocol, defaultModel string) (out *OpenAIForwardResult, forwardBody []byte, handled bool, forwardErr error) {
 	if account == nil || account.Platform != PlatformDeepseek || c.GetBool(deepSeekInternalTurn) {
-		return nil, false, nil
+		return nil, body, false, nil
 	}
 	val, _ := c.Get("api_key")
 	key, _ := val.(*APIKey)
 	if key == nil || key.Group == nil {
-		return nil, false, nil
-	}
-	// A group without the feature is served exactly as if the feature did not
-	// exist, including requests that carry a web_search or web_fetch tool.
-	if !key.Group.DeepSeekTools.Enabled {
-		return nil, false, nil
+		return nil, body, false, nil
 	}
 	if protocol == "chat" && !gjson.GetBytes(body, "messages").Exists() && gjson.GetBytes(body, "input").Exists() {
 		protocol = "responses"
 	}
-	if !deepSeekWantsTools(body, key.DeepSeekToolsAutoInject()) {
-		return nil, false, nil
+	// Without the hosted loop (tools off for the group, or tool_choice none)
+	// the provider's own web tool types are removed: the provider would run
+	// them as paid tool calls the gateway never bills. web_search* and
+	// web_fetch* keep their existing handling on the ordinary path.
+	if !key.Group.DeepSeekTools.Enabled || !deepSeekWantsTools(body, key.DeepSeekToolsAutoInject()) {
+		return nil, s.deepSeekBodyWithout(body, protocol, deepSeekProviderTool, deepSeekWantsTools(body, true), key, account), false, nil
 	}
-	// Tools the gateway adds on its own are an extra the client never asked
-	// for. When they cannot be set up, nothing has been sent or reserved yet,
-	// so the request is forwarded as the client sent it instead of failing.
-	// A request that names a server tool itself still gets the error.
-	unavailable := func(cause error) (*OpenAIForwardResult, bool, error) {
-		if deepSeekWantsTools(body, false) {
-			return nil, true, cause
-		}
+	// The tools are optional. When they cannot be set up, nothing has been sent
+	// or reserved yet, so the request is answered on the ordinary path instead of
+	// failing: tools the gateway would add itself are simply not added, and web
+	// tools the client declared are removed with a notice that live information
+	// could not be checked.
+	unavailable := func(cause error) (*OpenAIForwardResult, []byte, bool, error) {
 		logger.L().Warn("deepseek tools: optional tools unavailable, forwarding without them",
 			zap.Int64("account_id", account.ID), zap.Int64("group_id", key.Group.ID), zap.Error(cause))
-		return nil, false, nil
+		if !deepSeekWantsTools(body, false) {
+			return nil, body, false, nil
+		}
+		stripped := s.deepSeekBodyWithout(body, protocol, func(typ string) bool { return deepSeekExplicitTool(typ) != "" }, true, key, account)
+		if next, err := sjson.DeleteBytes(stripped, "max_tool_calls"); err == nil {
+			stripped = next
+		}
+		return nil, stripped, false, nil
 	}
 	if gjson.GetBytes(body, "background").Bool() {
 		return unavailable(errors.New("built-in DeepSeek tools do not support background requests"))
@@ -534,10 +537,6 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 	snapshot, err := deepSeekToolSnapshot(key, supplier)
 	if err != nil {
 		return unavailable(err)
-	}
-	if deepSeekCanUseNative(account, supplier, body, protocol) {
-		out, e := s.forwardDeepSeekNative(ctx, c, account, body, key, snapshot)
-		return out, true, e
 	}
 	req, _, err := prepareDeepSeekHosted(body, protocol, key.DeepSeekToolsAutoInject())
 	if err != nil {
@@ -573,7 +572,7 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 	seen := map[string]observedCall{}
 	for {
 		if err := loopCtx.Err(); err != nil {
-			return result, true, err
+			return result, nil, true, err
 		}
 		// RPM is charged by the outer handler once, not once per model turn.
 		if len(result.DeepSeekModelTurns) > 0 {
@@ -582,21 +581,21 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 				pending += cost.ActualCost
 			}
 			if err = s.checkDeepSeekToolBudget(loopCtx, key, pending); err != nil {
-				return result, true, err
+				return result, nil, true, err
 			}
 		}
 		current, marshalErr := json.Marshal(req.Body)
 		if marshalErr != nil {
-			return result, true, marshalErr
+			return result, nil, true, marshalErr
 		}
 		limit := int64(32 << 20)
 		if s.cfg != nil && s.cfg.Gateway.MaxBodySize > 0 {
 			limit = s.cfg.Gateway.MaxBodySize
 		}
 		if int64(len(current)) > limit {
-			return result, true, errors.New("DeepSeek conversation exceeds request body limit")
+			return result, nil, true, errors.New("DeepSeek conversation exceeds request body limit")
 		}
-		turn, capture, turnErr := s.deepSeekModelTurn(loopCtx, c, account, current, protocol, defaultModel, false)
+		turn, capture, turnErr := s.deepSeekModelTurn(loopCtx, c, account, current, protocol, defaultModel)
 		if turn != nil {
 			firstVisible := result.FirstTokenMs
 			result.addDeepSeekTurn(turn)
@@ -611,7 +610,7 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 		if turn != nil {
 			result.deepSeekBilling.input.UpstreamEndpoint = GetActualOpenAIUpstreamEndpoint(c)
 			if err = s.checkpointDeepSeekUsage(loopCtx, result); err != nil {
-				return result, true, err
+				return result, nil, true, err
 			}
 		}
 		if turnErr != nil {
@@ -629,46 +628,46 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 			}
 			// No account failover may replay earlier successful model/tool work.
 			if len(result.DeepSeekModelTurns) == 0 && snapshot.Cost() == 0 && !req.ToolsUnavailable && !c.Writer.Written() && (incremental == nil || !incremental.created) {
-				return nil, true, turnErr
+				return nil, nil, true, turnErr
 			}
-			return result, true, fmt.Errorf("DeepSeek continuation failed: %v", turnErr)
+			return result, nil, true, fmt.Errorf("DeepSeek continuation failed: %v", turnErr)
 		}
 		if turn == nil || capture.status != 200 {
-			return result, true, errors.New("DeepSeek model returned no successful result")
+			return result, nil, true, errors.New("DeepSeek model returned no successful result")
 		}
 		if err := loopCtx.Err(); err != nil {
-			return result, true, err
+			return result, nil, true, err
 		}
 		if result.ClientDisconnect || (incremental != nil && incremental.writeErr != nil) {
-			return result, true, errors.New("DeepSeek client disconnected")
+			return result, nil, true, errors.New("DeepSeek client disconnected")
 		}
 		calls, clientCalls := req.calls(capture.body.Bytes())
 		if len(calls) > 0 && req.OutputLimitKey != "" && req.OutputRemaining <= 0 {
-			return result, true, errors.New("DeepSeek request output token budget exhausted before tool continuation")
+			return result, nil, true, errors.New("DeepSeek request output token budget exhausted before tool continuation")
 		}
 		if len(calls) == 0 || (capture.incremental != nil && capture.incremental.terminal.Status == "incomplete") {
 			if incremental != nil {
 				heartbeat.Stop()
-				return result, true, incremental.complete(capture, result, events)
+				return result, nil, true, incremental.complete(capture, result, events)
 			}
 			final, err := finishDeepSeekHostedResponse(protocol, capture.body.Bytes(), result, events)
 			if err != nil {
-				return result, true, err
+				return result, nil, true, err
 			}
 			c.Data(http.StatusOK, "application/json", final)
-			return result, true, nil
+			return result, nil, true, nil
 		}
 		outputs := map[string]string{}
 		for _, call := range calls {
 			if err := loopCtx.Err(); err != nil {
-				return result, true, err
+				return result, nil, true, err
 			}
 			if call.ID == "" {
-				return result, true, errors.New("DeepSeek tool call has no ID")
+				return result, nil, true, errors.New("DeepSeek tool call has no ID")
 			}
 			if previous, ok := seen[call.ID]; ok {
 				if previous.fingerprint != call.Operation+":"+HashUsageRequestPayload(call.Arguments) {
-					return result, true, errors.New("DeepSeek reused a tool call ID with different arguments")
+					return result, nil, true, errors.New("DeepSeek reused a tool call ID with different arguments")
 				}
 				outputs[call.ID] = previous.output
 				continue
@@ -688,24 +687,24 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 			// Do not issue another operation using stale enablement or quota state.
 			refreshed, err := s.accountRepo.GetByID(loopCtx, supplier.ID)
 			if err != nil {
-				return result, true, err
+				return result, nil, true, err
 			}
 			if err = validateDeepSeekToolAccount(key, refreshed); err != nil {
-				return result, true, err
+				return result, nil, true, err
 			}
 			if refreshed.ID != snapshot.SupplierAccountID {
-				return result, true, errors.New("DeepSeek tool supplier changed during request")
+				return result, nil, true, errors.New("DeepSeek tool supplier changed during request")
 			}
 			price := snapshot.SearchPrice
 			if call.Operation == "fetch" {
 				price = snapshot.FetchPrice
 			}
 			if err = s.checkDeepSeekToolBudget(loopCtx, key, result.DeepSeekTools.Cost()+price); err != nil {
-				return result, true, err
+				return result, nil, true, err
 			}
 			reservationCount := len(result.deepSeekBilling.reservations)
 			if err = s.reserveDeepSeekTool(loopCtx, key, result, price); err != nil {
-				return result, true, err
+				return result, nil, true, err
 			}
 			data, success, toolErr := s.ExecuteDeepSeekTool(loopCtx, refreshed, call.Operation, call.Arguments)
 			req.Calls++
@@ -728,32 +727,32 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 			events = append(events, deepSeekToolEvent(call, data, success))
 			if success {
 				if err = s.checkpointDeepSeekUsage(loopCtx, result); err != nil {
-					return result, true, err
+					return result, nil, true, err
 				}
 			} else if reservations := result.deepSeekBilling.reservations; len(reservations) > reservationCount {
 				reservations[len(reservations)-1].Release()
 			}
 			if incremental != nil {
 				if err := incremental.toolCompleted(events[len(events)-1]); err != nil {
-					return result, true, err
+					return result, nil, true, err
 				}
 			}
 		}
 		if clientCalls {
 			if incremental != nil {
 				heartbeat.Stop()
-				return result, true, incremental.complete(capture, result, events)
+				return result, nil, true, incremental.complete(capture, result, events)
 			}
 			final, err := finishDeepSeekHostedResponse(protocol, capture.body.Bytes(), result, events)
 			if err != nil {
-				return result, true, err
+				return result, nil, true, err
 			}
 			final = removeDeepSeekOwnedCalls(protocol, final, req.Owned)
 			c.Data(http.StatusOK, "application/json", final)
-			return result, true, nil
+			return result, nil, true, nil
 		}
 		if err := req.appendTurn(capture.body.Bytes(), outputs); err != nil {
-			return result, true, err
+			return result, nil, true, err
 		}
 		req.removeExhaustedTools()
 	}

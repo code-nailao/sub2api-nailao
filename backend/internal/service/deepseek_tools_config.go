@@ -118,6 +118,7 @@ func ValidateDeepSeekToolAccountConfig(platform, accountType string, extra map[s
 			return fmt.Errorf("%s must be a non-negative price", key)
 		}
 	}
+	// No longer read: kept only so accounts saved with it still validate.
 	if value, ok := extra["deepseek_native_tools_enabled"]; ok {
 		if _, valid := value.(bool); !valid {
 			return fmt.Errorf("deepseek_native_tools_enabled must be a boolean")

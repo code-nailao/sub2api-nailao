@@ -40,8 +40,10 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		return nil, fixedErr
 	}
 	body = fixedBody
-	if result, handled, err := s.tryForwardDeepSeekTools(ctx, c, account, body, "messages", defaultMappedModel); handled {
+	if result, next, handled, err := s.tryForwardDeepSeekTools(ctx, c, account, body, "messages", defaultMappedModel); handled {
 		return result, err
+	} else {
+		body = next
 	}
 	observedHTTPStatus := 0
 	defer func() {

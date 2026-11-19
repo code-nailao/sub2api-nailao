@@ -20,4 +20,7 @@ describe('DeepSeek tools configuration', () => {
     expect(form.deepseek_tts_cost_per_10k_chars).toBe(null)
     expect(form.deepseek_ocr_cost_per_1k_pages).toBe(null)
   })
+  it('no longer carries the native tool switch', () => {
+    expect(Object.keys(deepSeekToolAccountForm({ deepseek_tools_enabled: true, deepseek_native_tools_enabled: true }))).not.toContain('deepseek_native_tools_enabled')
+  })
 })
