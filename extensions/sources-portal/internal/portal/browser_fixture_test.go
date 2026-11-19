@@ -72,14 +72,31 @@ func TestBrowserFixture(t *testing.T) {
 		s.HomeFiles = os.DirFS(homeDir)
 	}
 	if studioURL := os.Getenv("PORTAL_BROWSER_STUDIO_URL"); studioURL != "" || os.Getenv("PORTAL_BROWSER_CANVAS_URL") != "" {
-		s.Studio, err = OpenStudio(t.TempDir(), "https://fixture-api.example.com", []StudioCapability{{GroupID: 26, Engine: "sub2api", Models: []string{"gpt-image-1"}}, {GroupID: 74, Engine: "sub2api", Models: []string{"gpt-image-1"}}}, "")
+		// The model API origin handed to the clients. A client build accepts only
+		// its own site's hosts, so a run against real client builds names one of
+		// them here; it comes from the environment so no deployment is named in
+		// this file. The browser driver answers every request to it locally.
+		apiOrigin := "https://fixture-api.example.com"
+		if raw := os.Getenv("PORTAL_BROWSER_API_ORIGIN"); raw != "" {
+			if apiOrigin, err = CanonicalOrigin(raw); err != nil {
+				t.Fatal("fixture API origin must be a fixed HTTPS origin")
+			}
+		}
+		s.Studio, err = OpenStudio(t.TempDir(), apiOrigin, []StudioCapability{{GroupID: 26, Engine: "sub2api", Models: []string{"gpt-image-1"}}, {GroupID: 74, Engine: "sub2api", Models: []string{"gpt-image-1"}}}, "")
 		if err != nil {
 			t.Fatal(err)
 		}
 		s.StudioURL = studioURL
 		s.CanvasURL = os.Getenv("PORTAL_BROWSER_CANVAS_URL")
 		var mu sync.Mutex
-		keys := map[int64]studioKey{}
+		// Group 81 is one nobody registered and key 9001 is the user's own key in
+		// it, for the group settings and the custom connection dialogs. Key 9002
+		// is in an Antigravity group, whose images are served under another prefix.
+		keys := map[int64]studioKey{
+			9001: {ID: 9001, UserID: 9, GroupID: 81, Name: "我的图片密钥", Key: "sk-own-fixture-9001", Status: "active"},
+			9002: {ID: 9002, UserID: 9, GroupID: 85, Name: "我的 Antigravity 密钥", Key: "sk-own-fixture-9002", Status: "active"},
+		}
+		platforms := map[int64]string{85: "antigravity"}
 		count := int64(0)
 		browserToken := "fixture." + base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":9,"sid":"browser-fixture","version":2}`)) + ".fixture"
 		otherToken := "fixture." + base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":10,"sid":"other-fixture","version":2}`)) + ".fixture"
@@ -115,7 +132,12 @@ func TestBrowserFixture(t *testing.T) {
 				payload, _ := json.Marshal(map[string]any{"code": 0, "data": map[string]any{"accounts": identities}})
 				return reply(200, string(payload)), nil
 			case "/api/v1/groups/available":
-				return reply(200, `{"code":0,"data":[{"id":26,"name":"普通图片 A","status":"active","platform":"openai","allow_image_generation":true},{"id":74,"name":"普通图片 B","status":"active","platform":"openai","allow_image_generation":true}]}`), nil
+				return reply(200, `{"code":0,"data":[{"id":26,"name":"普通图片 A","status":"active","platform":"openai","allow_image_generation":true},{"id":74,"name":"普通图片 B","status":"active","platform":"openai","allow_image_generation":true},{"id":81,"name":"后加的图片分组","status":"active","platform":"openai","allow_image_generation":true}]}`), nil
+			case mainGroupListPath:
+				if role != "admin" {
+					return reply(403, ""), nil
+				}
+				return reply(200, `{"code":0,"data":[{"id":26,"name":"普通图片 A","status":"active","platform":"openai","allow_image_generation":true},{"id":74,"name":"普通图片 B","status":"active","platform":"openai","allow_image_generation":true},{"id":81,"name":"后加的图片分组","status":"active","platform":"openai","allow_image_generation":true},{"id":82,"name":"文字分组","status":"active","platform":"openai","allow_image_generation":false},{"id":83,"name":"其他平台","status":"active","platform":"anthropic","allow_image_generation":true}]}`), nil
 			case "/api/v1/keys":
 				if r.Method == "POST" {
 					var in struct {
@@ -129,8 +151,33 @@ func TestBrowserFixture(t *testing.T) {
 					b, _ := json.Marshal(key)
 					return reply(200, `{"code":0,"data":`+string(b)+`}`), nil
 				}
-				return reply(200, `{"code":0,"data":{"items":[]}}`), nil
+				if r.URL.Query().Get("search") != "" {
+					return reply(200, `{"code":0,"data":{"items":[]}}`), nil
+				}
+				items := []map[string]any{}
+				for _, key := range keys {
+					if key.UserID == userID {
+						platform := platforms[key.GroupID]
+						if platform == "" {
+							platform = "openai"
+						}
+						items = append(items, map[string]any{"id": key.ID, "user_id": key.UserID, "group_id": key.GroupID, "key": key.Key, "name": key.Name, "status": key.Status, "group": map[string]string{"name": fmt.Sprintf("分组 %d", key.GroupID), "platform": platform}})
+					}
+				}
+				b, _ := json.Marshal(map[string]any{"code": 0, "data": map[string]any{"items": items}})
+				return reply(200, string(b)), nil
 			default:
+				if mainGroupModelsPath.MatchString(r.URL.Path) {
+					return reply(200, `{"code":0,"data":{"models":["gpt-5","gpt-image-1","gpt-image-2"]}}`), nil
+				}
+				// The model gateway under the prefixes this fixture serves; a list
+				// asked for under any other prefix is not found.
+				switch r.URL.Path {
+				case "/v1beta/models", "/antigravity/v1beta/models":
+					return reply(200, `{"models":[{"name":"models/gemini-3-pro"},{"name":"models/gemini-3-pro-image-preview"}]}`), nil
+				case "/v1/models", "/alt/v1/models":
+					return reply(200, `{"object":"list","data":[{"id":"gpt-5"},{"id":"gpt-image-1"},{"id":"gpt-image-2"}]}`), nil
+				}
 				var id int64
 				_, _ = fmt.Sscanf(r.URL.Path, "/api/v1/keys/%d", &id)
 				key, ok := keys[id]

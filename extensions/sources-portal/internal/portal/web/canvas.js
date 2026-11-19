@@ -1,4 +1,5 @@
 import { authorizedJSON, clearSession, currentToken } from "./session.js";
+import { openCustomSettings, openGroupSettings } from "./studio-settings.js";
 
 const params = new URLSearchParams(location.search);
 const frame = document.querySelector("#studio");
@@ -13,10 +14,15 @@ const login = document.querySelector("#canvas-login");
 const open = document.querySelector("#canvas-open");
 const title = document.querySelector("#canvas-title");
 const home = document.querySelector("#canvas-home");
+const customButton = document.querySelector("#canvas-custom");
+const manageButton = document.querySelector("#canvas-manage");
+const ownKeyButton = document.querySelector("#canvas-own-key");
 let studioURL, configuration, hostConfig;
 let ack = false, generation = 0, locked = false, connecting = false, bootstrapping = false;
 let sendTimer, checkTimer, startupTimer;
 const granted = new Map();
+// The user's own-key connection is addressed like a group, by a reserved ID.
+let custom = { groupId: 0, enabled: false, configured: false };
 const validRequestID = (value) => typeof value === "string" && /^[\w-]{16,80}$/.test(value);
 
 function showState(state, text) {
@@ -77,6 +83,7 @@ function lock(text) {
   frame.src = "about:blank";
   frame.hidden = true;
   select.disabled = true;
+  customButton.hidden = manageButton.hidden = ownKeyButton.hidden = true;
   recover(text);
   notifyHost(false);
 }
@@ -213,6 +220,70 @@ retry.onclick = () => {
   if (configuration && ack) { showState("ready"); notifyHost(true); return; }
   void connect();
 };
+function watchSession() {
+  clearInterval(checkTimer);
+  checkTimer = setInterval(() => {
+    if (!locked && document.visibilityState === "visible") void api("/api/canvas/groups").catch((error) => recover(error.message));
+  }, 30000);
+}
+const noGroups = () => custom.enabled
+  ? "当前账号没有已登记的生图分组。可以点“使用我的密钥”，用自己的 API 密钥连接。"
+  : "当前账号没有可用的生图分组，请联系管理员。";
+// Fills the group menu and returns how many entries it has. keep is the value
+// to stay on when it is still offered.
+function renderGroups(data, keep) {
+  const groupId = Number.isSafeInteger(data.custom?.group_id) && data.custom.group_id > 0 ? data.custom.group_id : 0;
+  const enabled = data.custom?.enabled === true && groupId > 0;
+  custom = { groupId, enabled, configured: enabled && data.custom?.configured === true };
+  const entries = data.groups.map(({ id, name }) => ({ id, name }));
+  if (custom.configured) entries.push({ id: custom.groupId, name: "自定义连接（我的密钥）" });
+  select.replaceChildren();
+  for (const group of entries) {
+    const option = document.createElement("option");
+    option.value = group.id;
+    option.textContent = group.name;
+    select.append(option);
+  }
+  if (keep && entries.some((group) => String(group.id) === keep)) select.value = keep;
+  customButton.hidden = ownKeyButton.hidden = !custom.enabled;
+  manageButton.hidden = data.can_manage !== true;
+  return entries.length;
+}
+// After a settings change: read the groups again and reconnect only when the
+// selected entry changed (or selectId asks for one).
+async function reloadGroups(selectId) {
+  if (locked || connecting || bootstrapping || !studioURL) return;
+  try {
+    const data = await api("/api/canvas/groups");
+    if (locked) return;
+    const previous = select.value;
+    const count = renderGroups(data, selectId || previous);
+    select.disabled = !count;
+    if (!count) {
+      recover(noGroups());
+      return;
+    }
+    select.onchange = connect;
+    if ((selectId || select.value !== previous || !configuration) && await connect()) watchSession();
+  } catch (error) {
+    if (!locked) recover(error.message);
+  }
+}
+const connectionMenu = document.querySelector("#canvas-connection-menu");
+customButton.onclick = ownKeyButton.onclick = () => {
+  if (locked) return;
+  connectionMenu.open = false;
+  openCustomSettings({ onSaved: (configured) => {
+    // A changed or removed connection must not be resent from the earlier grant.
+    granted.delete(`group-${custom.groupId}`);
+    void reloadGroups(configured ? String(custom.groupId) : "");
+  } });
+};
+manageButton.onclick = () => {
+  if (locked) return;
+  connectionMenu.open = false;
+  openGroupSettings({ onSaved: () => void reloadGroups("") });
+};
 async function bootstrap() {
   if (locked || bootstrapping) return;
   bootstrapping = true;
@@ -227,25 +298,13 @@ async function bootstrap() {
     studioURL.searchParams.set("src_host", location.origin);
     studioURL.searchParams.set("theme", hostConfig?.theme || (params.get("theme") === "dark" ? "dark" : "light"));
     document.querySelector("#keys").href = data.main_origin + "/keys";
-    select.replaceChildren();
-    for (const group of data.groups) {
-      const option = document.createElement("option");
-      option.value = group.id;
-      option.textContent = group.name;
-      select.append(option);
-    }
-    if (!data.groups.length) {
+    if (!renderGroups(data)) {
       select.disabled = true;
-      recover("当前账号没有可用的生图分组，请联系管理员。");
+      recover(noGroups());
       return;
     }
     select.onchange = connect;
-    if (await connect()) {
-      clearInterval(checkTimer);
-      checkTimer = setInterval(() => {
-        if (!locked && document.visibilityState === "visible") void api("/api/canvas/groups").catch((error) => recover(error.message));
-      }, 30000);
-    }
+    if (await connect()) watchSession();
   } catch (error) {
     if (!locked) recover(error.message);
   } finally {
