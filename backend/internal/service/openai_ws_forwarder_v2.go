@@ -38,6 +38,22 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if s == nil || account == nil {
 		return nil, wrapOpenAIWSFallback("invalid_state", errors.New("service or account is nil"))
 	}
+	if blocked := s.validateFixedRequestSpeedAccount(ctx, account, firstNonEmptyString(mappedModel, originalModel)); blocked != nil {
+		return nil, blocked
+	}
+	if RequestSpeedFromContext(ctx) != "" {
+		// Direct transport callers also cannot override the supplier's fixed
+		// credential tier. Clone before deleting to preserve the caller's map.
+		if _, exists := reqBody["service_tier"]; exists {
+			cloned := make(map[string]any, len(reqBody))
+			for key, value := range reqBody {
+				if key != "service_tier" {
+					cloned[key] = value
+				}
+			}
+			reqBody = cloned
+		}
+	}
 	responseModelObserver := &upstreamResponseModelObserver{}
 
 	wsURL, err := s.buildOpenAIResponsesWSURL(account)
@@ -426,7 +442,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			UpstreamResponseModel:         responseModelObserver.Model(),
 			UpstreamResponseModelConflict: responseModelObserver.Conflict(),
 			UpstreamResponseServiceTier:   responseModelObserver.ServiceTier(),
+			FixedUpstreamRequestTier:      RequestSpeedServiceTierFromContext(ctx),
 			ServiceTier:                   resolvedOpenAIUpstreamServiceTierFromObserver(responseModelObserver, extractOpenAIServiceTier(reqBody)),
+			RequestedServiceTier:          RequestedOpenAIServiceTierFromContext(ctx),
 			ReasoningEffort:               extractOpenAIReasoningEffort(reqBody, mappedModel, originalModel),
 			Stream:                        reqStream,
 			OpenAIWSMode:                  true,

@@ -149,20 +149,27 @@
             </div>
           </div>
 
-          <div v-if="enableTierMultipliers" class="mt-3 grid max-w-3xl grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          <div v-if="showTierPresets" class="mt-3 space-y-2">
+            <p class="text-xs text-gray-500">{{ t('admin.channels.form.tierMultiplierHint') }}</p>
+            <div class="flex flex-wrap gap-2">
+              <button type="button" class="btn btn-secondary text-xs" data-testid="tier-preset-api" @click="applyTierPreset(2, 6)">{{ t(showUltrafast ? 'admin.channels.form.apiTierPreset' : 'admin.channels.form.apiFastPreset') }}</button>
+              <button type="button" class="btn btn-secondary text-xs" data-testid="tier-preset-subscription" @click="applyTierPreset(2.5, 8)">{{ t(showUltrafast ? 'admin.channels.form.subscriptionTierPreset' : 'admin.channels.form.subscriptionFastPreset') }}</button>
+            </div>
+          </div>
+          <div v-if="enableTierMultipliers || showTierPresets" class="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
             <div>
               <label class="text-xs text-gray-400">{{ t('admin.channels.form.fastMultiplier') }}</label>
               <input :value="entry.fast_multiplier" @input="emitField('fast_multiplier', ($event.target as HTMLInputElement).value)"
                 type="number" step="any" min="0.000001" class="input mt-0.5 text-sm" :placeholder="t('admin.channels.form.multiplierPlaceholder')" />
             </div>
-            <div>
-              <label class="text-xs text-gray-400">{{ t('admin.channels.form.flexMultiplier') }}</label>
-              <input :value="entry.flex_multiplier" @input="emitField('flex_multiplier', ($event.target as HTMLInputElement).value)"
-                type="number" step="any" min="0.000001" class="input mt-0.5 text-sm" :placeholder="t('admin.channels.form.multiplierPlaceholder')" />
-            </div>
-            <div v-if="props.platform === 'openai'">
+            <div v-if="showUltrafast" data-testid="ultrafast-field">
               <label class="text-xs text-gray-400">{{ t('admin.channels.form.ultrafastMultiplier') }}</label>
               <input :value="entry.ultrafast_multiplier" @input="emitField('ultrafast_multiplier', ($event.target as HTMLInputElement).value)"
+                type="number" step="any" min="0.000001" class="input mt-0.5 text-sm" :placeholder="t('admin.channels.form.multiplierPlaceholder')" />
+            </div>
+            <div v-if="enableTierMultipliers" data-testid="flex-field">
+              <label class="text-xs text-gray-400">{{ t('admin.channels.form.flexMultiplier') }}</label>
+              <input :value="entry.flex_multiplier" @input="emitField('flex_multiplier', ($event.target as HTMLInputElement).value)"
                 type="number" step="any" min="0.000001" class="input mt-0.5 text-sm" :placeholder="t('admin.channels.form.multiplierPlaceholder')" />
             </div>
           </div>
@@ -311,6 +318,7 @@
 
 <script setup lang="ts">
 import { ref, computed } from 'vue'
+import { supportsFast, supportsUltrafast } from '@/features/sources/pricing/serviceTiers'
 import { useI18n } from 'vue-i18n'
 import Select from '@/components/common/Select.vue'
 import Icon from '@/components/icons/Icon.vue'
@@ -330,17 +338,38 @@ const props = withDefaults(defineProps<{
   platform?: string
   hideTokenIntervals?: boolean
   enableTimePricing?: boolean
+  enableServiceTiers?: boolean
   enableTierMultipliers?: boolean
 }>(), {
   hideTokenIntervals: false,
   enableTimePricing: false,
   enableTierMultipliers: false,
+  enableServiceTiers: false,
 })
 
 const emit = defineEmits<{
   update: [entry: PricingFormEntry]
   remove: []
 }>()
+
+const showTierPresets = computed(() => (props.enableTierMultipliers || props.enableServiceTiers) &&
+  props.entry.models.length > 0 && props.entry.models.every(supportsFast))
+// Sources keeps its rule (only Ultra Fast capable models) and adds upstream's
+// rule for channels (only OpenAI), so the field never appears where it cannot
+// bill. Group pricing already limits enableServiceTiers to OpenAI-capable
+// group platforms (including composite groups), so it needs no extra check;
+// a card mounted without a platform has not been scoped away from OpenAI.
+const showUltrafast = computed(() => showTierPresets.value &&
+  (props.enableServiceTiers || !props.platform || props.platform === 'openai') &&
+  props.entry.models.every(supportsUltrafast))
+
+function applyTierPreset(fast: number, ultra: number) {
+  emit('update', {
+    ...props.entry,
+    fast_multiplier: fast,
+    ...(showUltrafast.value ? { ultrafast_multiplier: ultra } : {}),
+  })
+}
 
 // Collapse state: entries with existing models default to collapsed
 const collapsed = ref(props.entry.models.length > 0)

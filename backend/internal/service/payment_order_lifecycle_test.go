@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,6 +28,23 @@ type paymentOrderLifecycleQueryProvider struct {
 	cancelCalls       int
 	responses         []*payment.QueryOrderResponse
 	resp              *payment.QueryOrderResponse
+}
+
+// Lifecycle tests inject the provider transport while retaining a persisted
+// merchant identity, as the application resolves providers from the database.
+func bindPaymentOrderProviderFixture(t *testing.T, svc *PaymentService, provider payment.Provider) {
+	t.Helper()
+	types := make([]string, 0, len(provider.SupportedTypes()))
+	for _, value := range provider.SupportedTypes() {
+		types = append(types, string(value))
+	}
+	_, err := svc.entClient.PaymentProviderInstance.Create().
+		SetProviderKey(provider.ProviderKey()).SetName("lifecycle fixture").
+		SetConfig("{}").SetSupportedTypes(strings.Join(types, ",")).SetEnabled(true).
+		Save(context.Background())
+	require.NoError(t, err)
+	svc.loadBalancer = payment.NewDefaultLoadBalancer(svc.entClient, nil)
+	t.Cleanup(replacePaymentProviderFactoryForTest(t, provider))
 }
 
 type paymentOrderLifecycleRedeemRepo struct {
@@ -245,6 +263,7 @@ func TestVerifyOrderByOutTradeNoBackfillsTradeNoFromPaidQuery(t *testing.T) {
 		userRepo:        userRepo,
 		providersLoaded: true,
 	}
+	bindPaymentOrderProviderFixture(t, svc, provider)
 
 	got, err := svc.VerifyOrderByOutTradeNo(ctx, order.OutTradeNo, user.ID)
 	require.NoError(t, err)
@@ -353,6 +372,7 @@ func TestVerifyOrderByOutTradeNoRetriesZeroAmountPaidQueryOnce(t *testing.T) {
 		userRepo:        userRepo,
 		providersLoaded: true,
 	}
+	bindPaymentOrderProviderFixture(t, svc, provider)
 
 	got, err := svc.VerifyOrderByOutTradeNo(ctx, order.OutTradeNo, user.ID)
 	require.NoError(t, err)
@@ -437,6 +457,7 @@ func TestVerifyOrderByOutTradeNoRejectsPaidQueryWithZeroAmount(t *testing.T) {
 		userRepo:        userRepo,
 		providersLoaded: true,
 	}
+	bindPaymentOrderProviderFixture(t, svc, provider)
 
 	got, err := svc.VerifyOrderByOutTradeNo(ctx, order.OutTradeNo, user.ID)
 	require.NoError(t, err)
@@ -498,6 +519,7 @@ func TestVerifyOrderByOutTradeNoDoesNotCancelUnpaidUpstreamOrder(t *testing.T) {
 		registry:        registry,
 		providersLoaded: true,
 	}
+	bindPaymentOrderProviderFixture(t, svc, provider)
 
 	got, err := svc.VerifyOrderByOutTradeNo(ctx, order.OutTradeNo, user.ID)
 	require.NoError(t, err)
@@ -555,6 +577,7 @@ func TestCancelOrderStillClosesUnpaidUpstreamOrder(t *testing.T) {
 		registry:        registry,
 		providersLoaded: true,
 	}
+	bindPaymentOrderProviderFixture(t, svc, provider)
 
 	outcome, err := svc.CancelOrder(ctx, order.ID, user.ID)
 	require.NoError(t, err)
@@ -654,6 +677,7 @@ func TestReconcilePendingPaymentOrdersBackfillsPaidOrder(t *testing.T) {
 		userRepo:        userRepo,
 		providersLoaded: true,
 	}
+	bindPaymentOrderProviderFixture(t, svc, provider)
 
 	recovered, err := svc.ReconcilePendingPaymentOrders(ctx)
 	require.NoError(t, err)
@@ -714,6 +738,7 @@ func TestReconcilePendingPaymentOrdersQueriesAlipayOrder(t *testing.T) {
 		registry:        registry,
 		providersLoaded: true,
 	}
+	bindPaymentOrderProviderFixture(t, svc, provider)
 
 	recovered, err := svc.ReconcilePendingPaymentOrders(ctx)
 	require.NoError(t, err)
@@ -805,6 +830,7 @@ func TestVerifyOrderByOutTradeNoUsesOutTradeNoWhenPaymentTradeNoAlreadyExistsFor
 		userRepo:        userRepo,
 		providersLoaded: true,
 	}
+	bindPaymentOrderProviderFixture(t, svc, provider)
 
 	got, err := svc.VerifyOrderByOutTradeNo(ctx, order.OutTradeNo, user.ID)
 	require.NoError(t, err)
@@ -812,20 +838,20 @@ func TestVerifyOrderByOutTradeNoUsesOutTradeNoWhenPaymentTradeNoAlreadyExistsFor
 	require.Equal(t, "upstream-trade-existing", got.PaymentTradeNo)
 }
 
-func TestPaymentOrderAllowsRegistryFallbackOnlyForLegacyOrdersWithoutPinnedProviderState(t *testing.T) {
+func TestPaymentOrderAllowsCurrentProviderFallbackOnlyForLegacyOrdersWithoutPinnedProviderState(t *testing.T) {
 	t.Parallel()
 
-	require.True(t, paymentOrderAllowsRegistryFallback(&dbent.PaymentOrder{
+	require.True(t, paymentOrderAllowsCurrentProviderFallback(&dbent.PaymentOrder{
 		PaymentType: payment.TypeAlipay,
 	}))
 
 	instanceID := "12"
-	require.False(t, paymentOrderAllowsRegistryFallback(&dbent.PaymentOrder{
+	require.False(t, paymentOrderAllowsCurrentProviderFallback(&dbent.PaymentOrder{
 		PaymentType:        payment.TypeAlipay,
 		ProviderInstanceID: &instanceID,
 	}))
 
-	require.False(t, paymentOrderAllowsRegistryFallback(&dbent.PaymentOrder{
+	require.False(t, paymentOrderAllowsCurrentProviderFallback(&dbent.PaymentOrder{
 		PaymentType: payment.TypeAlipay,
 		ProviderSnapshot: map[string]any{
 			"schema_version":       2,
@@ -862,5 +888,6 @@ func newPaymentOrderLifecycleTestClient(t *testing.T) *dbent.Client {
 	drv := entsql.OpenDB(dialect.SQLite, db)
 	client := enttest.NewClient(t, enttest.WithOptions(dbent.Driver(drv)))
 	t.Cleanup(func() { _ = client.Close() })
+	installPaymentProofTestSchema(t, client)
 	return client
 }

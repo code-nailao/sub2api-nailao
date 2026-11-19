@@ -406,3 +406,17 @@ func TestNormalizeOrigins(t *testing.T) {
 		})
 	}
 }
+
+func TestCORS_SourcesStudioIdempotentSubmitAndLookup(t *testing.T) {
+	for _, method := range []string{"POST", "GET"} {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodOptions, "/v1/images/tasks/by-idempotency", nil)
+		c.Request.Header.Set("Origin", "https://studio.example.test")
+		c.Request.Header.Set("Access-Control-Request-Method", method)
+		c.Request.Header.Set("Access-Control-Request-Headers", "authorization,content-type,idempotency-key")
+		CORS(config.CORSConfig{AllowedOrigins: []string{"https://studio.example.test"}})(c)
+		assert.Equal(t, http.StatusNoContent, w.Code)
+		assert.Contains(t, w.Header().Get("Access-Control-Allow-Headers"), "Idempotency-Key")
+	}
+}

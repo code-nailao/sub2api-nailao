@@ -174,6 +174,7 @@ type mockObjectStore struct {
 	uploadFileCalls  int
 	deletedKeys      []string
 	failDeleteKeys   map[string]error
+	rangeObserver    func(string, int64, int64)
 }
 
 type cancelingUploadFailureStore struct {
@@ -195,6 +196,23 @@ func (m *cancelingUploadFailureStore) UploadFile(_ context.Context, key string, 
 		return 0, closeErr
 	}
 
+	m.mu.Lock()
+	m.objects[key] = data
+	m.mu.Unlock()
+	m.cancel()
+	return 0, fmt.Errorf("injected upload failure after object landed")
+}
+
+func (m *cancelingUploadFailureStore) UploadFileRange(_ context.Context, key, filePath string, offset, length int64, _ string) (int64, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.NewSectionReader(file, offset, length))
+	if err != nil {
+		return 0, err
+	}
 	m.mu.Lock()
 	m.objects[key] = data
 	m.mu.Unlock()
@@ -239,6 +257,25 @@ func (m *mockObjectStore) UploadFile(ctx context.Context, key string, filePath s
 	}
 	defer func() { _ = file.Close() }()
 	return m.Upload(ctx, key, file, contentType)
+}
+
+func (m *mockObjectStore) UploadFileRange(ctx context.Context, key, filePath string, offset, length int64, contentType string) (int64, error) {
+	if m.rangeObserver != nil {
+		m.rangeObserver(filePath, offset, length)
+	}
+	m.mu.Lock()
+	m.uploadFileCalls++
+	call, failAt := m.uploadFileCalls, m.failUploadFileAt
+	m.mu.Unlock()
+	if failAt > 0 && call == failAt {
+		return 0, fmt.Errorf("injected upload failure at call %d", call)
+	}
+	file, err := os.Open(filePath)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	return m.Upload(ctx, key, io.NewSectionReader(file, offset, length), contentType)
 }
 
 func (m *mockObjectStore) Download(_ context.Context, key string) (io.ReadCloser, error) {
@@ -1189,7 +1226,7 @@ func TestRecoverStaleRecords(t *testing.T) {
 	_ = svc.saveRecord(context.Background(), &BackupRecord{
 		ID:        "stale-1",
 		Status:    "running",
-		StartedAt: time.Now().Add(-1 * time.Hour).Format(time.RFC3339),
+		StartedAt: time.Now().Add(-3 * time.Hour).Format(time.RFC3339),
 	})
 	// 模拟一条孤立的恢复中记录
 	_ = svc.saveRecord(context.Background(), &BackupRecord{
@@ -1227,7 +1264,7 @@ func TestBackupService_RecoverStaleRecords_CleansBackupObjects(t *testing.T) {
 		ID:        "stale-parts",
 		Status:    "running",
 		Parts:     parts,
-		StartedAt: time.Now().Add(-time.Hour).Format(time.RFC3339),
+		StartedAt: time.Now().Add(-3 * time.Hour).Format(time.RFC3339),
 	}))
 
 	svc.recoverStaleRecords()
@@ -1255,7 +1292,7 @@ func TestBackupService_RecoverStaleRecords_PreservesKeysWhenCleanupFails(t *test
 		ID:        "stale-cleanup-failed",
 		Status:    "running",
 		Parts:     []BackupPart{part},
-		StartedAt: time.Now().Add(-time.Hour).Format(time.RFC3339),
+		StartedAt: time.Now().Add(-3 * time.Hour).Format(time.RFC3339),
 	}))
 
 	svc.recoverStaleRecords()
@@ -1367,4 +1404,64 @@ func TestBackupService_StartRestore_SplitParts(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "completed", final.RestoreStatus)
 	require.Equal(t, dumpContent, dumper.restored)
+}
+
+// Inspect scratch space during every upload, then exercise the existing restore
+// reader. This catches a regression that reintroduces copied temporary parts.
+func TestBackupService_RangeUploadScratchAndRestore(t *testing.T) {
+	for _, failAt := range []int{0, 2} {
+		t.Run(fmt.Sprintf("fail_at_%d", failAt), func(t *testing.T) {
+			temp := t.TempDir()
+			t.Setenv("TMPDIR", temp)
+			repo := newMockSettingRepo()
+			seedS3Config(t, repo)
+			dump := entropyBackupFixture(512 * 1024)
+			store := newMockObjectStore()
+			store.failUploadFileAt = failAt
+			observed := 0
+			store.rangeObserver = func(path string, offset, size int64) {
+				entries, err := os.ReadDir(temp)
+				require.NoError(t, err)
+				require.Len(t, entries, 1, "only the original gzip may exist during uploads")
+				info, err := os.Stat(path)
+				require.NoError(t, err)
+				require.Equal(t, entries[0].Name(), info.Name())
+				require.GreaterOrEqual(t, offset, int64(0))
+				require.LessOrEqual(t, offset+size, info.Size())
+				observed++
+			}
+			svc := newTestBackupService(repo, &mockDumper{dumpData: dump}, store)
+			svc.partSizeBytes = 256
+			record, err := svc.CreateBackup(context.Background(), "manual", 14)
+			require.Positive(t, observed)
+			entries, readErr := os.ReadDir(temp)
+			require.NoError(t, readErr)
+			require.Empty(t, entries)
+			if failAt > 0 {
+				require.Error(t, err)
+				require.Equal(t, "failed", record.Status)
+				require.Empty(t, store.objects)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, "completed", record.Status)
+			for _, part := range record.Parts {
+				data := store.objects[part.S3Key]
+				require.Equal(t, part.SizeBytes, int64(len(data)))
+				require.Equal(t, fmt.Sprintf("%x", sha256.Sum256(data)), part.SHA256)
+			}
+			path, err := svc.downloadBackupParts(context.Background(), store, record.Parts)
+			require.NoError(t, err)
+			defer os.Remove(path)
+			file, err := os.Open(path)
+			require.NoError(t, err)
+			defer file.Close()
+			reader, err := gzip.NewReader(file)
+			require.NoError(t, err)
+			restored, err := io.ReadAll(reader)
+			require.NoError(t, err)
+			require.NoError(t, reader.Close())
+			require.Equal(t, dump, restored)
+		})
+	}
 }

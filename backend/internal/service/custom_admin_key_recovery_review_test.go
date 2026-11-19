@@ -50,7 +50,10 @@ func TestScopedAdminReviewRecoveryCommitBoundary(t *testing.T) {
 			blocker := &scopedRecoveryReviewBlocker{}
 			admin := &adminServiceImpl{accountRepo: repo, entClient: client, runtimeBlocker: blocker}
 			mock.ExpectBegin()
-			mock.ExpectExec(`SELECT pg_advisory_xact_lock`).WithArgs(int64(31)).WillReturnResult(sqlmock.NewResult(0, 1))
+			// The global request-speed configuration lock precedes the per-account
+			// lock so scoped-admin writes share one lock order with speed-config writers.
+			mock.ExpectExec(`SELECT pg_advisory_xact_lock\(hashtextextended\('sources_request_speed_config', 0\)\)`).WithoutArgs().WillReturnResult(sqlmock.NewResult(0, 1))
+			mock.ExpectExec(`SELECT pg_advisory_xact_lock\(hashtextextended\('scoped_admin_account:'`).WithArgs(int64(31)).WillReturnResult(sqlmock.NewResult(0, 1))
 			mock.ExpectExec(`SELECT id FROM accounts`).WithArgs(int64(31)).WillReturnResult(sqlmock.NewResult(0, 1))
 			mock.ExpectExec(`SELECT account_id FROM account_groups`).WithArgs(int64(31)).WillReturnResult(sqlmock.NewResult(0, 1))
 			if mode == "read_failure" {

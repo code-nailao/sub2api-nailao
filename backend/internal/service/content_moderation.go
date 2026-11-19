@@ -24,6 +24,8 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/httpclient"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/servertiming"
+
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 )
 
 const (
@@ -612,7 +614,7 @@ func NewContentModerationService(
 		for i := 0; i < svc.workerCount; i++ {
 			go svc.worker(i)
 		}
-		go svc.cleanupWorker()
+		processrole.StartBackground("ContentModerationRetention", func() { go svc.cleanupWorker() })
 	}
 	return svc
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 	"github.com/Wei-Shaw/sub2api/migrations"
 
 	"entgo.io/ent/dialect"
@@ -136,6 +137,9 @@ func InitEnt(cfg *config.Config) (*ent.Client, *sql.DB, error) {
 	migrationCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	if err := initializeDatabaseWithRetry(migrationCtx, func(ctx context.Context) error {
+		if !processrole.BackgroundEnabled() {
+			return verifySourcesMigrations(ctx, drv.DB(), migrations.FS)
+		}
 		return applyMigrationsFS(ctx, drv.DB(), migrations.FS)
 	}); err != nil {
 		_ = drv.Close() // 迁移失败时关闭驱动，避免资源泄露
@@ -146,7 +150,11 @@ func InitEnt(cfg *config.Config) (*ent.Client, *sql.DB, error) {
 	client := ent.NewClient(ent.Driver(drv))
 
 	// 启动阶段：从配置或数据库中确保系统密钥可用。
-	if err := ensureBootstrapSecrets(migrationCtx, client, cfg); err != nil {
+	bootstrap := ensureBootstrapSecrets
+	if !processrole.BackgroundEnabled() {
+		bootstrap = readSourcesBootstrapSecrets
+	}
+	if err := bootstrap(migrationCtx, client, cfg); err != nil {
 		_ = client.Close()
 		return nil, nil, err
 	}
@@ -159,9 +167,11 @@ func InitEnt(cfg *config.Config) (*ent.Client, *sql.DB, error) {
 
 	seedCtx, seedCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer seedCancel()
-	if err := ensureSimpleModeStartup(seedCtx, client, cfg); err != nil {
-		_ = client.Close()
-		return nil, nil, err
+	if processrole.BackgroundEnabled() {
+		if err := ensureSimpleModeStartup(seedCtx, client, cfg); err != nil {
+			_ = client.Close()
+			return nil, nil, err
+		}
 	}
 
 	return client, drv.DB(), nil

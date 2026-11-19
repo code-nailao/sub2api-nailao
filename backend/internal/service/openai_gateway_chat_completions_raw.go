@@ -71,7 +71,13 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	body []byte,
 	defaultMappedModel string,
 	startTime time.Time,
-) (*OpenAIForwardResult, error) {
+) (out *OpenAIForwardResult, forwardError error) {
+	observedHTTPStatus := 0
+	defer func() {
+		if observedHTTPStatus > 0 && forwardError != nil && (out == nil || out.UpstreamRejection == nil) {
+			forwardError = &UpstreamRejectionHTTPError{StatusCode: observedHTTPStatus, Cause: forwardError}
+		}
+	}()
 
 	// 1. Parse minimal fields needed for routing/billing
 	originalModel := gjson.GetBytes(body, "model").String()
@@ -222,6 +228,14 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	// 7. Handle error response with failover
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
+		if rejection := DetectUpstreamRejectionHTTP(account, resp.StatusCode, respBody); rejection != nil {
+			result := upstreamRejectionForwardResult(resp, originalModel, billingModel, upstreamModel, clientStream, startTime, rejection)
+			result.UpstreamEndpoint = grokChatRawEndpoint
+			return result, writeUpstreamRejectionHTTP(c, rejection)
+		}
+		if account.GetUpstreamRejectionProfile() != "" {
+			observedHTTPStatus = resp.StatusCode
+		}
 		if account.Platform == PlatformGrok {
 			kind := "http_error"
 			if s.shouldFailoverGrokUpstreamError(resp.StatusCode, respBody) {
@@ -267,12 +281,13 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	// 8. Forward response
 	var result *OpenAIForwardResult
 	var forwardErr error
-	if clientStream {
+	if clientStream && !upstreamRejectionJSONResponse(account, resp) {
 		result, forwardErr = s.streamRawChatCompletions(c, resp, account, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime, len(body))
 	} else {
 		result, forwardErr = s.bufferRawChatCompletions(c, resp, account, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
 	}
 	if result != nil {
+		result.Stream = clientStream
 		addOpenAIUsage(&result.Usage, bridgeUsage)
 		result.UpstreamEndpoint = grokChatRawEndpoint
 	}
@@ -314,6 +329,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 		observer = beginUpstreamResponseModelObservation(c)
 	}
 	requestID := resp.Header.Get("x-request-id")
+	rejectionObserver := newUpstreamRejectionSSEObserver(account, resp.StatusCode)
 	writeStreamHeaders := s.newStreamHeaderWriter(c, resp.Header)
 
 	var usage OpenAIUsage
@@ -331,6 +347,8 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	pendingLines := make([]string, 0, 8)
 	refusalDetector := newOpenAIChatSilentRefusalDetector(requestBodyLen)
 	var terminal openAIRawStreamTerminalState
+	profileTerminal := ""
+	profileChoiceEnds := make(map[string]bool)
 
 	writeLine := func(line string) {
 		if clientDisconnected {
@@ -366,10 +384,25 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		rejectionObserver.ObserveLine(line)
 		refusalDetector.ObserveSSELine(line)
 		if payload, ok := extractOpenAISSEDataLine(line); ok {
 			trimmedPayload := strings.TrimSpace(payload)
 			terminal.ObserveDataLine(trimmedPayload)
+			if account.GetUpstreamRejectionProfile() != "" {
+				if trimmedPayload == "[DONE]" {
+					profileTerminal = "[DONE]"
+				}
+				if gjson.Valid(payload) {
+					for i, choice := range gjson.Get(payload, "choices").Array() {
+						id := fmt.Sprint(i)
+						if index := choice.Get("index"); index.Exists() {
+							id = index.String()
+						}
+						profileChoiceEnds[id] = strings.TrimSpace(choice.Get("finish_reason").String()) != ""
+					}
+				}
+			}
 			if trimmedPayload != "[DONE]" {
 				observer.ObserveOpenAI([]byte(payload), strings.TrimSpace(gjson.Get(payload, "type").String()))
 				usageOnlyChunk := isOpenAIChatUsageOnlyStreamChunk(payload)
@@ -395,6 +428,8 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	resultWithUsage := func() *OpenAIForwardResult {
 		return &OpenAIForwardResult{
 			RequestID:                     requestID,
+			UpstreamRejection:             rejectionObserver.Evidence(),
+			UpstreamTerminalEvent:         profileTerminal,
 			UpstreamHeaders:               resp.Header,
 			Usage:                         usage,
 			Model:                         originalModel,
@@ -411,6 +446,16 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 		}
 	}
 
+	rejectionObserver.Finish()
+	if account.GetUpstreamRejectionProfile() != "" && profileTerminal == "" && len(profileChoiceEnds) > 0 {
+		allFinished := true
+		for _, finished := range profileChoiceEnds {
+			allFinished = allFinished && finished
+		}
+		if allFinished {
+			profileTerminal = "chat.completed"
+		}
+	}
 	scanErr := scanner.Err()
 	if scanErr != nil && !errors.Is(scanErr, context.Canceled) && !errors.Is(scanErr, context.DeadlineExceeded) {
 		logger.L().Warn("openai chat_completions raw: stream read error",
@@ -424,6 +469,25 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	clientAborted := clientDisconnected ||
 		errors.Is(scanErr, context.Canceled) ||
 		errors.Is(scanErr, context.DeadlineExceeded)
+	// A fully recognized refusal is already a billable supplier terminal, even
+	// if the socket later ends without usage/[DONE]. Never replay that request.
+	if rejection := rejectionObserver.Evidence(); rejection != nil &&
+		(scanErr != nil || terminal.IsTruncated(clientOutputStarted)) {
+		return resultWithUsage(), &UpstreamRejectionError{Evidence: rejection}
+	}
+
+	if account.GetUpstreamRejectionProfile() != "" && rejectionObserver.Evidence() == nil &&
+		(profileTerminal == "" || !hasBillableGrokChatUsage(usage)) {
+		// Early usage is not proof of completion. A canceled stream may still
+		// generate upstream fees, so retain its durable hold for reconciliation.
+		result := resultWithUsage()
+		result.ClientDisconnect = clientAborted
+		cause := scanErr
+		if cause == nil {
+			cause = ErrOpenAIUpstreamStreamTruncated
+		}
+		return result, newOpenAIUpstreamStreamReadError(cause)
+	}
 
 	// 上游在任何终止信号之前结束：连接被 reset（scanErr != nil）或干净 EOF。
 	// 两者都不能再记成功——此前统一返回 nil error，把上游截断伪装成
@@ -452,7 +516,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	}
 
 	if scanErr == nil && !clientDisconnected && !clientOutputStarted {
-		if refusalDetector.IsSilentRefusal() {
+		if rejectionObserver.Evidence() == nil && refusalDetector.IsSilentRefusal() {
 			return nil, newOpenAISilentRefusalFailoverError(c, account, requestID)
 		}
 		if len(pendingLines) > 0 {
@@ -539,13 +603,14 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 		observer = beginUpstreamResponseModelObservation(c)
 	}
 	observer.ObserveOpenAI(respBody, strings.TrimSpace(gjson.GetBytes(respBody, "type").String()))
+	rejection := observeUpstreamRejectionBody(account, resp.StatusCode, respBody)
 
 	var usage OpenAIUsage
 	if parsedUsage, ok := extractOpenAIUsageFromJSONBytes(respBody); ok {
 		usage = parsedUsage
 	}
 	responseModel := gjson.GetBytes(respBody, "model").String()
-	if requiresBillableGrokChatUsage(account, billingModel, upstreamModel, responseModel) && !hasBillableGrokChatUsage(usage) {
+	if rejection == nil && requiresBillableGrokChatUsage(account, billingModel, upstreamModel, responseModel) && !hasBillableGrokChatUsage(usage) {
 		upstreamRequestID := firstNonEmpty(requestID, resp.Header.Get("xai-request-id"))
 		return nil, newGrokMissingUsageFailoverError(c, account, upstreamRequestID)
 	}
@@ -565,6 +630,8 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 
 	return &OpenAIForwardResult{
 		RequestID:                     requestID,
+		UpstreamRejection:             rejection,
+		UpstreamTerminalEvent:         upstreamRejectionJSONCompletion(account, respBody),
 		UpstreamHeaders:               resp.Header,
 		Usage:                         usage,
 		Model:                         originalModel,

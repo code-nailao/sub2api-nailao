@@ -172,12 +172,39 @@ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscripti
 			return
 		}
 		ctx := context.WithValue(c.Request.Context(), ctxkey.UserID, apiKey.User.ID)
+		requestSpeed, speedErr := service.ResolveAPIKeyRequestSpeed(apiKey)
+		if speedErr != nil {
+			AbortWithError(c, http.StatusForbidden, "REQUEST_SPEED_INVALID", "Invalid request tier configuration")
+			return
+		}
+		if requestSpeed != "" {
+			keyID, groupID, selectedSpeed := apiKey.ID, apiKey.Group.ID, requestSpeed
+			ctx = service.WithRequestSpeed(ctx, groupID, selectedSpeed)
+			ctx = service.WithRequestSpeedValidator(ctx, func(checkCtx context.Context) error {
+				latest, err := apiKeyService.GetByID(checkCtx, keyID)
+				if err != nil || latest == nil || !latest.IsActive() || latest.Group == nil || latest.Group.Status != service.StatusActive || latest.GroupID == nil || *latest.GroupID != groupID {
+					return service.ErrRequestSpeedInvalid
+				}
+				currentSpeed, err := service.ResolveAPIKeyRequestSpeed(latest)
+				if err != nil || currentSpeed != selectedSpeed {
+					return service.ErrRequestSpeedInvalid
+				}
+				return nil
+			})
+		}
 		c.Request = c.Request.WithContext(ctx)
 		billingInfoRequest := c.Request.URL.Path == "/v1/sub2api/billing"
 		// Async image task polling only reads data that already belongs to the
 		// authenticated key and must remain available after the completed
 		// generation consumes the key's remaining balance.
-		skipBilling := c.Request.URL.Path == "/v1/usage" || billingInfoRequest || isAsyncImageTaskRead(c.Request.Method, c.Request.URL.Path)
+		videoTaskRead := isGrokVideoTaskRead(c.Request.Method, c.Request.URL.Path)
+		// A completed task remains readable after its charge exhausts the key.
+		// Credential expiry, unlike exhausted funds, is still an auth boundary.
+		if cfg.RunMode != config.RunModeSimple && videoTaskRead && (apiKey.Status == service.StatusAPIKeyExpired || apiKey.IsExpired()) {
+			AbortWithError(c, 403, "API_KEY_EXPIRED", "API key 已过期")
+			return
+		}
+		skipBilling := c.Request.URL.Path == "/v1/usage" || billingInfoRequest || isAsyncImageTaskRead(c.Request.Method, c.Request.URL.Path) || videoTaskRead
 
 		// ── 4. SimpleMode → early return ─────────────────────────────
 
@@ -346,6 +373,28 @@ func isAsyncImageTaskRead(method, path string) bool {
 		return false
 	}
 	return strings.HasPrefix(path, "/v1/images/tasks/") || strings.HasPrefix(path, "/images/tasks/")
+}
+
+// isGrokVideoTaskRead only matches the registered status/content GET shapes.
+// It never grants task ownership: the media handler must verify user/key binding.
+func isGrokVideoTaskRead(method, path string) bool {
+	if method != http.MethodGet {
+		return false
+	}
+	path = strings.TrimPrefix(path, "/v1")
+	if !strings.HasPrefix(path, "/videos/") {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(path, "/videos/"), "/")
+	if len(parts) > 1 && (parts[0] == "generations" || parts[0] == "edits" || parts[0] == "extensions") {
+		parts = parts[1:]
+	}
+	if len(parts) != 1 && (len(parts) != 2 || parts[1] != "content") {
+		return false
+	}
+	id := parts[0]
+	return id != "" && id != "." && id != ".." && id != "generations" && id != "edits" && id != "extensions" &&
+		!strings.ContainsAny(id, "%\\") && strings.TrimSpace(id) == id
 }
 
 // GetAPIKeyFromContext 从上下文中获取API key

@@ -25,7 +25,7 @@ func TestUsageLogRepositoryGetAllGroupUsageSummaryUsesRollupTail(t *testing.T) {
 
 	// 尾段起点必须以参数形式进 WHERE —— 这正是把 usage_logs 全表扫换回
 	// idx_usage_logs_created_at 索引扫的那一步。
-	mock.ExpectQuery(`(?s)usage_group_daily_rollups.*FROM usage_logs ul\s+WHERE ul\.created_at >= \$7`).
+	mock.ExpectQuery(`(?s)usage_group_daily_rollups.*FROM usage_cleanup_group_source ul\s+WHERE ul\.created_at >= \$7`).
 		WithArgs(
 			todayStart,
 			yesterdayStart,
@@ -84,7 +84,7 @@ func TestUsageLogRepositoryGetAllGroupUsageSummaryFallsBackWhenWatermarkInvalid(
 
 			mock.ExpectQuery(`(?s)COUNT\(\*\).*usage_group_rollup_state.*WHERE id = 1`).
 				WillReturnRows(tc.rows)
-			mock.ExpectQuery(`(?s)usage_group_daily_rollups.*FROM usage_logs ul\s+WHERE ul\.created_at >= \$7`).
+			mock.ExpectQuery(`(?s)usage_group_daily_rollups.*FROM usage_cleanup_group_source ul\s+WHERE ul\.created_at >= \$7`).
 				WithArgs(todayStart, yesterdayStart, "2026-03-08", false, "1970-01-01", "1970-01-01", epoch).
 				WillReturnRows(sqlmock.NewRows([]string{"group_id", "total_cost", "today_cost", "yesterday_cost"}))
 
@@ -147,7 +147,10 @@ func TestUsageLogRepositoryGetAllGroupUsageSummaryTailStartsAtExpiredBefore(t *t
 
 			mock.ExpectQuery(`(?s)COUNT\(\*\).*MAX\(expired_before\).*usage_group_rollup_state.*WHERE id = 1`).
 				WillReturnRows(tc.rows)
-			mock.ExpectQuery(`(?s)usage_group_daily_rollups.*FROM usage_logs ul\s+WHERE ul\.created_at >= \$7`).
+			mock.ExpectQuery(`(?s)SELECT EXISTS.*FROM usage_cleanup_group_daily.*< \$1`).
+				WithArgs(expiredBefore).
+				WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+			mock.ExpectQuery(`(?s)usage_group_daily_rollups.*FROM usage_cleanup_group_source ul\s+WHERE ul\.created_at >= \$7`).
 				WithArgs(todayStart, yesterdayStart, "2026-03-08", tc.valid, tc.retained, tc.closed, tc.tailStart).
 				WillReturnRows(sqlmock.NewRows([]string{"group_id", "total_cost", "today_cost", "yesterday_cost"}))
 
@@ -156,4 +159,36 @@ func TestUsageLogRepositoryGetAllGroupUsageSummaryTailStartsAtExpiredBefore(t *t
 			require.NoError(t, mock.ExpectationsWereMet())
 		})
 	}
+}
+
+func TestUsageLogRepositoryGroupSummaryPreservesArchivedCostsAcrossRawExpiry(t *testing.T) {
+	db, mock := newSQLMock(t)
+	repo := newUsageLogRepositoryWithSQL(nil, db)
+	useGroupUsageRepositoryTestTimezone(t, "Asia/Shanghai")
+	todayStart := time.Date(2026, 8, 13, 16, 0, 0, 0, time.UTC)
+	yesterdayStart := todayStart.Add(-24 * time.Hour)
+	expiredBefore := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	epoch := time.Unix(0, 0).UTC()
+
+	// This apparently current rollup may include both archived costs and raw
+	// costs that native retention has expired. Do not add archives to it.
+	mock.ExpectQuery(`(?s)COUNT\(\*\).*MAX\(expired_before\).*usage_group_rollup_state.*WHERE id = 1`).
+		WillReturnRows(sqlmock.NewRows([]string{"count", "closed_before", "retained_from", "timezone_name", "expired_before"}).
+			AddRow(1, "2026-08-14", expiredBefore, "Asia/Shanghai", expiredBefore))
+	mock.ExpectQuery(`(?s)SELECT EXISTS.*FROM usage_cleanup_group_daily.*< \$1`).
+		WithArgs(expiredBefore).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	// The raw branch is bounded by expiry; the archive branch deliberately is
+	// not. Historical rollups are disabled so their archive portion is not
+	// counted twice, and the tail includes all preserved archive dates.
+	mock.ExpectQuery(`(?s)usage_group_daily_rollups.*WHERE \$4::boolean.*FROM usage_logs\s+WHERE group_id IS NOT NULL AND created_at >= \$8\s+UNION ALL\s+SELECT bucket_date::timestamp AT TIME ZONE 'Asia/Shanghai', group_id, actual_cost\s+FROM usage_cleanup_group_daily\s+\) ul\s+WHERE ul\.created_at >= \$7`).
+		WithArgs(todayStart, yesterdayStart, "2026-08-13", false, "1970-01-01", "1970-01-01", epoch, expiredBefore).
+		WillReturnRows(sqlmock.NewRows([]string{"group_id", "total_cost", "today_cost", "yesterday_cost"}).
+			AddRow(int64(7), 101.25, 1.25, 0))
+
+	rows, err := repo.GetAllGroupUsageSummary(context.Background(), todayStart)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.InDelta(t, 101.25, rows[0].TotalCost, 0.0000001)
+	require.NoError(t, mock.ExpectationsWereMet())
 }

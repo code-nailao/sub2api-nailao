@@ -113,10 +113,14 @@ func (s *OpenAIGatewayService) forwardAnthropicViaRawChatCompletions(
 	// Use the final outbound value for usage logs and billing.
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(chatBody, upstreamModel, billingModel, originalModel)
 	reasoningEffort = ApplyThinkingEnabledFallback(reasoningEffort, chatBody, upstreamModel)
-	// Unlike forwardResponsesViaRawChatCompletions, applyOpenAIFastPolicyToBody
-	// is intentionally skipped: Anthropic Messages bodies carry no service_tier,
-	// so the converted Chat Completions body never contains one and the policy
-	// would always be a no-op on this path.
+	if RequestSpeedFromContext(ctx) != "" {
+		var policyErr error
+		chatBody, policyErr = s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, chatBody)
+		if policyErr != nil {
+			writeAnthropicError(c, http.StatusForbidden, "permission_error", policyErr.Error())
+			return nil, policyErr
+		}
+	}
 
 	logger.L().Debug("openai messages: forwarding via raw chat completions",
 		zap.Int64("account_id", account.ID),

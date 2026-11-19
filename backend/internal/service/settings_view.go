@@ -198,12 +198,14 @@ type SystemSettings struct {
 	OpsMetricsIntervalSeconds    int
 
 	// Channel Monitor feature
-	ChannelMonitorEnabled                bool   `json:"channel_monitor_enabled"`
-	ChannelMonitorMode                   string `json:"channel_monitor_mode"`
-	ChannelMonitorDefaultIntervalSeconds int    `json:"channel_monitor_default_interval_seconds"`
-	ChannelMonitorHideThroughput         bool   `json:"channel_monitor_hide_throughput"`
-	ChannelMonitorShowQuota              bool   `json:"channel_monitor_show_quota"`
-	ChannelMonitorHideUserRanking        bool   `json:"channel_monitor_hide_user_ranking"`
+	ChannelMonitorEnabled                  bool   `json:"channel_monitor_enabled"`
+	ChannelMonitorMode                     string `json:"channel_monitor_mode"`
+	ChannelMonitorDefaultIntervalSeconds   int    `json:"channel_monitor_default_interval_seconds"`
+	ChannelMonitorDegradedThresholdSeconds int    `json:"channel_monitor_degraded_threshold_seconds"`
+	ChannelMonitorRequestTimeoutSeconds    int    `json:"channel_monitor_request_timeout_seconds"`
+	ChannelMonitorHideThroughput           bool   `json:"channel_monitor_hide_throughput"`
+	ChannelMonitorShowQuota                bool   `json:"channel_monitor_show_quota"`
+	ChannelMonitorHideUserRanking          bool   `json:"channel_monitor_hide_user_ranking"`
 
 	// Grok model mapping policy (admin settings; empty mapping falls back to these).
 	GrokDefaultTextModel           string `json:"grok_default_text_model"`
@@ -718,7 +720,8 @@ type OpenAIFastPolicyRule struct {
 
 // OpenAIFastPolicySettings OpenAI fast 策略配置
 type OpenAIFastPolicySettings struct {
-	Rules []OpenAIFastPolicyRule `json:"rules"`
+	GroupTierPoliciesEnabled bool                   `json:"group_tier_policies_enabled"`
+	Rules                    []OpenAIFastPolicyRule `json:"rules"`
 }
 
 // DefaultOpenAIFastPolicySettings 返回默认的 OpenAI fast 策略配置。

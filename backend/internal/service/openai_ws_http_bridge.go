@@ -443,11 +443,20 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	if writeClientMessage == nil {
 		return nil, errors.New("client websocket writer is nil")
 	}
+	if blocked := s.validateFixedRequestSpeedAccount(ctx, account, firstNonEmptyString(gjson.GetBytes(payload, "model").String(), originalModel)); blocked != nil {
+		return nil, blocked
+	}
 	responseModelObserver := &upstreamResponseModelObserver{}
 
 	body, err := prepareOpenAIWSHTTPBridgeBody(account, payload)
 	if err != nil {
 		return nil, fmt.Errorf("prepare http bridge body: %w", err)
+	}
+	if RequestSpeedFromContext(ctx) != "" {
+		body, err = s.applyOpenAIFastPolicyToBody(ctx, account, firstNonEmptyString(gjson.GetBytes(body, "model").String(), originalModel), body)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// Codex fingerprint convergence, same as Forward / forwardOpenAIPassthrough. Builders only read
 	// staged IDs; without staging, the bridge sends no account-level session_id, so clients without
@@ -695,7 +704,9 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			UpstreamResponseModel:         responseModelObserver.Model(),
 			UpstreamResponseModelConflict: responseModelObserver.Conflict(),
 			UpstreamResponseServiceTier:   responseModelObserver.ServiceTier(),
+			FixedUpstreamRequestTier:      RequestSpeedServiceTierFromContext(ctx),
 			ServiceTier:                   resolvedOpenAIUpstreamServiceTierFromObserver(responseModelObserver, extractOpenAIServiceTierFromBody(body)),
+			RequestedServiceTier:          RequestedOpenAIServiceTierFromContext(ctx),
 			ReasoningEffort:               ApplyThinkingEnabledFallback(extractOpenAIReasoningEffortFromBody(body, mappedModel, originalModel), body, mappedModel),
 			RequestedReasoningEffort:      CanonicalRequestedReasoningEffort(body, originalModel, mappedModel),
 			Stream:                        reqStream,

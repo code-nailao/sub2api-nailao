@@ -369,6 +369,7 @@ func sanitizeGroupOpenAIFast(group *Group) {
 	if group == nil || !groupSupportsOpenAIFast(group.Platform) {
 		if group != nil {
 			group.ForceOpenAIFast = false
+			group.OpenAIServiceTierPolicy = ""
 			group.ForceOpenAIUltrafast = false
 			group.FreeOpenAIFast = false
 		}
@@ -408,6 +409,9 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 	}
 
 	platform := NormalizeGroupPlatform(input.Platform)
+	if err := validateGroupServiceTierPolicy(input.OpenAIServiceTierPolicy); err != nil {
+		return nil, err
+	}
 	// 固定账号 manifest 配置：账号绑定发生在创建之后，创建时无法校验成员关系，
 	// 拒绝开启并在创建后的编辑里配置。
 	if normalizeCodexModelsManifestConfig(platform, input.CodexModelsManifestConfig).Enabled {
@@ -448,7 +452,21 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 	videoPrice720P := normalizePrice(input.VideoPrice720P)
 	videoPrice1080P := normalizePrice(input.VideoPrice1080P)
 	webSearchPricePerCall := normalizePrice(input.WebSearchPricePerCall)
+	upstreamRejectionPrice := DefaultUpstreamRejectionPrice
+	if input.UpstreamRejectionPrice != nil {
+		upstreamRejectionPrice = *input.UpstreamRejectionPrice
+	}
+	if err := ValidateGroupUpstreamRejectionBillingConfig(platform, subscriptionType, input.UpstreamRejectionBillingEnabled, upstreamRejectionPrice); err != nil {
+		return nil, err
+	}
 	searchPricePer1k := normalizePrice(input.SearchPricePer1k)
+	deepSeekTools := DeepSeekToolsConfig{}
+	if input.DeepSeekTools != nil {
+		deepSeekTools = *input.DeepSeekTools
+	}
+	if err := ValidateDeepSeekToolsConfig(platform, subscriptionType, deepSeekTools, searchPricePer1k); err != nil {
+		return nil, err
+	}
 	audioRealtimePricePerMin := normalizePrice(input.AudioRealtimePricePerMin)
 	audioTTSPricePerMillionChars := normalizePrice(input.AudioTTSPricePerMillionChars)
 	audioSTTPricePerHour := normalizePrice(input.AudioSTTPricePerHour)
@@ -614,6 +632,9 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 		VideoPrice1080P:                 videoPrice1080P,
 		VideoModelPrices:                NormalizeVideoModelPrices(input.VideoModelPrices),
 		WebSearchPricePerCall:           webSearchPricePerCall,
+		UpstreamRejectionBillingEnabled: input.UpstreamRejectionBillingEnabled,
+		UpstreamRejectionPrice:          upstreamRejectionPrice,
+		DeepSeekTools:                   deepSeekTools,
 		SearchPricePer1k:                searchPricePer1k,
 		AudioRealtimePricePerMin:        audioRealtimePricePerMin,
 		AudioTTSPricePerMillionChars:    audioTTSPricePerMillionChars,
@@ -627,6 +648,9 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 		AllowMessagesDispatch:           input.AllowMessagesDispatch,
 		AllowLive:                       input.AllowLive,
 		ForceOpenAIFast:                 input.ForceOpenAIFast,
+		OpenAIServiceTierPolicy:         input.OpenAIServiceTierPolicy,
+		RequestSpeedSelectionEnabled:    input.RequestSpeedSelectionEnabled,
+		DefaultRequestSpeedTier:         input.DefaultRequestSpeedTier,
 		ForceOpenAIUltrafast:            input.ForceOpenAIUltrafast,
 		FreeOpenAIFast:                  input.FreeOpenAIFast,
 		RequireOAuthOnly:                input.RequireOAuthOnly,
@@ -648,6 +672,9 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 		group.AllowLive = false
 	}
 	sanitizeGroupReasoningEffortPolicy(group)
+	if err := ValidateGroupRequestSpeed(group); err != nil {
+		return nil, err
+	}
 	if err := s.groupRepo.Create(ctx, group); err != nil {
 		return nil, err
 	}
@@ -948,11 +975,26 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 	if input.VideoModelPrices != nil {
 		group.VideoModelPrices = NormalizeVideoModelPrices(input.VideoModelPrices)
 	}
+	if input.UpstreamRejectionBillingEnabled != nil {
+		group.UpstreamRejectionBillingEnabled = *input.UpstreamRejectionBillingEnabled
+	}
+	if input.UpstreamRejectionPrice != nil {
+		group.UpstreamRejectionPrice = *input.UpstreamRejectionPrice
+	}
+	if err := ValidateGroupUpstreamRejectionBillingConfig(group.Platform, group.SubscriptionType, group.UpstreamRejectionBillingEnabled, group.UpstreamRejectionPrice); err != nil {
+		return nil, err
+	}
 	if input.WebSearchPricePerCall != nil {
 		group.WebSearchPricePerCall = normalizePrice(input.WebSearchPricePerCall)
 	}
 	if input.SearchPricePer1k != nil {
 		group.SearchPricePer1k = normalizePrice(input.SearchPricePer1k)
+	}
+	if input.DeepSeekTools != nil {
+		group.DeepSeekTools = *input.DeepSeekTools
+	}
+	if err := ValidateDeepSeekToolsConfig(group.Platform, group.SubscriptionType, group.DeepSeekTools, group.SearchPricePer1k); err != nil {
+		return nil, err
 	}
 	if input.AudioRealtimePricePerMin != nil {
 		group.AudioRealtimePricePerMin = normalizePrice(input.AudioRealtimePricePerMin)
@@ -1018,8 +1060,20 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 	if input.AllowLive != nil {
 		group.AllowLive = *input.AllowLive
 	}
+	if input.RequestSpeedSelectionEnabled != nil {
+		group.RequestSpeedSelectionEnabled = *input.RequestSpeedSelectionEnabled
+	}
+	if input.DefaultRequestSpeedTier != nil {
+		group.DefaultRequestSpeedTier = *input.DefaultRequestSpeedTier
+	}
 	if input.ForceOpenAIFast != nil {
 		group.ForceOpenAIFast = *input.ForceOpenAIFast
+	}
+	if input.OpenAIServiceTierPolicy != nil {
+		if err := validateGroupServiceTierPolicy(*input.OpenAIServiceTierPolicy); err != nil {
+			return nil, err
+		}
+		group.OpenAIServiceTierPolicy = *input.OpenAIServiceTierPolicy
 	}
 	if input.ForceOpenAIUltrafast != nil {
 		group.ForceOpenAIUltrafast = *input.ForceOpenAIUltrafast
@@ -1089,6 +1143,9 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 		}
 	}
 
+	if err := ValidateGroupRequestSpeed(group); err != nil {
+		return nil, err
+	}
 	if err := s.groupRepo.Update(ctx, group); err != nil {
 		return nil, err
 	}

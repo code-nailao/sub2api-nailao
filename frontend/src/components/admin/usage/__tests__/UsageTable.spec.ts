@@ -34,6 +34,7 @@ const localizedMessages: Record<'en' | 'zh', Record<string, string>> = {
 
 const messages: Record<string, string> = {
   'usage.outputTps': 'Output TPS',
+  'usage.performanceCache': 'Cache',
   'admin.usage.userDeletedBadge': 'Deleted',
   'usage.costDetails': 'Cost Breakdown',
   'admin.usage.inputCost': 'Input Cost',
@@ -108,6 +109,7 @@ const DataTableStub = {
         <slot name="cell-billing_mode" :row="row" />
         <slot name="cell-tokens" :row="row" />
         <slot name="cell-latency" :row="row" />
+        <slot name="cell-cache_hit_rate" :row="row" />
         <slot name="cell-cost" :row="row" />
         <slot name="cell-request_id" :row="row" />
         <slot name="cell-upstream_request_id" :row="row" />
@@ -145,6 +147,43 @@ const baseImageRow = {
 }
 
 describe('admin UsageTable tooltip', () => {
+  it('renders the public minimal content fee without disclosing account costs or internal metadata', async () => {
+    const row = { ...baseImageRow, request_id: 'public-fee', image_count: 0, billing_mode: 'token',
+      actual_cost: 0.1, total_cost: 0.1, rate_multiplier: 9, account_rate_multiplier: 6, account_stats_cost: 8.765432,
+      billing_snapshot: { charge_kind: 'content_rejection', fixed_charge: 0.1, original_status: 403,
+        rejection_rule_id: 'private-internal-rule', rejection_rule_version: 'grok_content_rejection_v1' } }
+    const wrapper = mount(UsageTable, { props: { data: [row], loading: false, columns: [], showAccountBilling: false },
+      global: { stubs: { DataTable: DataTableStub, EmptyState: true, Icon: true, Teleport: true } } })
+    const trigger = wrapper.findAll('.group.relative').at(-1)!
+    await trigger.trigger('click')
+    await nextTick()
+    expect(wrapper.get('[data-testid="rejection-charge"]').exists()).toBe(true)
+    expect(wrapper.text()).toContain('¥0.100000')
+    for (const value of ['403', 'private-internal-rule', 'grok_content_rejection_v1', 'legacy_profile_v0', '8.765432', 'Account billed', 'Account rate']) expect(wrapper.html()).not.toContain(value)
+    wrapper.unmount()
+  })
+
+  it('renders a fixed rejection without normal rates, unit-price breakdown, or invented account cost', async () => {
+    const row = { ...baseImageRow, request_id: 'rejection-fixture', image_count: 0, billing_mode: 'token',
+      actual_cost: 0.1, total_cost: 0.1, rate_multiplier: 9, account_rate_multiplier: 6,
+      billing_snapshot: { version: 1, charge_kind: 'upstream_rejection', fixed_charge: 0.1,
+        original_status: 403, rejection_rule_id: 'policy', rejection_rule_version: 'v1' } }
+    const wrapper = mount(UsageTable, { props: { data: [row], loading: false, columns: [] },
+      global: { stubs: { DataTable: DataTableStub, EmptyState: true, Icon: true, Teleport: true } } })
+    const trigger = wrapper.findAll('.group.relative').at(-1)!
+    await trigger.trigger('click')
+    await nextTick()
+    expect(wrapper.find('[data-testid="rejection-charge"]').exists()).toBe(true)
+    expect(wrapper.html()).not.toContain('403')
+    expect(wrapper.html()).not.toContain('fixture-policy')
+    expect(wrapper.text()).toContain('User billed')
+    for (const label of ['Service tier', 'Cost Breakdown', 'Account billed', 'Account rate', '9.00x', '6.00x']) expect(wrapper.text()).not.toContain(label)
+    expect(wrapper.find('.max-w-\\[calc\\(100vw-24px\\)\\]').exists()).toBe(true)
+    await trigger.trigger('keydown.esc')
+    expect(wrapper.find('[data-testid="rejection-charge"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
   it('shows the two OpenAI cache-write buckets without Anthropic lifetime labels', async () => {
     const row = { ...baseImageRow, image_count: 0, billing_mode: 'token', cache_creation_tokens: 2399, cache_creation_30m_tokens: 9, cache_creation_12h_tokens: 2390 }
     const wrapper = mount(UsageTable, {

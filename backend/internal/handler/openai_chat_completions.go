@@ -253,6 +253,17 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
 		writerSizeBeforeForward := c.Writer.Size()
+		rejectionAttempt, beginErr := h.gatewayService.BeginUpstreamRejectionBilling(c.Request.Context(), apiKey, account, reqModel, body)
+		if beginErr != nil {
+			if accountReleaseFunc != nil {
+				accountReleaseFunc()
+			}
+			status, code, message := upstreamRejectionAdmissionError(beginErr)
+			h.handleStreamingAwareError(c, status, code, message, streamStarted)
+			return
+		}
+		h.setDeepSeekUsageMetadata(c, apiKey, account, clientRequestedUsageFields(c, channelMapping, reqModel, ""), pricingAt, body)
+		c.Request = c.Request.WithContext(service.WithUpstreamRejectionBillingAttempt(c.Request.Context(), rejectionAttempt))
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer func() {
 				if accountReleaseFunc != nil {
@@ -261,11 +272,12 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			}()
 			return h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, promptCacheKey, "")
 		}()
+		err = h.gatewayService.FinishUpstreamRejectionBillingAttempt(c.Request.Context(), rejectionAttempt, result, err)
 		var cyberBlockBodyChat []byte
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyChat = body
 		}
-		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, cyberBlockBodyChat, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
+		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, shouldRecordCyberFallbackUsage(err, result, rejectionAttempt != nil), cyberBlockBodyChat, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
 
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
 		upstreamLatencyMs, _ := getContextInt64(c, service.OpsUpstreamLatencyMsKey)
@@ -321,6 +333,19 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 				}
 			})
 		}
+		if err != nil && result != nil && result.DeepSeekTools != nil {
+			submitChatUsage(result)
+			h.writeDeepSeekContinuationError(c, result)
+			return
+		}
+		if result != nil && result.UpstreamRejection != nil {
+			submitChatUsage(result)
+			if err != nil && !c.Writer.Written() {
+				h.ensureForwardErrorResponse(c, streamStarted)
+			}
+			return
+		}
+
 		if err != nil {
 			if result != nil && result.ImageCount > 0 {
 				reqLog.Warn("openai_chat_completions.forward_partial_error_with_image_result",

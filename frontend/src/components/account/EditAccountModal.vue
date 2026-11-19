@@ -364,6 +364,7 @@
               :model-mappings="modelMappings"
               :platform="account?.platform || 'anthropic'"
               :account-id="account?.id"
+              :unprefixed-grok-only="rejectionProfileEnabled"
               :show-sync-button="account.platform !== 'grok' || !account.id"
               @upstream-sync-finished="refreshGrokDiagnostics"
             />
@@ -514,6 +515,21 @@
             </div>
           </template>
         </div>
+
+        <section v-if="account.platform === 'grok'" class="mt-4 border-t border-gray-200 pt-4 dark:border-dark-600" aria-labelledby="account-rejection-title">
+          <h4 id="account-rejection-title" class="text-sm font-medium text-gray-700 dark:text-gray-300">{{ t('upstreamRejection.accountTitle') }}</h4>
+          <label class="flex min-h-11 items-center gap-2">
+            <input v-model="rejectionProfileEnabled" type="checkbox" data-testid="account-rejection-enabled" />
+            <span class="text-sm text-gray-700 dark:text-gray-300">{{ t('upstreamRejection.accountEnabled') }}</span>
+          </label>
+          <p class="mb-3 text-xs text-gray-500 dark:text-gray-400">{{ t('upstreamRejection.accountHint') }}</p>
+          <template v-if="rejectionProfileEnabled">
+            <label for="account-rejection-cost" class="input-label">{{ t('upstreamRejection.cost') }}</label>
+            <input id="account-rejection-cost" v-model.number="rejectionUpstreamCost" type="number" min="0.00000001" step="0.00000001" required class="input" data-testid="account-rejection-cost" :aria-invalid="!rejectionCostValid" aria-describedby="account-rejection-currency" />
+            <p id="account-rejection-currency" class="mt-2 text-xs text-gray-500 dark:text-gray-400">{{ t('upstreamRejection.currency') }}</p>
+            <p v-if="!rejectionCostValid" role="alert" class="mt-2 text-sm text-red-600 dark:text-red-400">{{ t('upstreamRejection.invalidPrice') }}</p>
+          </template>
+        </section>
 
         <!-- Pool Mode Section -->
         <div class="border-t border-gray-200 pt-4 dark:border-dark-600">
@@ -960,7 +976,8 @@
             :model-mappings="modelMappings"
             :platform="account?.platform || 'anthropic'"
             :account-id="account?.id"
-            :show-sync-button="account.platform !== 'grok' || !account.id"
+            :unprefixed-grok-only="rejectionProfileEnabled"
+              :show-sync-button="account.platform !== 'grok' || !account.id"
             @upstream-sync-finished="refreshGrokDiagnostics"
           />
 
@@ -1228,7 +1245,7 @@
 
           <!-- Whitelist Mode -->
           <div v-if="modelRestrictionMode === 'whitelist'">
-            <ModelWhitelistSelector v-model="allowedModels" :model-mappings="modelMappings" :platform="account?.platform || 'anthropic'" :account-id="account?.id" />
+            <ModelWhitelistSelector v-model="allowedModels" :model-mappings="modelMappings" :platform="account?.platform || 'anthropic'" :account-id="account?.id" :unprefixed-grok-only="rejectionProfileEnabled" />
             <p class="text-xs text-gray-500 dark:text-gray-400">
               {{ t('admin.accounts.selectedModels', { count: allowedModels.length }) }}
               <span v-if="allowedModels.length === 0 && modelMappings.length === 0">{{
@@ -1926,6 +1943,7 @@
         <ProxySelector v-model="form.proxy_id" :proxies="proxies" />
       </div>
 
+      <DeepSeekToolAccountFields v-if="account?.platform === 'deepseek' && account?.type === 'apikey'" v-model="deepSeekToolSettings" :base-url="editBaseUrl" />
       <UpstreamRequestIdHeaderField
         v-model="upstreamRequestIdHeader"
         :platform="account.platform"
@@ -3347,6 +3365,12 @@
         :mixed-scheduling="mixedScheduling"
         data-tour="account-form-groups"
       />
+      <AccountRequestSpeedFields
+        v-if="account?.platform === 'openai' && account?.type === 'apikey'"
+        v-model="requestSpeedMappings"
+        :groups="requestSpeedGroups"
+        :error="requestSpeedError"
+      />
 
     </form>
 
@@ -3429,6 +3453,8 @@ import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import Select from '@/components/common/Select.vue'
 import HelpTooltip from '@/components/common/HelpTooltip.vue'
+import DeepSeekToolAccountFields from '@/components/account/DeepSeekToolAccountFields.vue'
+import { deepSeekToolAccountForm } from '@/utils/deepseekTools'
 import UpstreamRequestIdHeaderField from '@/components/account/UpstreamRequestIdHeaderField.vue'
 import OpenAIImageSizeTiersField from '@/components/account/OpenAIImageSizeTiersField.vue'
 import {
@@ -3442,6 +3468,9 @@ import Icon from '@/components/icons/Icon.vue'
 import ProxySelector from '@/components/common/ProxySelector.vue'
 import ProxyAdBanner from '@/components/common/ProxyAdBanner.vue'
 import GroupSelector from '@/components/common/GroupSelector.vue'
+import AccountRequestSpeedFields from './AccountRequestSpeedFields.vue'
+import type { RequestSpeedTier } from '@/types'
+import { CONTENT_REJECTION_PROFILE, isValidRejectionAmount, isUnprefixedGrokModel } from '@/utils/upstreamRejection'
 import ModelWhitelistSelector from '@/components/account/ModelWhitelistSelector.vue'
 import GrokModelDiagnosticsPanel from '@/components/account/GrokModelDiagnosticsPanel.vue'
 import QuotaLimitCard from '@/components/account/QuotaLimitCard.vue'
@@ -4110,11 +4139,15 @@ const autoPause7dDisabled = ref(false)
 const autoResetCreditEnabled = ref(false)
 const autoResetCredit5hThreshold = ref(100)
 const autoResetCredit7dThreshold = ref(100)
+const rejectionProfileEnabled = ref(false)
+const rejectionUpstreamCost = ref<number | string>(0.1)
+const rejectionCostValid = computed(() => isValidRejectionAmount(rejectionUpstreamCost.value, rejectionProfileEnabled.value))
 const upstreamBillingAutoProbeEnabled = ref(false)
 const upstreamBillingRateSyncEnabled = ref(false)
 const mixedScheduling = ref(false) // For antigravity accounts: enable mixed scheduling
 // 上游ID：直接上游声明请求标识的响应头名，留空不记录。
 const upstreamRequestIdHeader = ref('')
+const deepSeekToolSettings = ref(deepSeekToolAccountForm())
 const readUpstreamRequestIdHeader = (extra: unknown): string => {
   const value = (extra as Record<string, unknown> | undefined)?.upstream_request_id_header
   return typeof value === 'string' ? value : ''
@@ -4530,6 +4563,13 @@ const form = reactive({
   expires_at: null as number | null
 })
 
+const requestSpeedMappings = ref<Record<string, RequestSpeedTier[]>>({})
+const requestSpeedError = ref('')
+const requestSpeedGroups = computed(() => props.groups.filter(group =>
+  form.group_ids.includes(group.id) && group.platform === 'openai' &&
+  group.request_speed_selection_enabled === true
+))
+
 const handleUpstreamBillingRateSyncChange = (enabled: boolean) => {
   upstreamBillingRateSyncEnabled.value = enabled
   if (enabled) {
@@ -4637,6 +4677,8 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     ? newAccount.status
     : 'active'
   form.group_ids = newAccount.group_ids || []
+  requestSpeedMappings.value = Object.fromEntries(Object.entries(newAccount.request_speed_tiers_by_group || {}).map(([groupID, tiers]) => [groupID, [...tiers]]))
+  requestSpeedError.value = ''
   form.expires_at = newAccount.expires_at ?? null
 
   // Load intercept warmup requests setting (applies to all account types)
@@ -4660,6 +4702,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
 	const extra = newAccount.extra as Record<string, unknown> | undefined
 	mixedScheduling.value = extra?.mixed_scheduling === true
 	allowOverages.value = extra?.allow_overages === true
+	deepSeekToolSettings.value = deepSeekToolAccountForm(extra as Record<string, unknown>)
 	upstreamRequestIdHeader.value = readUpstreamRequestIdHeader(extra)
 	openAIImagesUrlToB64JsonEnabled.value = extra?.images_url_to_b64_json === true
 	openAIImageSizeTiers.value = readOpenAIImageSizeTiers(extra)
@@ -4672,6 +4715,8 @@ const syncFormFromAccount = (newAccount: Account | null) => {
 		typeof extra?.auto_reset_credit_5h_threshold === 'number' ? extra.auto_reset_credit_5h_threshold * 100 : 100
 	autoResetCredit7dThreshold.value =
 		typeof extra?.auto_reset_credit_7d_threshold === 'number' ? extra.auto_reset_credit_7d_threshold * 100 : 100
+  rejectionProfileEnabled.value = newAccount.platform === 'grok' && newAccount.type === 'apikey' && extra?.upstream_rejection_profile === CONTENT_REJECTION_PROFILE
+  rejectionUpstreamCost.value = typeof extra?.upstream_rejection_cost === 'number' ? extra.upstream_rejection_cost : 0.1
 	upstreamBillingAutoProbeEnabled.value = extra?.upstream_billing_probe_enabled === true
   upstreamBillingRateSyncEnabled.value =
     upstreamBillingAutoProbeEnabled.value && extra?.upstream_billing_rate_sync_enabled === true
@@ -5592,6 +5637,7 @@ const parseDateTimeLocal = parseDateTimeLocalInput
 
 // Methods
 const handleClose = () => {
+  requestSpeedError.value = ''
   antigravityMixedChannelConfirmed.value = false
   clearMixedChannelDialog()
   emit('close')
@@ -5635,9 +5681,19 @@ const persistGrokMediaEligibility = async (accountID: number, updatedAccount: Ac
 }
 
 const submitUpdateAccount = async (accountID: number, updatePayload: Record<string, unknown>) => {
+  requestSpeedError.value = ''
+  const requestPayload = { ...updatePayload }
+  if (props.account?.platform === 'openai' && props.account.type === 'apikey') {
+    const enabledGroupIDs = new Set(requestSpeedGroups.value.map(group => String(group.id)))
+    const mappings = Object.fromEntries(Object.entries(requestSpeedMappings.value).filter(([groupID]) =>
+      form.group_ids.includes(Number(groupID)) && enabledGroupIDs.has(groupID)
+    ))
+    const previous = props.account.request_speed_tiers_by_group || {}
+    if (JSON.stringify(previous) !== JSON.stringify(mappings)) requestPayload.request_speed_tiers_by_group = mappings
+  }
   submitting.value = true
   try {
-    let updatedAccount = await adminAPI.accounts.update(accountID, withAntigravityConfirmFlag(updatePayload))
+    let updatedAccount = await adminAPI.accounts.update(accountID, withAntigravityConfirmFlag(requestPayload))
     updatedAccount = await persistGrokMediaEligibility(accountID, updatedAccount)
     appStore.showSuccess(t('admin.accounts.accountUpdated'))
     emit('updated', updatedAccount)
@@ -5653,7 +5709,11 @@ const submitUpdateAccount = async (accountID: number, updatePayload: Record<stri
       })
       return
     }
-    appStore.showError(error.message || t('admin.accounts.failedToUpdate'))
+    const message = error.message || error.response?.data?.message || t('admin.accounts.failedToUpdate')
+    if (String(error.reason || error.response?.data?.reason || '').startsWith('REQUEST_SPEED_')) {
+      requestSpeedError.value = message
+    }
+    appStore.showError(message)
   } finally {
     submitting.value = false
   }
@@ -5662,6 +5722,17 @@ const submitUpdateAccount = async (accountID: number, updatePayload: Record<stri
 const handleSubmit = async () => {
   if (!props.account) return
   const accountID = props.account.id
+  if (props.account.platform === 'grok' && props.account.type === 'apikey' && rejectionProfileEnabled.value) {
+    if (!rejectionCostValid.value) {
+      appStore.showError(t('upstreamRejection.invalidPrice'))
+      document.getElementById('account-rejection-cost')?.focus()
+      return
+    }
+    if (allowedModels.value.some(model => !isUnprefixedGrokModel(model)) || modelMappings.value.some(mapping => !isUnprefixedGrokModel(mapping.from) || !isUnprefixedGrokModel(mapping.to))) {
+      appStore.showError(t('upstreamRejection.invalidModel'))
+      return
+    }
+  }
 
   if (form.status !== 'active' && form.status !== 'inactive' && form.status !== 'error') {
     appStore.showError(t('admin.accounts.pleaseSelectStatus'))
@@ -6416,6 +6487,24 @@ const handleSubmit = async () => {
       // Quota notify config
       writeQuotaNotifyToExtra(newExtra, 'update')
       updatePayload.extra = newExtra
+    }
+
+    if (props.account.platform === 'grok' && props.account.type === 'apikey') {
+      const extra = { ...((updatePayload.extra || props.account.extra || {}) as Record<string, unknown>) }
+      if (rejectionProfileEnabled.value) {
+        extra.upstream_rejection_profile = CONTENT_REJECTION_PROFILE
+        extra.upstream_rejection_cost = Number(rejectionUpstreamCost.value)
+        extra.upstream_rejection_currency = 'USD'
+      } else if (props.account.extra?.upstream_rejection_profile === CONTENT_REJECTION_PROFILE) {
+        delete extra.upstream_rejection_profile
+        delete extra.upstream_rejection_cost
+        delete extra.upstream_rejection_currency
+      }
+      updatePayload.extra = extra
+    }
+
+    if (props.account.platform === 'deepseek' && props.account.type === 'apikey') {
+      updatePayload.extra = { ...(updatePayload.extra || props.account.extra || {}), ...deepSeekToolSettings.value }
     }
 
     // 上游ID头名只在改动时写回 extra，避免用弹窗打开时的快照覆盖运行态键。

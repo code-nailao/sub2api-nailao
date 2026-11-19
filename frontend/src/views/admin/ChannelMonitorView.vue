@@ -56,6 +56,8 @@
           v-model:provider="providerFilter"
           v-model:enabled="enabledFilter"
           :loading="loading"
+          :sort-loading="sortLoading"
+          @sort="openSortModal"
           @reload="reload"
           @create="openCreateDialog"
           @manage-templates="showTemplateManager = true"
@@ -149,6 +151,14 @@
       @updated="reload"
     />
 
+    <MonitorOrderDialog
+      :show="showSortModal"
+      :items="sortableMonitors"
+      :submitting="sortSubmitting"
+      @close="showSortModal = false"
+      @save="saveSortOrder"
+    />
+
     <MonitorRunResultDialog
       :show="showRunResult"
       :results="runResults"
@@ -170,6 +180,8 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
+import MonitorOrderDialog from '@/features/sources/monitor/MonitorOrderDialog.vue'
+import { loadMonitorOrder } from '@/features/sources/monitor/order'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
@@ -221,6 +233,11 @@ const searchQuery = ref('')
 const providerFilter = ref<Provider | ''>('')
 const enabledFilter = ref<'' | 'true' | 'false'>('')
 const pagination = reactive({ page: 1, page_size: getPersistedPageSize(), total: 0 })
+
+const showSortModal = ref(false)
+const sortableMonitors = ref<ChannelMonitor[]>([])
+const sortLoading = ref(false)
+const sortSubmitting = ref(false)
 
 const showDialog = ref(false)
 const showTemplateManager = ref(false)
@@ -312,6 +329,35 @@ function openEditDialog(row: ChannelMonitor) {
 function closeDialog() {
   showDialog.value = false
   editing.value = null
+}
+
+async function openSortModal() {
+  if (sortLoading.value) return
+  sortLoading.value = true
+  try {
+    sortableMonitors.value = await loadMonitorOrder(adminAPI.channelMonitor.list)
+    showSortModal.value = true
+  } catch (err: unknown) {
+    appStore.showError(extractApiErrorMessage(err, t('admin.channelMonitor.loadError')))
+  } finally {
+    sortLoading.value = false
+  }
+}
+
+async function saveSortOrder(items: ChannelMonitor[]) {
+  if (sortSubmitting.value) return
+  sortSubmitting.value = true
+  try {
+    await adminAPI.channelMonitor.updateSortOrder(items.map((item, index) => ({ id: item.id, sort_order: index * 10 })))
+    appStore.showSuccess(t('admin.channelMonitor.sortOrderUpdated'))
+    showSortModal.value = false
+    pagination.page = 1
+    await reload()
+  } catch (err: unknown) {
+    appStore.showError(extractApiErrorMessage(err, t('admin.channelMonitor.failedToUpdateSortOrder')))
+  } finally {
+    sortSubmitting.value = false
+  }
 }
 
 async function toggleEnabled(row: ChannelMonitor) {

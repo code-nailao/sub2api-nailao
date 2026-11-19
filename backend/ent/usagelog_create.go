@@ -155,6 +155,12 @@ func (_c *UsageLogCreate) SetNillableBillingTier(v *string) *UsageLogCreate {
 	return _c
 }
 
+// SetBillingSnapshot sets the "billing_snapshot" field.
+func (_c *UsageLogCreate) SetBillingSnapshot(v map[string]interface{}) *UsageLogCreate {
+	_c.mutation.SetBillingSnapshot(v)
+	return _c
+}
+
 // SetBillingMode sets the "billing_mode" field.
 func (_c *UsageLogCreate) SetBillingMode(v string) *UsageLogCreate {
 	_c.mutation.SetBillingMode(v)
@@ -1045,6 +1051,10 @@ func (_c *UsageLogCreate) createSpec() (*UsageLog, *sqlgraph.CreateSpec) {
 		_spec.SetField(usagelog.FieldBillingTier, field.TypeString, value)
 		_node.BillingTier = &value
 	}
+	if value, ok := _c.mutation.BillingSnapshot(); ok {
+		_spec.SetField(usagelog.FieldBillingSnapshot, field.TypeJSON, value)
+		_node.BillingSnapshot = value
+	}
 	if value, ok := _c.mutation.BillingMode(); ok {
 		_spec.SetField(usagelog.FieldBillingMode, field.TypeString, value)
 		_node.BillingMode = &value
@@ -1511,6 +1521,24 @@ func (u *UsageLogUpsert) UpdateBillingTier() *UsageLogUpsert {
 // ClearBillingTier clears the value of the "billing_tier" field.
 func (u *UsageLogUpsert) ClearBillingTier() *UsageLogUpsert {
 	u.SetNull(usagelog.FieldBillingTier)
+	return u
+}
+
+// SetBillingSnapshot sets the "billing_snapshot" field.
+func (u *UsageLogUpsert) SetBillingSnapshot(v map[string]interface{}) *UsageLogUpsert {
+	u.Set(usagelog.FieldBillingSnapshot, v)
+	return u
+}
+
+// UpdateBillingSnapshot sets the "billing_snapshot" field to the value that was provided on create.
+func (u *UsageLogUpsert) UpdateBillingSnapshot() *UsageLogUpsert {
+	u.SetExcluded(usagelog.FieldBillingSnapshot)
+	return u
+}
+
+// ClearBillingSnapshot clears the value of the "billing_snapshot" field.
+func (u *UsageLogUpsert) ClearBillingSnapshot() *UsageLogUpsert {
+	u.SetNull(usagelog.FieldBillingSnapshot)
 	return u
 }
 
@@ -2434,6 +2462,27 @@ func (u *UsageLogUpsertOne) UpdateBillingTier() *UsageLogUpsertOne {
 func (u *UsageLogUpsertOne) ClearBillingTier() *UsageLogUpsertOne {
 	return u.Update(func(s *UsageLogUpsert) {
 		s.ClearBillingTier()
+	})
+}
+
+// SetBillingSnapshot sets the "billing_snapshot" field.
+func (u *UsageLogUpsertOne) SetBillingSnapshot(v map[string]interface{}) *UsageLogUpsertOne {
+	return u.Update(func(s *UsageLogUpsert) {
+		s.SetBillingSnapshot(v)
+	})
+}
+
+// UpdateBillingSnapshot sets the "billing_snapshot" field to the value that was provided on create.
+func (u *UsageLogUpsertOne) UpdateBillingSnapshot() *UsageLogUpsertOne {
+	return u.Update(func(s *UsageLogUpsert) {
+		s.UpdateBillingSnapshot()
+	})
+}
+
+// ClearBillingSnapshot clears the value of the "billing_snapshot" field.
+func (u *UsageLogUpsertOne) ClearBillingSnapshot() *UsageLogUpsertOne {
+	return u.Update(func(s *UsageLogUpsert) {
+		s.ClearBillingSnapshot()
 	})
 }
 
@@ -3632,6 +3681,27 @@ func (u *UsageLogUpsertBulk) UpdateBillingTier() *UsageLogUpsertBulk {
 func (u *UsageLogUpsertBulk) ClearBillingTier() *UsageLogUpsertBulk {
 	return u.Update(func(s *UsageLogUpsert) {
 		s.ClearBillingTier()
+	})
+}
+
+// SetBillingSnapshot sets the "billing_snapshot" field.
+func (u *UsageLogUpsertBulk) SetBillingSnapshot(v map[string]interface{}) *UsageLogUpsertBulk {
+	return u.Update(func(s *UsageLogUpsert) {
+		s.SetBillingSnapshot(v)
+	})
+}
+
+// UpdateBillingSnapshot sets the "billing_snapshot" field to the value that was provided on create.
+func (u *UsageLogUpsertBulk) UpdateBillingSnapshot() *UsageLogUpsertBulk {
+	return u.Update(func(s *UsageLogUpsert) {
+		s.UpdateBillingSnapshot()
+	})
+}
+
+// ClearBillingSnapshot clears the value of the "billing_snapshot" field.
+func (u *UsageLogUpsertBulk) ClearBillingSnapshot() *UsageLogUpsertBulk {
+	return u.Update(func(s *UsageLogUpsert) {
+		s.ClearBillingSnapshot()
 	})
 }
 

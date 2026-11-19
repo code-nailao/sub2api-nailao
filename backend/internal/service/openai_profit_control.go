@@ -334,6 +334,25 @@ func (s *OpenAIGatewayService) ProfitControlVetoLatest(ctx context.Context, sele
 	if s == nil {
 		return selected, false, ""
 	}
+	if RequestSpeedFromContext(ctx) != "" {
+		if blocked := ValidateRequestSpeedConfiguration(ctx); blocked != nil {
+			return selected, true, "request_speed_configuration_changed"
+		}
+		// A queue wait must not revive a revoked mapping from the scheduler snapshot.
+		if selected == nil || !AccountSupportsRequestSpeed(ctx, selected, nil) {
+			return selected, true, "request_speed_mismatch"
+		}
+		latest := selected
+		if s.accountRepo != nil {
+			var err error
+			latest, err = s.accountRepo.GetByID(ctx, selected.ID)
+			if err != nil || latest == nil || !latest.IsSchedulable() || !AccountSupportsRequestSpeed(ctx, latest, nil) {
+				return selected, true, "request_speed_mismatch"
+			}
+		}
+		vetoed, reason := openAIProfitControlVetoReason(ctx, latest)
+		return latest, vetoed, reason
+	}
 	return profitControlVetoLatest(ctx, selected, s.schedulerSnapshot)
 }
 

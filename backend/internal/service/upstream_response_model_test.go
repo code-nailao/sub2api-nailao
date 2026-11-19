@@ -255,6 +255,46 @@ func TestUpstreamResponseModelObserverServiceTierUntypedPayloads(t *testing.T) {
 	})
 }
 
+// Captured terminal-field projection from the authorized Ultrafast canary.
+// IDs are replaced and unrelated provider content is omitted; this is an
+// offline replay and never makes a supplier request.
+const observedUltrafastSSEReplay = `event: response.created
+data: {"type":"response.created","response":{"object":"response","model":"gpt-6.1-sol","status":"in_progress","service_tier":"ultrafast","id":"resp_vulcan076_sanitized"}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"object":"response","model":"gpt-6.1-sol","status":"in_progress","service_tier":"ultrafast","id":"resp_vulcan076_sanitized"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"object":"response","model":"gpt-6.1-sol","status":"completed","service_tier":"ultrafast","id":"resp_vulcan076_sanitized","usage":{"input_tokens":4226,"output_tokens":5,"total_tokens":4231}}}
+
+`
+
+func TestUpstreamResponseModelObserverUltrafastReplay(t *testing.T) {
+	t.Run("SSE terminal only", func(t *testing.T) {
+		observer := &upstreamResponseModelObserver{}
+		terminalStart := strings.Index(observedUltrafastSSEReplay, "event: response.completed")
+		require.Positive(t, terminalStart)
+		observeOpenAISSEBody(observer, observedUltrafastSSEReplay[:terminalStart])
+		require.Equal(t, "gpt-6.1-sol", observer.Model())
+		require.Empty(t, observer.ServiceTier(), "created/in_progress only echo the requested tier")
+
+		observeOpenAISSEBody(observer, observedUltrafastSSEReplay[terminalStart:])
+		require.Equal(t, "ultrafast", observer.ServiceTier(), "completed declares the actual upstream processing tier")
+		require.False(t, observer.Conflict())
+	})
+	t.Run("terminal supersedes an earlier chunk", func(t *testing.T) {
+		observer := &upstreamResponseModelObserver{}
+		observer.ObserveOpenAI([]byte(`{"model":"gpt-6.1-sol","service_tier":"priority"}`), "")
+		observeOpenAISSEBody(observer, observedUltrafastSSEReplay)
+		require.Equal(t, "ultrafast", observer.ServiceTier())
+	})
+	t.Run("non-stream JSON normalizes Ultrafast", func(t *testing.T) {
+		observer := &upstreamResponseModelObserver{}
+		observer.ObserveOpenAI([]byte(`{"object":"response","model":"gpt-6.1-sol","status":"completed","service_tier":" UltraFast "}`), "")
+		require.Equal(t, "ultrafast", observer.ServiceTier())
+	})
+}
+
 func TestUpstreamResponseModelObserverServiceTierAnthropicSpeed(t *testing.T) {
 	t.Run("message_start reports standard", func(t *testing.T) {
 		observer := &upstreamResponseModelObserver{}

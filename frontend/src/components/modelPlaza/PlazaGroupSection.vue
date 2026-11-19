@@ -49,6 +49,7 @@
         <Icon name="infoCircle" size="xs" class="h-3 w-3" />
         {{ longContextNote }}
       </p>
+      <UpstreamRejectionNotice :group="group" class="mt-3" />
     </header>
 
     <!-- 模型价格表:整行(含 hover 底色/分区底色)顶到卡片边缘,左右留白由表格首列/末列的 padding 提供 -->
@@ -78,6 +79,7 @@ import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/icons/Icon.vue'
 import GroupBadge from '@/components/common/GroupBadge.vue'
+import UpstreamRejectionNotice from '@/components/common/UpstreamRejectionNotice.vue'
 import PlazaModelPricingTable from './PlazaModelPricingTable.vue'
 import type { ModelPlazaGroup } from '@/api/modelPlaza'
 import type { GroupPlatform, SubscriptionType } from '@/types'

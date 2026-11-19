@@ -8,7 +8,7 @@
         <header class="page-header mb-0 flex flex-wrap items-start justify-between gap-4 border-b border-gray-100 px-5 py-4 dark:border-dark-700 sm:px-6">
           <div class="min-w-0">
             <h1 class="page-title flex items-center gap-2 text-xl font-black text-gray-900 dark:text-white">
-              <span class="inline-flex h-8 w-8 items-center justify-center rounded-xl bg-blue-50 text-blue-500 dark:bg-blue-900/30 dark:text-blue-400">
+              <span class="inline-flex h-8 w-8 items-center justify-center rounded-xl bg-teal-50 text-teal-600 dark:bg-teal-900/30 dark:text-teal-300">
                 <Icon name="chart" size="sm" />
               </span>
               {{ t('channelMonitorV2.title') }}
@@ -17,10 +17,10 @@
               <span class="relative flex h-2 w-2 shrink-0">
                 <span
                   class="relative inline-flex h-2 w-2 rounded-full"
-                  :class="loading || refreshing ? 'bg-gray-400' : 'bg-green-500'"
+                  :class="snapshot?.coverage.data_through && !loadError ? 'bg-emerald-500' : 'bg-gray-400'"
                 ></span>
               </span>
-              <span v-if="refreshing" class="inline-flex items-center gap-1 text-primary-600 dark:text-primary-300">
+              <span v-if="refreshing" class="inline-flex items-center gap-1 text-teal-600 dark:text-teal-300">
                 <LoadingSpinner size="sm" />
                 {{ t('channelMonitorV2.updating') }}
               </span>
@@ -47,7 +47,8 @@
             class="btn btn-secondary btn-icon flex h-8 w-8 items-center justify-center rounded-lg bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-dark-700 dark:text-gray-400 dark:hover:bg-dark-600"
             type="button"
             :title="t('common.refresh')"
-            :disabled="loading"
+            :aria-label="t('common.refresh')"
+            :disabled="loading || refreshing"
             @click="reload(false)"
           >
             <Icon name="refresh" size="sm" :class="loading ? 'animate-spin' : ''" />
@@ -90,7 +91,7 @@
         </div>
 
         <!-- Single compact toolbar row: range · filters · view controls -->
-        <div class="monitor-toolbar flex flex-nowrap items-center gap-1.5 overflow-x-auto px-4 py-3 sm:gap-2 sm:px-5">
+        <div class="monitor-toolbar flex flex-wrap items-center gap-3 px-4 py-3 sm:px-5">
           <div
             class="tabs inline-flex shrink-0"
             role="group"
@@ -108,8 +109,26 @@
             </button>
           </div>
 
-          <span class="mx-0.5 hidden h-5 w-px shrink-0 bg-gray-200 dark:bg-dark-700 sm:block" aria-hidden="true"></span>
+          <span class="hidden h-5 w-px shrink-0 bg-gray-200 dark:bg-dark-700 sm:block" aria-hidden="true"></span>
+          <p class="text-xs text-gray-500 dark:text-gray-400">{{ t('channelMonitorV2.cards.passiveDescription') }}</p>
+          <button
+            v-if="isAdmin"
+            type="button"
+            class="btn btn-ghost btn-sm sm:ml-auto"
+            :aria-expanded="diagnosticsExpanded"
+            aria-controls="monitor-admin-diagnostics"
+            @click="toggleDiagnostics"
+          >
+            <Icon name="chevronDown" size="sm" :class="diagnosticsExpanded ? 'rotate-180' : ''" />
+            {{ t('channelMonitorV2.cards.adminDiagnostics') }}
+          </button>
+        </div>
 
+        <div
+          v-if="isAdmin && diagnosticsExpanded"
+          id="monitor-admin-diagnostics"
+          class="flex flex-wrap items-center gap-2 border-t border-gray-100 px-4 py-3 dark:border-dark-700 sm:px-5"
+        >
           <FilterMultiSelect
             v-model="filter.platforms"
             compact
@@ -144,6 +163,7 @@
           <span class="mx-0.5 hidden h-5 w-px shrink-0 bg-gray-200 dark:bg-dark-700 md:block" aria-hidden="true"></span>
 
           <Select
+            v-if="trendView !== 'cards'"
             v-model="matrixGroupBy"
             :options="matrixGroupOptions"
             :placeholder="t('channelMonitorV2.groupBy.label')"
@@ -155,6 +175,14 @@
             role="group"
             :aria-label="t('channelMonitorV2.trendView.label')"
           >
+            <button
+              type="button"
+              class="tab !px-2 !py-1 text-xs"
+              :class="trendView === 'cards' ? 'tab-active' : ''"
+              @click="trendView = 'cards'"
+            >
+              {{ t('channelMonitorV2.trendView.cards') }}
+            </button>
             <button
               type="button"
               class="tab !px-2 !py-1 text-xs"
@@ -193,9 +221,14 @@
         </div>
       </section>
 
+      <div v-if="loadError" class="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-700/40 dark:bg-amber-900/15 dark:text-amber-200" role="alert">
+        <div><p class="font-medium">{{ t('channelMonitorV2.loadFailed') }}</p><p class="mt-1 text-xs">{{ t(matrix ? 'channelMonitorV2.cards.loadFailedRetained' : 'channelMonitorV2.cards.loadFailedRetry') }}</p></div>
+        <button type="button" class="btn btn-secondary btn-sm" :disabled="loading || refreshing" @click="reload(false)">{{ t('common.refresh') }}</button>
+      </div>
+
       <!-- Overview KPI: success · TTFT · tokens/s(optional) · cache · (+ RPM when throughput visible) -->
       <section
-        v-if="snapshot"
+        v-if="isAdmin && snapshot && trendView !== 'cards'"
         class="grid grid-cols-2 gap-3 sm:grid-cols-3"
         :class="showThroughput ? 'xl:grid-cols-5' : 'xl:grid-cols-4'"
         :aria-label="t('channelMonitorV2.summaryAria')"
@@ -235,7 +268,7 @@
         />
       </section>
       <section
-        v-else-if="loading"
+        v-else-if="isAdmin && loading && trendView !== 'cards'"
         class="grid grid-cols-2 gap-3 sm:grid-cols-3"
         :class="showThroughput ? 'xl:grid-cols-5' : 'xl:grid-cols-4'"
         aria-hidden="true"
@@ -247,9 +280,19 @@
         />
       </section>
 
-      <div class="relative min-h-[320px]">
+      <div v-if="!loadError || matrix" class="relative min-h-[320px]">
+        <ChannelCardBoard
+          v-if="!isAdmin || trendView === 'cards'"
+          :rows="matrixRows"
+          :coverage="matrix?.coverage || null"
+          :config="snapshot?.config || null"
+          :groups="dimensions.groups"
+          :is-admin="isAdmin"
+          :loading="loading || refreshing"
+          @saved="displayOrderSaved"
+        />
         <MonitorTrendChart
-          v-if="trendView === 'line'"
+          v-else-if="trendView === 'line'"
           :trend="snapshot?.trend || []"
           :coverage="snapshot?.coverage || null"
           :loading="loading && !snapshot"
@@ -269,7 +312,17 @@
         </div>
       </div>
 
-      <section class="card flex min-h-0 flex-col overflow-hidden !rounded-3xl !border-0 shadow-sm ring-1 ring-gray-900/5 dark:!bg-dark-800 dark:ring-dark-700">
+      <button
+        v-if="isAdmin && trendView === 'cards'"
+        type="button"
+        class="btn btn-ghost btn-sm"
+        :aria-expanded="detailsExpanded"
+        @click="detailsExpanded = !detailsExpanded"
+      >
+        <Icon name="chevronDown" size="sm" :class="detailsExpanded ? 'rotate-180' : ''" />
+        {{ t('channelMonitorV2.cards.advancedDetails') }}
+      </button>
+      <section v-if="isAdmin && (trendView !== 'cards' || detailsExpanded)" class="card flex min-h-0 flex-col overflow-hidden !rounded-3xl !border-0 shadow-sm ring-1 ring-gray-900/5 dark:!bg-dark-800 dark:ring-dark-700">
         <div class="border-b border-gray-100 px-5 pt-4 dark:border-dark-700 sm:px-6">
           <nav class="tabs w-full max-w-md sm:w-auto" role="tablist" :aria-label="t('channelMonitorV2.tabs.aria')">
             <button
@@ -470,6 +523,7 @@ import MetricCell from '@/features/channel-monitor-v2/MetricCell.vue'
 import MonitorRankBadge from '@/features/channel-monitor-v2/MonitorRankBadge.vue'
 import MonitorTrendChart from '@/features/channel-monitor-v2/MonitorTrendChart.vue'
 import RelayPulseMatrix from '@/features/channel-monitor-v2/RelayPulseMatrix.vue'
+import ChannelCardBoard from '@/features/sources/monitor-v2-cards/ChannelCardBoard.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
@@ -478,6 +532,7 @@ import * as api from '@/api/channelMonitorV2'
 import type {
   HealthState,
   MonitorDimensions,
+  MonitorConfig,
   MonitorErrorRow,
   MonitorFilter,
   MonitorHealth,
@@ -503,7 +558,7 @@ import {
 
 type Tab = 'models' | 'errors' | 'users'
 type HealthMode = 'overall' | 'success' | 'ttft' | 'cache'
-type TrendView = 'pulse' | 'line'
+type TrendView = 'cards' | 'pulse' | 'line'
 
 const route = useRoute()
 const router = useRouter()
@@ -547,14 +602,17 @@ const healthModeOptions = computed(() => [
 
 const filter = ref<MonitorFilter>({
   range: parseRange(route.query.range),
-  platforms: csv(route.query.platform),
-  groupIds: csv(route.query.group).map(Number).filter(Boolean),
-  models: csv(route.query.model),
+  platforms: isAdmin.value ? csv(route.query.platform) : [],
+  groupIds: isAdmin.value ? csv(route.query.group).map(Number).filter(Boolean) : [],
+  models: isAdmin.value ? csv(route.query.model) : [],
 })
 const activeTab = ref<Tab>(parseTab(route.query.tab, showUserRanking.value))
 const matrixGroupBy = ref<MonitorMatrixGroupBy>(parseMatrixGroupBy(route.query.group_by))
 const healthMode = ref<HealthMode>(parseHealthMode(route.query.health_mode))
-const trendView = ref<TrendView>(parseTrendView(route.query.trend_view))
+const trendView = ref<TrendView>(isAdmin.value ? parseTrendView(route.query.trend_view) : 'cards')
+const detailsExpanded = ref(false)
+const diagnosticsExpanded = ref(isAdmin.value && (trendView.value !== 'cards' || filter.value.platforms.length + filter.value.groupIds.length + filter.value.models.length > 0))
+const effectiveGroupBy = computed<MonitorMatrixGroupBy>(() => !isAdmin.value || trendView.value === 'cards' ? 'platform_group' : matrixGroupBy.value)
 const dimensions = ref<MonitorDimensions>({ platforms: [], groups: [], models: [] })
 const snapshot = ref<MonitorSnapshot | null>(null)
 const matrix = ref<MonitorMatrixResponse | null>(null)
@@ -564,6 +622,7 @@ const userRows = ref<MonitorUserRow[]>([])
 const loading = ref(false)
 const tabLoading = ref(false)
 const refreshing = ref(false)
+const loadError = ref(false)
 const expandedErrors = ref(new Set<string>())
 let controller: AbortController | null = null
 let sequence = 0
@@ -655,7 +714,7 @@ const bootstrapPercent = computed(() => {
 const matrixRows = computed(() => {
   const items = matrix.value?.items || []
   // platform_group views should only show real groups, never bare platform placeholders.
-  if (matrixGroupBy.value === 'platform_group' || matrixGroupBy.value === 'platform_group_model') {
+  if (effectiveGroupBy.value === 'platform_group' || effectiveGroupBy.value === 'platform_group_model') {
     return items.filter((row) => row.group_id != null && Number(row.group_id) > 0)
   }
   return items
@@ -687,7 +746,7 @@ function parseHealthMode(value: unknown): HealthMode {
   return allowed.includes(value as HealthMode) ? (value as HealthMode) : 'overall'
 }
 function parseTrendView(value: unknown): TrendView {
-  return value === 'line' ? 'line' : 'pulse'
+  return value === 'line' || value === 'pulse' ? value : 'cards'
 }
 function syncQuery() {
   void router.replace({
@@ -698,7 +757,7 @@ function syncQuery() {
       model: filter.value.models.join(',') || undefined,
       group_by: matrixGroupBy.value,
       health_mode: healthMode.value,
-      trend_view: trendView.value === 'line' ? 'line' : undefined,
+      trend_view: trendView.value === 'cards' ? undefined : trendView.value,
       tab: activeTab.value,
     },
   })
@@ -719,13 +778,19 @@ async function loadDimensions(signal?: AbortSignal, id = sequence) {
 async function loadMetrics(signal?: AbortSignal, id = sequence) {
   const [nextSnapshot, nextMatrix] = await Promise.all([
     api.getSnapshot(filter.value, isAdmin.value, signal),
-    api.getMatrix(filter.value, matrixGroupBy.value, isAdmin.value, signal),
+    api.getMatrix(filter.value, effectiveGroupBy.value, isAdmin.value, signal),
   ])
   if (id !== sequence) return
+  // A poll started before an administrator saved an order may arrive afterwards.
+  // Keep config versions monotonic so a successful save is not visually undone.
+  if (snapshot.value && snapshot.value.config.version > nextSnapshot.config.version) {
+    nextSnapshot.config = snapshot.value.config
+  }
   snapshot.value = nextSnapshot
   matrix.value = nextMatrix
+  loadError.value = false
   scheduleAutoRefresh()
-  await loadTab(signal, id)
+  if (isAdmin.value && (trendView.value !== 'cards' || detailsExpanded.value)) await loadTab(signal, id)
 }
 
 async function reload(silent = true) {
@@ -738,13 +803,11 @@ async function reload(silent = true) {
   try {
     // Catalog + metrics in parallel; catalog ignores dimension filters so options never shrink.
     await Promise.all([
-      loadDimensions(request.signal, id),
+      isAdmin.value ? loadDimensions(request.signal, id) : Promise.resolve(),
       loadMetrics(request.signal, id),
     ])
   } catch (error) {
-    if ((error as { name?: string }).name !== 'CanceledError') {
-      appStore.showError(extractApiErrorMessage(error, t('channelMonitorV2.loadFailed')))
-    }
+    reportLoadError(error, id)
   } finally {
     if (id === sequence) {
       loading.value = false
@@ -765,9 +828,7 @@ async function reloadMetricsOnly(silent = true) {
   try {
     await loadMetrics(request.signal, id)
   } catch (error) {
-    if ((error as { name?: string }).name !== 'CanceledError') {
-      appStore.showError(extractApiErrorMessage(error, t('channelMonitorV2.loadFailed')))
-    }
+    reportLoadError(error, id)
   } finally {
     if (id === sequence) {
       loading.value = false
@@ -776,15 +837,25 @@ async function reloadMetricsOnly(silent = true) {
     }
   }
 }
+function reportLoadError(error: unknown, id: number) {
+  const failure = error as { name?: string; code?: string }
+  if (id !== sequence || failure?.name === 'CanceledError' || failure?.name === 'AbortError' || failure?.code === 'ERR_CANCELED') return
+  loadError.value = true
+  appStore.showError(extractApiErrorMessage(error, t('channelMonitorV2.loadFailed')))
+}
 async function loadTab(signal?: AbortSignal, id = sequence) {
+  if (!isAdmin.value) return
   tabLoading.value = true
   try {
     if (activeTab.value === 'models') {
-      modelRows.value = (await api.getModels(filter.value, isAdmin.value, signal)).items || []
+      const next = await api.getModels(filter.value, isAdmin.value, signal)
+      if (id === sequence && isAdmin.value) modelRows.value = next.items || []
     } else if (activeTab.value === 'errors') {
-      errorRows.value = (await api.getErrors(filter.value, isAdmin.value, signal)).items || []
+      const next = await api.getErrors(filter.value, isAdmin.value, signal)
+      if (id === sequence && isAdmin.value) errorRows.value = next.items || []
     } else if (showUserRanking.value) {
-      userRows.value = (await api.getUsers(filter.value, isAdmin.value, signal)).items || []
+      const next = await api.getUsers(filter.value, isAdmin.value, signal)
+      if (id === sequence && isAdmin.value) userRows.value = next.items || []
     } else {
       userRows.value = []
     }
@@ -794,6 +865,13 @@ async function loadTab(signal?: AbortSignal, id = sequence) {
     appStore.showError(extractApiErrorMessage(error, t('channelMonitorV2.detailLoadFailed')))
   } finally {
     if (id === sequence) tabLoading.value = false
+  }
+}
+function toggleDiagnostics() {
+  diagnosticsExpanded.value = !diagnosticsExpanded.value
+  if (!diagnosticsExpanded.value) {
+    trendView.value = 'cards'
+    clearDimensions()
   }
 }
 function setRange(value: MonitorRange) {
@@ -909,15 +987,36 @@ watch(
   },
   { deep: true }
 )
-watch(matrixGroupBy, () => {
-  syncQuery()
-  void reloadMetricsOnly(true)
-})
+watch(matrixGroupBy, syncQuery)
+watch(effectiveGroupBy, () => { void reloadMetricsOnly(true) })
 watch(healthMode, syncQuery)
-watch(trendView, syncQuery)
+watch(trendView, () => {
+  syncQuery()
+  if (trendView.value !== 'cards') void loadTab()
+})
+watch(detailsExpanded, (expanded) => { if (expanded) void loadTab() })
+function displayOrderSaved(config: MonitorConfig) {
+  if (snapshot.value) snapshot.value.config = config
+}
 watch(activeTab, () => {
   syncQuery()
   void loadTab()
+})
+watch(isAdmin, (allowed) => {
+  if (allowed) return
+  controller?.abort()
+  sequence++
+  snapshot.value = null
+  matrix.value = null
+  dimensions.value = { platforms: [], groups: [], models: [] }
+  loadError.value = false
+  trendView.value = 'cards'
+  diagnosticsExpanded.value = false
+  detailsExpanded.value = false
+  modelRows.value = []
+  errorRows.value = []
+  userRows.value = []
+  clearDimensions()
 })
 watch(showUserRanking, (allowed) => {
   if (!allowed && activeTab.value === 'users') {

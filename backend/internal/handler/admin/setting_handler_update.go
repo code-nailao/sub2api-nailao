@@ -335,12 +335,14 @@ type UpdateSettingsRequest struct {
 	PaymentAlipayMobilePrecreateDeepLink *bool `json:"payment_alipay_mobile_precreate_deep_link"`
 
 	// Channel Monitor feature switch
-	ChannelMonitorEnabled                *bool   `json:"channel_monitor_enabled"`
-	ChannelMonitorMode                   *string `json:"channel_monitor_mode"`
-	ChannelMonitorDefaultIntervalSeconds *int    `json:"channel_monitor_default_interval_seconds"`
-	ChannelMonitorHideThroughput         *bool   `json:"channel_monitor_hide_throughput"`
-	ChannelMonitorShowQuota              *bool   `json:"channel_monitor_show_quota"`
-	ChannelMonitorHideUserRanking        *bool   `json:"channel_monitor_hide_user_ranking"`
+	ChannelMonitorEnabled                  *bool   `json:"channel_monitor_enabled"`
+	ChannelMonitorMode                     *string `json:"channel_monitor_mode"`
+	ChannelMonitorDefaultIntervalSeconds   *int    `json:"channel_monitor_default_interval_seconds"`
+	ChannelMonitorDegradedThresholdSeconds *int    `json:"channel_monitor_degraded_threshold_seconds"`
+	ChannelMonitorRequestTimeoutSeconds    *int    `json:"channel_monitor_request_timeout_seconds"`
+	ChannelMonitorHideThroughput           *bool   `json:"channel_monitor_hide_throughput"`
+	ChannelMonitorShowQuota                *bool   `json:"channel_monitor_show_quota"`
+	ChannelMonitorHideUserRanking          *bool   `json:"channel_monitor_hide_user_ranking"`
 
 	// Grok model mapping policy
 	GrokDefaultTextModel           *string `json:"grok_default_text_model"`
@@ -501,6 +503,25 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		response.BadRequest(c, "Invalid request: "+err.Error())
 		return
 	}
+	// Older admin pages submit only rules. Omitting the new switch (or null)
+	// must preserve it; an explicit false remains an intentional disable.
+	if req.OpenAIFastPolicySettings != nil {
+		var fields struct {
+			GroupTierPoliciesEnabled *bool `json:"group_tier_policies_enabled"`
+		}
+		if err := json.Unmarshal(sentFields["openai_fast_policy_settings"], &fields); err != nil {
+			response.BadRequest(c, "Invalid request: "+err.Error())
+			return
+		}
+		if fields.GroupTierPoliciesEnabled == nil {
+			previous, err := h.settingService.GetOpenAIFastPolicySettings(c.Request.Context())
+			if err != nil {
+				response.ErrorFrom(c, err)
+				return
+			}
+			req.OpenAIFastPolicySettings.GroupTierPoliciesEnabled = previous.GroupTierPoliciesEnabled
+		}
+	}
 	auditReq := settingsAuditRequest(req)
 	omitted := omittedSettingKeys(sentFields)
 
@@ -517,6 +538,26 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 
 	// 两个安全开关的请求字段为指针：省略字段=保持现值，避免旧客户端/脚本
 	// 用不含新字段的全量 payload 保存设置时把安全开关静默重置。
+	// 只在本次请求包含任一参数时写入验证过的一对，旧页面保存不覆盖新设置。
+	if req.ChannelMonitorDegradedThresholdSeconds != nil || req.ChannelMonitorRequestTimeoutSeconds != nil {
+		delete(omitted, service.SettingKeyChannelMonitorDegradedThresholdSeconds)
+		delete(omitted, service.SettingKeyChannelMonitorRequestTimeoutSeconds)
+	} else {
+		omitted[service.SettingKeyChannelMonitorDegradedThresholdSeconds] = struct{}{}
+		omitted[service.SettingKeyChannelMonitorRequestTimeoutSeconds] = struct{}{}
+	}
+	monitorDegradedSeconds := previousSettings.ChannelMonitorDegradedThresholdSeconds
+	monitorTimeoutSeconds := previousSettings.ChannelMonitorRequestTimeoutSeconds
+	if req.ChannelMonitorDegradedThresholdSeconds != nil {
+		monitorDegradedSeconds = *req.ChannelMonitorDegradedThresholdSeconds
+	}
+	if req.ChannelMonitorRequestTimeoutSeconds != nil {
+		monitorTimeoutSeconds = *req.ChannelMonitorRequestTimeoutSeconds
+	}
+	if err := service.ValidateChannelMonitorProbeTiming(monitorDegradedSeconds, monitorTimeoutSeconds); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
 	sessionBindingEnabled := previousSettings.SessionBindingEnabled
 	if req.SessionBindingEnabled != nil {
 		sessionBindingEnabled = *req.SessionBindingEnabled
@@ -1918,6 +1959,8 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 			}
 			return previousSettings.AccountQuotaNotifyEmails
 		}(),
+		ChannelMonitorDegradedThresholdSeconds: monitorDegradedSeconds,
+		ChannelMonitorRequestTimeoutSeconds:    monitorTimeoutSeconds,
 		ChannelMonitorEnabled: func() bool {
 			if req.ChannelMonitorEnabled != nil {
 				return *req.ChannelMonitorEnabled
@@ -2430,12 +2473,14 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		PaymentAlipayForceQRCode:                               updatedPaymentCfg.AlipayForceQRCode,
 		PaymentAlipayMobilePrecreateDeepLink:                   updatedPaymentCfg.AlipayMobilePrecreateDeepLink,
 
-		ChannelMonitorEnabled:                updatedSettings.ChannelMonitorEnabled,
-		ChannelMonitorMode:                   updatedSettings.ChannelMonitorMode,
-		ChannelMonitorDefaultIntervalSeconds: updatedSettings.ChannelMonitorDefaultIntervalSeconds,
-		ChannelMonitorHideThroughput:         updatedSettings.ChannelMonitorHideThroughput,
-		ChannelMonitorShowQuota:              updatedSettings.ChannelMonitorShowQuota,
-		ChannelMonitorHideUserRanking:        updatedSettings.ChannelMonitorHideUserRanking,
+		ChannelMonitorEnabled:                  updatedSettings.ChannelMonitorEnabled,
+		ChannelMonitorMode:                     updatedSettings.ChannelMonitorMode,
+		ChannelMonitorDefaultIntervalSeconds:   updatedSettings.ChannelMonitorDefaultIntervalSeconds,
+		ChannelMonitorDegradedThresholdSeconds: updatedSettings.ChannelMonitorDegradedThresholdSeconds,
+		ChannelMonitorRequestTimeoutSeconds:    updatedSettings.ChannelMonitorRequestTimeoutSeconds,
+		ChannelMonitorHideThroughput:           updatedSettings.ChannelMonitorHideThroughput,
+		ChannelMonitorShowQuota:                updatedSettings.ChannelMonitorShowQuota,
+		ChannelMonitorHideUserRanking:          updatedSettings.ChannelMonitorHideUserRanking,
 
 		GrokDefaultTextModel:           updatedSettings.GrokDefaultTextModel,
 		GrokCrossClientModelMapEnabled: updatedSettings.GrokCrossClientModelMapEnabled,

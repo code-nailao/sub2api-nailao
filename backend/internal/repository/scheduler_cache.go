@@ -1390,33 +1390,34 @@ func (c *schedulerCache) mgetChunked(ctx context.Context, keys []string) ([]any,
 
 func buildSchedulerMetadataAccount(account service.Account) service.Account {
 	return service.Account{
-		ID:                      account.ID,
-		Name:                    account.Name,
-		Platform:                account.Platform,
-		Type:                    account.Type,
-		Concurrency:             account.Concurrency,
-		LoadFactor:              account.LoadFactor,
-		Priority:                account.Priority,
-		RateMultiplier:          account.RateMultiplier,
-		Status:                  account.Status,
-		LastUsedAt:              account.LastUsedAt,
-		ExpiresAt:               account.ExpiresAt,
-		AutoPauseOnExpired:      account.AutoPauseOnExpired,
-		Schedulable:             account.Schedulable,
-		RateLimitedAt:           account.RateLimitedAt,
-		RateLimitResetAt:        account.RateLimitResetAt,
-		OverloadUntil:           account.OverloadUntil,
-		TempUnschedulableUntil:  account.TempUnschedulableUntil,
-		TempUnschedulableReason: account.TempUnschedulableReason,
-		SessionWindowStart:      account.SessionWindowStart,
-		SessionWindowEnd:        account.SessionWindowEnd,
-		SessionWindowStatus:     account.SessionWindowStatus,
-		ParentAccountID:         account.ParentAccountID,
-		QuotaDimension:          account.QuotaDimension,
-		AccountGroups:           filterSchedulerAccountGroups(account.AccountGroups),
-		GroupIDs:                filterSchedulerGroupIDs(account.GroupIDs, account.AccountGroups),
-		Credentials:             filterSchedulerCredentials(account.Credentials),
-		Extra:                   filterSchedulerExtra(account.Extra),
+		ID:                       account.ID,
+		Name:                     account.Name,
+		Platform:                 account.Platform,
+		Type:                     account.Type,
+		Concurrency:              account.Concurrency,
+		LoadFactor:               account.LoadFactor,
+		Priority:                 account.Priority,
+		RateMultiplier:           account.RateMultiplier,
+		Status:                   account.Status,
+		LastUsedAt:               account.LastUsedAt,
+		ExpiresAt:                account.ExpiresAt,
+		AutoPauseOnExpired:       account.AutoPauseOnExpired,
+		Schedulable:              account.Schedulable,
+		RateLimitedAt:            account.RateLimitedAt,
+		RateLimitResetAt:         account.RateLimitResetAt,
+		OverloadUntil:            account.OverloadUntil,
+		TempUnschedulableUntil:   account.TempUnschedulableUntil,
+		TempUnschedulableReason:  account.TempUnschedulableReason,
+		SessionWindowStart:       account.SessionWindowStart,
+		SessionWindowEnd:         account.SessionWindowEnd,
+		SessionWindowStatus:      account.SessionWindowStatus,
+		ParentAccountID:          account.ParentAccountID,
+		QuotaDimension:           account.QuotaDimension,
+		AccountGroups:            filterSchedulerAccountGroups(account.AccountGroups),
+		RequestSpeedTiersByGroup: cloneRequestSpeedMappings(account.RequestSpeedTiersByGroup),
+		GroupIDs:                 filterSchedulerGroupIDs(account.GroupIDs, account.AccountGroups),
+		Credentials:              filterSchedulerCredentials(account.Credentials),
+		Extra:                    filterSchedulerExtra(account.Extra),
 	}
 }
 
@@ -1431,10 +1432,11 @@ func filterSchedulerAccountGroups(accountGroups []service.AccountGroup) []servic
 			continue
 		}
 		filtered = append(filtered, service.AccountGroup{
-			AccountID: ag.AccountID,
-			GroupID:   ag.GroupID,
-			Priority:  ag.Priority,
-			CreatedAt: ag.CreatedAt,
+			AccountID:         ag.AccountID,
+			GroupID:           ag.GroupID,
+			Priority:          ag.Priority,
+			CreatedAt:         ag.CreatedAt,
+			RequestSpeedTiers: append([]string(nil), ag.RequestSpeedTiers...),
 		})
 	}
 	if len(filtered) == 0 {
@@ -1642,4 +1644,15 @@ func filterSchedulerUpstreamBillingProbe(value any) map[string]any {
 		filtered["data"] = filteredData
 	}
 	return filtered
+}
+
+func cloneRequestSpeedMappings(mappings map[string][]string) map[string][]string {
+	if mappings == nil {
+		return nil
+	}
+	out := make(map[string][]string, len(mappings))
+	for groupID, tiers := range mappings {
+		out[groupID] = append([]string(nil), tiers...)
+	}
+	return out
 }

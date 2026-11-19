@@ -47,6 +47,10 @@ func (s *PaymentService) HandlePaymentNotification(ctx context.Context, n *payme
 		// Fallback only for true legacy "sub2_N" DB-ID payloads when the
 		// current out_trade_no lookup genuinely did not find an order.
 		if oid, ok := parseLegacyPaymentOrderID(n.OrderID, err); ok {
+			legacy, e := s.entClient.PaymentOrder.Get(ctx, oid)
+			if e != nil || legacy.OutTradeNo != "" {
+				return ErrOrderNotFound
+			}
 			return s.confirmPayment(ctx, oid, n.TradeNo, n.Amount, pk, n.Metadata)
 		}
 		if dbent.IsNotFound(err) {
@@ -140,6 +144,9 @@ func (s *PaymentService) confirmPayment(ctx context.Context, oid int64, tradeNo 
 	if math.Abs(paid-o.PayAmount) > paymentAmountToleranceForCurrency(PaymentOrderCurrency(o)) {
 		s.writeAuditLog(ctx, o.ID, "PAYMENT_AMOUNT_MISMATCH", pk, map[string]any{"expected": o.PayAmount, "paid": paid, "tradeNo": tradeNo})
 		return fmt.Errorf("amount mismatch: expected %s, got %s", strconv.FormatFloat(o.PayAmount, 'f', -1, 64), strconv.FormatFloat(paid, 'f', -1, 64))
+	}
+	if verifiedPaymentOrder(o) {
+		return s.confirmVerifiedNotification(ctx, o, tradeNo, metadata)
 	}
 	return s.toPaid(ctx, o, tradeNo, paid, pk)
 }
@@ -296,6 +303,9 @@ func (s *PaymentService) ExecuteBalanceFulfillment(ctx context.Context, oid int6
 	}
 	if o.Status != OrderStatusPaid && o.Status != OrderStatusFailed && o.Status != OrderStatusRecharging {
 		return infraerrors.BadRequest("INVALID_STATUS", "order cannot fulfill in status "+o.Status)
+	}
+	if err := s.requirePaymentReceipt(ctx, o); err != nil {
+		return err
 	}
 	lease, err := s.acquirePaymentFulfillmentLease(ctx, o)
 	if err != nil {
@@ -458,6 +468,9 @@ func (s *PaymentService) doBalance(ctx context.Context, o *dbent.PaymentOrder, l
 }
 
 func (s *PaymentService) markCompleted(ctx context.Context, o *dbent.PaymentOrder, lease *paymentFulfillmentLease, auditAction string) error {
+	if verifiedPaymentOrder(o) {
+		return s.completeVerifiedOrder(ctx, o, lease, auditAction)
+	}
 	if lease == nil {
 		return errors.New("missing payment fulfillment lease")
 	}
@@ -931,6 +944,17 @@ func (s *PaymentService) RetryFulfillment(ctx context.Context, oid int64) error 
 	o, err := s.entClient.PaymentOrder.Get(ctx, oid)
 	if err != nil {
 		return infraerrors.NotFound("NOT_FOUND", "order not found")
+	}
+	if verifiedPaymentOrder(o) && o.Status == OrderStatusPaymentReview {
+		p, err := s.getOrderProvider(ctx, o)
+		if err != nil {
+			return err
+		}
+		q, err := p.QueryOrder(ctx, paymentOrderQueryReference(o, p))
+		if err != nil {
+			return err
+		}
+		return s.acceptPaymentEvidence(ctx, o, p, q, true)
 	}
 	if o.PaidAt == nil {
 		return infraerrors.BadRequest("INVALID_STATUS", "order is not paid")

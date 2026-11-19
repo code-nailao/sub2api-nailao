@@ -524,6 +524,48 @@ func (_c *GroupCreate) SetNillableWebSearchPricePerCall(v *float64) *GroupCreate
 	return _c
 }
 
+// SetUpstreamRejectionBillingEnabled sets the "upstream_rejection_billing_enabled" field.
+func (_c *GroupCreate) SetUpstreamRejectionBillingEnabled(v bool) *GroupCreate {
+	_c.mutation.SetUpstreamRejectionBillingEnabled(v)
+	return _c
+}
+
+// SetNillableUpstreamRejectionBillingEnabled sets the "upstream_rejection_billing_enabled" field if the given value is not nil.
+func (_c *GroupCreate) SetNillableUpstreamRejectionBillingEnabled(v *bool) *GroupCreate {
+	if v != nil {
+		_c.SetUpstreamRejectionBillingEnabled(*v)
+	}
+	return _c
+}
+
+// SetUpstreamRejectionPrice sets the "upstream_rejection_price" field.
+func (_c *GroupCreate) SetUpstreamRejectionPrice(v float64) *GroupCreate {
+	_c.mutation.SetUpstreamRejectionPrice(v)
+	return _c
+}
+
+// SetNillableUpstreamRejectionPrice sets the "upstream_rejection_price" field if the given value is not nil.
+func (_c *GroupCreate) SetNillableUpstreamRejectionPrice(v *float64) *GroupCreate {
+	if v != nil {
+		_c.SetUpstreamRejectionPrice(*v)
+	}
+	return _c
+}
+
+// SetDeepseekTools sets the "deepseek_tools" field.
+func (_c *GroupCreate) SetDeepseekTools(v domain.DeepSeekToolsConfig) *GroupCreate {
+	_c.mutation.SetDeepseekTools(v)
+	return _c
+}
+
+// SetNillableDeepseekTools sets the "deepseek_tools" field if the given value is not nil.
+func (_c *GroupCreate) SetNillableDeepseekTools(v *domain.DeepSeekToolsConfig) *GroupCreate {
+	if v != nil {
+		_c.SetDeepseekTools(*v)
+	}
+	return _c
+}
+
 // SetSearchPricePer1k sets the "search_price_per_1k" field.
 func (_c *GroupCreate) SetSearchPricePer1k(v float64) *GroupCreate {
 	_c.mutation.SetSearchPricePer1k(v)
@@ -720,6 +762,48 @@ func (_c *GroupCreate) SetAllowLive(v bool) *GroupCreate {
 func (_c *GroupCreate) SetNillableAllowLive(v *bool) *GroupCreate {
 	if v != nil {
 		_c.SetAllowLive(*v)
+	}
+	return _c
+}
+
+// SetOpenaiServiceTierPolicy sets the "openai_service_tier_policy" field.
+func (_c *GroupCreate) SetOpenaiServiceTierPolicy(v string) *GroupCreate {
+	_c.mutation.SetOpenaiServiceTierPolicy(v)
+	return _c
+}
+
+// SetNillableOpenaiServiceTierPolicy sets the "openai_service_tier_policy" field if the given value is not nil.
+func (_c *GroupCreate) SetNillableOpenaiServiceTierPolicy(v *string) *GroupCreate {
+	if v != nil {
+		_c.SetOpenaiServiceTierPolicy(*v)
+	}
+	return _c
+}
+
+// SetRequestSpeedSelectionEnabled sets the "request_speed_selection_enabled" field.
+func (_c *GroupCreate) SetRequestSpeedSelectionEnabled(v bool) *GroupCreate {
+	_c.mutation.SetRequestSpeedSelectionEnabled(v)
+	return _c
+}
+
+// SetNillableRequestSpeedSelectionEnabled sets the "request_speed_selection_enabled" field if the given value is not nil.
+func (_c *GroupCreate) SetNillableRequestSpeedSelectionEnabled(v *bool) *GroupCreate {
+	if v != nil {
+		_c.SetRequestSpeedSelectionEnabled(*v)
+	}
+	return _c
+}
+
+// SetDefaultRequestSpeedTier sets the "default_request_speed_tier" field.
+func (_c *GroupCreate) SetDefaultRequestSpeedTier(v string) *GroupCreate {
+	_c.mutation.SetDefaultRequestSpeedTier(v)
+	return _c
+}
+
+// SetNillableDefaultRequestSpeedTier sets the "default_request_speed_tier" field if the given value is not nil.
+func (_c *GroupCreate) SetNillableDefaultRequestSpeedTier(v *string) *GroupCreate {
+	if v != nil {
+		_c.SetDefaultRequestSpeedTier(*v)
 	}
 	return _c
 }
@@ -1161,6 +1245,14 @@ func (_c *GroupCreate) defaults() error {
 		v := group.DefaultVideoRateMultiplier
 		_c.mutation.SetVideoRateMultiplier(v)
 	}
+	if _, ok := _c.mutation.UpstreamRejectionBillingEnabled(); !ok {
+		v := group.DefaultUpstreamRejectionBillingEnabled
+		_c.mutation.SetUpstreamRejectionBillingEnabled(v)
+	}
+	if _, ok := _c.mutation.UpstreamRejectionPrice(); !ok {
+		v := group.DefaultUpstreamRejectionPrice
+		_c.mutation.SetUpstreamRejectionPrice(v)
+	}
 	if _, ok := _c.mutation.LongContextPricingEnabled(); !ok {
 		v := group.DefaultLongContextPricingEnabled
 		_c.mutation.SetLongContextPricingEnabled(v)
@@ -1192,6 +1284,14 @@ func (_c *GroupCreate) defaults() error {
 	if _, ok := _c.mutation.AllowLive(); !ok {
 		v := group.DefaultAllowLive
 		_c.mutation.SetAllowLive(v)
+	}
+	if _, ok := _c.mutation.RequestSpeedSelectionEnabled(); !ok {
+		v := group.DefaultRequestSpeedSelectionEnabled
+		_c.mutation.SetRequestSpeedSelectionEnabled(v)
+	}
+	if _, ok := _c.mutation.DefaultRequestSpeedTier(); !ok {
+		v := group.DefaultDefaultRequestSpeedTier
+		_c.mutation.SetDefaultRequestSpeedTier(v)
 	}
 	if _, ok := _c.mutation.ForceOpenaiFast(); !ok {
 		v := group.DefaultForceOpenaiFast
@@ -1366,6 +1466,17 @@ func (_c *GroupCreate) check() error {
 	if _, ok := _c.mutation.VideoRateMultiplier(); !ok {
 		return &ValidationError{Name: "video_rate_multiplier", err: errors.New(`ent: missing required field "Group.video_rate_multiplier"`)}
 	}
+	if _, ok := _c.mutation.UpstreamRejectionBillingEnabled(); !ok {
+		return &ValidationError{Name: "upstream_rejection_billing_enabled", err: errors.New(`ent: missing required field "Group.upstream_rejection_billing_enabled"`)}
+	}
+	if _, ok := _c.mutation.UpstreamRejectionPrice(); !ok {
+		return &ValidationError{Name: "upstream_rejection_price", err: errors.New(`ent: missing required field "Group.upstream_rejection_price"`)}
+	}
+	if v, ok := _c.mutation.UpstreamRejectionPrice(); ok {
+		if err := group.UpstreamRejectionPriceValidator(v); err != nil {
+			return &ValidationError{Name: "upstream_rejection_price", err: fmt.Errorf(`ent: validator failed for field "Group.upstream_rejection_price": %w`, err)}
+		}
+	}
 	if v, ok := _c.mutation.SearchPricePer1k(); ok {
 		if err := group.SearchPricePer1kValidator(v); err != nil {
 			return &ValidationError{Name: "search_price_per_1k", err: fmt.Errorf(`ent: validator failed for field "Group.search_price_per_1k": %w`, err)}
@@ -1409,6 +1520,17 @@ func (_c *GroupCreate) check() error {
 	}
 	if _, ok := _c.mutation.AllowLive(); !ok {
 		return &ValidationError{Name: "allow_live", err: errors.New(`ent: missing required field "Group.allow_live"`)}
+	}
+	if v, ok := _c.mutation.OpenaiServiceTierPolicy(); ok {
+		if err := group.OpenaiServiceTierPolicyValidator(v); err != nil {
+			return &ValidationError{Name: "openai_service_tier_policy", err: fmt.Errorf(`ent: validator failed for field "Group.openai_service_tier_policy": %w`, err)}
+		}
+	}
+	if _, ok := _c.mutation.RequestSpeedSelectionEnabled(); !ok {
+		return &ValidationError{Name: "request_speed_selection_enabled", err: errors.New(`ent: missing required field "Group.request_speed_selection_enabled"`)}
+	}
+	if _, ok := _c.mutation.DefaultRequestSpeedTier(); !ok {
+		return &ValidationError{Name: "default_request_speed_tier", err: errors.New(`ent: missing required field "Group.default_request_speed_tier"`)}
 	}
 	if _, ok := _c.mutation.ForceOpenaiFast(); !ok {
 		return &ValidationError{Name: "force_openai_fast", err: errors.New(`ent: missing required field "Group.force_openai_fast"`)}
@@ -1648,6 +1770,18 @@ func (_c *GroupCreate) createSpec() (*Group, *sqlgraph.CreateSpec) {
 		_spec.SetField(group.FieldWebSearchPricePerCall, field.TypeFloat64, value)
 		_node.WebSearchPricePerCall = &value
 	}
+	if value, ok := _c.mutation.UpstreamRejectionBillingEnabled(); ok {
+		_spec.SetField(group.FieldUpstreamRejectionBillingEnabled, field.TypeBool, value)
+		_node.UpstreamRejectionBillingEnabled = value
+	}
+	if value, ok := _c.mutation.UpstreamRejectionPrice(); ok {
+		_spec.SetField(group.FieldUpstreamRejectionPrice, field.TypeFloat64, value)
+		_node.UpstreamRejectionPrice = value
+	}
+	if value, ok := _c.mutation.DeepseekTools(); ok {
+		_spec.SetField(group.FieldDeepseekTools, field.TypeJSON, value)
+		_node.DeepseekTools = value
+	}
 	if value, ok := _c.mutation.SearchPricePer1k(); ok {
 		_spec.SetField(group.FieldSearchPricePer1k, field.TypeFloat64, value)
 		_node.SearchPricePer1k = &value
@@ -1711,6 +1845,18 @@ func (_c *GroupCreate) createSpec() (*Group, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.AllowLive(); ok {
 		_spec.SetField(group.FieldAllowLive, field.TypeBool, value)
 		_node.AllowLive = value
+	}
+	if value, ok := _c.mutation.OpenaiServiceTierPolicy(); ok {
+		_spec.SetField(group.FieldOpenaiServiceTierPolicy, field.TypeString, value)
+		_node.OpenaiServiceTierPolicy = value
+	}
+	if value, ok := _c.mutation.RequestSpeedSelectionEnabled(); ok {
+		_spec.SetField(group.FieldRequestSpeedSelectionEnabled, field.TypeBool, value)
+		_node.RequestSpeedSelectionEnabled = value
+	}
+	if value, ok := _c.mutation.DefaultRequestSpeedTier(); ok {
+		_spec.SetField(group.FieldDefaultRequestSpeedTier, field.TypeString, value)
+		_node.DefaultRequestSpeedTier = value
 	}
 	if value, ok := _c.mutation.ForceOpenaiFast(); ok {
 		_spec.SetField(group.FieldForceOpenaiFast, field.TypeBool, value)
@@ -2532,6 +2678,54 @@ func (u *GroupUpsert) ClearWebSearchPricePerCall() *GroupUpsert {
 	return u
 }
 
+// SetUpstreamRejectionBillingEnabled sets the "upstream_rejection_billing_enabled" field.
+func (u *GroupUpsert) SetUpstreamRejectionBillingEnabled(v bool) *GroupUpsert {
+	u.Set(group.FieldUpstreamRejectionBillingEnabled, v)
+	return u
+}
+
+// UpdateUpstreamRejectionBillingEnabled sets the "upstream_rejection_billing_enabled" field to the value that was provided on create.
+func (u *GroupUpsert) UpdateUpstreamRejectionBillingEnabled() *GroupUpsert {
+	u.SetExcluded(group.FieldUpstreamRejectionBillingEnabled)
+	return u
+}
+
+// SetUpstreamRejectionPrice sets the "upstream_rejection_price" field.
+func (u *GroupUpsert) SetUpstreamRejectionPrice(v float64) *GroupUpsert {
+	u.Set(group.FieldUpstreamRejectionPrice, v)
+	return u
+}
+
+// UpdateUpstreamRejectionPrice sets the "upstream_rejection_price" field to the value that was provided on create.
+func (u *GroupUpsert) UpdateUpstreamRejectionPrice() *GroupUpsert {
+	u.SetExcluded(group.FieldUpstreamRejectionPrice)
+	return u
+}
+
+// AddUpstreamRejectionPrice adds v to the "upstream_rejection_price" field.
+func (u *GroupUpsert) AddUpstreamRejectionPrice(v float64) *GroupUpsert {
+	u.Add(group.FieldUpstreamRejectionPrice, v)
+	return u
+}
+
+// SetDeepseekTools sets the "deepseek_tools" field.
+func (u *GroupUpsert) SetDeepseekTools(v domain.DeepSeekToolsConfig) *GroupUpsert {
+	u.Set(group.FieldDeepseekTools, v)
+	return u
+}
+
+// UpdateDeepseekTools sets the "deepseek_tools" field to the value that was provided on create.
+func (u *GroupUpsert) UpdateDeepseekTools() *GroupUpsert {
+	u.SetExcluded(group.FieldDeepseekTools)
+	return u
+}
+
+// ClearDeepseekTools clears the value of the "deepseek_tools" field.
+func (u *GroupUpsert) ClearDeepseekTools() *GroupUpsert {
+	u.SetNull(group.FieldDeepseekTools)
+	return u
+}
+
 // SetSearchPricePer1k sets the "search_price_per_1k" field.
 func (u *GroupUpsert) SetSearchPricePer1k(v float64) *GroupUpsert {
 	u.Set(group.FieldSearchPricePer1k, v)
@@ -2811,6 +3005,48 @@ func (u *GroupUpsert) SetAllowLive(v bool) *GroupUpsert {
 // UpdateAllowLive sets the "allow_live" field to the value that was provided on create.
 func (u *GroupUpsert) UpdateAllowLive() *GroupUpsert {
 	u.SetExcluded(group.FieldAllowLive)
+	return u
+}
+
+// SetOpenaiServiceTierPolicy sets the "openai_service_tier_policy" field.
+func (u *GroupUpsert) SetOpenaiServiceTierPolicy(v string) *GroupUpsert {
+	u.Set(group.FieldOpenaiServiceTierPolicy, v)
+	return u
+}
+
+// UpdateOpenaiServiceTierPolicy sets the "openai_service_tier_policy" field to the value that was provided on create.
+func (u *GroupUpsert) UpdateOpenaiServiceTierPolicy() *GroupUpsert {
+	u.SetExcluded(group.FieldOpenaiServiceTierPolicy)
+	return u
+}
+
+// ClearOpenaiServiceTierPolicy clears the value of the "openai_service_tier_policy" field.
+func (u *GroupUpsert) ClearOpenaiServiceTierPolicy() *GroupUpsert {
+	u.SetNull(group.FieldOpenaiServiceTierPolicy)
+	return u
+}
+
+// SetRequestSpeedSelectionEnabled sets the "request_speed_selection_enabled" field.
+func (u *GroupUpsert) SetRequestSpeedSelectionEnabled(v bool) *GroupUpsert {
+	u.Set(group.FieldRequestSpeedSelectionEnabled, v)
+	return u
+}
+
+// UpdateRequestSpeedSelectionEnabled sets the "request_speed_selection_enabled" field to the value that was provided on create.
+func (u *GroupUpsert) UpdateRequestSpeedSelectionEnabled() *GroupUpsert {
+	u.SetExcluded(group.FieldRequestSpeedSelectionEnabled)
+	return u
+}
+
+// SetDefaultRequestSpeedTier sets the "default_request_speed_tier" field.
+func (u *GroupUpsert) SetDefaultRequestSpeedTier(v string) *GroupUpsert {
+	u.Set(group.FieldDefaultRequestSpeedTier, v)
+	return u
+}
+
+// UpdateDefaultRequestSpeedTier sets the "default_request_speed_tier" field to the value that was provided on create.
+func (u *GroupUpsert) UpdateDefaultRequestSpeedTier() *GroupUpsert {
+	u.SetExcluded(group.FieldDefaultRequestSpeedTier)
 	return u
 }
 
@@ -3772,6 +4008,62 @@ func (u *GroupUpsertOne) ClearWebSearchPricePerCall() *GroupUpsertOne {
 	})
 }
 
+// SetUpstreamRejectionBillingEnabled sets the "upstream_rejection_billing_enabled" field.
+func (u *GroupUpsertOne) SetUpstreamRejectionBillingEnabled(v bool) *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetUpstreamRejectionBillingEnabled(v)
+	})
+}
+
+// UpdateUpstreamRejectionBillingEnabled sets the "upstream_rejection_billing_enabled" field to the value that was provided on create.
+func (u *GroupUpsertOne) UpdateUpstreamRejectionBillingEnabled() *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateUpstreamRejectionBillingEnabled()
+	})
+}
+
+// SetUpstreamRejectionPrice sets the "upstream_rejection_price" field.
+func (u *GroupUpsertOne) SetUpstreamRejectionPrice(v float64) *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetUpstreamRejectionPrice(v)
+	})
+}
+
+// AddUpstreamRejectionPrice adds v to the "upstream_rejection_price" field.
+func (u *GroupUpsertOne) AddUpstreamRejectionPrice(v float64) *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.AddUpstreamRejectionPrice(v)
+	})
+}
+
+// UpdateUpstreamRejectionPrice sets the "upstream_rejection_price" field to the value that was provided on create.
+func (u *GroupUpsertOne) UpdateUpstreamRejectionPrice() *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateUpstreamRejectionPrice()
+	})
+}
+
+// SetDeepseekTools sets the "deepseek_tools" field.
+func (u *GroupUpsertOne) SetDeepseekTools(v domain.DeepSeekToolsConfig) *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetDeepseekTools(v)
+	})
+}
+
+// UpdateDeepseekTools sets the "deepseek_tools" field to the value that was provided on create.
+func (u *GroupUpsertOne) UpdateDeepseekTools() *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateDeepseekTools()
+	})
+}
+
+// ClearDeepseekTools clears the value of the "deepseek_tools" field.
+func (u *GroupUpsertOne) ClearDeepseekTools() *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.ClearDeepseekTools()
+	})
+}
+
 // SetSearchPricePer1k sets the "search_price_per_1k" field.
 func (u *GroupUpsertOne) SetSearchPricePer1k(v float64) *GroupUpsertOne {
 	return u.Update(func(s *GroupUpsert) {
@@ -4098,6 +4390,55 @@ func (u *GroupUpsertOne) SetAllowLive(v bool) *GroupUpsertOne {
 func (u *GroupUpsertOne) UpdateAllowLive() *GroupUpsertOne {
 	return u.Update(func(s *GroupUpsert) {
 		s.UpdateAllowLive()
+	})
+}
+
+// SetOpenaiServiceTierPolicy sets the "openai_service_tier_policy" field.
+func (u *GroupUpsertOne) SetOpenaiServiceTierPolicy(v string) *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetOpenaiServiceTierPolicy(v)
+	})
+}
+
+// UpdateOpenaiServiceTierPolicy sets the "openai_service_tier_policy" field to the value that was provided on create.
+func (u *GroupUpsertOne) UpdateOpenaiServiceTierPolicy() *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateOpenaiServiceTierPolicy()
+	})
+}
+
+// ClearOpenaiServiceTierPolicy clears the value of the "openai_service_tier_policy" field.
+func (u *GroupUpsertOne) ClearOpenaiServiceTierPolicy() *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.ClearOpenaiServiceTierPolicy()
+	})
+}
+
+// SetRequestSpeedSelectionEnabled sets the "request_speed_selection_enabled" field.
+func (u *GroupUpsertOne) SetRequestSpeedSelectionEnabled(v bool) *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetRequestSpeedSelectionEnabled(v)
+	})
+}
+
+// UpdateRequestSpeedSelectionEnabled sets the "request_speed_selection_enabled" field to the value that was provided on create.
+func (u *GroupUpsertOne) UpdateRequestSpeedSelectionEnabled() *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateRequestSpeedSelectionEnabled()
+	})
+}
+
+// SetDefaultRequestSpeedTier sets the "default_request_speed_tier" field.
+func (u *GroupUpsertOne) SetDefaultRequestSpeedTier(v string) *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetDefaultRequestSpeedTier(v)
+	})
+}
+
+// UpdateDefaultRequestSpeedTier sets the "default_request_speed_tier" field to the value that was provided on create.
+func (u *GroupUpsertOne) UpdateDefaultRequestSpeedTier() *GroupUpsertOne {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateDefaultRequestSpeedTier()
 	})
 }
 
@@ -5260,6 +5601,62 @@ func (u *GroupUpsertBulk) ClearWebSearchPricePerCall() *GroupUpsertBulk {
 	})
 }
 
+// SetUpstreamRejectionBillingEnabled sets the "upstream_rejection_billing_enabled" field.
+func (u *GroupUpsertBulk) SetUpstreamRejectionBillingEnabled(v bool) *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetUpstreamRejectionBillingEnabled(v)
+	})
+}
+
+// UpdateUpstreamRejectionBillingEnabled sets the "upstream_rejection_billing_enabled" field to the value that was provided on create.
+func (u *GroupUpsertBulk) UpdateUpstreamRejectionBillingEnabled() *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateUpstreamRejectionBillingEnabled()
+	})
+}
+
+// SetUpstreamRejectionPrice sets the "upstream_rejection_price" field.
+func (u *GroupUpsertBulk) SetUpstreamRejectionPrice(v float64) *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetUpstreamRejectionPrice(v)
+	})
+}
+
+// AddUpstreamRejectionPrice adds v to the "upstream_rejection_price" field.
+func (u *GroupUpsertBulk) AddUpstreamRejectionPrice(v float64) *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.AddUpstreamRejectionPrice(v)
+	})
+}
+
+// UpdateUpstreamRejectionPrice sets the "upstream_rejection_price" field to the value that was provided on create.
+func (u *GroupUpsertBulk) UpdateUpstreamRejectionPrice() *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateUpstreamRejectionPrice()
+	})
+}
+
+// SetDeepseekTools sets the "deepseek_tools" field.
+func (u *GroupUpsertBulk) SetDeepseekTools(v domain.DeepSeekToolsConfig) *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetDeepseekTools(v)
+	})
+}
+
+// UpdateDeepseekTools sets the "deepseek_tools" field to the value that was provided on create.
+func (u *GroupUpsertBulk) UpdateDeepseekTools() *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateDeepseekTools()
+	})
+}
+
+// ClearDeepseekTools clears the value of the "deepseek_tools" field.
+func (u *GroupUpsertBulk) ClearDeepseekTools() *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.ClearDeepseekTools()
+	})
+}
+
 // SetSearchPricePer1k sets the "search_price_per_1k" field.
 func (u *GroupUpsertBulk) SetSearchPricePer1k(v float64) *GroupUpsertBulk {
 	return u.Update(func(s *GroupUpsert) {
@@ -5586,6 +5983,55 @@ func (u *GroupUpsertBulk) SetAllowLive(v bool) *GroupUpsertBulk {
 func (u *GroupUpsertBulk) UpdateAllowLive() *GroupUpsertBulk {
 	return u.Update(func(s *GroupUpsert) {
 		s.UpdateAllowLive()
+	})
+}
+
+// SetOpenaiServiceTierPolicy sets the "openai_service_tier_policy" field.
+func (u *GroupUpsertBulk) SetOpenaiServiceTierPolicy(v string) *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetOpenaiServiceTierPolicy(v)
+	})
+}
+
+// UpdateOpenaiServiceTierPolicy sets the "openai_service_tier_policy" field to the value that was provided on create.
+func (u *GroupUpsertBulk) UpdateOpenaiServiceTierPolicy() *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateOpenaiServiceTierPolicy()
+	})
+}
+
+// ClearOpenaiServiceTierPolicy clears the value of the "openai_service_tier_policy" field.
+func (u *GroupUpsertBulk) ClearOpenaiServiceTierPolicy() *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.ClearOpenaiServiceTierPolicy()
+	})
+}
+
+// SetRequestSpeedSelectionEnabled sets the "request_speed_selection_enabled" field.
+func (u *GroupUpsertBulk) SetRequestSpeedSelectionEnabled(v bool) *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetRequestSpeedSelectionEnabled(v)
+	})
+}
+
+// UpdateRequestSpeedSelectionEnabled sets the "request_speed_selection_enabled" field to the value that was provided on create.
+func (u *GroupUpsertBulk) UpdateRequestSpeedSelectionEnabled() *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateRequestSpeedSelectionEnabled()
+	})
+}
+
+// SetDefaultRequestSpeedTier sets the "default_request_speed_tier" field.
+func (u *GroupUpsertBulk) SetDefaultRequestSpeedTier(v string) *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.SetDefaultRequestSpeedTier(v)
+	})
+}
+
+// UpdateDefaultRequestSpeedTier sets the "default_request_speed_tier" field to the value that was provided on create.
+func (u *GroupUpsertBulk) UpdateDefaultRequestSpeedTier() *GroupUpsertBulk {
+	return u.Update(func(s *GroupUpsert) {
+		s.UpdateDefaultRequestSpeedTier()
 	})
 }
 

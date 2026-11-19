@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -26,6 +27,10 @@ type ChannelMonitorRepository interface {
 	Delete(ctx context.Context, id int64) error
 	List(ctx context.Context, params ChannelMonitorListParams) ([]*ChannelMonitor, int64, error)
 	FindByDuplicateOperationID(ctx context.Context, operationID string) (*ChannelMonitor, error)
+	UpdateSortOrders(ctx context.Context, updates []ChannelMonitorSortOrderUpdate) error
+
+	// ResolveUsageGroupsByAPIKeys reads live local key membership in one batch.
+	ResolveUsageGroupsByAPIKeys(ctx context.Context, keys []string) (map[string]int64, error)
 
 	// 调度器辅助
 	ListEnabled(ctx context.Context) ([]*ChannelMonitor, error)
@@ -619,6 +624,15 @@ func (s *ChannelMonitorService) RunCheck(ctx context.Context, id int64) ([]*Chec
 		return nil, ErrChannelMonitorAPIKeyDecryptFailed
 	}
 
+	timing := rt.probeTiming()
+	ctx = withChannelMonitorProbeTiming(ctx, timing)
+	budget := timing.RequestTimeout + monitorPingTimeout + monitorRunOneBuffer
+	if checkMode != MonitorCheckModeProbe {
+		budget += monitorQuotaFetchTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
 	var results []*CheckResult
 	switch checkMode {
 	case MonitorCheckModeQuota:
@@ -628,6 +642,12 @@ func (s *ChannelMonitorService) RunCheck(ctx context.Context, id int64) ([]*Chec
 		attachQuotaSnapshot(results, s.fetchQuotaSnapshot(ctx, m))
 	default:
 		results = s.runChecksConcurrent(ctx, m)
+	}
+	if err := ctx.Err(); errors.Is(err, context.Canceled) {
+		// The caller stopped (runner shutdown or a disconnected admin request).
+		// Results of an interrupted probe say nothing about the channel; do not
+		// record them as a failure in the history timeline.
+		return results, err
 	}
 	s.persistCheckResults(ctx, m, results)
 	return results, nil

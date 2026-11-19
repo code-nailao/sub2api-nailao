@@ -20,6 +20,10 @@ type groupUsageRollupSnapshot struct {
 	closedBefore string    // date，历史日桶的右开边界
 	retainedDate string    // retained_from 在服务端时区内的日期，历史日桶的左闭边界
 	tailStart    time.Time // 尾段（还没进日桶的那部分 usage_logs）的起点，不早于 expired_before
+	// When native retention crosses preserved cleanup summaries, old rollups
+	// cannot distinguish expired raw costs from retained archive costs.
+	preservedArchiveFallback bool
+	rawExpiredBefore         time.Time
 }
 
 // readGroupUsageRollupSnapshot 读一次汇总水位并在 Go 侧判定有效性。
@@ -55,6 +59,26 @@ func (r *usageLogRepository) readGroupUsageRollupSnapshot(ctx context.Context, t
 		closedBefore: "1970-01-01",
 		retainedDate: "1970-01-01",
 		tailStart:    tailFloor,
+	}
+	if tailFloor.After(time.Unix(0, 0).UTC()) {
+		var preservedHistory bool
+		if err := scanSingleRow(ctx, r.sql, `
+			SELECT EXISTS (
+				SELECT 1 FROM usage_cleanup_group_daily
+				WHERE bucket_date::timestamp AT TIME ZONE 'Asia/Shanghai' < $1
+			)
+		`, []any{tailFloor}, &preservedHistory); err != nil {
+			return groupUsageRollupSnapshot{}, fmt.Errorf("读取已保留分组历史: %w", err)
+		}
+		if preservedHistory {
+			// The private summaries are durable history, not expired raw rows.
+			// Recompute from retained raw + all summaries instead of counting
+			// old mixed rollups a second time or hiding preserved history.
+			invalid.tailStart = time.Unix(0, 0).UTC()
+			invalid.preservedArchiveFallback = true
+			invalid.rawExpiredBefore = tailFloor
+			return invalid, nil
+		}
 	}
 	if rowCount != 1 || !closedBefore.Valid || !retainedFrom.Valid ||
 		!stateTimezone.Valid || stateTimezone.String != timezoneName ||
@@ -106,7 +130,7 @@ func (r *usageLogRepository) getAllGroupUsageSummaryFromRollups(ctx context.Cont
 	// 换成参数之后走 idx_usage_logs_created_at：
 	//   Index Scan … Index Cond: (created_at >= $7)
 	//   Execution Time: 34 ms
-	const query = `
+	const queryTemplate = `
 		WITH historical AS (
 			SELECT
 				rollup.group_id,
@@ -129,7 +153,7 @@ func (r *usageLogRepository) getAllGroupUsageSummaryFromRollups(ctx context.Cont
 					WHERE ul.created_at >= $2
 						AND ul.created_at < $1
 				), 0) AS yesterday_cost
-			FROM usage_logs ul
+			FROM %s ul
 			WHERE ul.created_at >= $7
 			GROUP BY ul.group_id
 		)
@@ -144,9 +168,8 @@ func (r *usageLogRepository) getAllGroupUsageSummaryFromRollups(ctx context.Cont
 		ORDER BY g.id
 	`
 
-	rows, err := r.sql.QueryContext(
-		ctx,
-		query,
+	source := "usage_cleanup_group_source"
+	args := []any{
 		todayStart,
 		yesterdayStart,
 		yesterdayDate,
@@ -154,7 +177,18 @@ func (r *usageLogRepository) getAllGroupUsageSummaryFromRollups(ctx context.Cont
 		state.retainedDate,
 		state.closedBefore,
 		state.tailStart,
-	)
+	}
+	if state.preservedArchiveFallback {
+		source = `(
+			SELECT created_at, group_id, actual_cost FROM usage_logs
+			WHERE group_id IS NOT NULL AND created_at >= $8
+			UNION ALL
+			SELECT bucket_date::timestamp AT TIME ZONE 'Asia/Shanghai', group_id, actual_cost
+			FROM usage_cleanup_group_daily
+		)`
+		args = append(args, state.rawExpiredBefore)
+	}
+	rows, err := r.sql.QueryContext(ctx, fmt.Sprintf(queryTemplate, source), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -388,10 +422,15 @@ func beginGroupUsageRollupBuild(ctx context.Context, q sqlExecutor, todayStart t
 	startDate := closedBefore
 	if timezoneChanged || closedBefore <= retainedDate {
 		var earliest sql.NullTime
-		if err := scanSingleRow(ctx, q, `
-			SELECT MIN(created_at)
-			FROM usage_logs
-			WHERE created_at >= $1
+		// Cleanup summaries retain billed history after raw usage removal.
+		// Search both branches, while respecting the native raw-retention floor.
+		if err := scanSingleRow(ctx, q, `SELECT LEAST(
+			(SELECT created_at FROM usage_logs
+			 WHERE created_at >= $1 ORDER BY created_at LIMIT 1),
+			(SELECT bucket_date::timestamp AT TIME ZONE 'Asia/Shanghai'
+			 FROM usage_cleanup_group_daily
+			 WHERE bucket_date::timestamp AT TIME ZONE 'Asia/Shanghai' >= $1
+			 ORDER BY bucket_date LIMIT 1))
 		`, []any{expiredBefore.UTC()}, &earliest); err != nil {
 			return nil, fmt.Errorf("读取最早用量记录: %w", err)
 		}
@@ -466,7 +505,7 @@ func buildGroupUsageRollups(ctx context.Context, q sqlExecutor, plan *groupUsage
 			group_id,
 			COALESCE(SUM(actual_cost), 0) AS actual_cost,
 			NOW()
-		FROM usage_logs
+		FROM usage_cleanup_group_source
 		WHERE group_id IS NOT NULL
 			AND created_at >= $1
 			AND created_at < $2

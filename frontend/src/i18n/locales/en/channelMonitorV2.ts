@@ -1,7 +1,67 @@
 /** Channel Monitor V2 (user + admin passive monitor UI) */
 export default {
   channelMonitorV2: {
-    title: 'Channel Monitor',
+    cards: {
+      loadFailedRetained: 'Showing the last successful data. The current range or filters have not been applied; please retry.',
+      loadFailedRetry: 'Channel statistics could not be loaded. Please retry.',
+
+      imageGrouping: 'Image channel layout',
+      imageSeparate: 'Group in Image category',
+      imageProvider: 'Place at the end of its provider',
+      imageGroupingHint: 'Manual categories take precedence. Choose “Follow default” to make a channel follow this setting again.',
+      followDefault: 'Follow default',
+
+      passiveDescription: 'V2 usage-based monitoring · Cache and availability',
+      adminDiagnostics: 'Admin diagnostics / Advanced filters',
+      shortMetricHint: 'Gray means no traffic or insufficient samples. — means no statistic is available.',
+
+      "title": "Channel cards",
+      "all": "All",
+      "categoryFilter": "Channel categories",
+      "search": "Search channel names…",
+      "userRate": "Your rate",
+      "rateHint": "Your applicable group multiplier. Actual charges depend on model pricing, usage and billing rules.",
+      "availability": "Availability",
+      "domestic": "Chinese models",
+      "periods": "Last {count} periods",
+      "timelineAria": "History for {name}",
+      "states": {
+            "healthy": "Healthy",
+            "warning": "Watch",
+            "critical": "Incident",
+            "unknown": "No traffic / low sample"
+      },
+      "categories": {
+            "openai": "OpenAI",
+            "anthropic": "Anthropic",
+            "grok": "Grok",
+            "gemini": "Gemini",
+            "domestic": "Chinese models",
+            "image": "Image",
+            "other": "Other"
+      },
+      "attentionOnly": "Needs attention only",
+      "ratesUnavailable": "Your applicable rates could not be loaded. Values are left blank; refresh to retry.",
+      "sortTitle": "Customize order",
+      "sortHint": "Arrange categories and channels. Saved changes apply to all users. You can also change a channel’s category.",
+      "sortScope": "Sorting scope",
+      "categoryOrder": "Category order",
+      "dragHint": "Drag the handle, or use the up and down buttons.",
+      "moveUp": "Move {name} up",
+      "moveDown": "Move {name} down",
+      "groupCategory": "Category for {name}",
+      "emptyCategory": "No channels in this category.",
+      "resetOrder": "Restore default order",
+      "sortGroup": "Arrange channels in {name}",
+      "adjustOrder": "Arrange",
+      "orderLoadFailed": "Unable to load the order. Close and reopen to retry.",
+      "orderSaveFailed": "Unable to save. If another administrator changed the configuration, close and reopen to reload it.",
+      "orderSaved": "Channel display order saved",
+      "metricHint": "Each bar represents one time period. Select it for details. Colors use the V2 health rules; gray means no traffic or insufficient samples. Missing cache and first-token metrics display —.",
+      "empty": "No matching channels",
+      "advancedDetails": "Model, error and usage details"
+},
+    title: 'Channel status',
     updating: 'Updating data',
     updatedTo: 'Updated to {time}',
     partialCoverage: 'Partial historical coverage',
@@ -30,7 +90,7 @@ export default {
     groupBy: {
       label: 'Group by', platform: 'Platform', platformGroup: 'Platform / Group', platformModel: 'Platform / Model', platformGroupModel: 'Platform / Group / Model'
     },
-    trendView: { label: 'Trend view', pulse: 'Pulse matrix', line: 'Line chart' },
+    trendView: { cards: 'Channel cards', label: 'Trend view', pulse: 'Pulse matrix', line: 'Line chart' },
     healthMode: { label: 'Health display', overall: 'Overall', success: 'Error rate', ttft: 'First token', cache: 'Cache rate' },
     tabs: { aria: 'Detail dimension', models: 'Models', errors: 'Error reasons', users: 'User ranking' },
     metrics: {

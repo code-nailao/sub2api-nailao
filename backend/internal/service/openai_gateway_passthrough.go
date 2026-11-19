@@ -134,7 +134,15 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	reasoningEffort *string,
 	reqStream bool,
 	startTime time.Time,
-) (*OpenAIForwardResult, error) {
+) (out *OpenAIForwardResult, forwardError error) {
+	observedHTTPStatus := 0
+	defer func() {
+		if observedHTTPStatus > 0 && forwardError != nil && (out == nil || out.UpstreamRejection == nil) {
+			forwardError = &UpstreamRejectionHTTPError{StatusCode: observedHTTPStatus, Cause: forwardError}
+		}
+	}()
+	var upstreamRejection *UpstreamRejectionEvidence
+	upstreamTerminalEvent := ""
 	requestedModel := reqModel
 	upstreamPassthroughModel := ""
 	if isOpenAIResponsesCompactPath(c) {
@@ -385,14 +393,22 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			probeBody := s.readUpstreamErrorBody(resp)
 			_ = resp.Body.Close()
 			resp.Body = io.NopCloser(bytes.NewReader(probeBody))
+			if rejection := DetectUpstreamRejectionHTTP(account, resp.StatusCode, probeBody); rejection != nil {
+				result := upstreamRejectionForwardResult(resp, reqModel, actualModel, actualModel, reqStream, startTime, rejection)
+				result.UpstreamEndpoint = openAIResponsesUpstreamEndpoint
+				return result, writeUpstreamRejectionHTTP(c, rejection)
+			}
+			if account.GetUpstreamRejectionProfile() != "" {
+				observedHTTPStatus = resp.StatusCode
+			}
 			if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, probeBody); retryErr != nil {
 				return nil, fmt.Errorf("normalize passthrough rejected Responses field retry body: %w", retryErr)
-			} else if changed && rejectedFieldRetryState.Allow(retryBody) {
+			} else if changed && account.GetUpstreamRejectionProfile() == "" && rejectedFieldRetryState.Allow(retryBody) {
 				body = retryBody
 				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying passthrough request after %s (account: %s)", reason, account.Name)
 				continue
 			}
-			if !agentTaskRecoveryTried && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, probeBody) {
+			if account.GetUpstreamRejectionProfile() == "" && !agentTaskRecoveryTried && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, probeBody) {
 				agentTaskRecoveryTried = true
 				expectedTaskID := account.GetCredential("task_id")
 				if recoveryErr := s.recoverAgentIdentityTask(ctx, account, expectedTaskID); recoveryErr != nil {
@@ -403,7 +419,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(probeBody)))
 			if retryBody, fallbackModel, retry := s.prepareOpenAICompactFallbackRetry(
 				c, account, requestedModel, body, resp.StatusCode, upstreamMsg, probeBody, compactModelFallbackRetried,
-			); retry {
+			); retry && account.GetUpstreamRejectionProfile() == "" {
 				s.appendOpenAICompactFallbackRetryOps(c, account, resp, probeBody, upstreamMsg, true)
 				fromModel := strings.TrimSpace(gjson.GetBytes(body, "model").String())
 				body = retryBody
@@ -442,12 +458,38 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			s.noteOpenAICodexTurnStateProvenance(c, account)
 		}
 
-		if reqStream {
+		if reqStream && !upstreamRejectionJSONResponse(account, resp) {
 			result, handleErr := s.handleStreamingResponsePassthrough(ctx, resp, c, account, startTime, reqModel, upstreamPassthroughModel)
+			if result != nil && result.upstreamRejection != nil {
+				upstreamRejection = result.upstreamRejection
+				if handleErr != nil {
+					forward := upstreamRejectionForwardResult(resp, reqModel, actualModel, actualModel, reqStream, startTime, upstreamRejection)
+					forward.UpstreamEndpoint = openAIResponsesUpstreamEndpoint
+					forward.UpstreamTerminalEvent = result.upstreamTerminalEvent
+					forward.ResponseID = result.responseID
+					if result.usage != nil {
+						forward.Usage = *result.usage
+					}
+					_ = resp.Body.Close()
+					return forward, &UpstreamRejectionError{Evidence: upstreamRejection}
+				}
+			}
+			if handleErr != nil && result != nil && account.GetUpstreamRejectionProfile() != "" {
+				partial := upstreamRejectionForwardResult(resp, reqModel, actualModel, actualModel, reqStream, startTime, nil)
+				partial.UpstreamEndpoint = openAIResponsesUpstreamEndpoint
+				partial.UpstreamTerminalEvent = result.upstreamTerminalEvent
+				partial.ResponseID = result.responseID
+				if result.usage != nil {
+					partial.Usage = *result.usage
+				}
+				_ = resp.Body.Close()
+				return partial, handleErr
+			}
+
 			if handleErr != nil {
 				if retryBody, fallbackModel, retry := s.applyOpenAIPassthroughCompactFallbackFromSignal(
 					c, account, requestedModel, body, handleErr, compactModelFallbackRetried, resp,
-				); retry {
+				); retry && account.GetUpstreamRejectionProfile() == "" {
 					body = retryBody
 					upstreamPassthroughModel = fallbackModel
 					compactModelFallbackRetried = true
@@ -464,6 +506,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 				_ = resp.Body.Close()
 				return nil, handleErr
 			}
+			upstreamTerminalEvent = result.upstreamTerminalEvent
 			usage = result.usage
 			firstTokenMs = result.firstTokenMs
 			responseID = strings.TrimSpace(result.responseID)
@@ -471,10 +514,36 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			imageOutputSizes = result.imageOutputSizes
 		} else {
 			result, handleErr := s.handleNonStreamingResponsePassthrough(ctx, resp, c, account, reqModel, upstreamPassthroughModel)
+			if result != nil && result.upstreamRejection != nil {
+				upstreamRejection = result.upstreamRejection
+				if handleErr != nil {
+					forward := upstreamRejectionForwardResult(resp, reqModel, actualModel, actualModel, reqStream, startTime, upstreamRejection)
+					forward.UpstreamEndpoint = openAIResponsesUpstreamEndpoint
+					forward.UpstreamTerminalEvent = result.upstreamTerminalEvent
+					forward.ResponseID = result.responseID
+					if result.usage != nil {
+						forward.Usage = *result.usage
+					}
+					_ = resp.Body.Close()
+					return forward, &UpstreamRejectionError{Evidence: upstreamRejection}
+				}
+			}
+			if handleErr != nil && result != nil && account.GetUpstreamRejectionProfile() != "" {
+				partial := upstreamRejectionForwardResult(resp, reqModel, actualModel, actualModel, reqStream, startTime, nil)
+				partial.UpstreamEndpoint = openAIResponsesUpstreamEndpoint
+				partial.UpstreamTerminalEvent = result.upstreamTerminalEvent
+				partial.ResponseID = result.responseID
+				if result.usage != nil {
+					partial.Usage = *result.usage
+				}
+				_ = resp.Body.Close()
+				return partial, handleErr
+			}
+
 			if handleErr != nil {
 				if retryBody, fallbackModel, retry := s.applyOpenAIPassthroughCompactFallbackFromSignal(
 					c, account, requestedModel, body, handleErr, compactModelFallbackRetried, resp,
-				); retry {
+				); retry && account.GetUpstreamRejectionProfile() == "" {
 					body = retryBody
 					upstreamPassthroughModel = fallbackModel
 					compactModelFallbackRetried = true
@@ -491,6 +560,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 				_ = resp.Body.Close()
 				return nil, handleErr
 			}
+			upstreamTerminalEvent = result.upstreamTerminalEvent
 			usage = result.usage
 			responseID = strings.TrimSpace(result.responseID)
 			imageCount = result.imageCount
@@ -516,6 +586,8 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	}
 
 	forwardResult := &OpenAIForwardResult{
+		UpstreamRejection:             upstreamRejection,
+		UpstreamTerminalEvent:         upstreamTerminalEvent,
 		RequestID:                     resp.Header.Get("x-request-id"),
 		UpstreamHeaders:               resp.Header,
 		ResponseID:                    responseID,
@@ -1006,14 +1078,18 @@ func collectOpenAIPassthroughTimeoutHeaders(h http.Header) []string {
 }
 
 type openaiStreamingResultPassthrough struct {
-	usage            *OpenAIUsage
-	firstTokenMs     *int
-	responseID       string
-	imageCount       int
-	imageOutputSizes []string
+	upstreamTerminalEvent string
+	upstreamRejection     *UpstreamRejectionEvidence
+	usage                 *OpenAIUsage
+	firstTokenMs          *int
+	responseID            string
+	imageCount            int
+	imageOutputSizes      []string
 }
 
 type openaiNonStreamingResultPassthrough struct {
+	upstreamTerminalEvent string
+	upstreamRejection     *UpstreamRejectionEvidence
 	*OpenAIUsage
 	usage            *OpenAIUsage
 	responseID       string
@@ -1899,7 +1975,24 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	startTime time.Time,
 	originalModel string,
 	mappedModel string,
-) (*openaiStreamingResultPassthrough, error) {
+) (result *openaiStreamingResultPassthrough, resultErr error) {
+	rejectionObserver := newUpstreamRejectionSSEObserver(account, resp.StatusCode)
+	defer func() {
+		rejectionObserver.Finish()
+		if result != nil {
+			result.upstreamTerminalEvent = rejectionObserver.CompletionEvent()
+		}
+		if evidence := rejectionObserver.Evidence(); evidence != nil {
+			if result == nil {
+				result = &openaiStreamingResultPassthrough{usage: &OpenAIUsage{}}
+			}
+			result.upstreamRejection = evidence
+			if resultErr != nil {
+				resultErr = &UpstreamRejectionError{Evidence: evidence}
+			}
+		}
+	}()
+
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
@@ -2044,16 +2137,18 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	needModelReplace := strings.TrimSpace(originalModel) != "" && strings.TrimSpace(mappedModel) != "" && strings.TrimSpace(originalModel) != strings.TrimSpace(mappedModel)
 	resultWithUsage := func() *openaiStreamingResultPassthrough {
 		return &openaiStreamingResultPassthrough{
-			usage:            usage,
-			firstTokenMs:     firstTokenMs,
-			responseID:       responseID,
-			imageCount:       imageCounter.Count(),
-			imageOutputSizes: imageCounter.Sizes(),
+			upstreamTerminalEvent: rejectionObserver.CompletionEvent(),
+			usage:                 usage,
+			firstTokenMs:          firstTokenMs,
+			responseID:            responseID,
+			imageCount:            imageCounter.Count(),
+			imageOutputSizes:      imageCounter.Sizes(),
 		}
 	}
 
 	for documentScanner.Scan() {
 		line := documentScanner.Text()
+		rejectionObserver.ObserveLine(line)
 		if eventType, ok := extractOpenAISSEEventLine(line); ok {
 			pendingSSEEventType = eventType
 			eventType = strings.TrimSpace(eventType)
@@ -2138,12 +2233,12 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 					})
 				}
 				outputStarted := openAIStreamClientOutputStarted(c, clientOutputStarted)
-				if !outputStarted && !cyberHit {
+				if !outputStarted && !cyberHit && rejectionObserver.Evidence() == nil {
 					if compactErr := newOpenAICompactFallbackSignal(c, dataBytes, failedMessage); compactErr != nil {
 						return resultWithUsage(), compactErr
 					}
 				}
-				if outputStarted && !cyberHit {
+				if outputStarted && !cyberHit && rejectionObserver.Evidence() == nil {
 					if codexFailureTerminal && eventType == "error" {
 						// Wait for the authoritative response.failed before mutating
 						// account health; EOF synthesis applies the pending effect.
@@ -2160,7 +2255,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				}
 				if !outputStarted {
 					shouldFailover := false
-					if !cyberHit {
+					if !cyberHit && rejectionObserver.Evidence() == nil {
 						if eventType == "error" {
 							shouldFailover = openAIStreamErrorEventShouldFailover(dataBytes, failedMessage)
 						} else {
@@ -2171,7 +2266,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 						return resultWithUsage(),
 							s.newOpenAIStreamFailoverErrorWithModel(c, account, true, upstreamRequestID, dataBytes, failedMessage, mappedModel, resp.Header)
 					}
-					if !cyberHit && !sawBareError {
+					if !cyberHit && rejectionObserver.Evidence() == nil && !sawBareError {
 						if status, errType, errMsg, matched := applyOpenAIStreamFailedErrorPassthroughRule(c, account.Platform, dataBytes, failedMessage); matched {
 							// 命中透传规则也要记录 ops 上游错误事件（对齐 CC/Messages 与
 							// antigravity 先例），否则透传命中的 failed 在监控中不可见。
@@ -2223,7 +2318,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			// to the client) are silent upstream refusals: fail over instead of
 			// recording a successful 0/0 usage turn (issue #5009).
 			if (eventType == "response.completed" || eventType == "response.done") &&
-				!sawFailedEvent && !semanticOutputSeen && !clientOutputStarted &&
+				!sawFailedEvent && !semanticOutputSeen && !clientOutputStarted && rejectionObserver.Evidence() == nil &&
 				openAIResponsesCompletedEventIsEmpty(dataBytes, usage) {
 				return resultWithUsage(), newOpenAIResponsesEmptyCompletedFailoverError(c, account, upstreamRequestID)
 			}
@@ -2280,6 +2375,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		if (sawDone || sawTerminalEvent) && line == "" && (!codexFailureTerminal || !sawBareError) {
 			break
 		}
+	}
+	if evidence := rejectionObserver.Evidence(); evidence != nil && (documentScanner.Err() != nil || (!sawDone && !sawTerminalEvent)) {
+		return resultWithUsage(), &UpstreamRejectionError{Evidence: evidence}
 	}
 	ensureResponseFailedTerminal()
 	if err := documentScanner.Err(); err != nil {
@@ -2348,11 +2446,27 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	account *Account,
 	originalModel string,
 	mappedModel string,
-) (*openaiNonStreamingResultPassthrough, error) {
+) (result *openaiNonStreamingResultPassthrough, resultErr error) {
 	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
 	if err != nil {
 		return nil, err
 	}
+	rejection := observeUpstreamRejectionBody(account, resp.StatusCode, body)
+	defer func() {
+		if rejection != nil {
+			if result == nil {
+				parsedUsage, _ := extractOpenAIUsageFromJSONBytes(body)
+				if bodyHasSSEFraming(body) {
+					parsedUsage = *s.parseSSEUsageFromBody(string(body))
+				}
+				result = &openaiNonStreamingResultPassthrough{usage: &parsedUsage, OpenAIUsage: &parsedUsage}
+			}
+			result.upstreamRejection = rejection
+			if resultErr != nil {
+				resultErr = &UpstreamRejectionError{Evidence: rejection}
+			}
+		}
+	}()
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
@@ -2411,11 +2525,13 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 		c.Data(resp.StatusCode, contentType, body)
 	}
 	return &openaiNonStreamingResultPassthrough{
-		OpenAIUsage:      usage,
-		usage:            usage,
-		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
-		imageCount:       countOpenAIResponseImageOutputsFromJSONBytes(body),
-		imageOutputSizes: collectOpenAIResponseImageOutputSizesFromJSONBytes(body),
+		upstreamRejection:     rejection,
+		upstreamTerminalEvent: upstreamRejectionJSONCompletion(account, body),
+		OpenAIUsage:           usage,
+		usage:                 usage,
+		responseID:            extractOpenAIResponseIDFromJSONBytes(body),
+		imageCount:            countOpenAIResponseImageOutputsFromJSONBytes(body),
+		imageOutputSizes:      collectOpenAIResponseImageOutputSizesFromJSONBytes(body),
 	}, nil
 }
 
@@ -2423,10 +2539,27 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 // response for the passthrough path. It mirrors handleSSEToJSON while
 // preserving passthrough payloads, except compact-only model remapping may
 // rewrite model fields back to the original requested model.
-func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c *gin.Context, account *Account, body []byte, originalModel string, mappedModel string) (*openaiNonStreamingResultPassthrough, error) {
+func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c *gin.Context, account *Account, body []byte, originalModel string, mappedModel string) (result *openaiNonStreamingResultPassthrough, resultErr error) {
+	rejection := observeUpstreamRejectionBody(account, resp.StatusCode, body)
+	completion := upstreamRejectionSSECompletion(account, resp.StatusCode, body)
+	defer func() {
+		if rejection != nil {
+			if result == nil {
+				parsedUsage, _ := extractOpenAIUsageFromJSONBytes(body)
+				if bodyHasSSEFraming(body) {
+					parsedUsage = *s.parseSSEUsageFromBody(string(body))
+				}
+				result = &openaiNonStreamingResultPassthrough{usage: &parsedUsage, OpenAIUsage: &parsedUsage}
+			}
+			result.upstreamRejection = rejection
+			if resultErr != nil {
+				resultErr = &UpstreamRejectionError{Evidence: rejection}
+			}
+		}
+	}()
 	bodyText := string(body)
 	terminalType, terminalPayload, terminalOK := extractOpenAISSETerminalEvent(bodyText)
-	if terminalOK && (terminalType == "response.failed" || terminalType == "error") {
+	if rejection == nil && terminalOK && (terminalType == "response.failed" || terminalType == "error") {
 		msg := extractOpenAISSEErrorMessage(terminalPayload)
 		if msg == "" {
 			msg = "Upstream compact response failed"
@@ -2497,11 +2630,13 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 	}
 
 	return &openaiNonStreamingResultPassthrough{
-		OpenAIUsage:      usage,
-		usage:            usage,
-		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
-		imageCount:       countOpenAIImageOutputsFromSSEBody(bodyText),
-		imageOutputSizes: collectOpenAIImageOutputSizesFromSSEBody(bodyText),
+		upstreamRejection:     rejection,
+		upstreamTerminalEvent: completion,
+		OpenAIUsage:           usage,
+		usage:                 usage,
+		responseID:            extractOpenAIResponseIDFromJSONBytes(body),
+		imageCount:            countOpenAIImageOutputsFromSSEBody(bodyText),
+		imageOutputSizes:      collectOpenAIImageOutputSizesFromSSEBody(bodyText),
 	}, nil
 }
 

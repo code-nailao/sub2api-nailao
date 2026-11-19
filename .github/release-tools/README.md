@@ -1,4 +1,23 @@
-# Release matrix
+# Sources clean release component scope
+
+The active `Sources clean release` workflow builds and verifies the complete Main/Portal bundle. Publication scope is resolved from the exact source checkout before publication. `.github/release-tools/component-scopes.json` pins **0.2.62 to Main only**; all unlisted versions retain the existing Main + Portal default. The manual `components` input accepts `auto`, `main` or `both`; an explicit value cannot contradict a pinned version.
+
+`clean_components.py` wraps the existing native image publisher and asset uploader. Main-only scope never inspects or builds the Portal registry image. The image receipt records `publication_scope` and a source/version/manifest-hash bound `component_selection`; retries cannot expand or narrow that scope. Release metadata requires exactly the selected, registry-verified component tags and keeps immutable-asset full readback. Image repositories come from the repository-root `.sources-identity.json`, the same file the workflow checks against `github.repository`. A built Portal binary does not imply a published/deployed Portal image. No Latest promotion or production cutover is performed.
+
+Older immutable source refs without this helper retain the original two-component path. The workflow rejects requesting Main-only for such refs rather than silently publishing both.
+
+Read-only selection checks:
+
+```sh
+python3 .github/release-tools/clean_components.py resolve --version 0.2.62
+# main
+python3 .github/release-tools/clean_components.py resolve --version 0.2.63
+# main,portal
+```
+
+Run `python3 -m unittest discover -s .github/release-tools -p 'test_release_matrix.py'` on Linux/Bash 4+. The suite exercises the real native publisher/uploader with fake Docker/GitHub transports, including Main-only registry calls, both-component defaults, immutable tags/assets, full readback and scope-safe retries. The older matrix shell helper uses Bash 4 lowercase expansion and does not run under macOS's bundled Bash 3.
+
+# Legacy release matrix helpers
 
 The release workflow builds the frontend once, then runs each configured Go target on its own Linux runner. `CGO_ENABLED=0` permits cross-compilation. The target matrix is read from `.goreleaser.yaml`, including its exclusions; simple releases select Linux amd64 only.
 

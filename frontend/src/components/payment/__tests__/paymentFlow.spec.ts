@@ -491,3 +491,19 @@ describe('readPaymentRecoverySnapshot', () => {
     expect(restored?.paymentEnv).toBe('')
   })
 })
+
+
+describe('native BEpusdt checkout', () => {
+  it('uses the upstream native checkout URL without a private UI wrapper', () => {
+    const url = 'https://pay.example/pay/checkout/native-test'
+    const decision = decidePaymentLaunch(createOrderResult({ pay_url: url, payment_mode: 'redirect', out_trade_no: 'MAIN_USDT_test' }), { visibleMethod: 'usdt_bsc', orderType: 'balance', isMobile: false })
+    expect(decision.kind).toBe('redirect_waiting')
+    expect(decision.paymentState.payUrl).toBe(url)
+  })
+  it('preserves an unknown submission as the original pending order instead of inviting a new create', () => {
+    const decision = decidePaymentLaunch(createOrderResult({ out_trade_no: 'MAIN_USDT_unknown', verification_pending: true }), { visibleMethod: 'usdt_bsc', orderType: 'balance', isMobile: false })
+    expect(decision.kind).toBe('redirect_waiting')
+    expect(decision.recovery?.orderId).toBe(101)
+    expect(decision.paymentState.payUrl).toBe('')
+  })
+})

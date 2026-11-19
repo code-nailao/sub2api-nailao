@@ -378,12 +378,14 @@ func (h *SettingHandler) GetSettings(c *gin.Context) {
 		PaymentAlipayForceQRCode:                               paymentCfg.AlipayForceQRCode,
 		PaymentAlipayMobilePrecreateDeepLink:                   paymentCfg.AlipayMobilePrecreateDeepLink,
 
-		ChannelMonitorEnabled:                settings.ChannelMonitorEnabled,
-		ChannelMonitorMode:                   settings.ChannelMonitorMode,
-		ChannelMonitorDefaultIntervalSeconds: settings.ChannelMonitorDefaultIntervalSeconds,
-		ChannelMonitorHideThroughput:         settings.ChannelMonitorHideThroughput,
-		ChannelMonitorShowQuota:              settings.ChannelMonitorShowQuota,
-		ChannelMonitorHideUserRanking:        settings.ChannelMonitorHideUserRanking,
+		ChannelMonitorEnabled:                  settings.ChannelMonitorEnabled,
+		ChannelMonitorMode:                     settings.ChannelMonitorMode,
+		ChannelMonitorDefaultIntervalSeconds:   settings.ChannelMonitorDefaultIntervalSeconds,
+		ChannelMonitorDegradedThresholdSeconds: settings.ChannelMonitorDegradedThresholdSeconds,
+		ChannelMonitorRequestTimeoutSeconds:    settings.ChannelMonitorRequestTimeoutSeconds,
+		ChannelMonitorHideThroughput:           settings.ChannelMonitorHideThroughput,
+		ChannelMonitorShowQuota:                settings.ChannelMonitorShowQuota,
+		ChannelMonitorHideUserRanking:          settings.ChannelMonitorHideUserRanking,
 
 		GrokDefaultTextModel:           settings.GrokDefaultTextModel,
 		GrokCrossClientModelMapEnabled: settings.GrokCrossClientModelMapEnabled,
@@ -429,7 +431,7 @@ func openaiFastPolicySettingsToDTO(s *service.OpenAIFastPolicySettings) *dto.Ope
 	for i, r := range s.Rules {
 		rules[i] = dto.OpenAIFastPolicyRule(r)
 	}
-	return &dto.OpenAIFastPolicySettings{Rules: rules}
+	return &dto.OpenAIFastPolicySettings{Rules: rules, GroupTierPoliciesEnabled: s.GroupTierPoliciesEnabled}
 }
 
 // openaiFastPolicySettingsFromDTO converts dto -> service for OpenAI fast policy.
@@ -451,7 +453,7 @@ func openaiFastPolicySettingsFromDTO(s *dto.OpenAIFastPolicySettings) *service.O
 		}
 		rules[i].ServiceTier = tier
 	}
-	return &service.OpenAIFastPolicySettings{Rules: rules}
+	return &service.OpenAIFastPolicySettings{Rules: rules, GroupTierPoliciesEnabled: s.GroupTierPoliciesEnabled}
 }
 
 func loginAgreementDocumentsToDTO(items []service.LoginAgreementDocument) []dto.LoginAgreementDocument {

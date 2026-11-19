@@ -6,6 +6,10 @@ import (
 )
 
 func lockScopedAdminAccount(ctx context.Context, tx *dbent.Tx, id int64) error {
+	// Keep scoped-admin outer transactions in the same configuration lock order.
+	if _, err := tx.Client().ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtextextended('sources_request_speed_config', 0))"); err != nil {
+		return err
+	}
 	_, err := tx.Client().ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('scoped_admin_account:' || $1::text, 0))`, id)
 	return err
 }

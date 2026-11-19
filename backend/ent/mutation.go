@@ -116,6 +116,8 @@ type APIKeyMutation struct {
 	deleted_at         *time.Time
 	key                *string
 	name               *string
+	deepseek_tool_mode *string
+	request_speed_tier *string
 	status             *string
 	last_used_at       *time.Time
 	ip_whitelist       *[]string
@@ -529,6 +531,91 @@ func (m *APIKeyMutation) GroupIDCleared() bool {
 func (m *APIKeyMutation) ResetGroupID() {
 	m.group = nil
 	delete(m.clearedFields, apikey.FieldGroupID)
+}
+
+// SetDeepseekToolMode sets the "deepseek_tool_mode" field.
+func (m *APIKeyMutation) SetDeepseekToolMode(s string) {
+	m.deepseek_tool_mode = &s
+}
+
+// DeepseekToolMode returns the value of the "deepseek_tool_mode" field in the mutation.
+func (m *APIKeyMutation) DeepseekToolMode() (r string, exists bool) {
+	v := m.deepseek_tool_mode
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldDeepseekToolMode returns the old "deepseek_tool_mode" field's value of the APIKey entity.
+// If the APIKey object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *APIKeyMutation) OldDeepseekToolMode(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldDeepseekToolMode is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldDeepseekToolMode requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldDeepseekToolMode: %w", err)
+	}
+	return oldValue.DeepseekToolMode, nil
+}
+
+// ResetDeepseekToolMode resets all changes to the "deepseek_tool_mode" field.
+func (m *APIKeyMutation) ResetDeepseekToolMode() {
+	m.deepseek_tool_mode = nil
+}
+
+// SetRequestSpeedTier sets the "request_speed_tier" field.
+func (m *APIKeyMutation) SetRequestSpeedTier(s string) {
+	m.request_speed_tier = &s
+}
+
+// RequestSpeedTier returns the value of the "request_speed_tier" field in the mutation.
+func (m *APIKeyMutation) RequestSpeedTier() (r string, exists bool) {
+	v := m.request_speed_tier
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldRequestSpeedTier returns the old "request_speed_tier" field's value of the APIKey entity.
+// If the APIKey object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *APIKeyMutation) OldRequestSpeedTier(ctx context.Context) (v *string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldRequestSpeedTier is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldRequestSpeedTier requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldRequestSpeedTier: %w", err)
+	}
+	return oldValue.RequestSpeedTier, nil
+}
+
+// ClearRequestSpeedTier clears the value of the "request_speed_tier" field.
+func (m *APIKeyMutation) ClearRequestSpeedTier() {
+	m.request_speed_tier = nil
+	m.clearedFields[apikey.FieldRequestSpeedTier] = struct{}{}
+}
+
+// RequestSpeedTierCleared returns if the "request_speed_tier" field was cleared in this mutation.
+func (m *APIKeyMutation) RequestSpeedTierCleared() bool {
+	_, ok := m.clearedFields[apikey.FieldRequestSpeedTier]
+	return ok
+}
+
+// ResetRequestSpeedTier resets all changes to the "request_speed_tier" field.
+func (m *APIKeyMutation) ResetRequestSpeedTier() {
+	m.request_speed_tier = nil
+	delete(m.clearedFields, apikey.FieldRequestSpeedTier)
 }
 
 // SetStatus sets the "status" field.
@@ -1532,7 +1619,7 @@ func (m *APIKeyMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *APIKeyMutation) Fields() []string {
-	fields := make([]string, 0, 23)
+	fields := make([]string, 0, 25)
 	if m.created_at != nil {
 		fields = append(fields, apikey.FieldCreatedAt)
 	}
@@ -1553,6 +1640,12 @@ func (m *APIKeyMutation) Fields() []string {
 	}
 	if m.group != nil {
 		fields = append(fields, apikey.FieldGroupID)
+	}
+	if m.deepseek_tool_mode != nil {
+		fields = append(fields, apikey.FieldDeepseekToolMode)
+	}
+	if m.request_speed_tier != nil {
+		fields = append(fields, apikey.FieldRequestSpeedTier)
 	}
 	if m.status != nil {
 		fields = append(fields, apikey.FieldStatus)
@@ -1624,6 +1717,10 @@ func (m *APIKeyMutation) Field(name string) (ent.Value, bool) {
 		return m.Name()
 	case apikey.FieldGroupID:
 		return m.GroupID()
+	case apikey.FieldDeepseekToolMode:
+		return m.DeepseekToolMode()
+	case apikey.FieldRequestSpeedTier:
+		return m.RequestSpeedTier()
 	case apikey.FieldStatus:
 		return m.Status()
 	case apikey.FieldLastUsedAt:
@@ -1679,6 +1776,10 @@ func (m *APIKeyMutation) OldField(ctx context.Context, name string) (ent.Value, 
 		return m.OldName(ctx)
 	case apikey.FieldGroupID:
 		return m.OldGroupID(ctx)
+	case apikey.FieldDeepseekToolMode:
+		return m.OldDeepseekToolMode(ctx)
+	case apikey.FieldRequestSpeedTier:
+		return m.OldRequestSpeedTier(ctx)
 	case apikey.FieldStatus:
 		return m.OldStatus(ctx)
 	case apikey.FieldLastUsedAt:
@@ -1768,6 +1869,20 @@ func (m *APIKeyMutation) SetField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.SetGroupID(v)
+		return nil
+	case apikey.FieldDeepseekToolMode:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetDeepseekToolMode(v)
+		return nil
+	case apikey.FieldRequestSpeedTier:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetRequestSpeedTier(v)
 		return nil
 	case apikey.FieldStatus:
 		v, ok := value.(string)
@@ -2016,6 +2131,9 @@ func (m *APIKeyMutation) ClearedFields() []string {
 	if m.FieldCleared(apikey.FieldGroupID) {
 		fields = append(fields, apikey.FieldGroupID)
 	}
+	if m.FieldCleared(apikey.FieldRequestSpeedTier) {
+		fields = append(fields, apikey.FieldRequestSpeedTier)
+	}
 	if m.FieldCleared(apikey.FieldLastUsedAt) {
 		fields = append(fields, apikey.FieldLastUsedAt)
 	}
@@ -2056,6 +2174,9 @@ func (m *APIKeyMutation) ClearField(name string) error {
 		return nil
 	case apikey.FieldGroupID:
 		m.ClearGroupID()
+		return nil
+	case apikey.FieldRequestSpeedTier:
+		m.ClearRequestSpeedTier()
 		return nil
 	case apikey.FieldLastUsedAt:
 		m.ClearLastUsedAt()
@@ -2106,6 +2227,12 @@ func (m *APIKeyMutation) ResetField(name string) error {
 		return nil
 	case apikey.FieldGroupID:
 		m.ResetGroupID()
+		return nil
+	case apikey.FieldDeepseekToolMode:
+		m.ResetDeepseekToolMode()
+		return nil
+	case apikey.FieldRequestSpeedTier:
+		m.ResetRequestSpeedTier()
 		return nil
 	case apikey.FieldStatus:
 		m.ResetStatus()
@@ -5088,19 +5215,21 @@ func (m *AccountMutation) ResetEdge(name string) error {
 // AccountGroupMutation represents an operation that mutates the AccountGroup nodes in the graph.
 type AccountGroupMutation struct {
 	config
-	op             Op
-	typ            string
-	priority       *int
-	addpriority    *int
-	created_at     *time.Time
-	clearedFields  map[string]struct{}
-	account        *int64
-	clearedaccount bool
-	group          *int64
-	clearedgroup   bool
-	done           bool
-	oldValue       func(context.Context) (*AccountGroup, error)
-	predicates     []predicate.AccountGroup
+	op                        Op
+	typ                       string
+	request_speed_tiers       *[]string
+	appendrequest_speed_tiers []string
+	priority                  *int
+	addpriority               *int
+	created_at                *time.Time
+	clearedFields             map[string]struct{}
+	account                   *int64
+	clearedaccount            bool
+	group                     *int64
+	clearedgroup              bool
+	done                      bool
+	oldValue                  func(context.Context) (*AccountGroup, error)
+	predicates                []predicate.AccountGroup
 }
 
 var _ ent.Mutation = (*AccountGroupMutation)(nil)
@@ -5177,6 +5306,40 @@ func (m *AccountGroupMutation) GroupID() (r int64, exists bool) {
 // ResetGroupID resets all changes to the "group_id" field.
 func (m *AccountGroupMutation) ResetGroupID() {
 	m.group = nil
+}
+
+// SetRequestSpeedTiers sets the "request_speed_tiers" field.
+func (m *AccountGroupMutation) SetRequestSpeedTiers(s []string) {
+	m.request_speed_tiers = &s
+	m.appendrequest_speed_tiers = nil
+}
+
+// RequestSpeedTiers returns the value of the "request_speed_tiers" field in the mutation.
+func (m *AccountGroupMutation) RequestSpeedTiers() (r []string, exists bool) {
+	v := m.request_speed_tiers
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// AppendRequestSpeedTiers adds s to the "request_speed_tiers" field.
+func (m *AccountGroupMutation) AppendRequestSpeedTiers(s []string) {
+	m.appendrequest_speed_tiers = append(m.appendrequest_speed_tiers, s...)
+}
+
+// AppendedRequestSpeedTiers returns the list of values that were appended to the "request_speed_tiers" field in this mutation.
+func (m *AccountGroupMutation) AppendedRequestSpeedTiers() ([]string, bool) {
+	if len(m.appendrequest_speed_tiers) == 0 {
+		return nil, false
+	}
+	return m.appendrequest_speed_tiers, true
+}
+
+// ResetRequestSpeedTiers resets all changes to the "request_speed_tiers" field.
+func (m *AccountGroupMutation) ResetRequestSpeedTiers() {
+	m.request_speed_tiers = nil
+	m.appendrequest_speed_tiers = nil
 }
 
 // SetPriority sets the "priority" field.
@@ -5325,12 +5488,15 @@ func (m *AccountGroupMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *AccountGroupMutation) Fields() []string {
-	fields := make([]string, 0, 4)
+	fields := make([]string, 0, 5)
 	if m.account != nil {
 		fields = append(fields, accountgroup.FieldAccountID)
 	}
 	if m.group != nil {
 		fields = append(fields, accountgroup.FieldGroupID)
+	}
+	if m.request_speed_tiers != nil {
+		fields = append(fields, accountgroup.FieldRequestSpeedTiers)
 	}
 	if m.priority != nil {
 		fields = append(fields, accountgroup.FieldPriority)
@@ -5350,6 +5516,8 @@ func (m *AccountGroupMutation) Field(name string) (ent.Value, bool) {
 		return m.AccountID()
 	case accountgroup.FieldGroupID:
 		return m.GroupID()
+	case accountgroup.FieldRequestSpeedTiers:
+		return m.RequestSpeedTiers()
 	case accountgroup.FieldPriority:
 		return m.Priority()
 	case accountgroup.FieldCreatedAt:
@@ -5383,6 +5551,13 @@ func (m *AccountGroupMutation) SetField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.SetGroupID(v)
+		return nil
+	case accountgroup.FieldRequestSpeedTiers:
+		v, ok := value.([]string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetRequestSpeedTiers(v)
 		return nil
 	case accountgroup.FieldPriority:
 		v, ok := value.(int)
@@ -5467,6 +5642,9 @@ func (m *AccountGroupMutation) ResetField(name string) error {
 		return nil
 	case accountgroup.FieldGroupID:
 		m.ResetGroupID()
+		return nil
+	case accountgroup.FieldRequestSpeedTiers:
+		m.ResetRequestSpeedTiers()
 		return nil
 	case accountgroup.FieldPriority:
 		m.ResetPriority()
@@ -14619,6 +14797,8 @@ type ChannelMonitorMutation struct {
 	appendextra_models      []string
 	group_name              *string
 	enabled                 *bool
+	sort_order              *int
+	addsort_order           *int
 	interval_seconds        *int
 	addinterval_seconds     *int
 	jitter_seconds          *int
@@ -15271,6 +15451,62 @@ func (m *ChannelMonitorMutation) ResetEnabled() {
 	m.enabled = nil
 }
 
+// SetSortOrder sets the "sort_order" field.
+func (m *ChannelMonitorMutation) SetSortOrder(i int) {
+	m.sort_order = &i
+	m.addsort_order = nil
+}
+
+// SortOrder returns the value of the "sort_order" field in the mutation.
+func (m *ChannelMonitorMutation) SortOrder() (r int, exists bool) {
+	v := m.sort_order
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldSortOrder returns the old "sort_order" field's value of the ChannelMonitor entity.
+// If the ChannelMonitor object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ChannelMonitorMutation) OldSortOrder(ctx context.Context) (v int, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldSortOrder is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldSortOrder requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldSortOrder: %w", err)
+	}
+	return oldValue.SortOrder, nil
+}
+
+// AddSortOrder adds i to the "sort_order" field.
+func (m *ChannelMonitorMutation) AddSortOrder(i int) {
+	if m.addsort_order != nil {
+		*m.addsort_order += i
+	} else {
+		m.addsort_order = &i
+	}
+}
+
+// AddedSortOrder returns the value that was added to the "sort_order" field in this mutation.
+func (m *ChannelMonitorMutation) AddedSortOrder() (r int, exists bool) {
+	v := m.addsort_order
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetSortOrder resets all changes to the "sort_order" field.
+func (m *ChannelMonitorMutation) ResetSortOrder() {
+	m.sort_order = nil
+	m.addsort_order = nil
+}
+
 // SetIntervalSeconds sets the "interval_seconds" field.
 func (m *ChannelMonitorMutation) SetIntervalSeconds(i int) {
 	m.interval_seconds = &i
@@ -15840,7 +16076,7 @@ func (m *ChannelMonitorMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *ChannelMonitorMutation) Fields() []string {
-	fields := make([]string, 0, 21)
+	fields := make([]string, 0, 22)
 	if m.created_at != nil {
 		fields = append(fields, channelmonitor.FieldCreatedAt)
 	}
@@ -15879,6 +16115,9 @@ func (m *ChannelMonitorMutation) Fields() []string {
 	}
 	if m.enabled != nil {
 		fields = append(fields, channelmonitor.FieldEnabled)
+	}
+	if m.sort_order != nil {
+		fields = append(fields, channelmonitor.FieldSortOrder)
 	}
 	if m.interval_seconds != nil {
 		fields = append(fields, channelmonitor.FieldIntervalSeconds)
@@ -15938,6 +16177,8 @@ func (m *ChannelMonitorMutation) Field(name string) (ent.Value, bool) {
 		return m.GroupName()
 	case channelmonitor.FieldEnabled:
 		return m.Enabled()
+	case channelmonitor.FieldSortOrder:
+		return m.SortOrder()
 	case channelmonitor.FieldIntervalSeconds:
 		return m.IntervalSeconds()
 	case channelmonitor.FieldJitterSeconds:
@@ -15989,6 +16230,8 @@ func (m *ChannelMonitorMutation) OldField(ctx context.Context, name string) (ent
 		return m.OldGroupName(ctx)
 	case channelmonitor.FieldEnabled:
 		return m.OldEnabled(ctx)
+	case channelmonitor.FieldSortOrder:
+		return m.OldSortOrder(ctx)
 	case channelmonitor.FieldIntervalSeconds:
 		return m.OldIntervalSeconds(ctx)
 	case channelmonitor.FieldJitterSeconds:
@@ -16105,6 +16348,13 @@ func (m *ChannelMonitorMutation) SetField(name string, value ent.Value) error {
 		}
 		m.SetEnabled(v)
 		return nil
+	case channelmonitor.FieldSortOrder:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetSortOrder(v)
+		return nil
 	case channelmonitor.FieldIntervalSeconds:
 		v, ok := value.(int)
 		if !ok {
@@ -16172,6 +16422,9 @@ func (m *ChannelMonitorMutation) AddedFields() []string {
 	if m.addaccount_id != nil {
 		fields = append(fields, channelmonitor.FieldAccountID)
 	}
+	if m.addsort_order != nil {
+		fields = append(fields, channelmonitor.FieldSortOrder)
+	}
 	if m.addinterval_seconds != nil {
 		fields = append(fields, channelmonitor.FieldIntervalSeconds)
 	}
@@ -16191,6 +16444,8 @@ func (m *ChannelMonitorMutation) AddedField(name string) (ent.Value, bool) {
 	switch name {
 	case channelmonitor.FieldAccountID:
 		return m.AddedAccountID()
+	case channelmonitor.FieldSortOrder:
+		return m.AddedSortOrder()
 	case channelmonitor.FieldIntervalSeconds:
 		return m.AddedIntervalSeconds()
 	case channelmonitor.FieldJitterSeconds:
@@ -16212,6 +16467,13 @@ func (m *ChannelMonitorMutation) AddField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.AddAccountID(v)
+		return nil
+	case channelmonitor.FieldSortOrder:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddSortOrder(v)
 		return nil
 	case channelmonitor.FieldIntervalSeconds:
 		v, ok := value.(int)
@@ -16332,6 +16594,9 @@ func (m *ChannelMonitorMutation) ResetField(name string) error {
 		return nil
 	case channelmonitor.FieldEnabled:
 		m.ResetEnabled()
+		return nil
+	case channelmonitor.FieldSortOrder:
+		m.ResetSortOrder()
 		return nil
 	case channelmonitor.FieldIntervalSeconds:
 		m.ResetIntervalSeconds()
@@ -22135,6 +22400,10 @@ type GroupMutation struct {
 	video_model_prices                      *map[string]map[string]float64
 	web_search_price_per_call               *float64
 	addweb_search_price_per_call            *float64
+	upstream_rejection_billing_enabled      *bool
+	upstream_rejection_price                *float64
+	addupstream_rejection_price             *float64
+	deepseek_tools                          *domain.DeepSeekToolsConfig
 	search_price_per_1k                     *float64
 	addsearch_price_per_1k                  *float64
 	audio_realtime_price_per_min            *float64
@@ -22160,6 +22429,9 @@ type GroupMutation struct {
 	addsort_order                           *int
 	allow_messages_dispatch                 *bool
 	allow_live                              *bool
+	openai_service_tier_policy              *string
+	request_speed_selection_enabled         *bool
+	default_request_speed_tier              *string
 	force_openai_fast                       *bool
 	force_openai_ultrafast                  *bool
 	free_openai_fast                        *bool
@@ -24166,6 +24438,147 @@ func (m *GroupMutation) ResetWebSearchPricePerCall() {
 	delete(m.clearedFields, group.FieldWebSearchPricePerCall)
 }
 
+// SetUpstreamRejectionBillingEnabled sets the "upstream_rejection_billing_enabled" field.
+func (m *GroupMutation) SetUpstreamRejectionBillingEnabled(b bool) {
+	m.upstream_rejection_billing_enabled = &b
+}
+
+// UpstreamRejectionBillingEnabled returns the value of the "upstream_rejection_billing_enabled" field in the mutation.
+func (m *GroupMutation) UpstreamRejectionBillingEnabled() (r bool, exists bool) {
+	v := m.upstream_rejection_billing_enabled
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldUpstreamRejectionBillingEnabled returns the old "upstream_rejection_billing_enabled" field's value of the Group entity.
+// If the Group object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *GroupMutation) OldUpstreamRejectionBillingEnabled(ctx context.Context) (v bool, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldUpstreamRejectionBillingEnabled is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldUpstreamRejectionBillingEnabled requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldUpstreamRejectionBillingEnabled: %w", err)
+	}
+	return oldValue.UpstreamRejectionBillingEnabled, nil
+}
+
+// ResetUpstreamRejectionBillingEnabled resets all changes to the "upstream_rejection_billing_enabled" field.
+func (m *GroupMutation) ResetUpstreamRejectionBillingEnabled() {
+	m.upstream_rejection_billing_enabled = nil
+}
+
+// SetUpstreamRejectionPrice sets the "upstream_rejection_price" field.
+func (m *GroupMutation) SetUpstreamRejectionPrice(f float64) {
+	m.upstream_rejection_price = &f
+	m.addupstream_rejection_price = nil
+}
+
+// UpstreamRejectionPrice returns the value of the "upstream_rejection_price" field in the mutation.
+func (m *GroupMutation) UpstreamRejectionPrice() (r float64, exists bool) {
+	v := m.upstream_rejection_price
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldUpstreamRejectionPrice returns the old "upstream_rejection_price" field's value of the Group entity.
+// If the Group object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *GroupMutation) OldUpstreamRejectionPrice(ctx context.Context) (v float64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldUpstreamRejectionPrice is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldUpstreamRejectionPrice requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldUpstreamRejectionPrice: %w", err)
+	}
+	return oldValue.UpstreamRejectionPrice, nil
+}
+
+// AddUpstreamRejectionPrice adds f to the "upstream_rejection_price" field.
+func (m *GroupMutation) AddUpstreamRejectionPrice(f float64) {
+	if m.addupstream_rejection_price != nil {
+		*m.addupstream_rejection_price += f
+	} else {
+		m.addupstream_rejection_price = &f
+	}
+}
+
+// AddedUpstreamRejectionPrice returns the value that was added to the "upstream_rejection_price" field in this mutation.
+func (m *GroupMutation) AddedUpstreamRejectionPrice() (r float64, exists bool) {
+	v := m.addupstream_rejection_price
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetUpstreamRejectionPrice resets all changes to the "upstream_rejection_price" field.
+func (m *GroupMutation) ResetUpstreamRejectionPrice() {
+	m.upstream_rejection_price = nil
+	m.addupstream_rejection_price = nil
+}
+
+// SetDeepseekTools sets the "deepseek_tools" field.
+func (m *GroupMutation) SetDeepseekTools(dstc domain.DeepSeekToolsConfig) {
+	m.deepseek_tools = &dstc
+}
+
+// DeepseekTools returns the value of the "deepseek_tools" field in the mutation.
+func (m *GroupMutation) DeepseekTools() (r domain.DeepSeekToolsConfig, exists bool) {
+	v := m.deepseek_tools
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldDeepseekTools returns the old "deepseek_tools" field's value of the Group entity.
+// If the Group object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *GroupMutation) OldDeepseekTools(ctx context.Context) (v domain.DeepSeekToolsConfig, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldDeepseekTools is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldDeepseekTools requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldDeepseekTools: %w", err)
+	}
+	return oldValue.DeepseekTools, nil
+}
+
+// ClearDeepseekTools clears the value of the "deepseek_tools" field.
+func (m *GroupMutation) ClearDeepseekTools() {
+	m.deepseek_tools = nil
+	m.clearedFields[group.FieldDeepseekTools] = struct{}{}
+}
+
+// DeepseekToolsCleared returns if the "deepseek_tools" field was cleared in this mutation.
+func (m *GroupMutation) DeepseekToolsCleared() bool {
+	_, ok := m.clearedFields[group.FieldDeepseekTools]
+	return ok
+}
+
+// ResetDeepseekTools resets all changes to the "deepseek_tools" field.
+func (m *GroupMutation) ResetDeepseekTools() {
+	m.deepseek_tools = nil
+	delete(m.clearedFields, group.FieldDeepseekTools)
+}
+
 // SetSearchPricePer1k sets the "search_price_per_1k" field.
 func (m *GroupMutation) SetSearchPricePer1k(f float64) {
 	m.search_price_per_1k = &f
@@ -25021,6 +25434,127 @@ func (m *GroupMutation) OldAllowLive(ctx context.Context) (v bool, err error) {
 // ResetAllowLive resets all changes to the "allow_live" field.
 func (m *GroupMutation) ResetAllowLive() {
 	m.allow_live = nil
+}
+
+// SetOpenaiServiceTierPolicy sets the "openai_service_tier_policy" field.
+func (m *GroupMutation) SetOpenaiServiceTierPolicy(s string) {
+	m.openai_service_tier_policy = &s
+}
+
+// OpenaiServiceTierPolicy returns the value of the "openai_service_tier_policy" field in the mutation.
+func (m *GroupMutation) OpenaiServiceTierPolicy() (r string, exists bool) {
+	v := m.openai_service_tier_policy
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldOpenaiServiceTierPolicy returns the old "openai_service_tier_policy" field's value of the Group entity.
+// If the Group object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *GroupMutation) OldOpenaiServiceTierPolicy(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldOpenaiServiceTierPolicy is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldOpenaiServiceTierPolicy requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldOpenaiServiceTierPolicy: %w", err)
+	}
+	return oldValue.OpenaiServiceTierPolicy, nil
+}
+
+// ClearOpenaiServiceTierPolicy clears the value of the "openai_service_tier_policy" field.
+func (m *GroupMutation) ClearOpenaiServiceTierPolicy() {
+	m.openai_service_tier_policy = nil
+	m.clearedFields[group.FieldOpenaiServiceTierPolicy] = struct{}{}
+}
+
+// OpenaiServiceTierPolicyCleared returns if the "openai_service_tier_policy" field was cleared in this mutation.
+func (m *GroupMutation) OpenaiServiceTierPolicyCleared() bool {
+	_, ok := m.clearedFields[group.FieldOpenaiServiceTierPolicy]
+	return ok
+}
+
+// ResetOpenaiServiceTierPolicy resets all changes to the "openai_service_tier_policy" field.
+func (m *GroupMutation) ResetOpenaiServiceTierPolicy() {
+	m.openai_service_tier_policy = nil
+	delete(m.clearedFields, group.FieldOpenaiServiceTierPolicy)
+}
+
+// SetRequestSpeedSelectionEnabled sets the "request_speed_selection_enabled" field.
+func (m *GroupMutation) SetRequestSpeedSelectionEnabled(b bool) {
+	m.request_speed_selection_enabled = &b
+}
+
+// RequestSpeedSelectionEnabled returns the value of the "request_speed_selection_enabled" field in the mutation.
+func (m *GroupMutation) RequestSpeedSelectionEnabled() (r bool, exists bool) {
+	v := m.request_speed_selection_enabled
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldRequestSpeedSelectionEnabled returns the old "request_speed_selection_enabled" field's value of the Group entity.
+// If the Group object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *GroupMutation) OldRequestSpeedSelectionEnabled(ctx context.Context) (v bool, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldRequestSpeedSelectionEnabled is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldRequestSpeedSelectionEnabled requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldRequestSpeedSelectionEnabled: %w", err)
+	}
+	return oldValue.RequestSpeedSelectionEnabled, nil
+}
+
+// ResetRequestSpeedSelectionEnabled resets all changes to the "request_speed_selection_enabled" field.
+func (m *GroupMutation) ResetRequestSpeedSelectionEnabled() {
+	m.request_speed_selection_enabled = nil
+}
+
+// SetDefaultRequestSpeedTier sets the "default_request_speed_tier" field.
+func (m *GroupMutation) SetDefaultRequestSpeedTier(s string) {
+	m.default_request_speed_tier = &s
+}
+
+// DefaultRequestSpeedTier returns the value of the "default_request_speed_tier" field in the mutation.
+func (m *GroupMutation) DefaultRequestSpeedTier() (r string, exists bool) {
+	v := m.default_request_speed_tier
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldDefaultRequestSpeedTier returns the old "default_request_speed_tier" field's value of the Group entity.
+// If the Group object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *GroupMutation) OldDefaultRequestSpeedTier(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldDefaultRequestSpeedTier is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldDefaultRequestSpeedTier requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldDefaultRequestSpeedTier: %w", err)
+	}
+	return oldValue.DefaultRequestSpeedTier, nil
+}
+
+// ResetDefaultRequestSpeedTier resets all changes to the "default_request_speed_tier" field.
+func (m *GroupMutation) ResetDefaultRequestSpeedTier() {
+	m.default_request_speed_tier = nil
 }
 
 // SetForceOpenaiFast sets the "force_openai_fast" field.
@@ -26032,7 +26566,7 @@ func (m *GroupMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *GroupMutation) Fields() []string {
-	fields := make([]string, 0, 69)
+	fields := make([]string, 0, 75)
 	if m.created_at != nil {
 		fields = append(fields, group.FieldCreatedAt)
 	}
@@ -26144,6 +26678,15 @@ func (m *GroupMutation) Fields() []string {
 	if m.web_search_price_per_call != nil {
 		fields = append(fields, group.FieldWebSearchPricePerCall)
 	}
+	if m.upstream_rejection_billing_enabled != nil {
+		fields = append(fields, group.FieldUpstreamRejectionBillingEnabled)
+	}
+	if m.upstream_rejection_price != nil {
+		fields = append(fields, group.FieldUpstreamRejectionPrice)
+	}
+	if m.deepseek_tools != nil {
+		fields = append(fields, group.FieldDeepseekTools)
+	}
 	if m.search_price_per_1k != nil {
 		fields = append(fields, group.FieldSearchPricePer1k)
 	}
@@ -26191,6 +26734,15 @@ func (m *GroupMutation) Fields() []string {
 	}
 	if m.allow_live != nil {
 		fields = append(fields, group.FieldAllowLive)
+	}
+	if m.openai_service_tier_policy != nil {
+		fields = append(fields, group.FieldOpenaiServiceTierPolicy)
+	}
+	if m.request_speed_selection_enabled != nil {
+		fields = append(fields, group.FieldRequestSpeedSelectionEnabled)
+	}
+	if m.default_request_speed_tier != nil {
+		fields = append(fields, group.FieldDefaultRequestSpeedTier)
 	}
 	if m.force_openai_fast != nil {
 		fields = append(fields, group.FieldForceOpenaiFast)
@@ -26322,6 +26874,12 @@ func (m *GroupMutation) Field(name string) (ent.Value, bool) {
 		return m.VideoModelPrices()
 	case group.FieldWebSearchPricePerCall:
 		return m.WebSearchPricePerCall()
+	case group.FieldUpstreamRejectionBillingEnabled:
+		return m.UpstreamRejectionBillingEnabled()
+	case group.FieldUpstreamRejectionPrice:
+		return m.UpstreamRejectionPrice()
+	case group.FieldDeepseekTools:
+		return m.DeepseekTools()
 	case group.FieldSearchPricePer1k:
 		return m.SearchPricePer1k()
 	case group.FieldAudioRealtimePricePerMin:
@@ -26354,6 +26912,12 @@ func (m *GroupMutation) Field(name string) (ent.Value, bool) {
 		return m.AllowMessagesDispatch()
 	case group.FieldAllowLive:
 		return m.AllowLive()
+	case group.FieldOpenaiServiceTierPolicy:
+		return m.OpenaiServiceTierPolicy()
+	case group.FieldRequestSpeedSelectionEnabled:
+		return m.RequestSpeedSelectionEnabled()
+	case group.FieldDefaultRequestSpeedTier:
+		return m.DefaultRequestSpeedTier()
 	case group.FieldForceOpenaiFast:
 		return m.ForceOpenaiFast()
 	case group.FieldForceOpenaiUltrafast:
@@ -26469,6 +27033,12 @@ func (m *GroupMutation) OldField(ctx context.Context, name string) (ent.Value, e
 		return m.OldVideoModelPrices(ctx)
 	case group.FieldWebSearchPricePerCall:
 		return m.OldWebSearchPricePerCall(ctx)
+	case group.FieldUpstreamRejectionBillingEnabled:
+		return m.OldUpstreamRejectionBillingEnabled(ctx)
+	case group.FieldUpstreamRejectionPrice:
+		return m.OldUpstreamRejectionPrice(ctx)
+	case group.FieldDeepseekTools:
+		return m.OldDeepseekTools(ctx)
 	case group.FieldSearchPricePer1k:
 		return m.OldSearchPricePer1k(ctx)
 	case group.FieldAudioRealtimePricePerMin:
@@ -26501,6 +27071,12 @@ func (m *GroupMutation) OldField(ctx context.Context, name string) (ent.Value, e
 		return m.OldAllowMessagesDispatch(ctx)
 	case group.FieldAllowLive:
 		return m.OldAllowLive(ctx)
+	case group.FieldOpenaiServiceTierPolicy:
+		return m.OldOpenaiServiceTierPolicy(ctx)
+	case group.FieldRequestSpeedSelectionEnabled:
+		return m.OldRequestSpeedSelectionEnabled(ctx)
+	case group.FieldDefaultRequestSpeedTier:
+		return m.OldDefaultRequestSpeedTier(ctx)
 	case group.FieldForceOpenaiFast:
 		return m.OldForceOpenaiFast(ctx)
 	case group.FieldForceOpenaiUltrafast:
@@ -26801,6 +27377,27 @@ func (m *GroupMutation) SetField(name string, value ent.Value) error {
 		}
 		m.SetWebSearchPricePerCall(v)
 		return nil
+	case group.FieldUpstreamRejectionBillingEnabled:
+		v, ok := value.(bool)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetUpstreamRejectionBillingEnabled(v)
+		return nil
+	case group.FieldUpstreamRejectionPrice:
+		v, ok := value.(float64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetUpstreamRejectionPrice(v)
+		return nil
+	case group.FieldDeepseekTools:
+		v, ok := value.(domain.DeepSeekToolsConfig)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetDeepseekTools(v)
+		return nil
 	case group.FieldSearchPricePer1k:
 		v, ok := value.(float64)
 		if !ok {
@@ -26912,6 +27509,27 @@ func (m *GroupMutation) SetField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.SetAllowLive(v)
+		return nil
+	case group.FieldOpenaiServiceTierPolicy:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetOpenaiServiceTierPolicy(v)
+		return nil
+	case group.FieldRequestSpeedSelectionEnabled:
+		v, ok := value.(bool)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetRequestSpeedSelectionEnabled(v)
+		return nil
+	case group.FieldDefaultRequestSpeedTier:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetDefaultRequestSpeedTier(v)
 		return nil
 	case group.FieldForceOpenaiFast:
 		v, ok := value.(bool)
@@ -27084,6 +27702,9 @@ func (m *GroupMutation) AddedFields() []string {
 	if m.addweb_search_price_per_call != nil {
 		fields = append(fields, group.FieldWebSearchPricePerCall)
 	}
+	if m.addupstream_rejection_price != nil {
+		fields = append(fields, group.FieldUpstreamRejectionPrice)
+	}
 	if m.addsearch_price_per_1k != nil {
 		fields = append(fields, group.FieldSearchPricePer1k)
 	}
@@ -27156,6 +27777,8 @@ func (m *GroupMutation) AddedField(name string) (ent.Value, bool) {
 		return m.AddedVideoPrice1080p()
 	case group.FieldWebSearchPricePerCall:
 		return m.AddedWebSearchPricePerCall()
+	case group.FieldUpstreamRejectionPrice:
+		return m.AddedUpstreamRejectionPrice()
 	case group.FieldSearchPricePer1k:
 		return m.AddedSearchPricePer1k()
 	case group.FieldAudioRealtimePricePerMin:
@@ -27304,6 +27927,13 @@ func (m *GroupMutation) AddField(name string, value ent.Value) error {
 		}
 		m.AddWebSearchPricePerCall(v)
 		return nil
+	case group.FieldUpstreamRejectionPrice:
+		v, ok := value.(float64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddUpstreamRejectionPrice(v)
+		return nil
 	case group.FieldSearchPricePer1k:
 		v, ok := value.(float64)
 		if !ok {
@@ -27424,6 +28054,9 @@ func (m *GroupMutation) ClearedFields() []string {
 	if m.FieldCleared(group.FieldWebSearchPricePerCall) {
 		fields = append(fields, group.FieldWebSearchPricePerCall)
 	}
+	if m.FieldCleared(group.FieldDeepseekTools) {
+		fields = append(fields, group.FieldDeepseekTools)
+	}
 	if m.FieldCleared(group.FieldSearchPricePer1k) {
 		fields = append(fields, group.FieldSearchPricePer1k)
 	}
@@ -27447,6 +28080,9 @@ func (m *GroupMutation) ClearedFields() []string {
 	}
 	if m.FieldCleared(group.FieldModelRouting) {
 		fields = append(fields, group.FieldModelRouting)
+	}
+	if m.FieldCleared(group.FieldOpenaiServiceTierPolicy) {
+		fields = append(fields, group.FieldOpenaiServiceTierPolicy)
 	}
 	return fields
 }
@@ -27504,6 +28140,9 @@ func (m *GroupMutation) ClearField(name string) error {
 	case group.FieldWebSearchPricePerCall:
 		m.ClearWebSearchPricePerCall()
 		return nil
+	case group.FieldDeepseekTools:
+		m.ClearDeepseekTools()
+		return nil
 	case group.FieldSearchPricePer1k:
 		m.ClearSearchPricePer1k()
 		return nil
@@ -27527,6 +28166,9 @@ func (m *GroupMutation) ClearField(name string) error {
 		return nil
 	case group.FieldModelRouting:
 		m.ClearModelRouting()
+		return nil
+	case group.FieldOpenaiServiceTierPolicy:
+		m.ClearOpenaiServiceTierPolicy()
 		return nil
 	}
 	return fmt.Errorf("unknown Group nullable field %s", name)
@@ -27647,6 +28289,15 @@ func (m *GroupMutation) ResetField(name string) error {
 	case group.FieldWebSearchPricePerCall:
 		m.ResetWebSearchPricePerCall()
 		return nil
+	case group.FieldUpstreamRejectionBillingEnabled:
+		m.ResetUpstreamRejectionBillingEnabled()
+		return nil
+	case group.FieldUpstreamRejectionPrice:
+		m.ResetUpstreamRejectionPrice()
+		return nil
+	case group.FieldDeepseekTools:
+		m.ResetDeepseekTools()
+		return nil
 	case group.FieldSearchPricePer1k:
 		m.ResetSearchPricePer1k()
 		return nil
@@ -27694,6 +28345,15 @@ func (m *GroupMutation) ResetField(name string) error {
 		return nil
 	case group.FieldAllowLive:
 		m.ResetAllowLive()
+		return nil
+	case group.FieldOpenaiServiceTierPolicy:
+		m.ResetOpenaiServiceTierPolicy()
+		return nil
+	case group.FieldRequestSpeedSelectionEnabled:
+		m.ResetRequestSpeedSelectionEnabled()
+		return nil
+	case group.FieldDefaultRequestSpeedTier:
+		m.ResetDefaultRequestSpeedTier()
 		return nil
 	case group.FieldForceOpenaiFast:
 		m.ResetForceOpenaiFast()
@@ -44789,6 +45449,7 @@ type UsageLogMutation struct {
 	addchannel_id                *int64
 	model_mapping_chain          *string
 	billing_tier                 *string
+	billing_snapshot             *map[string]interface{}
 	billing_mode                 *string
 	input_tokens                 *int
 	addinput_tokens              *int
@@ -45502,6 +46163,55 @@ func (m *UsageLogMutation) BillingTierCleared() bool {
 func (m *UsageLogMutation) ResetBillingTier() {
 	m.billing_tier = nil
 	delete(m.clearedFields, usagelog.FieldBillingTier)
+}
+
+// SetBillingSnapshot sets the "billing_snapshot" field.
+func (m *UsageLogMutation) SetBillingSnapshot(value map[string]interface{}) {
+	m.billing_snapshot = &value
+}
+
+// BillingSnapshot returns the value of the "billing_snapshot" field in the mutation.
+func (m *UsageLogMutation) BillingSnapshot() (r map[string]interface{}, exists bool) {
+	v := m.billing_snapshot
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldBillingSnapshot returns the old "billing_snapshot" field's value of the UsageLog entity.
+// If the UsageLog object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *UsageLogMutation) OldBillingSnapshot(ctx context.Context) (v map[string]interface{}, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldBillingSnapshot is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldBillingSnapshot requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldBillingSnapshot: %w", err)
+	}
+	return oldValue.BillingSnapshot, nil
+}
+
+// ClearBillingSnapshot clears the value of the "billing_snapshot" field.
+func (m *UsageLogMutation) ClearBillingSnapshot() {
+	m.billing_snapshot = nil
+	m.clearedFields[usagelog.FieldBillingSnapshot] = struct{}{}
+}
+
+// BillingSnapshotCleared returns if the "billing_snapshot" field was cleared in this mutation.
+func (m *UsageLogMutation) BillingSnapshotCleared() bool {
+	_, ok := m.clearedFields[usagelog.FieldBillingSnapshot]
+	return ok
+}
+
+// ResetBillingSnapshot resets all changes to the "billing_snapshot" field.
+func (m *UsageLogMutation) ResetBillingSnapshot() {
+	m.billing_snapshot = nil
+	delete(m.clearedFields, usagelog.FieldBillingSnapshot)
 }
 
 // SetBillingMode sets the "billing_mode" field.
@@ -47644,7 +48354,7 @@ func (m *UsageLogMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *UsageLogMutation) Fields() []string {
-	fields := make([]string, 0, 49)
+	fields := make([]string, 0, 50)
 	if m.user != nil {
 		fields = append(fields, usagelog.FieldUserID)
 	}
@@ -47680,6 +48390,9 @@ func (m *UsageLogMutation) Fields() []string {
 	}
 	if m.billing_tier != nil {
 		fields = append(fields, usagelog.FieldBillingTier)
+	}
+	if m.billing_snapshot != nil {
+		fields = append(fields, usagelog.FieldBillingSnapshot)
 	}
 	if m.billing_mode != nil {
 		fields = append(fields, usagelog.FieldBillingMode)
@@ -47824,6 +48537,8 @@ func (m *UsageLogMutation) Field(name string) (ent.Value, bool) {
 		return m.ModelMappingChain()
 	case usagelog.FieldBillingTier:
 		return m.BillingTier()
+	case usagelog.FieldBillingSnapshot:
+		return m.BillingSnapshot()
 	case usagelog.FieldBillingMode:
 		return m.BillingMode()
 	case usagelog.FieldGroupID:
@@ -47931,6 +48646,8 @@ func (m *UsageLogMutation) OldField(ctx context.Context, name string) (ent.Value
 		return m.OldModelMappingChain(ctx)
 	case usagelog.FieldBillingTier:
 		return m.OldBillingTier(ctx)
+	case usagelog.FieldBillingSnapshot:
+		return m.OldBillingSnapshot(ctx)
 	case usagelog.FieldBillingMode:
 		return m.OldBillingMode(ctx)
 	case usagelog.FieldGroupID:
@@ -48097,6 +48814,13 @@ func (m *UsageLogMutation) SetField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.SetBillingTier(v)
+		return nil
+	case usagelog.FieldBillingSnapshot:
+		v, ok := value.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetBillingSnapshot(v)
 		return nil
 	case usagelog.FieldBillingMode:
 		v, ok := value.(string)
@@ -48687,6 +49411,9 @@ func (m *UsageLogMutation) ClearedFields() []string {
 	if m.FieldCleared(usagelog.FieldBillingTier) {
 		fields = append(fields, usagelog.FieldBillingTier)
 	}
+	if m.FieldCleared(usagelog.FieldBillingSnapshot) {
+		fields = append(fields, usagelog.FieldBillingSnapshot)
+	}
 	if m.FieldCleared(usagelog.FieldBillingMode) {
 		fields = append(fields, usagelog.FieldBillingMode)
 	}
@@ -48766,6 +49493,9 @@ func (m *UsageLogMutation) ClearField(name string) error {
 		return nil
 	case usagelog.FieldBillingTier:
 		m.ClearBillingTier()
+		return nil
+	case usagelog.FieldBillingSnapshot:
+		m.ClearBillingSnapshot()
 		return nil
 	case usagelog.FieldBillingMode:
 		m.ClearBillingMode()
@@ -48855,6 +49585,9 @@ func (m *UsageLogMutation) ResetField(name string) error {
 		return nil
 	case usagelog.FieldBillingTier:
 		m.ResetBillingTier()
+		return nil
+	case usagelog.FieldBillingSnapshot:
+		m.ResetBillingSnapshot()
 		return nil
 	case usagelog.FieldBillingMode:
 		m.ResetBillingMode()

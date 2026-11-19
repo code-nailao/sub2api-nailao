@@ -99,6 +99,34 @@ func (_c *APIKeyCreate) SetNillableGroupID(v *int64) *APIKeyCreate {
 	return _c
 }
 
+// SetDeepseekToolMode sets the "deepseek_tool_mode" field.
+func (_c *APIKeyCreate) SetDeepseekToolMode(v string) *APIKeyCreate {
+	_c.mutation.SetDeepseekToolMode(v)
+	return _c
+}
+
+// SetNillableDeepseekToolMode sets the "deepseek_tool_mode" field if the given value is not nil.
+func (_c *APIKeyCreate) SetNillableDeepseekToolMode(v *string) *APIKeyCreate {
+	if v != nil {
+		_c.SetDeepseekToolMode(*v)
+	}
+	return _c
+}
+
+// SetRequestSpeedTier sets the "request_speed_tier" field.
+func (_c *APIKeyCreate) SetRequestSpeedTier(v string) *APIKeyCreate {
+	_c.mutation.SetRequestSpeedTier(v)
+	return _c
+}
+
+// SetNillableRequestSpeedTier sets the "request_speed_tier" field if the given value is not nil.
+func (_c *APIKeyCreate) SetNillableRequestSpeedTier(v *string) *APIKeyCreate {
+	if v != nil {
+		_c.SetRequestSpeedTier(*v)
+	}
+	return _c
+}
+
 // SetStatus sets the "status" field.
 func (_c *APIKeyCreate) SetStatus(v string) *APIKeyCreate {
 	_c.mutation.SetStatus(v)
@@ -383,6 +411,10 @@ func (_c *APIKeyCreate) defaults() error {
 		v := apikey.DefaultUpdatedAt()
 		_c.mutation.SetUpdatedAt(v)
 	}
+	if _, ok := _c.mutation.DeepseekToolMode(); !ok {
+		v := apikey.DefaultDeepseekToolMode
+		_c.mutation.SetDeepseekToolMode(v)
+	}
 	if _, ok := _c.mutation.Status(); !ok {
 		v := apikey.DefaultStatus
 		_c.mutation.SetStatus(v)
@@ -448,6 +480,9 @@ func (_c *APIKeyCreate) check() error {
 		if err := apikey.NameValidator(v); err != nil {
 			return &ValidationError{Name: "name", err: fmt.Errorf(`ent: validator failed for field "APIKey.name": %w`, err)}
 		}
+	}
+	if _, ok := _c.mutation.DeepseekToolMode(); !ok {
+		return &ValidationError{Name: "deepseek_tool_mode", err: errors.New(`ent: missing required field "APIKey.deepseek_tool_mode"`)}
 	}
 	if _, ok := _c.mutation.Status(); !ok {
 		return &ValidationError{Name: "status", err: errors.New(`ent: missing required field "APIKey.status"`)}
@@ -530,6 +565,14 @@ func (_c *APIKeyCreate) createSpec() (*APIKey, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.Name(); ok {
 		_spec.SetField(apikey.FieldName, field.TypeString, value)
 		_node.Name = value
+	}
+	if value, ok := _c.mutation.DeepseekToolMode(); ok {
+		_spec.SetField(apikey.FieldDeepseekToolMode, field.TypeString, value)
+		_node.DeepseekToolMode = value
+	}
+	if value, ok := _c.mutation.RequestSpeedTier(); ok {
+		_spec.SetField(apikey.FieldRequestSpeedTier, field.TypeString, value)
+		_node.RequestSpeedTier = &value
 	}
 	if value, ok := _c.mutation.Status(); ok {
 		_spec.SetField(apikey.FieldStatus, field.TypeString, value)
@@ -778,6 +821,36 @@ func (u *APIKeyUpsert) UpdateGroupID() *APIKeyUpsert {
 // ClearGroupID clears the value of the "group_id" field.
 func (u *APIKeyUpsert) ClearGroupID() *APIKeyUpsert {
 	u.SetNull(apikey.FieldGroupID)
+	return u
+}
+
+// SetDeepseekToolMode sets the "deepseek_tool_mode" field.
+func (u *APIKeyUpsert) SetDeepseekToolMode(v string) *APIKeyUpsert {
+	u.Set(apikey.FieldDeepseekToolMode, v)
+	return u
+}
+
+// UpdateDeepseekToolMode sets the "deepseek_tool_mode" field to the value that was provided on create.
+func (u *APIKeyUpsert) UpdateDeepseekToolMode() *APIKeyUpsert {
+	u.SetExcluded(apikey.FieldDeepseekToolMode)
+	return u
+}
+
+// SetRequestSpeedTier sets the "request_speed_tier" field.
+func (u *APIKeyUpsert) SetRequestSpeedTier(v string) *APIKeyUpsert {
+	u.Set(apikey.FieldRequestSpeedTier, v)
+	return u
+}
+
+// UpdateRequestSpeedTier sets the "request_speed_tier" field to the value that was provided on create.
+func (u *APIKeyUpsert) UpdateRequestSpeedTier() *APIKeyUpsert {
+	u.SetExcluded(apikey.FieldRequestSpeedTier)
+	return u
+}
+
+// ClearRequestSpeedTier clears the value of the "request_speed_tier" field.
+func (u *APIKeyUpsert) ClearRequestSpeedTier() *APIKeyUpsert {
+	u.SetNull(apikey.FieldRequestSpeedTier)
 	return u
 }
 
@@ -1203,6 +1276,41 @@ func (u *APIKeyUpsertOne) UpdateGroupID() *APIKeyUpsertOne {
 func (u *APIKeyUpsertOne) ClearGroupID() *APIKeyUpsertOne {
 	return u.Update(func(s *APIKeyUpsert) {
 		s.ClearGroupID()
+	})
+}
+
+// SetDeepseekToolMode sets the "deepseek_tool_mode" field.
+func (u *APIKeyUpsertOne) SetDeepseekToolMode(v string) *APIKeyUpsertOne {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.SetDeepseekToolMode(v)
+	})
+}
+
+// UpdateDeepseekToolMode sets the "deepseek_tool_mode" field to the value that was provided on create.
+func (u *APIKeyUpsertOne) UpdateDeepseekToolMode() *APIKeyUpsertOne {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.UpdateDeepseekToolMode()
+	})
+}
+
+// SetRequestSpeedTier sets the "request_speed_tier" field.
+func (u *APIKeyUpsertOne) SetRequestSpeedTier(v string) *APIKeyUpsertOne {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.SetRequestSpeedTier(v)
+	})
+}
+
+// UpdateRequestSpeedTier sets the "request_speed_tier" field to the value that was provided on create.
+func (u *APIKeyUpsertOne) UpdateRequestSpeedTier() *APIKeyUpsertOne {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.UpdateRequestSpeedTier()
+	})
+}
+
+// ClearRequestSpeedTier clears the value of the "request_speed_tier" field.
+func (u *APIKeyUpsertOne) ClearRequestSpeedTier() *APIKeyUpsertOne {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.ClearRequestSpeedTier()
 	})
 }
 
@@ -1841,6 +1949,41 @@ func (u *APIKeyUpsertBulk) UpdateGroupID() *APIKeyUpsertBulk {
 func (u *APIKeyUpsertBulk) ClearGroupID() *APIKeyUpsertBulk {
 	return u.Update(func(s *APIKeyUpsert) {
 		s.ClearGroupID()
+	})
+}
+
+// SetDeepseekToolMode sets the "deepseek_tool_mode" field.
+func (u *APIKeyUpsertBulk) SetDeepseekToolMode(v string) *APIKeyUpsertBulk {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.SetDeepseekToolMode(v)
+	})
+}
+
+// UpdateDeepseekToolMode sets the "deepseek_tool_mode" field to the value that was provided on create.
+func (u *APIKeyUpsertBulk) UpdateDeepseekToolMode() *APIKeyUpsertBulk {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.UpdateDeepseekToolMode()
+	})
+}
+
+// SetRequestSpeedTier sets the "request_speed_tier" field.
+func (u *APIKeyUpsertBulk) SetRequestSpeedTier(v string) *APIKeyUpsertBulk {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.SetRequestSpeedTier(v)
+	})
+}
+
+// UpdateRequestSpeedTier sets the "request_speed_tier" field to the value that was provided on create.
+func (u *APIKeyUpsertBulk) UpdateRequestSpeedTier() *APIKeyUpsertBulk {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.UpdateRequestSpeedTier()
+	})
+}
+
+// ClearRequestSpeedTier clears the value of the "request_speed_tier" field.
+func (u *APIKeyUpsertBulk) ClearRequestSpeedTier() *APIKeyUpsertBulk {
+	return u.Update(func(s *APIKeyUpsert) {
+		s.ClearRequestSpeedTier()
 	})
 }
 

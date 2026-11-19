@@ -43,12 +43,27 @@ func (r *apiKeyRepository) activeQuery() *dbent.APIKeyQuery {
 }
 
 func (r *apiKeyRepository) Create(ctx context.Context, key *service.APIKey) error {
-	builder := r.client.APIKey.Create().
+	if key.GroupID == nil && key.RequestSpeedTier == nil {
+		return r.createAPIKeyRecord(ctx, clientFromContext(ctx, r.client), key)
+	}
+	return r.withRequestSpeedTx(ctx, func(txCtx context.Context, client *dbent.Client) error {
+		tier, err := resolveKeyRequestSpeedForWrite(txCtx, client, key.GroupID, key.RequestSpeedTier, key.RequestSpeedTier == nil)
+		if err != nil {
+			return err
+		}
+		key.RequestSpeedTier = tier
+		return r.createAPIKeyRecord(txCtx, client, key)
+	})
+}
+
+func (r *apiKeyRepository) createAPIKeyRecord(ctx context.Context, client *dbent.Client, key *service.APIKey) error {
+	builder := client.APIKey.Create().
 		SetUserID(key.UserID).
 		SetKey(key.Key).
 		SetName(key.Name).
 		SetStatus(key.Status).
 		SetNillableGroupID(key.GroupID).
+		SetNillableRequestSpeedTier(key.RequestSpeedTier).
 		SetNillableLastUsedAt(key.LastUsedAt).
 		SetQuota(key.Quota).
 		SetQuotaUsed(key.QuotaUsed).
@@ -57,6 +72,9 @@ func (r *apiKeyRepository) Create(ctx context.Context, key *service.APIKey) erro
 		SetRateLimit1d(key.RateLimit1d).
 		SetRateLimit7d(key.RateLimit7d)
 
+	if key.DeepSeekToolMode != "" {
+		builder.SetDeepseekToolMode(key.DeepSeekToolMode)
+	}
 	if len(key.IPWhitelist) > 0 {
 		builder.SetIPWhitelist(key.IPWhitelist)
 	}
@@ -133,7 +151,9 @@ func (r *apiKeyRepository) GetByKeyForAuth(ctx context.Context, key string) (*se
 		Select(
 			apikey.FieldID,
 			apikey.FieldUserID,
+			apikey.FieldDeepseekToolMode,
 			apikey.FieldGroupID,
+			apikey.FieldRequestSpeedTier,
 			apikey.FieldName,
 			apikey.FieldStatus,
 			apikey.FieldIPWhitelist,
@@ -196,6 +216,9 @@ func (r *apiKeyRepository) GetByKeyForAuth(ctx context.Context, key string) (*se
 				group.FieldVideoPrice1080p,
 				group.FieldVideoModelPrices,
 				group.FieldWebSearchPricePerCall,
+				group.FieldUpstreamRejectionBillingEnabled,
+				group.FieldUpstreamRejectionPrice,
+				group.FieldDeepseekTools,
 				group.FieldSearchPricePer1k,
 				group.FieldAudioRealtimePricePerMin,
 				group.FieldAudioTtsPricePerMillionChars,
@@ -212,7 +235,10 @@ func (r *apiKeyRepository) GetByKeyForAuth(ctx context.Context, key string) (*se
 				group.FieldAllowMessagesDispatch,
 				group.FieldAllowLive,
 				group.FieldForceOpenaiFast,
+				group.FieldOpenaiServiceTierPolicy,
 				group.FieldForceOpenaiUltrafast,
+				group.FieldRequestSpeedSelectionEnabled,
+				group.FieldDefaultRequestSpeedTier,
 				group.FieldFreeOpenaiFast,
 				group.FieldDefaultMappedModel,
 				group.FieldMessagesDispatchModelConfig,
@@ -246,7 +272,66 @@ func (r *apiKeyRepository) GetByKeyForAuth(ctx context.Context, key string) (*se
 	return apiKeyEntityToService(m), nil
 }
 
+// RenameIfNameMatches 把原名称、所有者及分组条件放进同一 UPDATE，避开检查后的竞态。
+func (r *apiKeyRepository) RenameIfNameMatches(ctx context.Context, id, userID, groupID int64, expectedName, name string) (bool, error) {
+	client := clientFromContext(ctx, r.client)
+	affected, err := client.APIKey.Update().
+		Where(apikey.IDEQ(id), apikey.UserIDEQ(userID), apikey.GroupIDEQ(groupID), apikey.NameEQ(expectedName), apikey.DeletedAtIsNil()).
+		SetName(name).
+		SetUpdatedAt(time.Now()).
+		Save(ctx)
+	return affected == 1, err
+}
+
 func (r *apiKeyRepository) Update(ctx context.Context, key *service.APIKey, fields service.APIKeyUpdateFields) error {
+	if !fields.GroupID && !fields.RequestSpeedTier {
+		return r.updateAPIKeyRecord(ctx, key, fields)
+	}
+	return r.withRequestSpeedTx(ctx, func(txCtx context.Context, client *dbent.Client) error {
+		// Every relevant write takes the target group lock before the key lock,
+		// matching group disable's group-before-keys ordering.
+		groupConfig, err := loadKeyRequestSpeedGroup(txCtx, client, key.GroupID)
+		if err != nil {
+			return err
+		}
+		rows, err := client.QueryContext(txCtx, "SELECT group_id FROM api_keys WHERE id=$1 AND deleted_at IS NULL"+rowLockClause(client, "FOR UPDATE"), key.ID)
+		if err != nil {
+			return err
+		}
+		var existing sql.NullInt64
+		if !rows.Next() {
+			_ = rows.Close()
+			return service.ErrAPIKeyNotFound
+		}
+		err = rows.Scan(&existing)
+		closeErr := rows.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if fields.CheckExpectedGroupID && !nullableGroupIDEqual(existing, fields.ExpectedGroupID) {
+			return service.ErrRequestSpeedConflict
+		}
+		changedGroup := fields.GroupID && !nullableGroupIDEqual(existing, key.GroupID)
+		if !changedGroup && !fields.RequestSpeedTier {
+			return r.updateAPIKeyRecord(txCtx, key, fields)
+		}
+		if changedGroup && !fields.RequestSpeedTier {
+			key.RequestSpeedTier = nil
+		}
+		tier, err := validateKeyRequestSpeedForWrite(txCtx, client, groupConfig, key.RequestSpeedTier, fields.ResolveRequestSpeedDefault || (changedGroup && !fields.RequestSpeedTier))
+		if err != nil {
+			return err
+		}
+		key.RequestSpeedTier = tier
+		fields.RequestSpeedTier = true
+		return r.updateAPIKeyRecord(txCtx, key, fields)
+	})
+}
+
+func (r *apiKeyRepository) updateAPIKeyRecord(ctx context.Context, key *service.APIKey, fields service.APIKeyUpdateFields) error {
 	// 空掩码代表调用方不改任何列，直接返回，避免产生一次无意义的整行写。
 	if fields.IsEmpty() {
 		return nil
@@ -262,6 +347,16 @@ func (r *apiKeyRepository) Update(ctx context.Context, key *service.APIKey, fiel
 	builder := client.APIKey.Update().
 		Where(apikey.IDEQ(key.ID), apikey.DeletedAtIsNil()).
 		SetUpdatedAt(now)
+	if fields.DeepSeekToolMode {
+		builder.SetDeepseekToolMode(key.DeepSeekToolMode)
+	}
+	if fields.RequestSpeedTier {
+		if key.RequestSpeedTier == nil {
+			builder.ClearRequestSpeedTier()
+		} else {
+			builder.SetRequestSpeedTier(*key.RequestSpeedTier)
+		}
+	}
 	if fields.Name {
 		builder.SetName(key.Name)
 	}
@@ -727,18 +822,29 @@ func (r *apiKeyRepository) ClearGroupIDByGroupID(ctx context.Context, groupID in
 	n, err := r.client.APIKey.Update().
 		Where(apikey.GroupIDEQ(groupID), apikey.DeletedAtIsNil()).
 		ClearGroupID().
+		ClearRequestSpeedTier().
 		Save(ctx)
 	return int64(n), err
 }
 
 // UpdateGroupIDByUserAndGroup 将用户下绑定 oldGroupID 的所有 Key 迁移到 newGroupID
 func (r *apiKeyRepository) UpdateGroupIDByUserAndGroup(ctx context.Context, userID, oldGroupID, newGroupID int64) (int64, error) {
-	client := clientFromContext(ctx, r.client)
-	n, err := client.APIKey.Update().
-		Where(apikey.UserIDEQ(userID), apikey.GroupIDEQ(oldGroupID), apikey.DeletedAtIsNil()).
-		SetGroupID(newGroupID).
-		Save(ctx)
-	return int64(n), err
+	var migrated int
+	err := r.withRequestSpeedTx(ctx, func(txCtx context.Context, client *dbent.Client) error {
+		tier, err := resolveKeyRequestSpeedForWrite(txCtx, client, &newGroupID, nil, true)
+		if err != nil {
+			return err
+		}
+		update := client.APIKey.Update().Where(apikey.UserIDEQ(userID), apikey.GroupIDEQ(oldGroupID), apikey.DeletedAtIsNil()).SetGroupID(newGroupID)
+		if tier == nil {
+			update.ClearRequestSpeedTier()
+		} else {
+			update.SetRequestSpeedTier(*tier)
+		}
+		migrated, err = update.Save(txCtx)
+		return err
+	})
+	return int64(migrated), err
 }
 
 // CountByGroupID 获取分组的 API Key 数量
@@ -888,29 +994,31 @@ func apiKeyEntityToService(m *dbent.APIKey) *service.APIKey {
 		return nil
 	}
 	out := &service.APIKey{
-		ID:            m.ID,
-		UserID:        m.UserID,
-		Key:           m.Key,
-		Name:          m.Name,
-		Status:        m.Status,
-		IPWhitelist:   m.IPWhitelist,
-		IPBlacklist:   m.IPBlacklist,
-		LastUsedAt:    m.LastUsedAt,
-		CreatedAt:     m.CreatedAt,
-		UpdatedAt:     m.UpdatedAt,
-		GroupID:       m.GroupID,
-		Quota:         m.Quota,
-		QuotaUsed:     m.QuotaUsed,
-		ExpiresAt:     m.ExpiresAt,
-		RateLimit5h:   m.RateLimit5h,
-		RateLimit1d:   m.RateLimit1d,
-		RateLimit7d:   m.RateLimit7d,
-		Usage5h:       m.Usage5h,
-		Usage1d:       m.Usage1d,
-		Usage7d:       m.Usage7d,
-		Window5hStart: m.Window5hStart,
-		Window1dStart: m.Window1dStart,
-		Window7dStart: m.Window7dStart,
+		ID:               m.ID,
+		UserID:           m.UserID,
+		Key:              m.Key,
+		Name:             m.Name,
+		Status:           m.Status,
+		IPWhitelist:      m.IPWhitelist,
+		IPBlacklist:      m.IPBlacklist,
+		LastUsedAt:       m.LastUsedAt,
+		CreatedAt:        m.CreatedAt,
+		UpdatedAt:        m.UpdatedAt,
+		DeepSeekToolMode: m.DeepseekToolMode,
+		GroupID:          m.GroupID,
+		RequestSpeedTier: m.RequestSpeedTier,
+		Quota:            m.Quota,
+		QuotaUsed:        m.QuotaUsed,
+		ExpiresAt:        m.ExpiresAt,
+		RateLimit5h:      m.RateLimit5h,
+		RateLimit1d:      m.RateLimit1d,
+		RateLimit7d:      m.RateLimit7d,
+		Usage5h:          m.Usage5h,
+		Usage1d:          m.Usage1d,
+		Usage7d:          m.Usage7d,
+		Window5hStart:    m.Window5hStart,
+		Window1dStart:    m.Window1dStart,
+		Window7dStart:    m.Window7dStart,
 	}
 	if m.Edges.User != nil {
 		out.User = userEntityToService(m.Edges.User)
@@ -1011,6 +1119,9 @@ func groupEntityToService(g *dbent.Group) *service.Group {
 		VideoPrice1080P:                 g.VideoPrice1080p,
 		VideoModelPrices:                service.NormalizeVideoModelPrices(g.VideoModelPrices),
 		WebSearchPricePerCall:           g.WebSearchPricePerCall,
+		UpstreamRejectionBillingEnabled: g.UpstreamRejectionBillingEnabled,
+		UpstreamRejectionPrice:          g.UpstreamRejectionPrice,
+		DeepSeekTools:                   g.DeepseekTools,
 		SearchPricePer1k:                g.SearchPricePer1k,
 		AudioRealtimePricePerMin:        g.AudioRealtimePricePerMin,
 		AudioTTSPricePerMillionChars:    g.AudioTtsPricePerMillionChars,
@@ -1029,7 +1140,10 @@ func groupEntityToService(g *dbent.Group) *service.Group {
 		AllowMessagesDispatch:           g.AllowMessagesDispatch,
 		AllowLive:                       g.AllowLive,
 		ForceOpenAIFast:                 g.ForceOpenaiFast,
+		OpenAIServiceTierPolicy:         g.OpenaiServiceTierPolicy,
 		ForceOpenAIUltrafast:            g.ForceOpenaiUltrafast,
+		RequestSpeedSelectionEnabled:    g.RequestSpeedSelectionEnabled,
+		DefaultRequestSpeedTier:         g.DefaultRequestSpeedTier,
 		FreeOpenAIFast:                  g.FreeOpenaiFast,
 		RequireOAuthOnly:                g.RequireOauthOnly,
 		RequirePrivacySet:               g.RequirePrivacySet,

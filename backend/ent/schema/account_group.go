@@ -30,6 +30,7 @@ func (AccountGroup) Fields() []ent.Field {
 	return []ent.Field{
 		field.Int64("account_id"),
 		field.Int64("group_id"),
+		field.JSON("request_speed_tiers", []string{}).Default([]string{}),
 		field.Int("priority").
 			Default(50),
 		field.Time("created_at").

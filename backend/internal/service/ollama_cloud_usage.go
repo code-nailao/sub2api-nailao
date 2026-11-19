@@ -21,6 +21,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 	"github.com/google/uuid"
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/sync/errgroup"
@@ -451,15 +452,20 @@ func (s *OllamaCloudUsageService) Start() {
 		return
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.started || s.stopped {
-		s.mu.Unlock()
 		return
 	}
 	s.started = true
-	s.wg.Add(2)
-	s.mu.Unlock()
-	go s.runLoop()
+	// Request-triggered 429 probes belong to every serving instance. Only the
+	// periodic account scan belongs to the global background owner. Register
+	// both workers while holding mu so Stop cannot race Wait against wg.Add.
+	s.wg.Add(1)
 	go s.probeLoop()
+	processrole.StartBackground("OllamaCloudUsage", func() {
+		s.wg.Add(1)
+		go s.runLoop()
+	})
 }
 
 func (s *OllamaCloudUsageService) Stop() {

@@ -110,6 +110,30 @@ function mountTable(props = {}) {
 }
 
 describe('AvailableChannelsTable responsive surfaces', () => {
+  it('passes each group fee to both responsive surfaces without a user-rate override', () => {
+    const wrapper = mountTable({
+      rows: [{
+        ...rows[0],
+        platforms: [{
+          ...rows[0].platforms[0],
+          platform: 'grok',
+          groups: [{
+            ...rows[0].platforms[0].groups[0],
+            platform: 'grok',
+            upstream_rejection_billing_enabled: true,
+            upstream_rejection_price: 0.1,
+          }],
+        }],
+      }],
+    })
+    expect(wrapper.get('[data-testid="desktop-channels"]').findAll('[data-testid="upstream-rejection-notice"]')).toHaveLength(1)
+    expect(wrapper.get('[data-testid="mobile-channels"]').findAll('[data-testid="upstream-rejection-notice"]')).toHaveLength(1)
+    const notices = wrapper.findAllComponents({ name: 'UpstreamRejectionNotice' })
+    expect(notices).toHaveLength(2)
+    expect(notices.every(notice => notice.props('group').upstream_rejection_price === 0.1)).toBe(true)
+    expect(wrapper.get('[data-testid="desktop-channels"] [data-group-badge]').text()).toContain(':1.2:0.8')
+  })
+
   it('keeps the five-column table as the desktop-only surface', () => {
     const wrapper = mountTable()
     const desktop = wrapper.get('[data-testid="desktop-channels"]')

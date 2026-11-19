@@ -39,6 +39,32 @@ POSTGRES_ENV_FILE=""
 POSTGRES_PROBE_ENV_FILE=""
 REDIS_ENV_FILE=""
 
+# stat(1) differs between GNU and macOS: GNU takes -c FORMAT, macOS takes -f FORMAT.
+# Exit status alone cannot tell them apart, because each platform accepts the
+# other's flag and prints the wrong thing (GNU reads -f as "filesystem" and treats
+# '%Lp' as a path). So try GNU first and keep its answer only when it is a plain
+# number. This keeps the script runnable from the Linux CI job that checks it.
+file_stat() {
+    local target=$1 format=$2 value
+    case ${format} in
+        # The `|| true` matters: the script runs under `set -e`, where a failing
+        # command substitution would end the run instead of falling through.
+        mode)
+            value=$(stat -c '%a' "${target}" 2>/dev/null || true)
+            [[ ${value} =~ ^[0-7]+$ ]] || value=$(stat -f '%Lp' "${target}" 2>/dev/null || true)
+            ;;
+        owner)
+            value=$(stat -c '%u' "${target}" 2>/dev/null || true)
+            [[ ${value} =~ ^[0-9]+$ ]] || value=$(stat -f '%u' "${target}" 2>/dev/null || true)
+            ;;
+        *)
+            die "Unsupported stat format: ${format}"
+            ;;
+    esac
+    [[ -n ${value} ]] || return 1
+    printf '%s\n' "${value}"
+}
+
 info() {
     printf '[INFO] %s\n' "$*"
 }
@@ -402,8 +428,8 @@ validate_env_file_security() {
     local owner mode permissions
 
     [[ -f "${ENV_FILE}" ]] || die "Environment file not found: ${ENV_FILE}. Run '$0 init' first."
-    owner="$(stat -f '%u' "${ENV_FILE}")" || die "Unable to read owner for ${ENV_FILE}."
-    mode="$(stat -f '%Lp' "${ENV_FILE}")" || die "Unable to read permissions for ${ENV_FILE}."
+    owner="$(file_stat "${ENV_FILE}" owner)" || die "Unable to read owner for ${ENV_FILE}."
+    mode="$(file_stat "${ENV_FILE}" mode)" || die "Unable to read permissions for ${ENV_FILE}."
     [[ "${owner}" == "${EUID}" ]] || die "Environment file must be owned by the current user: ${ENV_FILE}"
     [[ "${mode}" =~ ^[0-7]+$ ]] || die "Unable to parse permissions for ${ENV_FILE}: ${mode}"
     permissions=$((8#${mode}))

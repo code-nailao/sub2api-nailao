@@ -4,6 +4,7 @@
       <div
         v-if="show"
         class="modal-overlay"
+        :class="{ 'sources-drawer-overlay': placement === 'right' }"
         :style="zIndexStyle"
         :aria-labelledby="dialogId"
         role="dialog"
@@ -11,7 +12,7 @@
         @click.self="handleClose"
       >
         <!-- Modal panel -->
-        <div ref="dialogRef" :class="['modal-content', widthClasses]" @click.stop>
+        <div ref="dialogRef" :class="['modal-content', placement === 'right' ? 'sources-drawer-panel' : widthClasses]" @click.stop @keydown="handleDrawerTab">
           <!-- Header -->
           <div class="modal-header">
             <h3 :id="dialogId" class="modal-title">
@@ -69,6 +70,7 @@ interface Props {
   closeOnClickOutside?: boolean
   showCloseButton?: boolean
   zIndex?: number
+  placement?: 'center' | 'right'
 }
 
 interface Emits {
@@ -80,7 +82,8 @@ const props = withDefaults(defineProps<Props>(), {
   closeOnEscape: true,
   closeOnClickOutside: false,
   showCloseButton: true,
-  zIndex: 50
+  zIndex: 50,
+  placement: 'center'
 })
 
 const emit = defineEmits<Emits>()
@@ -114,6 +117,15 @@ const handleEscape = (event: KeyboardEvent) => {
   if (props.show && props.closeOnEscape && event.key === 'Escape' && [...openDialogs].pop() === dialogId) {
     emit('close')
   }
+}
+
+const handleDrawerTab = (event: KeyboardEvent) => {
+  if (props.placement !== 'right' || event.key !== 'Tab') return
+  const controls = [...(dialogRef.value?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]') ?? [])]
+    .filter(element => !element.hidden && element.getAttribute('aria-hidden') !== 'true')
+  const first = controls[0], last = controls[controls.length - 1]
+  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
+  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
 }
 
 const updateScrollLock = (isOpen: boolean) => {
@@ -165,3 +177,9 @@ onUnmounted(() => {
   updateScrollLock(false)
 })
 </script>
+
+<style scoped>
+.sources-drawer-overlay { align-items: stretch; justify-content: flex-end; padding: 0; }
+.sources-drawer-panel { width: min(100%, 480px); max-width: 480px; height: 100dvh; max-height: 100dvh; margin: 0; border-radius: 0; display: flex; flex-direction: column; }
+.sources-drawer-panel :deep(.modal-body) { min-height: 0; flex: 1; overflow-y: auto; }
+</style>

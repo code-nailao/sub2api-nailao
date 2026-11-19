@@ -11,7 +11,7 @@
           <Icon name="menu" size="md" />
         </button>
 
-        <div class="hidden lg:block">
+        <div :class="hidePageTitle ? 'sr-only' : 'hidden lg:block'">
           <h1 class="text-lg font-semibold text-gray-900 dark:text-white">
             {{ pageTitle }}
           </h1>
@@ -267,6 +267,8 @@ import { resolveRouteMetaKeys } from '@/router/title'
 import { resolveSiteBillingMode } from '@/utils/siteBillingMode'
 
 const router = useRouter()
+withDefaults(defineProps<{ hidePageTitle?: boolean }>(), { hidePageTitle: false })
+
 const route = useRoute()
 const { t } = useI18n()
 const appStore = useAppStore()

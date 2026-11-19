@@ -72,7 +72,17 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 	promptCacheKey string,
 	defaultMappedModel string,
 	compatPromptCacheTenantIsolated bool,
-) (*OpenAIForwardResult, error) {
+) (out *OpenAIForwardResult, forwardErr error) {
+	defer func() { StampFixedUpstreamRequestTier(ctx, out) }()
+	fixedBody, fixedErr := s.prepareFixedRequestSpeedBody(ctx, account, body, defaultMappedModel, false)
+	if fixedErr != nil {
+		writeChatCompletionsError(c, http.StatusForbidden, "permission_error", fixedErr.Error())
+		return nil, fixedErr
+	}
+	body = fixedBody
+	if result, handled, err := s.tryForwardDeepSeekTools(ctx, c, account, body, "chat", defaultMappedModel); handled {
+		return result, err
+	}
 	rememberOpenCodeInboundBody(c, body)
 	beginUpstreamResponseModelObservation(c)
 	ClearActualOpenAIUpstreamEndpoint(c)

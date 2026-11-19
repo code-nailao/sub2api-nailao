@@ -229,6 +229,7 @@ func TestAPIContracts(t *testing.T) {
 					"user_id": 1,
 					"key": "sk_custom_1234567890",
 					"name": "Key One",
+					"deepseek_tool_mode": "inherit",
 					"group_id": null,
 					"status": "active",
 					"ip_whitelist": null,
@@ -241,6 +242,7 @@ func TestAPIContracts(t *testing.T) {
 					"rate_limit_5h": 0,
 					"rate_limit_1d": 0,
 					"rate_limit_7d": 0,
+					"request_speed_tier": null,
 					"usage_5h": 0,
 					"usage_1d": 0,
 					"usage_7d": 0,
@@ -258,13 +260,14 @@ func TestAPIContracts(t *testing.T) {
 			setup: func(t *testing.T, deps *contractDeps) {
 				t.Helper()
 				deps.apiKeyRepo.MustSeed(&service.APIKey{
-					ID:        100,
-					UserID:    1,
-					Key:       "sk_custom_1234567890",
-					Name:      "Key One",
-					Status:    service.StatusActive,
-					CreatedAt: deps.now,
-					UpdatedAt: deps.now,
+					ID:               100,
+					UserID:           1,
+					Key:              "sk_custom_1234567890",
+					Name:             "Key One",
+					DeepSeekToolMode: "inherit",
+					Status:           service.StatusActive,
+					CreatedAt:        deps.now,
+					UpdatedAt:        deps.now,
 				})
 			},
 			method:     http.MethodGet,
@@ -280,6 +283,7 @@ func TestAPIContracts(t *testing.T) {
 							"user_id": 1,
 							"key": "sk_custom_1234567890",
 							"name": "Key One",
+							"deepseek_tool_mode": "inherit",
 							"group_id": null,
 							"status": "active",
 							"ip_whitelist": null,
@@ -292,6 +296,7 @@ func TestAPIContracts(t *testing.T) {
 							"rate_limit_5h": 0,
 							"rate_limit_1d": 0,
 							"rate_limit_7d": 0,
+							"request_speed_tier": null,
 							"usage_5h": 0,
 							"usage_1d": 0,
 							"usage_7d": 0,
@@ -372,7 +377,14 @@ func TestAPIContracts(t *testing.T) {
 						"video_price_720p": null,
 						"video_price_1080p": null,
 						"web_search_price_per_call": null,
+						"upstream_rejection_billing_enabled": false,
+						"upstream_rejection_price": 0,
 						"search_price_per_1k": null,
+						"deepseek_tools": {
+							"enabled": false,
+							"auto_inject": false,
+							"fetch_price_per_1k": null
+						},
 						"audio_tts_price_per_million_chars": null,
 						"audio_stt_price_per_hour": null,
 						"audio_realtime_price_per_min": null,
@@ -396,6 +408,9 @@ func TestAPIContracts(t *testing.T) {
 						"max_reasoning_effort_over_limit": "",
 						"reasoning_effort_mappings": null,
 						"rpm_limit": 0,
+						"request_speed_selection_enabled": false,
+						"default_request_speed_tier": "",
+						"available_request_speed_tiers": [],
 						"created_at": "2025-01-02T03:04:05Z",
 						"updated_at": "2025-01-02T03:04:05Z"
 					}
@@ -960,6 +975,7 @@ func TestAPIContracts(t *testing.T) {
 					"claude_code_client_version_synced": "",
 					"claude_code_version_auto_sync_enabled": true,
 					"openai_fast_policy_settings": {
+						"group_tier_policies_enabled": false,
 						"rules": []
 					},
 					"custom_menu_items": [],
@@ -1003,6 +1019,8 @@ func TestAPIContracts(t *testing.T) {
 					"channel_monitor_show_quota": false,
 					"channel_monitor_hide_user_ranking": false,
 					"channel_monitor_default_interval_seconds": 60,
+					"channel_monitor_degraded_threshold_seconds": 20,
+					"channel_monitor_request_timeout_seconds": 60,
 					"available_channels_enabled": false,
 					"subscription_enabled": true,
 					"model_plaza_enabled": false,
@@ -1284,6 +1302,7 @@ func TestAPIContracts(t *testing.T) {
 					"claude_code_client_version_synced": "",
 					"claude_code_version_auto_sync_enabled": true,
 					"openai_fast_policy_settings": {
+						"group_tier_policies_enabled": false,
 						"rules": []
 					},
 					"payment_enabled": false,
@@ -1325,6 +1344,8 @@ func TestAPIContracts(t *testing.T) {
 					"channel_monitor_show_quota": false,
 					"channel_monitor_hide_user_ranking": false,
 					"channel_monitor_default_interval_seconds": 60,
+					"channel_monitor_degraded_threshold_seconds": 20,
+					"channel_monitor_request_timeout_seconds": 60,
 					"available_channels_enabled": false,
 					"subscription_enabled": true,
 					"model_plaza_enabled": false,

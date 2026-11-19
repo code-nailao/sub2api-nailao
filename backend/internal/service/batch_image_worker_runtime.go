@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 )
 
 type BatchImageWorkerRuntime struct {
@@ -57,7 +58,7 @@ func ProvideBatchImageWorkerRuntime(
 		StaleAfter: NewBatchImageWorkerOptionsFromConfig(cfg).StaleActiveAfter,
 		Limit:      NewBatchImageWorkerOptionsFromConfig(cfg).RecoverLimit,
 	}
-	runtime.Start()
+	processrole.StartBackground("BatchImageWorker", runtime.Start)
 	return runtime
 }
 

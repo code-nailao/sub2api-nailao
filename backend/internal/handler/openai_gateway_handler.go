@@ -817,6 +817,17 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		// 从不可变的 canonical forwardBody 派生本次尝试 body 并整块剔除上游私有的加密
 		// reasoning item（含耦合的 id/summary），避免非透传上游 400 拒绝 Kiro reasoning 形态。
 		attemptBody := h.deriveOpenAIForwardAttemptBody(reqLog, forwardBody, account, &passthroughFailoverState)
+		rejectionAttempt, beginErr := h.gatewayService.BeginUpstreamRejectionBilling(c.Request.Context(), apiKey, account, reqModel, body)
+		if beginErr != nil {
+			if accountReleaseFunc != nil {
+				accountReleaseFunc()
+			}
+			status, code, message := upstreamRejectionAdmissionError(beginErr)
+			h.handleStreamingAwareError(c, status, code, message, streamStarted)
+			return
+		}
+		h.setDeepSeekUsageMetadata(c, apiKey, account, clientRequestedUsageFields(c, channelMapping, reqModel, ""), pricingAt, body)
+		c.Request = c.Request.WithContext(service.WithUpstreamRejectionBillingAttempt(c.Request.Context(), rejectionAttempt))
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer func() {
 				if accountReleaseFunc != nil {
@@ -825,6 +836,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			}()
 			return h.gatewayService.Forward(c.Request.Context(), c, account, attemptBody)
 		}()
+		err = h.gatewayService.FinishUpstreamRejectionBillingAttempt(c.Request.Context(), rejectionAttempt, result, err)
 		if h.handleForwardRequestBodyMemoryOverload(c, err, streamStarted) {
 			return
 		}
@@ -832,7 +844,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyHTTP = sessionHashBody
 		}
-		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, cyberBlockBodyHTTP, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
+		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, shouldRecordCyberFallbackUsage(err, result, rejectionAttempt != nil), cyberBlockBodyHTTP, clientRequestedUsageFields(c, channelMapping, reqModel, ""), service.HashUsageRequestPayload(body))
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
 		upstreamLatencyMs, _ := getContextInt64(c, service.OpsUpstreamLatencyMsKey)
 		responseLatencyMs := forwardDurationMs
@@ -890,6 +902,21 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				}
 			})
 		}
+		// A supplier-chargeable refusal is a terminal request, never an account failure.
+		// Record even HTTP errors / zero-token responses once before returning.
+		if err != nil && result != nil && result.DeepSeekTools != nil {
+			submitResponsesUsage(result)
+			h.writeDeepSeekContinuationError(c, result)
+			return
+		}
+		if result != nil && result.UpstreamRejection != nil {
+			submitResponsesUsage(result)
+			if err != nil && !c.Writer.Written() {
+				h.ensureForwardErrorResponse(c, streamStarted)
+			}
+			return
+		}
+
 		if err != nil {
 			if result != nil && result.ClientDisconnect {
 				reqLog.Info("openai.client_disconnected",
@@ -1364,6 +1391,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			if len(failedAccountIDs) == 0 {
 				if err != nil {
 					cls := classifyOpenAICompatibleNoAccountErrorFromGin(c, h.gatewayService, apiKey, currentRoutingModel, reqModel)
+					cls = classifySelectionFailureError(err, cls)
 					if !cls.ModelNotFound {
 						markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
 					}
@@ -1414,6 +1442,17 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		// 应用渠道模型映射到请求体
 		forwardBody := mappedBodyForMessages(channelMappingMsg.Mapped, channelMappingMsg.MappedModel)
 		writerSizeBeforeForward := service.OpenAICompactKeepaliveAdjustedWrittenSize(c)
+		rejectionAttempt, beginErr := h.gatewayService.BeginUpstreamRejectionBilling(c.Request.Context(), apiKey, account, reqModel, body)
+		if beginErr != nil {
+			if accountReleaseFunc != nil {
+				accountReleaseFunc()
+			}
+			status, code, message := upstreamRejectionAdmissionError(beginErr)
+			h.anthropicStreamingAwareError(c, status, code, message, streamStarted)
+			return
+		}
+		h.setDeepSeekUsageMetadata(c, apiKey, account, clientRequestedUsageFields(c, channelMappingMsg, reqModel, ""), pricingAt, body)
+		c.Request = c.Request.WithContext(service.WithUpstreamRejectionBillingAttempt(c.Request.Context(), rejectionAttempt))
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer func() {
 				if accountReleaseFunc != nil {
@@ -1422,11 +1461,12 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			}()
 			return h.gatewayService.ForwardAsAnthropic(c.Request.Context(), c, account, forwardBody, promptCacheKey, defaultMappedModel)
 		}()
+		err = h.gatewayService.FinishUpstreamRejectionBillingAttempt(c.Request.Context(), rejectionAttempt, result, err)
 		var cyberBlockBodyMsg []byte
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyMsg = body
 		}
-		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, err != nil, cyberBlockBodyMsg, clientRequestedUsageFields(c, channelMappingMsg, reqModel, ""), service.HashUsageRequestPayload(body))
+		h.recordCyberPolicyIfMarked(c, apiKey, account, subscription, reqModel, shouldRecordCyberFallbackUsage(err, result, rejectionAttempt != nil), cyberBlockBodyMsg, clientRequestedUsageFields(c, channelMappingMsg, reqModel, ""), service.HashUsageRequestPayload(body))
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
 		upstreamLatencyMs, _ := getContextInt64(c, service.OpsUpstreamLatencyMsKey)
 		responseLatencyMs := forwardDurationMs
@@ -1484,6 +1524,21 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 				}
 			})
 		}
+		// A supplier-chargeable refusal is a terminal request, never an account failure.
+		// Record even HTTP errors / zero-token responses once before returning.
+		if err != nil && result != nil && result.DeepSeekTools != nil {
+			submitMessagesUsage(result)
+			h.writeDeepSeekContinuationError(c, result)
+			return
+		}
+		if result != nil && result.UpstreamRejection != nil {
+			submitMessagesUsage(result)
+			if err != nil && !c.Writer.Written() {
+				h.ensureAnthropicErrorResponse(c, streamStarted)
+			}
+			return
+		}
+
 		if err != nil {
 			if result != nil && result.ImageCount > 0 {
 				reqLog.Warn("openai_messages.forward_partial_error_with_image_result",
@@ -2506,6 +2561,13 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		return
 	}
 
+	// V1 does not expose a transport that cannot guarantee per-turn settlement.
+	// Reject before accepting the socket or acquiring any supplier resources.
+	if requiresUpstreamRejectionHTTP(apiKey) {
+		h.errorResponse(c, http.StatusBadRequest, "unsupported_transport", "Use HTTP with stream=true for this group; WebSocket is not supported")
+		return
+	}
+
 	reqLog := requestLogger(
 		c,
 		"handler.openai_gateway.responses_ws",
@@ -2895,6 +2957,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			requestPlatform,
 		)
 		if err != nil {
+			var tierBlocked *service.OpenAIFastBlockedError
+			if errors.Is(err, service.ErrRequestSpeedContinuationMismatch) || errors.As(err, &tierBlocked) {
+				closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, err.Error())
+				return
+			}
 			reqLog.Warn("openai.websocket_account_select_failed",
 				zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)),
 				zap.Int("excluded_account_count", len(failedAccountIDs)),
@@ -3131,6 +3198,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				// 当前账号，越线即要求客户端重连重选（连接绑定单一上游账号，
 				// 无法中途换号）。本 turn 的准入与计费共用同一 pricingAt。
 				turnBillingCtx := turnBillingAPIKeys.begin(ctx, h.apiKeyService, turn, apiKey)
+				if requiresUpstreamRejectionHTTP(turnBillingAPIKeys.forTurn(turn, apiKey)) {
+					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "Use HTTP with stream=true for this group; WebSocket is not supported", nil)
+				}
 				turnCtx, turnAt := h.gatewayService.WithOpenAITurnPricingContext(turnBillingCtx, apiKey.GroupID)
 				if _, vetoed, reason := h.gatewayService.ProfitControlVetoLatest(turnCtx, account); vetoed {
 					reqLog.Info("openai.websocket_turn_profit_vetoed",
@@ -3554,7 +3624,8 @@ func (h *OpenAIGatewayHandler) submitUsageRecordTask(parent context.Context, tas
 func (h *OpenAIGatewayHandler) submitOpenAIUsageRecordTask(parent context.Context, result *service.OpenAIForwardResult, task service.UsageRecordTask) {
 	// Money-critical bills never drop on pool overflow: media, search surcharge, voice.
 	if result != nil && (result.ImageCount > 0 || result.VideoCount > 0 ||
-		result.SearchCount > 0 || result.WebSearchCalls > 0 || result.AudioUsage != nil) {
+		result.DeepSeekTools != nil || result.SearchCount > 0 || result.WebSearchCalls > 0 || result.AudioUsage != nil ||
+		result.UpstreamRejection != nil || result.UpstreamRejectionReservationID != "") {
 		h.submitMandatoryUsageRecordTask(parent, task)
 		return
 	}
@@ -4557,7 +4628,7 @@ func (h *OpenAIGatewayHandler) recordCyberPolicyIfMarked(c *gin.Context, apiKey 
 		}
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), 30*time.Second)
 		defer cancel()
 		if cmSvc != nil {
 			cmSvc.RecordCyberPolicyEvent(ctx, service.CyberPolicyRecordInput{

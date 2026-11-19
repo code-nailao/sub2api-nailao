@@ -40,6 +40,14 @@
       </div>
     </template>
 
+    <template v-else-if="reviewOrder">
+      <div class="card space-y-4 p-6 text-center">
+        <p class="text-lg font-bold">{{ t('payment.status.payment_review') }}</p>
+        <p class="text-sm text-gray-600 dark:text-gray-300">{{ t('payment.result.reviewDescription') }}</p>
+        <button class="btn btn-primary" @click="handleDone">{{ t('common.confirm') }}</button>
+      </div>
+    </template>
+
     <!-- Cancelled -->
     <template v-else-if="outcome === 'cancelled'">
       <div class="card p-6">
@@ -271,6 +279,7 @@ const qrUrl = ref('')
 const remainingSeconds = ref(0)
 const cancelling = ref(false)
 const paidOrder = ref<PaymentOrder | null>(null)
+const reviewOrder = ref(false)
 const deepLinkState = ref<AlipayDeepLinkState>('idle')
 const deepLinkFallbackVisible = ref(false)
 const paymentCurrency = computed(() => normalizePaymentCurrency(props.currency))
@@ -428,10 +437,13 @@ async function pollStatus() {
     let order = await paymentStore.pollOrderStatus(props.orderId)
     if (!order) return
     // 已进入终态则不再处理迟到的响应。
-    if (outcome.value) return
+    if (outcome.value || reviewOrder.value) return
     order = await tryRecoverPendingOrder(order)
-    if (outcome.value) return
-    if (isSuccessStatus(order.status)) {
+    if (outcome.value || reviewOrder.value) return
+    if (order.status === 'PAYMENT_REVIEW') {
+      cleanup()
+      reviewOrder.value = true
+    } else if (isSuccessStatus(order.status)) {
       cleanup()
       paidOrder.value = order
       setOutcome('success')

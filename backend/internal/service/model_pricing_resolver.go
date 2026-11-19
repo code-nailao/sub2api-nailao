@@ -164,7 +164,13 @@ func matchGroupModelPricing(group *Group, model string) *ChannelModelPricing {
 			}
 		}
 	}
-	return wildcard
+	if wildcard != nil {
+		return wildcard
+	}
+	if normalized := normalizeKnownOpenAICodexModel(model); normalized != "" && normalized != model {
+		return matchGroupModelPricing(group, normalized)
+	}
+	return nil
 }
 
 // resolveBasePricing 从 LiteLLM 或 Fallback 获取基础定价

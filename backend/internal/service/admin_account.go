@@ -179,7 +179,7 @@ func duplicateAccountGroups(source *Account) ([]AccountGroup, []int64) {
 		groups := make([]AccountGroup, 0, len(source.AccountGroups))
 		groupIDs := make([]int64, 0, len(source.AccountGroups))
 		for _, sourceGroup := range source.AccountGroups {
-			groups = append(groups, AccountGroup{GroupID: sourceGroup.GroupID, Priority: sourceGroup.Priority})
+			groups = append(groups, AccountGroup{GroupID: sourceGroup.GroupID, Priority: sourceGroup.Priority, RequestSpeedTiers: append([]string(nil), sourceGroup.RequestSpeedTiers...)})
 			groupIDs = append(groupIDs, sourceGroup.GroupID)
 		}
 		return groups, groupIDs
@@ -479,6 +479,9 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 }
 
 func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccountInput) (*Account, error) {
+	if err := ValidateDeepSeekToolAccountConfig(input.Platform, input.Type, input.Extra); err != nil {
+		return nil, err
+	}
 	accountExtra, err := normalizeOpenAILongContextBillingExtra(input.Platform, input.Extra)
 	if err != nil {
 		return nil, err
@@ -535,14 +538,29 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	if err := s.ValidateAccountGroupBindings(ctx, groupIDs); err != nil {
 		return nil, err
 	}
-	if err := s.accountRepo.Create(ctx, account); err != nil {
-		return nil, err
-	}
-
-	// 绑定分组
-	if len(groupIDs) > 0 {
-		if err := s.accountRepo.BindGroups(ctx, account.ID, groupIDs); err != nil {
+	if input.RequestSpeedTiersByGroup != nil {
+		mappings, err := NormalizeAccountRequestSpeedMappings(ctx, s.groupRepo, account.Platform, account.Type, groupIDs, input.RequestSpeedTiersByGroup)
+		if err != nil {
 			return nil, err
+		}
+		creator := s.accountDuplicateRepo
+		if creator == nil {
+			creator, _ = s.accountRepo.(AccountDuplicateRepository)
+		}
+		if creator == nil {
+			return nil, ErrAccountRequestSpeedUnavailable
+		}
+		if err := creator.CreateWithAccountGroups(ctx, account, accountGroupsWithRequestSpeed(groupIDs, mappings)); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := s.accountRepo.Create(ctx, account); err != nil {
+			return nil, err
+		}
+		if len(groupIDs) > 0 {
+			if err := s.accountRepo.BindGroups(ctx, account.ID, groupIDs); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -716,6 +734,9 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		}
 		normalizedExtra = prepareCodexFingerprintExtraForUpdate(account, normalizedExtra)
 		account.Extra = normalizedExtra
+		if err := ValidateDeepSeekToolAccountConfig(account.Platform, account.Type, account.Extra); err != nil {
+			return nil, err
+		}
 		if account.Platform == PlatformAntigravity && wasOveragesEnabled && !account.IsOveragesEnabled() {
 			delete(account.Extra, "antigravity_credits_overages") // 清理旧版 overages 运行态
 			// 清除 AICredits 限流 key
@@ -868,7 +889,33 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		}
 	}
 
-	billingSettingsAppliedAtomically := false
+	requestSpeedAppliedAtomically := false
+	requestSpeedUpdater, requestSpeedAtomicSupported := s.accountRepo.(AccountRequestSpeedRepository)
+	needsRequestSpeedTransaction := input.RequestSpeedTiersByGroup != nil ||
+		((input.GroupIDs != nil || input.Type != "") && len(account.RequestSpeedTiersByGroup) > 0) ||
+		(input.GroupIDs != nil && requestSpeedAtomicSupported)
+	if needsRequestSpeedTransaction {
+		groupIDs := account.GroupIDs
+		if input.GroupIDs != nil {
+			groupIDs = *input.GroupIDs
+		}
+		mappings := input.RequestSpeedTiersByGroup
+		if mappings != nil {
+			clean, err := NormalizeAccountRequestSpeedMappings(ctx, s.groupRepo, account.Platform, account.Type, groupIDs, *mappings)
+			if err != nil {
+				return nil, err
+			}
+			mappings = &clean
+		}
+		if !requestSpeedAtomicSupported {
+			return nil, ErrAccountRequestSpeedUnavailable
+		}
+		if err := requestSpeedUpdater.UpdateWithRequestSpeedGroups(ctx, account, input.GroupIDs, mappings, requestedProbeEnabledUpdate, requestedRateSyncEnabledUpdate, input.RateMultiplier); err != nil {
+			return nil, err
+		}
+		requestSpeedAppliedAtomically = true
+	}
+	billingSettingsAppliedAtomically := requestSpeedAppliedAtomically
 	updater := s.accountBillingRepo
 	if updater == nil {
 		// Unit tests and narrow internal callers may construct adminServiceImpl
@@ -876,7 +923,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		// AdminAccountRepository.
 		updater, _ = s.accountRepo.(AccountBillingSettingsRepository)
 	}
-	if updater != nil {
+	if updater != nil && !requestSpeedAppliedAtomically {
 		if err := updater.UpdateWithAccountBillingSettings(
 			ctx,
 			account,
@@ -916,7 +963,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	}
 
 	// 绑定分组
-	if input.GroupIDs != nil {
+	if input.GroupIDs != nil && !requestSpeedAppliedAtomically {
 		if err := s.accountRepo.BindGroups(ctx, account.ID, *input.GroupIDs); err != nil {
 			return nil, err
 		}

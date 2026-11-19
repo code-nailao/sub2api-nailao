@@ -76,6 +76,7 @@ export interface ChannelMonitor {
   extra_models: string[]
   group_name: string
   enabled: boolean
+  sort_order: number
   interval_seconds: number
   /** 每次调度在 interval 基础上 ± [0, jitter] 的随机偏移（秒），0 = 固定间隔 */
   jitter_seconds: number
@@ -327,7 +328,7 @@ export async function del(id: number): Promise<void> {
  * Returns the latest check results for primary + extra models.
  */
 export async function runNow(id: number): Promise<RunNowResponse> {
-  const { data } = await apiClient.post<RunNowResponse>(`/admin/channel-monitors/${id}/run`)
+  const { data } = await apiClient.post<RunNowResponse>(`/admin/channel-monitors/${id}/run`, undefined, { timeout: 375_000 })
   return data
 }
 
@@ -345,8 +346,13 @@ export async function listHistory(
   return data
 }
 
+export async function updateSortOrder(updates: { id: number; sort_order: number }[]): Promise<void> {
+  await apiClient.put('/admin/channel-monitors/sort-order', { updates })
+}
+
 export const channelMonitorAPI = {
   list,
+  updateSortOrder,
   get,
   create,
   duplicate,

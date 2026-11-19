@@ -54,21 +54,23 @@ type AdminUser struct {
 }
 
 type APIKey struct {
-	ID          int64      `json:"id"`
-	UserID      int64      `json:"user_id"`
-	Key         string     `json:"key"`
-	Name        string     `json:"name"`
-	GroupID     *int64     `json:"group_id"`
-	Status      string     `json:"status"`
-	IPWhitelist []string   `json:"ip_whitelist"`
-	IPBlacklist []string   `json:"ip_blacklist"`
-	LastUsedAt  *time.Time `json:"last_used_at"`
-	LastUsedIP  *string    `json:"last_used_ip"`
-	Quota       float64    `json:"quota"`      // Quota limit in USD (0 = unlimited)
-	QuotaUsed   float64    `json:"quota_used"` // Used quota amount in USD
-	ExpiresAt   *time.Time `json:"expires_at"` // Expiration time (nil = never expires)
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	RequestSpeedTier *string    `json:"request_speed_tier"`
+	DeepSeekToolMode string     `json:"deepseek_tool_mode"`
+	ID               int64      `json:"id"`
+	UserID           int64      `json:"user_id"`
+	Key              string     `json:"key"`
+	Name             string     `json:"name"`
+	GroupID          *int64     `json:"group_id"`
+	Status           string     `json:"status"`
+	IPWhitelist      []string   `json:"ip_whitelist"`
+	IPBlacklist      []string   `json:"ip_blacklist"`
+	LastUsedAt       *time.Time `json:"last_used_at"`
+	LastUsedIP       *string    `json:"last_used_ip"`
+	Quota            float64    `json:"quota"`      // Quota limit in USD (0 = unlimited)
+	QuotaUsed        float64    `json:"quota_used"` // Used quota amount in USD
+	ExpiresAt        *time.Time `json:"expires_at"` // Expiration time (nil = never expires)
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 	// CurrentConcurrency is the real-time active request count for this API key.
 	CurrentConcurrency int `json:"current_concurrency"`
 
@@ -91,13 +93,16 @@ type APIKey struct {
 }
 
 type Group struct {
-	ID             int64   `json:"id"`
-	Name           string  `json:"name"`
-	Description    string  `json:"description"`
-	Platform       string  `json:"platform"`
-	RateMultiplier float64 `json:"rate_multiplier"`
-	IsExclusive    bool    `json:"is_exclusive"`
-	Status         string  `json:"status"`
+	RequestSpeedSelectionEnabled bool     `json:"request_speed_selection_enabled"`
+	DefaultRequestSpeedTier      string   `json:"default_request_speed_tier"`
+	AvailableRequestSpeedTiers   []string `json:"available_request_speed_tiers"`
+	ID                           int64    `json:"id"`
+	Name                         string   `json:"name"`
+	Description                  string   `json:"description"`
+	Platform                     string   `json:"platform"`
+	RateMultiplier               float64  `json:"rate_multiplier"`
+	IsExclusive                  bool     `json:"is_exclusive"`
+	Status                       string   `json:"status"`
 
 	// I18n 名称与描述的各语言译文。只有管理端输出；用户侧接口经 Localized 把
 	// name/description 换成请求语言的版本后清空本字段。
@@ -133,11 +138,14 @@ type Group struct {
 	// VideoModelPrices 可选按模型族×分辨率覆盖视频每秒单价 (USD/s)。
 	VideoModelPrices map[string]map[string]float64 `json:"video_model_prices,omitempty"`
 	// Codex alpha/search 网页搜索单次价格（USD/次）；null 表示使用默认价 0.01
-	WebSearchPricePerCall        *float64 `json:"web_search_price_per_call"`
-	SearchPricePer1k             *float64 `json:"search_price_per_1k"`
-	AudioRealtimePricePerMin     *float64 `json:"audio_realtime_price_per_min"`
-	AudioTtsPricePerMillionChars *float64 `json:"audio_tts_price_per_million_chars"`
-	AudioSttPricePerHour         *float64 `json:"audio_stt_price_per_hour"`
+	WebSearchPricePerCall           *float64                    `json:"web_search_price_per_call"`
+	UpstreamRejectionBillingEnabled bool                        `json:"upstream_rejection_billing_enabled"`
+	UpstreamRejectionPrice          float64                     `json:"upstream_rejection_price"`
+	DeepSeekTools                   service.DeepSeekToolsConfig `json:"deepseek_tools"`
+	SearchPricePer1k                *float64                    `json:"search_price_per_1k"`
+	AudioRealtimePricePerMin        *float64                    `json:"audio_realtime_price_per_min"`
+	AudioTtsPricePerMillionChars    *float64                    `json:"audio_tts_price_per_million_chars"`
+	AudioSttPricePerHour            *float64                    `json:"audio_stt_price_per_hour"`
 
 	// Claude Code 客户端限制
 	ClaudeCodeOnly  bool   `json:"claude_code_only"`
@@ -172,8 +180,9 @@ type Group struct {
 type AdminGroup struct {
 	Group
 	// ForceOpenAIFast 是管理端请求策略，用户侧分组 DTO 无需暴露。
-	ForceOpenAIFast      bool `json:"force_openai_fast"`
-	ForceOpenAIUltrafast bool `json:"force_openai_ultrafast"`
+	ForceOpenAIFast         bool   `json:"force_openai_fast"`
+	OpenAIServiceTierPolicy string `json:"openai_service_tier_policy,omitempty"`
+	ForceOpenAIUltrafast    bool   `json:"force_openai_ultrafast"`
 	// FreeOpenAIFast 是管理端计费策略，用户侧分组 DTO 无需暴露。
 	FreeOpenAIFast bool `json:"free_openai_fast"`
 
@@ -211,11 +220,12 @@ type AdminGroup struct {
 }
 
 type Account struct {
-	ID       int64   `json:"id"`
-	Name     string  `json:"name"`
-	Notes    *string `json:"notes"`
-	Platform string  `json:"platform"`
-	Type     string  `json:"type"`
+	RequestSpeedTiersByGroup map[string][]string `json:"request_speed_tiers_by_group"`
+	ID                       int64               `json:"id"`
+	Name                     string              `json:"name"`
+	Notes                    *string             `json:"notes"`
+	Platform                 string              `json:"platform"`
+	Type                     string              `json:"type"`
 	// Credentials 经 RedactCredentials 处理后只含非敏感子键；敏感 token / api_key / 私钥
 	// 的存在性通过 CredentialsStatus（has_<key>）暴露，原始值不返回前端。
 	Credentials             map[string]any                 `json:"credentials"`
@@ -432,10 +442,11 @@ type AccountListItem struct {
 }
 
 type AccountGroup struct {
-	AccountID int64     `json:"account_id"`
-	GroupID   int64     `json:"group_id"`
-	Priority  int       `json:"priority"`
-	CreatedAt time.Time `json:"created_at"`
+	RequestSpeedTiers []string  `json:"request_speed_tiers"`
+	AccountID         int64     `json:"account_id"`
+	GroupID           int64     `json:"group_id"`
+	Priority          int       `json:"priority"`
+	CreatedAt         time.Time `json:"created_at"`
 
 	Account *Account `json:"account,omitempty"`
 	Group   *Group   `json:"group,omitempty"`
@@ -604,6 +615,9 @@ type UsageLog struct {
 	Model     string `json:"model"`
 	// ServiceTier records the OpenAI service tier used for billing, e.g. "priority" / "flex".
 	ServiceTier *string `json:"service_tier,omitempty"`
+	// User rejection snapshots use a narrow public projection; normal snapshots
+	// retain the existing shape. Admin mapping explicitly restores audit evidence.
+	BillingSnapshot any `json:"billing_snapshot,omitempty"`
 	// ReasoningEffort is the client-requested effort (mapping-hidden, like Model).
 	// OpenAI: "low"/"medium"/"high"/"xhigh"; Claude: "low"/"medium"/"high"/"max".
 	// Historical rows without requested_reasoning_effort fall back to the stored effective value.

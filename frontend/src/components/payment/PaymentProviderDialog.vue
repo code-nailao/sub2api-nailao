@@ -332,6 +332,7 @@ import {
 /** Default payment_mode per provider key — "" means "no preference, use
  * provider's built-in default behavior". */
 function defaultPaymentMode(providerKey: string): string {
+  if (providerKey === 'bepusdt') return PAYMENT_MODE_REDIRECT
   if (providerKey === 'easypay') return PAYMENT_MODE_QRCODE
   return ''
 }
@@ -345,6 +346,7 @@ function providerSupportsPaymentMode(providerKey: string): boolean {
 /** Allowed payment_mode values per provider. Used to coerce DB values
  * from a different provider (or stale data) back to the default. */
 function isValidPaymentMode(providerKey: string, mode: string): boolean {
+  if (providerKey === 'bepusdt') return mode === PAYMENT_MODE_REDIRECT
   if (providerKey === 'easypay') {
     return mode === PAYMENT_MODE_QRCODE || mode === PAYMENT_MODE_POPUP
   }

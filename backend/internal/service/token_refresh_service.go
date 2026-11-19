@@ -35,6 +35,9 @@ const (
 	defaultTokenRefreshCycleTimeout             = 4 * time.Minute
 	maxTokenRefreshCycleTimeout                 = time.Hour
 	defaultTokenRefreshCleanupTimeout           = 2 * time.Second
+	// tokenRefreshStopGraceMargin covers bounded cleanup after the last
+	// in-flight attempt (cache sync is limited by the cleanup timeout).
+	tokenRefreshStopGraceMargin = 5 * time.Second
 )
 
 type tokenRefreshRegistration struct {
@@ -70,9 +73,14 @@ type TokenRefreshService struct {
 	privacyClientFactory PrivacyClientFactory
 	proxyRepo            ProxyRepository
 
-	stopCh        chan struct{}
-	stopOnce      sync.Once
-	wg            sync.WaitGroup
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
+	// stopCtx ends cycles, retries and admission waits when Stop begins.
+	// runCtx is the hard stop: it also aborts upstream attempts in flight and
+	// is cancelled only after they finished or the stop grace elapsed.
+	stopCtx       context.Context
+	stopCancel    context.CancelFunc
 	runCtx        context.Context
 	runCancel     context.CancelFunc
 	candidateMu   sync.Mutex
@@ -103,6 +111,7 @@ func NewTokenRefreshService(
 		refreshCfg = &cfg.TokenRefresh
 	}
 	runCtx, runCancel := context.WithCancel(context.Background())
+	stopCtx, stopCancel := context.WithCancel(runCtx)
 	s := &TokenRefreshService{
 		accountRepo:      accountRepo,
 		refreshPolicy:    DefaultBackgroundRefreshPolicy(),
@@ -111,6 +120,8 @@ func NewTokenRefreshService(
 		schedulerCache:   schedulerCache,
 		tempUnschedCache: tempUnschedCache,
 		stopCh:           make(chan struct{}),
+		stopCtx:          stopCtx,
+		stopCancel:       stopCancel,
 		runCtx:           runCtx,
 		runCancel:        runCancel,
 	}
@@ -215,21 +226,48 @@ func (s *TokenRefreshService) Start() {
 }
 
 // Stop 停止刷新服务（可安全多次调用）
+//
+// No new cycle, page, retry or upstream attempt starts once Stop begins, but an
+// upstream refresh already in flight is allowed to finish and persist: the
+// provider may have rotated the refresh token, and aborting the attempt would
+// discard the only valid replacement. In-flight attempts are bounded by the
+// attempt timeout; after that grace the hard stop cancels whatever remains.
 func (s *TokenRefreshService) Stop() {
 	s.stopOnce.Do(func() {
-		if s.runCancel != nil {
-			s.runCancel()
+		if s.stopCancel != nil {
+			s.stopCancel()
 		}
 		close(s.stopCh)
 	})
-	s.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	grace := time.NewTimer(s.attemptTimeout() + tokenRefreshStopGraceMargin)
+	defer grace.Stop()
+	select {
+	case <-done:
+	case <-grace.C:
+		slog.Warn("token_refresh.stop_grace_exceeded")
+		if s.runCancel != nil {
+			s.runCancel()
+		}
+		<-done
+	}
+	if s.runCancel != nil {
+		s.runCancel()
+	}
 	slog.Info("token_refresh.service_stopped")
 }
 
 // refreshLoop 刷新循环
 func (s *TokenRefreshService) refreshLoop() {
 	defer s.wg.Done()
-	ctx := s.runCtx
+	ctx := s.stopCtx
+	if ctx == nil {
+		ctx = s.runCtx
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -808,6 +846,56 @@ func clampRefreshAttemptToLockLease(timeout, lease time.Duration) time.Duration 
 	return timeout
 }
 
+// refreshAttemptContext bounds one upstream refresh attempt by the attempt
+// timeout. Cancelling the parent (shutdown, cycle deadline, admin client
+// disconnect) stops new attempts, retries and waits, but must not abort an
+// attempt already talking to the provider: a rotated refresh token returned
+// after an abort would be discarded. Only the hard stop ends an attempt early.
+func (s *TokenRefreshService) refreshAttemptContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), s.attemptTimeout())
+	if s.runCtx == nil {
+		return ctx, cancel
+	}
+	stopHard := context.AfterFunc(s.runCtx, cancel)
+	return ctx, func() {
+		stopHard()
+		cancel()
+	}
+}
+
+// abortRateAdmissionWithParent keeps provider rate admission cancellable by the
+// parent even though it runs inside the detached attempt context, so stopping
+// never starts an upstream call that was still waiting for a rate slot.
+func abortRateAdmissionWithParent(parent context.Context, acquire func(context.Context) (func(), error)) func(context.Context) (func(), error) {
+	return func(attemptCtx context.Context) (func(), error) {
+		waitCtx, cancelWait := context.WithCancel(attemptCtx)
+		stopWait := context.AfterFunc(parent, cancelWait)
+		defer func() {
+			stopWait()
+			cancelWait()
+		}()
+		release, err := acquire(waitCtx)
+		if err != nil {
+			if parentErr := parent.Err(); parentErr != nil {
+				return nil, parentErr
+			}
+			return nil, err
+		}
+		if parentErr := parent.Err(); parentErr != nil {
+			// Admission can succeed without waiting; still never start a new
+			// upstream call after the parent ended.
+			if release != nil {
+				release()
+			}
+			return nil, parentErr
+		}
+		return release, nil
+	}
+}
+
 func (s *TokenRefreshService) cycleTimeout() time.Duration {
 	if s.cfg != nil && s.cfg.CycleTimeoutSeconds > 0 {
 		seconds := min(s.cfg.CycleTimeoutSeconds, int(maxTokenRefreshCycleTimeout/time.Second))
@@ -859,7 +947,10 @@ func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 				acquireRate = gate.acquire
 			}
 		}
-		attemptCtx, cancelAttempt := context.WithTimeout(ctx, s.attemptTimeout())
+		if acquireRate != nil {
+			acquireRate = abortRateAdmissionWithParent(ctx, acquireRate)
+		}
+		attemptCtx, cancelAttempt := s.refreshAttemptContext(ctx)
 		var newCredentials map[string]any
 		var err error
 		shortCircuit := false
@@ -904,8 +995,11 @@ func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 			if releaseRate != nil {
 				releaseRate()
 			}
-			attemptTimedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
-			if err == nil && newCredentials != nil && !attemptTimedOut {
+			// The attempt context is detached from the parent, so its deadline is
+			// always the attempt timeout: never persist credentials past it, even
+			// when the parent ended meanwhile.
+			attemptExpired := attemptCtx.Err() != nil
+			if err == nil && newCredentials != nil && !attemptExpired {
 				newCredentials["_token_version"] = time.Now().UnixMilli()
 				if saveErr := persistAccountCredentials(attemptCtx, s.accountRepo, account, newCredentials); saveErr != nil {
 					err = fmt.Errorf("failed to save credentials: %w", saveErr)

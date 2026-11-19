@@ -92,6 +92,8 @@
       </div>
     </div>
 
+    <p v-if="unprefixedGrokOnly" class="mb-3 text-xs text-gray-500 dark:text-gray-400">{{ t('upstreamRejection.filterHint') }}</p>
+
     <!-- Quick Actions -->
     <div class="mb-4 flex flex-wrap gap-2">
       <button
@@ -156,6 +158,7 @@ import ModelIcon from '@/components/common/ModelIcon.vue'
 import Icon from '@/components/icons/Icon.vue'
 import { allModels, getModelsByPlatform } from '@/composables/useModelWhitelist'
 import { supportsUpstreamModelSync } from '@/constants/platformCatalog'
+import { isUnprefixedGrokModel } from '@/utils/upstreamRejection'
 import { extractApiErrorMessage } from '@/utils/apiError'
 
 const { t } = useI18n()
@@ -166,6 +169,7 @@ const props = withDefaults(defineProps<{
   platform?: string
   platforms?: string[]
   accountId?: number
+  unprefixedGrokOnly?: boolean
   syncCredentials?: {
     platform: string
     type: string
@@ -248,8 +252,9 @@ const availableOptions = computed(() => {
 
 const filteredModels = computed(() => {
   const query = searchQuery.value.toLowerCase().trim()
-  if (!query) return availableOptions.value
-  return availableOptions.value.filter(
+  const options = props.unprefixedGrokOnly ? availableOptions.value.filter(m => isUnprefixedGrokModel(m.value)) : availableOptions.value
+  if (!query) return options
+  return options.filter(
     m => m.value.toLowerCase().includes(query) || m.label.toLowerCase().includes(query)
   )
 })
@@ -264,6 +269,7 @@ const removeModel = (model: string) => {
 }
 
 const toggleModel = (model: string) => {
+  if (props.unprefixedGrokOnly && !isUnprefixedGrokModel(model)) return
   if (props.modelValue.includes(model)) {
     removeModel(model)
   } else {
@@ -280,6 +286,10 @@ const addCustom = () => {
   if (!model) return
   if (model.includes('*')) {
     appStore.showInfo(t('admin.accounts.modelWildcardNotSupported'))
+    return
+  }
+  if (props.unprefixedGrokOnly && !isUnprefixedGrokModel(model)) {
+    appStore.showError(t('upstreamRejection.invalidModel'))
     return
   }
   if (props.modelValue.includes(model)) {
@@ -303,7 +313,7 @@ const fillRelated = () => {
   const newModels = [...props.modelValue]
   for (const platform of normalizedPlatforms.value) {
     for (const model of getModelsByPlatform(platform)) {
-      if (!newModels.includes(model)) {
+      if ((!props.unprefixedGrokOnly || isUnprefixedGrokModel(model)) && !newModels.includes(model)) {
         newModels.push(model)
       }
     }
@@ -335,7 +345,7 @@ const syncUpstreamModels = async () => {
       return
     }
 
-    const upstreamModels = result.models.map(model => model.trim()).filter(Boolean)
+    const upstreamModels = result.models.map(model => model.trim()).filter(model => Boolean(model) && (!props.unprefixedGrokOnly || isUnprefixedGrokModel(model)))
     if (upstreamModels.length === 0) {
       appStore.showInfo(t('admin.accounts.syncUpstreamModelsEmpty'))
       return

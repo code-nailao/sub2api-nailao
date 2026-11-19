@@ -39,7 +39,8 @@ func TestUsageLogRepositoryCacheWriteTTLRoundTrip(t *testing.T) {
 				UserID: user.ID, APIKeyID: key.ID, AccountID: account.ID,
 				RequestID: uuid.NewString(), Model: "gpt-6-luna", InputTokens: 3,
 				CacheCreationTokens: 2399, CacheCreation30mTokens: 9, CacheCreation12hTokens: 2390,
-				CreatedAt: time.Now().UTC(),
+				CreatedAt:       time.Now().UTC(),
+				BillingSnapshot: &service.UsageBillingSnapshot{Version: 1, BilledTier: "ultrafast", TierMultiplier: 2.5, GroupMultiplier: 0.35},
 			}
 			switch mode {
 			case "single":
@@ -61,6 +62,7 @@ func TestUsageLogRepositoryCacheWriteTTLRoundTrip(t *testing.T) {
 			require.Equal(t, 2390, stored.CacheCreation12hTokens)
 			require.Zero(t, stored.CacheCreation5mTokens)
 			require.Zero(t, stored.CacheCreation1hTokens)
+			require.Equal(t, log.BillingSnapshot, stored.BillingSnapshot)
 		})
 	}
 }
@@ -68,11 +70,12 @@ func TestUsageLogRepositoryCacheWriteTTLRoundTrip(t *testing.T) {
 func TestChannelCacheWriteTTLPricesRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	short, long, statsLong, intervalLong := 0.8125e-6, 1.625e-6, 0.75e-6, 3.25e-6
+	ultrafast := 2.5
 	channel := &service.Channel{
 		Name: t.Name(), Status: service.StatusActive, BillingModelSource: service.BillingModelSourceRequested,
 		ModelPricing: []service.ChannelModelPricing{{
 			Platform: service.PlatformOpenAI, Models: []string{"gpt-6-luna"}, BillingMode: service.BillingModeToken,
-			CacheWritePrice: &short, CacheWrite12hPrice: &long,
+			CacheWritePrice: &short, CacheWrite12hPrice: &long, UltrafastMultiplier: &ultrafast,
 			Intervals: []service.PricingInterval{{MinTokens: 100, CacheWrite12hPrice: &intervalLong}},
 		}},
 		AccountStatsPricingRules: []service.AccountStatsPricingRule{{
@@ -89,12 +92,14 @@ func TestChannelCacheWriteTTLPricesRoundTrip(t *testing.T) {
 	loaded, err := repo.GetByID(ctx, channel.ID)
 	require.NoError(t, err)
 	require.InDelta(t, long, *loaded.ModelPricing[0].CacheWrite12hPrice, 1e-15)
+	require.Equal(t, &ultrafast, loaded.ModelPricing[0].UltrafastMultiplier)
 	require.InDelta(t, intervalLong, *loaded.ModelPricing[0].Intervals[0].CacheWrite12hPrice, 1e-15)
 	require.InDelta(t, statsLong, *loaded.AccountStatsPricingRules[0].Pricing[0].CacheWrite12hPrice, 1e-15)
 	require.InDelta(t, intervalLong, *loaded.AccountStatsPricingRules[0].Pricing[0].Intervals[0].CacheWrite12hPrice, 1e-15)
 	batch, err := repo.batchLoadModelPricing(ctx, []int64{channel.ID})
 	require.NoError(t, err)
 	require.InDelta(t, long, *batch[channel.ID][0].CacheWrite12hPrice, 1e-15)
+	require.Equal(t, &ultrafast, batch[channel.ID][0].UltrafastMultiplier)
 	stats, err := repo.batchLoadAccountStatsPricingRules(ctx, []int64{channel.ID})
 	require.NoError(t, err)
 	require.InDelta(t, statsLong, *stats[channel.ID][0].Pricing[0].CacheWrite12hPrice, 1e-15)
@@ -107,11 +112,13 @@ func TestChannelCacheWriteTTLPricesRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, listed[0].CacheWrite12hPrice)
 	require.Zero(t, *listed[0].CacheWrite12hPrice)
+	require.Equal(t, &ultrafast, listed[0].UltrafastMultiplier)
 
 	pricing.CacheWrite12hPrice = nil
 	require.NoError(t, repo.ReplaceModelPricing(ctx, channel.ID, []service.ChannelModelPricing{*pricing}))
 	listed, err = repo.ListModelPricing(ctx, channel.ID)
 	require.NoError(t, err)
 	require.Nil(t, listed[0].CacheWrite12hPrice)
+	require.Equal(t, &ultrafast, listed[0].UltrafastMultiplier)
 	require.InDelta(t, intervalLong, *listed[0].Intervals[0].CacheWrite12hPrice, 1e-15)
 }

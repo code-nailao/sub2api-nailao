@@ -19,7 +19,7 @@ const settingKeyBackupArchiveCheckpoint = "backup_monthly_archive_checkpoint"
 // while another instance still owns the Redis lock.
 func (s *BackupService) lockBackupRecordUpdates(ctx context.Context) (context.Context, func(), error) {
 	s.recordsMu.Lock()
-	writeCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	writeCtx, cancel := context.WithTimeout(ctx, backupRecordUpdateTimeout)
 	waitCtx, stopWaiting := context.WithTimeout(writeCtx, 10*time.Second)
 	defer stopWaiting()
 	const key = "backup:records:writer"
@@ -28,7 +28,7 @@ func (s *BackupService) lockBackupRecordUpdates(ctx context.Context) (context.Co
 		var ok bool
 		if s.lockCache != nil {
 			var err error
-			ok, err = s.lockCache.TryAcquireLeaderLock(waitCtx, key, s.instanceID, backupScheduledLeaderLockTTL)
+			ok, err = s.lockCache.TryAcquireLeaderLock(waitCtx, key, s.instanceID, backupRecordUpdateLockTTL)
 			if err != nil {
 				cancel()
 				s.recordsMu.Unlock()

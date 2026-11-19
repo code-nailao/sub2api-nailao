@@ -105,6 +105,9 @@ func TestAccountReadableSnapshot_DenylistTripwire(t *testing.T) {
 		"TempUnschedulableUntil": {}, "TempUnschedulableReason": {},
 		"SessionWindowStart": {}, "SessionWindowEnd": {}, "SessionWindowStatus": {},
 		"ParentAccountID": {}, "QuotaDimension": {}, "GroupIDs": {},
+		// Group ID -> fixed request-speed tier names: plain routing metadata with
+		// no secrets and no back-references, at the same sensitivity as GroupIDs.
+		"RequestSpeedTiersByGroup": {},
 	}
 	tp := reflect.TypeOf(Account{})
 	for i := 0; i < tp.NumField(); i++ {

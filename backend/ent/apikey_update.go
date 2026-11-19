@@ -120,6 +120,40 @@ func (_u *APIKeyUpdate) ClearGroupID() *APIKeyUpdate {
 	return _u
 }
 
+// SetDeepseekToolMode sets the "deepseek_tool_mode" field.
+func (_u *APIKeyUpdate) SetDeepseekToolMode(v string) *APIKeyUpdate {
+	_u.mutation.SetDeepseekToolMode(v)
+	return _u
+}
+
+// SetNillableDeepseekToolMode sets the "deepseek_tool_mode" field if the given value is not nil.
+func (_u *APIKeyUpdate) SetNillableDeepseekToolMode(v *string) *APIKeyUpdate {
+	if v != nil {
+		_u.SetDeepseekToolMode(*v)
+	}
+	return _u
+}
+
+// SetRequestSpeedTier sets the "request_speed_tier" field.
+func (_u *APIKeyUpdate) SetRequestSpeedTier(v string) *APIKeyUpdate {
+	_u.mutation.SetRequestSpeedTier(v)
+	return _u
+}
+
+// SetNillableRequestSpeedTier sets the "request_speed_tier" field if the given value is not nil.
+func (_u *APIKeyUpdate) SetNillableRequestSpeedTier(v *string) *APIKeyUpdate {
+	if v != nil {
+		_u.SetRequestSpeedTier(*v)
+	}
+	return _u
+}
+
+// ClearRequestSpeedTier clears the value of the "request_speed_tier" field.
+func (_u *APIKeyUpdate) ClearRequestSpeedTier() *APIKeyUpdate {
+	_u.mutation.ClearRequestSpeedTier()
+	return _u
+}
+
 // SetStatus sets the "status" field.
 func (_u *APIKeyUpdate) SetStatus(v string) *APIKeyUpdate {
 	_u.mutation.SetStatus(v)
@@ -593,6 +627,15 @@ func (_u *APIKeyUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if value, ok := _u.mutation.Name(); ok {
 		_spec.SetField(apikey.FieldName, field.TypeString, value)
 	}
+	if value, ok := _u.mutation.DeepseekToolMode(); ok {
+		_spec.SetField(apikey.FieldDeepseekToolMode, field.TypeString, value)
+	}
+	if value, ok := _u.mutation.RequestSpeedTier(); ok {
+		_spec.SetField(apikey.FieldRequestSpeedTier, field.TypeString, value)
+	}
+	if _u.mutation.RequestSpeedTierCleared() {
+		_spec.ClearField(apikey.FieldRequestSpeedTier, field.TypeString)
+	}
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(apikey.FieldStatus, field.TypeString, value)
 	}
@@ -904,6 +947,40 @@ func (_u *APIKeyUpdateOne) SetNillableGroupID(v *int64) *APIKeyUpdateOne {
 // ClearGroupID clears the value of the "group_id" field.
 func (_u *APIKeyUpdateOne) ClearGroupID() *APIKeyUpdateOne {
 	_u.mutation.ClearGroupID()
+	return _u
+}
+
+// SetDeepseekToolMode sets the "deepseek_tool_mode" field.
+func (_u *APIKeyUpdateOne) SetDeepseekToolMode(v string) *APIKeyUpdateOne {
+	_u.mutation.SetDeepseekToolMode(v)
+	return _u
+}
+
+// SetNillableDeepseekToolMode sets the "deepseek_tool_mode" field if the given value is not nil.
+func (_u *APIKeyUpdateOne) SetNillableDeepseekToolMode(v *string) *APIKeyUpdateOne {
+	if v != nil {
+		_u.SetDeepseekToolMode(*v)
+	}
+	return _u
+}
+
+// SetRequestSpeedTier sets the "request_speed_tier" field.
+func (_u *APIKeyUpdateOne) SetRequestSpeedTier(v string) *APIKeyUpdateOne {
+	_u.mutation.SetRequestSpeedTier(v)
+	return _u
+}
+
+// SetNillableRequestSpeedTier sets the "request_speed_tier" field if the given value is not nil.
+func (_u *APIKeyUpdateOne) SetNillableRequestSpeedTier(v *string) *APIKeyUpdateOne {
+	if v != nil {
+		_u.SetRequestSpeedTier(*v)
+	}
+	return _u
+}
+
+// ClearRequestSpeedTier clears the value of the "request_speed_tier" field.
+func (_u *APIKeyUpdateOne) ClearRequestSpeedTier() *APIKeyUpdateOne {
+	_u.mutation.ClearRequestSpeedTier()
 	return _u
 }
 
@@ -1409,6 +1486,15 @@ func (_u *APIKeyUpdateOne) sqlSave(ctx context.Context) (_node *APIKey, err erro
 	}
 	if value, ok := _u.mutation.Name(); ok {
 		_spec.SetField(apikey.FieldName, field.TypeString, value)
+	}
+	if value, ok := _u.mutation.DeepseekToolMode(); ok {
+		_spec.SetField(apikey.FieldDeepseekToolMode, field.TypeString, value)
+	}
+	if value, ok := _u.mutation.RequestSpeedTier(); ok {
+		_spec.SetField(apikey.FieldRequestSpeedTier, field.TypeString, value)
+	}
+	if _u.mutation.RequestSpeedTierCleared() {
+		_spec.ClearField(apikey.FieldRequestSpeedTier, field.TypeString)
 	}
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(apikey.FieldStatus, field.TypeString, value)

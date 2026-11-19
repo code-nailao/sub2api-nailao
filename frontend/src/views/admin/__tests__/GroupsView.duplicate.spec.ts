@@ -353,6 +353,69 @@ describe('GroupsView duplicate action', () => {
     wrapper.unmount()
   })
 
+  it.each([
+    ['gpt-6-astra', 'gpt-6.1-sol'],
+    ['gpt-6.1-sol', 'gpt-6.2-sol'],
+    ['gpt-6.2-astra'],
+  ])('renders tier controls through the group template and saves only multiplier overrides for %j', async (...models) => {
+    const group = {
+      ...sourceGroup,
+      rate_multiplier: 0.12,
+      openai_service_tier_policy: 'force_ultrafast' as const,
+      model_pricing: [{
+        platform: 'openai', models, billing_mode: 'token',
+        input_price: null, output_price: null, cache_write_price: null, cache_read_price: null,
+        image_input_price: null, image_output_price: null, per_request_price: null,
+        fast_multiplier: 2, ultrafast_multiplier: 6, intervals: [], time_pricing: null,
+      }],
+    }
+    listGroups.mockResolvedValue({ items: [group], total: 1, page: 1, page_size: 20, pages: 1 })
+    updateGroup.mockResolvedValue(group)
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === 'common.edit')!.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get<HTMLInputElement>('[data-testid="ultrafast-field"] input').element.value).toBe('6')
+    expect(wrapper.text()).not.toContain('admin.groups.openaiFast.hint')
+    await wrapper.get('[data-testid="tier-preset-subscription"]').trigger('click')
+    await wrapper.get('#edit-group-form').trigger('submit')
+    await flushPromises()
+    expect(updateGroup).toHaveBeenCalledWith(42, expect.objectContaining({
+      rate_multiplier: 0.12,
+      openai_service_tier_policy: 'force_ultrafast',
+      model_pricing: [expect.objectContaining({
+        fast_multiplier: 2.5, ultrafast_multiplier: 8,
+        input_price: null, output_price: null, cache_write_price: null, cache_read_price: null,
+      })],
+    }))
+    wrapper.unmount()
+  })
+
+  it('clears GPT-6.2 tier overrides to inherit defaults while preserving the standard price card', async () => {
+    const card = {
+      platform: 'openai', models: ['gpt-6.1-sol', 'gpt-6.2-sol'], billing_mode: 'token',
+      input_price: 2e-6, output_price: 10e-6, cache_write_price: 2.5e-6, cache_read_price: .1e-6,
+      image_input_price: 0, image_output_price: 0, per_request_price: null,
+      fast_multiplier: 2.5, ultrafast_multiplier: 8, intervals: [], time_pricing: null,
+    }
+    const group = { ...sourceGroup, model_pricing: [card] }
+    listGroups.mockResolvedValue({ items: [group], total: 1, page: 1, page_size: 20, pages: 1 })
+    updateGroup.mockResolvedValue(group)
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === 'common.edit')!.trigger('click')
+    await flushPromises()
+    await wrapper.findAll('input').find(input => input.element.parentElement?.textContent?.includes('admin.channels.form.fastMultiplier'))!.setValue('')
+    await wrapper.get('[data-testid="ultrafast-field"] input').setValue('')
+    await wrapper.get('#edit-group-form').trigger('submit')
+    await flushPromises()
+    expect(updateGroup).toHaveBeenCalledWith(42, expect.objectContaining({
+      model_pricing: [expect.objectContaining({ ...card, fast_multiplier: null, ultrafast_multiplier: null })],
+    }))
+    wrapper.unmount()
+  })
+
   it('blocks saving an invalid group reasoning multiplier and allows clearing it', async () => {
     const group = {
       ...sourceGroup,
@@ -447,6 +510,41 @@ describe('GroupsView duplicate action', () => {
       wrapper.unmount()
       vi.useRealTimers()
     }
+  })
+
+  it('loads and saves fixed rejection price without applying the group multiplier', async () => {
+    const group = { ...sourceGroup, platform: 'grok', rate_multiplier: 9, upstream_rejection_billing_enabled: true, upstream_rejection_price: 0.25 }
+    listGroups.mockResolvedValueOnce({ items: [group], total: 1, page: 1, page_size: 20, pages: 1 })
+    updateGroup.mockResolvedValue(group)
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.findAll('button').find(b => b.text() === 'common.edit')!.trigger('click')
+    await flushPromises()
+    expect((wrapper.get('[data-testid="edit-rejection-enabled"]').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('[data-testid="edit-rejection-price"]').element as HTMLInputElement).value).toBe('0.25')
+    await wrapper.get('[data-testid="edit-rejection-price"]').setValue('0.1')
+    await wrapper.get('#edit-group-form').trigger('submit.prevent')
+    await flushPromises()
+    expect(updateGroup).toHaveBeenCalledWith(42, expect.objectContaining({ upstream_rejection_billing_enabled: true, upstream_rejection_price: 0.1, rate_multiplier: 9 }))
+    wrapper.unmount()
+  })
+
+  it('defaults legacy groups off and blocks invalid enabled price before saving', async () => {
+    const group = { ...sourceGroup, platform: 'grok' }
+    listGroups.mockResolvedValueOnce({ items: [group], total: 1, page: 1, page_size: 20, pages: 1 })
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.findAll('button').find(b => b.text() === 'common.edit')!.trigger('click')
+    await flushPromises()
+    expect((wrapper.get('[data-testid="edit-rejection-enabled"]').element as HTMLInputElement).checked).toBe(false)
+    await wrapper.get('[data-testid="edit-rejection-enabled"]').setValue(true)
+    expect((wrapper.get('[data-testid="edit-rejection-price"]').element as HTMLInputElement).value).toBe('0.1')
+    await wrapper.get('[data-testid="edit-rejection-price"]').setValue('0')
+    await wrapper.get('#edit-group-form').trigger('submit.prevent')
+    await flushPromises()
+    expect(updateGroup).not.toHaveBeenCalled()
+    expect(showError).toHaveBeenCalledWith('upstreamRejection.invalidPrice')
+    wrapper.unmount()
   })
 
 })

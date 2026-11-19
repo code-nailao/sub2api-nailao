@@ -1,7 +1,7 @@
 <template>
-  <AppLayout>
-    <div class="custom-page-layout">
-      <div class="card flex-1 min-h-0 overflow-hidden">
+  <AppLayout :mode="studioLayoutMode">
+    <div class="custom-page-layout" :class="{ 'studio-page-layout': managedWorkspacePage }">
+      <div class="flex-1 min-h-0 overflow-hidden" :class="{ card: !managedWorkspacePage }">
         <div v-if="loading" class="flex h-full items-center justify-center py-12">
           <div
             class="h-8 w-8 animate-spin rounded-full border-2 border-primary-500 border-t-transparent"
@@ -94,11 +94,11 @@
         </div>
 
         <!-- Iframe embed mode -->
-        <div v-else ref="embedShell" class="custom-embed-shell">
+        <div v-else ref="embedShell" class="custom-embed-shell" :class="{ 'studio-embed-shell': managedWorkspacePage }">
           <a
-            v-if="!menuItem?.hide_open_button"
+            v-if="!menuItem?.hide_open_button && (!managedWorkspacePage || studioRecovery)"
             ref="openButton"
-            :href="embeddedUrl"
+            :href="managedWorkspacePage ? studioStandaloneUrl : embeddedUrl"
             target="_blank"
             rel="noopener noreferrer"
             class="btn btn-secondary btn-sm custom-open-fab"
@@ -114,10 +114,24 @@
             <Icon name="externalLink" size="sm" class="mr-1.5" :stroke-width="2" />
             {{ t('customPage.openInNewTab') }}
           </a>
+          <div v-if="managedWorkspacePage && !studioFrameLoaded && !studioRecovery" class="studio-loading-state" role="status" aria-live="polite" aria-busy="true">
+            <span class="studio-loading-mark" aria-hidden="true"></span>
+            <p>{{ studioLabels.loading }}</p>
+          </div>
+          <div v-if="managedWorkspacePage && studioRecovery" class="studio-recovery-bar" role="status">
+            <span>{{ studioLabels.recovery }}</span>
+            <button type="button" class="btn btn-secondary btn-sm" @click="retryStudioConnection">{{ studioLabels.retry }}</button>
+            <a href="/" class="btn btn-secondary btn-sm">{{ studioLabels.back }}</a>
+          </div>
           <iframe
+            ref="embeddedFrame"
+            :key="menuItemId"
             :src="embeddedUrl"
+            :aria-busy="managedWorkspacePage && !studioIntegrated && !studioRecovery ? true : undefined"
+            :title="menuItem?.label || studioLabels.loading"
             class="custom-embed-frame"
             allowfullscreen
+            @load="handleEmbedLoad"
           ></iframe>
         </div>
       </div>
@@ -135,8 +149,12 @@ import { useAuthStore } from '@/stores/auth'
 import { useAdminSettingsStore } from '@/stores/adminSettings'
 import AppLayout from '@/components/layout/AppLayout.vue'
 import Icon from '@/components/icons/Icon.vue'
-import { buildApiUrl } from '@/api/client'
+import { apiClient, buildApiUrl } from '@/api/client'
 import { buildEmbeddedUrl, detectTheme } from '@/utils/embedded-url'
+import { createEmbeddedSessionCheckHandler, isEmbeddedSessionPage } from '@/utils/embedded-session'
+import { appearance } from '@/features/sources/useAppearance'
+import { buildIntelligenceEmbedURL, createIntelligenceAppearanceBridge, isIntelligencePage } from '@/utils/intelligence-embed'
+import { buildStudioEmbedURL, buildStudioStandaloneURL, createStudioHostBridge, isStudioPage, isCanvasPage } from '@/utils/studio-embed'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 
@@ -160,9 +178,11 @@ const tocItems = ref<TocItem[]>([])
 const tocVisible = ref(typeof window !== 'undefined' ? window.innerWidth > 768 : true)
 const activeHeadingId = ref('')
 let themeObserver: MutationObserver | null = null
+let stopAppearance: (() => void) | undefined
 let markdownRequestVersion = 0
 
 const embedShell = ref<HTMLElement | null>(null)
+const embeddedFrame = ref<HTMLIFrameElement | null>(null)
 const openButton = ref<HTMLAnchorElement | null>(null)
 const openButtonPosition = ref<{ x: number; y: number } | null>(null)
 let buttonDrag: { pointerId: number; startX: number; startY: number; x: number; y: number } | null = null
@@ -241,9 +261,26 @@ const markdownSlug = computed(() => {
 })
 
 const isMarkdownMode = computed(() => !!markdownSlug.value)
+const canvasPage = computed(() => !isMarkdownMode.value && isCanvasPage(menuItem.value?.url || '', window.location.origin))
+const managedWorkspacePage = computed(() => canvasPage.value || (!isMarkdownMode.value && isStudioPage(menuItem.value?.url || '', window.location.origin)))
+const studioIntegrated = ref(false)
+const studioFrameLoaded = ref(false)
+const studioRecovery = ref(false)
+const studioLabels = computed(() => locale.value.startsWith('zh') ? {
+  loading: canvasPage.value ? '正在打开无限画布' : '正在打开图片工作台', recovery: '连接尚未就绪，可重试或返回主站。', retry: '重试连接', back: '返回主站',
+} : {
+  loading: canvasPage.value ? 'Opening infinite canvas' : 'Opening image workspace', recovery: 'Connection is not ready. Retry or return to the main site.', retry: 'Retry connection', back: 'Back to main site',
+})
+const studioStandaloneUrl = computed(() => buildStudioStandaloneURL(route.path || `/custom/${encodeURIComponent(menuItemId.value)}`, window.location.origin))
+const studioShellMode = computed(() => route.query?.studio_view === 'standalone' ? 'standalone' as const : 'embedded' as const)
+const studioLayoutMode = computed(() => !managedWorkspacePage.value ? 'default' : studioShellMode.value === 'standalone' ? 'studio-standalone' : 'studio')
 
 const embeddedUrl = computed(() => {
   if (!menuItem.value || isMarkdownMode.value) return ''
+  if (managedWorkspacePage.value) return buildStudioEmbedURL(menuItem.value.url)
+  if (isIntelligencePage(menuItem.value.url, window.location.origin)) {
+    return buildIntelligenceEmbedURL(menuItem.value.url, locale.value)
+  }
   return buildEmbeddedUrl(
     menuItem.value.url,
     authStore.user?.id,
@@ -258,6 +295,47 @@ const isValidUrl = computed(() => {
   const url = embeddedUrl.value
   return url.startsWith('http://') || url.startsWith('https://')
 })
+
+const intelligenceAppearance = createIntelligenceAppearanceBridge({
+  getFrame: () => embeddedFrame.value,
+  isEnabled: () => isIntelligencePage(menuItem.value?.url || '', window.location.origin),
+  getState: () => appearance().state,
+})
+
+const handleEmbeddedSessionCheck = createEmbeddedSessionCheckHandler({
+  getFrame: () => embeddedFrame.value,
+  isEnabled: () => isEmbeddedSessionPage(menuItem.value?.url || '', window.location.origin),
+  refreshSession: () => apiClient.get('/auth/me'),
+})
+
+const studioHost = createStudioHostBridge({
+  getFrame: () => embeddedFrame.value,
+  isEnabled: () => managedWorkspacePage.value,
+  getState: () => ({ shellMode: studioShellMode.value, standaloneUrl: studioStandaloneUrl.value, theme: pageTheme.value, lang: locale.value }),
+  onApplied: (ready) => { studioIntegrated.value = ready },
+  onRecovery: (needed) => { studioRecovery.value = needed },
+})
+
+function handleEmbedLoad() {
+  studioFrameLoaded.value = true
+  intelligenceAppearance.send()
+  studioHost.reset()
+  studioHost.send()
+}
+
+watch([pageTheme, () => locale.value, studioShellMode], () => studioHost.send())
+// A different custom page owns a different browsing context. Appearance and
+// same-workspace group changes retain the frame, but stale page content cannot flash.
+watch(menuItemId, () => { studioFrameLoaded.value = false; studioHost.reset() }, { flush: 'sync' })
+// Arm recovery as soon as the iframe exists, even if its document never loads.
+watch([embeddedFrame, managedWorkspacePage, embeddedUrl], () => {
+  if (managedWorkspacePage.value && embeddedFrame.value) studioHost.send()
+  else studioHost.reset()
+}, { flush: 'post', immediate: true })
+function retryStudioConnection() {
+  // Keep the same iframe, draft and session. A retry only repeats the handshake.
+  studioHost.send()
+}
 
 function generateHeadingId(text: string, index: number): string {
   const base = text
@@ -422,6 +500,10 @@ watch(markdownSlug, (slug) => {
 }, { immediate: true })
 
 onMounted(async () => {
+  window.addEventListener('message', handleEmbeddedSessionCheck)
+  window.addEventListener('message', intelligenceAppearance.receive)
+  window.addEventListener('message', studioHost.receive)
+  stopAppearance = appearance().subscribe(() => intelligenceAppearance.send())
   pageTheme.value = detectTheme()
 
   if (typeof document !== 'undefined') {
@@ -444,6 +526,11 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  window.removeEventListener('message', handleEmbeddedSessionCheck)
+  window.removeEventListener('message', intelligenceAppearance.receive)
+  window.removeEventListener('message', studioHost.receive)
+  studioHost.dispose()
+  stopAppearance?.()
   markdownRequestVersion++
   if (themeObserver) {
     themeObserver.disconnect()
@@ -457,6 +544,13 @@ onUnmounted(() => {
   @apply flex flex-col;
   height: calc(100vh - 64px - 4rem);
 }
+
+.studio-page-layout { height: 100%; }
+.studio-loading-state { @apply absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-gray-50 text-sm text-gray-700 dark:bg-dark-950 dark:text-dark-200; }
+.studio-loading-mark { @apply h-8 w-8 animate-spin rounded-full border-2 border-gray-200 border-t-primary-500 dark:border-dark-700 dark:border-t-primary-400; }
+.studio-recovery-bar { @apply absolute bottom-4 left-4 right-4 z-20 flex flex-wrap items-center justify-center gap-3 rounded-xl border border-gray-200 bg-white p-3 text-sm shadow-sm dark:border-dark-600 dark:bg-dark-900; }
+@media (prefers-reduced-motion: reduce) { .studio-loading-mark { animation: none; } }
+.custom-embed-shell.studio-embed-shell { border-radius: 0; background: transparent; }
 
 .toc-sidebar {
   @apply flex flex-col h-full border-r border-gray-200 dark:border-dark-600 bg-gray-50 dark:bg-dark-800;

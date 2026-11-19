@@ -88,6 +88,39 @@ func (s *S3BackupStore) UploadFile(ctx context.Context, key string, filePath str
 	return sizeBytes, nil
 }
 
+// UploadFileRange uploads a seekable view of one archive, allowing SDK retries
+// to rewind without buffering a part in RAM or materializing another file.
+func (s *S3BackupStore) UploadFileRange(ctx context.Context, key, filePath string, offset, length int64, contentType string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if offset < 0 || length <= 0 {
+		return 0, fmt.Errorf("invalid backup upload range")
+	}
+	file, err := os.Open(filePath)
+	if err != nil {
+		return 0, fmt.Errorf("open upload archive: %w", err)
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("stat upload archive: %w", err)
+	}
+	if !info.Mode().IsRegular() || offset > info.Size() || length > info.Size()-offset {
+		return 0, fmt.Errorf("backup upload range outside archive")
+	}
+	finish := servertiming.ObserveDependency(ctx, "s3")
+	defer finish()
+	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: &s.bucket, Key: &key, Body: io.NewSectionReader(file, offset, length),
+		ContentLength: &length, ContentType: &contentType,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("S3 PutObject file range: %w", err)
+	}
+	return length, nil
+}
+
 func (s *S3BackupStore) Download(ctx context.Context, key string) (io.ReadCloser, error) {
 	finish := servertiming.ObserveDependency(ctx, "s3")
 	result, err := s.client.GetObject(ctx, &s3.GetObjectInput{

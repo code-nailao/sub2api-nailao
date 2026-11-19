@@ -28,6 +28,10 @@ export default {
           modeV1Hint: '默认模式：按配置的渠道监控项定时发起上游健康检查（产生探测流量）。',
           defaultInterval: '默认检测间隔（秒）',
           defaultIntervalHint: '仅 V1 模式使用：新建渠道监控时表单的默认值，可被单个渠道覆盖。范围 15 – 3600 秒。',
+          degradedThreshold: '黄色阈值（秒）',
+          requestTimeout: '探测总超时（秒）',
+          timingHint: 'V1 主动探测：成功且耗时达到黄色阈值时显示黄色；总超时包含等待响应头及响应读取，失败仍显示红色。保存后下一轮探测生效，无需重启；在途探测和历史色条保持原样。Ping、连接、TLS 及配额检查另有独立超时。',
+          timingRangeError: '黄色阈值须为至少 1 秒的整数，并小于总超时；总超时须为 2–300 秒的整数。',
           hideThroughput: '对用户隐藏吞吐速率（RPM / TPM）',
           hideThroughputHint:
             '开启后，用户端渠道监控页面与用户 API 不返回 RPM/TPM，避免用「速率 × 时间窗」反推集群规模。管理员仍可见完整指标；错误率、延迟、缓存率照常展示。',
@@ -1181,6 +1185,7 @@ export default {
         commonPatterns: '常用模式'
       },
       openaiFastPolicy: {
+      groupTierPoliciesEnabled: '启用分组服务档位策略（关闭时强制 Ultrafast 组拒绝请求）',
         title: 'OpenAI Fast/Flex 策略',
         description: '基于请求体 service_tier 字段拦截/过滤/透传 OpenAI fast(priority)、ultrafast 与 flex 请求；仅作用于 OpenAI 网关。“全部 tier 值”仅包含显式传入的 tier。',
         empty: '尚未配置任何规则。点击下方按钮新增。',

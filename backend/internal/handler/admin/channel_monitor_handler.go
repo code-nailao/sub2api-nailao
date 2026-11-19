@@ -97,6 +97,7 @@ type channelMonitorResponse struct {
 	ExtraModels         []string                             `json:"extra_models"`
 	GroupName           string                               `json:"group_name"`
 	Enabled             bool                                 `json:"enabled"`
+	SortOrder           int                                  `json:"sort_order"`
 	IntervalSeconds     int                                  `json:"interval_seconds"`
 	JitterSeconds       int                                  `json:"jitter_seconds"`
 	LastCheckedAt       *string                              `json:"last_checked_at"`
@@ -173,6 +174,7 @@ func channelMonitorToResponse(m *service.ChannelMonitor) *channelMonitorResponse
 		ExtraModels:         extras,
 		GroupName:           m.GroupName,
 		Enabled:             m.Enabled,
+		SortOrder:           m.SortOrder,
 		IntervalSeconds:     m.IntervalSeconds,
 		JitterSeconds:       m.JitterSeconds,
 		CreatedBy:           m.CreatedBy,
@@ -268,9 +270,22 @@ func (h *ChannelMonitorHandler) List(c *gin.Context) {
 	}
 
 	summaries := h.batchSummaryFor(c, items)
-	out := make([]*channelMonitorResponse, 0, len(items))
+	usageGroups, usageErr := h.monitorService.ResolveUsageGroups(c.Request.Context(), items)
+	if usageErr != nil {
+		// Driver errors may contain credential parameters. Never log them.
+		slog.Warn("channel_monitor: usage group lookup unavailable", "monitors", len(items))
+	}
+	type listItem struct {
+		*channelMonitorResponse
+		UsageGroupID *int64 `json:"usage_group_id"`
+	}
+	out := make([]listItem, 0, len(items))
 	for _, m := range items {
-		out = append(out, buildListItemResponse(m, summaries[m.ID]))
+		item := listItem{channelMonitorResponse: buildListItemResponse(m, summaries[m.ID])}
+		if group := usageGroups[m.ID]; group > 0 {
+			item.UsageGroupID = &group
+		}
+		out = append(out, item)
 	}
 	response.Paginated(c, out, total, page, pageSize)
 }

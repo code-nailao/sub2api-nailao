@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 
 // OpenAIRecordUsageInput input for recording usage
 type OpenAIRecordUsageInput struct {
+	deepSeekCheckpoint bool
 	Result             *OpenAIForwardResult
 	APIKey             *APIKey
 	User               *User
@@ -181,6 +183,18 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	if result == nil {
 		return errors.New("openai usage result is nil")
 	}
+	if result.UpstreamRejectionReservationID != "" {
+		reservation, err := s.rejectionReservationForUsage(ctx, input)
+		if err != nil {
+			return err
+		}
+		if reservation.State == UpstreamRejectionRejected {
+			return s.ProjectUpstreamRejectionUsage(ctx, reservation)
+		}
+		if result.UpstreamRejection != nil {
+			return s.recordUpstreamRejectionUsage(ctx, input, reservation)
+		}
+	}
 	if s.rateLimitService != nil && input.Account != nil && input.Account.Platform == PlatformOpenAI {
 		s.rateLimitService.ResetOpenAI403Counter(ctx, input.Account.ID)
 	}
@@ -196,7 +210,11 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	if !isGrokVideoUsageResult(result, nil) {
 		ApplyOpenAIImageBillingResolution(result)
 	}
-	logServiceTierBillingDowngrade("service.openai_gateway", account, result.RequestID, ApplyOpenAIServiceTierBillingResolution(billingAccount, result))
+	if result.FixedUpstreamRequestTier == "" {
+		result.FixedUpstreamRequestTier = RequestSpeedServiceTierFromContext(ctx)
+	}
+	tierResolution := ApplyOpenAIServiceTierBillingResolution(billingAccount, result)
+	logServiceTierBillingDowngrade("service.openai_gateway", account, result.RequestID, tierResolution)
 
 	// OpenAI input_tokens 是总输入，包含缓存读取和缓存写入明细。
 	// 将三类 token 拆成互斥桶，避免缓存写入同时按普通输入和 cache_write 重复计费。
@@ -216,6 +234,13 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	// 变价）；未装配 PricingAt 的路径回退记录时刻，保持既有行为。不并入上面的
 	// Resolve，以免污染 user:group 倍率缓存。
 	baseMultiplier := multiplier
+	if state := result.deepSeekBilling; state != nil {
+		if state.baseRate == nil {
+			state.baseRate = &baseMultiplier
+		} else {
+			baseMultiplier = *state.baseRate
+		}
+	}
 	pricingAt := openAIUsagePricingAt(input)
 	multiplier, imageMultiplier := computePeakAwareMultipliers(apiKey, baseMultiplier, pricingAt)
 	videoMultiplier := resolveVideoRateMultiplier(apiKey, baseMultiplier)
@@ -262,6 +287,19 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 		pricingAt,
 	)
 	if err != nil {
+		if result.DeepSeekTools != nil {
+			return err
+		}
+		if result.UpstreamRejectionReservationID != "" {
+			r, readErr := s.rejectionReservationForUsage(ctx, input)
+			if readErr != nil {
+				return readErr
+			}
+			if markErr := s.markUpstreamRejectionUnknown(ctx, r); markErr != nil {
+				return markErr
+			}
+			return err
+		}
 		if !isUsagePricingUnavailableError(err) {
 			return err
 		}
@@ -310,6 +348,7 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	// Free Fast changes only the customer charge. Keep priority TotalCost and
 	// service_tier for upstream accounting, but evaluate ActualCost once more at
 	// the Standard tier using the same channel, peak, and long-context policy.
+	freeFastApplied := false
 	if groupBillsOpenAIFastAtStandard(apiKey, billingAccount, serviceTier) {
 		standardCost, standardErr := s.calculateOpenAIRecordUsageCost(
 			ctx,
@@ -333,6 +372,7 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 		// usage row instead of dropping it on the Standard re-evaluation.
 		if standardErr == nil && cost != nil && standardCost != nil {
 			cost.ActualCost = standardCost.ActualCost
+			freeFastApplied = true
 		}
 	}
 
@@ -355,7 +395,7 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	// Async Grok video: always use the stable task id for dedup (status + content polls
 	// share one bill). Context-local client/local IDs would otherwise create a new row
 	// per poll if Redis claim is lost.
-	if result.VideoCount > 0 {
+	if result.VideoCount > 0 && result.UpstreamRejectionReservationID == "" {
 		if stable := StableGrokVideoBillingRequestID(firstNonEmpty(
 			strings.TrimPrefix(strings.TrimSpace(result.RequestID), "grok-video:"),
 			strings.TrimSpace(result.ResponseID),
@@ -388,6 +428,10 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 		}
 		// Keep the image cache split in the existing usage_logs JSONB payload.
 		imageSizeBreakdown["image_cache_read_tokens"] = result.Usage.ImageCacheReadTokens
+	}
+	requestedTier := result.RequestedServiceTier
+	if requestedTier == nil {
+		requestedTier = RequestedOpenAIServiceTierFromContext(ctx)
 	}
 	usageLog := &UsageLog{
 		UserID:                   user.ID,
@@ -443,10 +487,29 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	}
 	if isVideoUsage && (cost == nil || cost.BillingMode != string(BillingModeToken)) {
 		usageLog.RateMultiplier = videoMultiplier
+		if result.UpstreamRejectionReservationID != "" && result.VideoBasePricePerSecond != nil && result.VideoFinalPricePerSecond != nil {
+			usageLog.RateMultiplier = 0
+			if *result.VideoBasePricePerSecond > 0 {
+				usageLog.RateMultiplier = *result.VideoFinalPricePerSecond / *result.VideoBasePricePerSecond
+			}
+		}
 	} else if result.ImageCount > 0 && (cost == nil || cost.BillingMode != string(BillingModeToken)) {
 		usageLog.RateMultiplier = imageMultiplier
 	} else {
 		usageLog.RateMultiplier = multiplier
+	}
+	// Scope the new evidence to supported text models; media and other models
+	// retain their existing usage representation and accounting.
+	if account.IsOpenAI() && supportsGroupFastModel(billingModel) && !isVideoUsage && result.ImageCount == 0 &&
+		cost != nil && (cost.BillingMode == "" || cost.BillingMode == string(BillingModeToken)) {
+		usageLog.BillingSnapshot = newUsageBillingSnapshot(requestedTier, tierResolution, cost, tokens, baseMultiplier, usageLog.RateMultiplier, freeFastApplied)
+	}
+	if result.DeepSeekTools != nil {
+		toolSnapshot := *result.DeepSeekTools
+		usageLog.BillingSnapshot = &UsageBillingSnapshot{Version: 1, ChargeKind: "deepseek_tools", DeepSeekTools: &toolSnapshot}
+		if toolSnapshot.Standalone {
+			usageLog.RateMultiplier = 1
+		}
 	}
 	usageLog.AccountRateMultiplier = &accountRateMultiplier
 	usageLog.BillingType = billingType
@@ -504,6 +567,45 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 		)
 	}
 
+	if result.DeepSeekTools != nil {
+		procurement := 0.0
+		if !result.DeepSeekTools.Standalone {
+			turns := result.DeepSeekModelTurns
+			if len(turns) == 0 {
+				turns = []OpenAIForwardResult{*result}
+			}
+			for i, turn := range turns {
+				state := result.deepSeekBilling
+				if state != nil && i < len(state.accountCosts) {
+					procurement += state.accountCosts[i]
+					continue
+				}
+				base := math.Max(0, cost.TotalCost-result.DeepSeekTools.Cost())
+				if state != nil && i < len(state.modelCosts) {
+					base = state.modelCosts[i].TotalCost
+				}
+				value := base * accountRateMultiplier
+				if apiKey.GroupID != nil {
+					u := turn.Usage
+					turnTokens := UsageTokens{InputTokens: max(0, u.InputTokens-u.CacheReadInputTokens-u.CacheCreationInputTokens), OutputTokens: u.OutputTokens, CacheReadTokens: u.CacheReadInputTokens, CacheCreationTokens: u.CacheCreationInputTokens}
+					row := &UsageLog{ServiceTier: turn.ServiceTier, ReasoningEffort: turn.ReasoningEffort}
+					applyAccountStatsCost(ctx, row, s.channelService, s.billingService, account.ID, *apiKey.GroupID, turn.UpstreamModel, turn.Model, turnTokens, base, pricingAt, accountStatsLongContextPricingEnabled(longContextBillingGate) && !modelLongContextExempt, 1)
+					if row.AccountStatsCost != nil {
+						value = *row.AccountStatsCost
+					}
+				}
+				if state != nil {
+					state.accountCosts = append(state.accountCosts, value)
+				}
+				procurement += value
+			}
+		}
+		if result.DeepSeekTools.SupplierAccountID == account.ID {
+			procurement += result.DeepSeekTools.SupplierCost()
+		}
+		usageLog.AccountStatsCost = &procurement
+	}
+
 	simpleModeKeyRateLimitOnly := simpleModeKeyRateLimitBillingEnabled(s.cfg, apiKey)
 	if s.cfg != nil && s.cfg.RunMode == config.RunModeSimple && !simpleModeKeyRateLimitOnly {
 		writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.openai_gateway")
@@ -519,26 +621,45 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 		quotaPlatform = PlatformFromAPIKey(apiKey)
 	}
 
-	_, billingErr := applyUsageBilling(ctx, requestID, usageLog, &postUsageBillingParams{
-		Cost:                       cost,
-		User:                       user,
-		APIKey:                     apiKey,
-		Account:                    account,
-		Subscription:               subscription,
-		RequestPayloadHash:         resolveUsageBillingPayloadFingerprint(ctx, input.RequestPayloadHash),
-		IsSubscriptionBill:         isSubscriptionBilling && !simpleModeKeyRateLimitOnly,
-		AccountRateMultiplier:      accountRateMultiplier,
-		APIKeyService:              input.APIKeyService,
-		Platform:                   quotaPlatform,
-		SimpleModeKeyRateLimitOnly: simpleModeKeyRateLimitOnly,
-	}, s.billingDeps(), s.usageBillingRepo)
+	params := &postUsageBillingParams{
+		DeepSeekTools:                  result.DeepSeekTools,
+		Cost:                           cost,
+		UpstreamRejectionReservationID: result.UpstreamRejectionReservationID,
+		User:                           user,
+		APIKey:                         apiKey,
+		Account:                        account,
+		Subscription:                   subscription,
+		RequestPayloadHash:             resolveUsageBillingPayloadFingerprint(ctx, input.RequestPayloadHash),
+		IsSubscriptionBill:             isSubscriptionBilling && !simpleModeKeyRateLimitOnly,
+		AccountRateMultiplier:          accountRateMultiplier,
+		APIKeyService:                  input.APIKeyService,
+		Platform:                       quotaPlatform,
+		SimpleModeKeyRateLimitOnly:     simpleModeKeyRateLimitOnly,
+	}
+	if result.DeepSeekTools != nil {
+		return s.recordDeepSeekUsage(ctx, input, usageLog, params)
+	}
+	_, billingErr := applyUsageBilling(ctx, requestID, usageLog, params, s.billingDeps(), s.usageBillingRepo)
 
 	if billingErr != nil {
+		if errors.Is(billingErr, ErrUpstreamRejectionWaived) {
+			// The hold was released at its deadline before this usage arrived.
+			// The ledger recorded it for supplier reconciliation; the customer
+			// is not billed, and this is a terminal outcome, not a failure.
+			logger.LegacyPrintf("service.openai_gateway", "late usage after deadline release recorded without charge: request_id=%s", result.UpstreamRejectionReservationID)
+			return nil
+		}
+		if result.UpstreamRejectionReservationID != "" || result.DeepSeekTools != nil {
+			return billingErr
+		}
 		usageLog.ActualCost = 0
 		writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.openai_gateway")
 		return billingErr
 	}
 	writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.openai_gateway")
+	if result.UpstreamRejectionReservationID != "" {
+		s.invalidateUpstreamRejectionCaches(ctx, apiKey, input.APIKeyService)
+	}
 
 	return nil
 }
@@ -602,6 +723,50 @@ func (s *OpenAIGatewayService) calculateOpenAIRecordUsageCost(
 	modelLongContextExempt bool,
 	pricingAt time.Time,
 ) (*CostBreakdown, error) {
+	if result != nil && result.DeepSeekTools != nil {
+		combined := &CostBreakdown{BillingMode: string(BillingModeToken)}
+		if result.DeepSeekTools.Standalone {
+			combined.BillingMode = string(BillingModePerRequest)
+		} else {
+			turns := result.DeepSeekModelTurns
+			if len(turns) == 0 {
+				one := *result
+				one.DeepSeekTools = nil
+				turns = []OpenAIForwardResult{one}
+			}
+			for i := range turns {
+				turn := turns[i]
+				turn.DeepSeekTools = nil
+				turn.DeepSeekModelTurns = nil
+				u := turn.Usage
+				turnTokens := UsageTokens{InputTokens: max(0, u.InputTokens-u.CacheReadInputTokens-u.CacheCreationInputTokens), OutputTokens: u.OutputTokens, CacheReadTokens: u.CacheReadInputTokens, CacheCreationTokens: u.CacheCreationInputTokens}
+				var cost *CostBreakdown
+				if state := result.deepSeekBilling; state != nil && i < len(state.modelCosts) {
+					frozen := state.modelCosts[i]
+					cost = &frozen
+				} else {
+					var err error
+					cost, err = s.calculateOpenAIRecordUsageCost(ctx, &turn, apiKey, billingModels, multiplier, imageMultiplier, videoMultiplier, webSearchMultiplier, turnTokens, serviceTier, longContextBillingGate, modelLongContextExempt, pricingAt)
+					if err != nil {
+						return nil, err
+					}
+					if result.deepSeekBilling != nil {
+						result.deepSeekBilling.modelCosts = append(result.deepSeekBilling.modelCosts, *cost)
+					}
+				}
+				combined.InputCost += cost.InputCost
+				combined.OutputCost += cost.OutputCost
+				combined.CacheCreationCost += cost.CacheCreationCost
+				combined.CacheReadCost += cost.CacheReadCost
+				combined.TotalCost += cost.TotalCost
+				combined.ActualCost += cost.ActualCost
+				combined.LongContextBillingApplied = combined.LongContextBillingApplied || cost.LongContextBillingApplied
+			}
+		}
+		combined.TotalCost += result.DeepSeekTools.Cost()
+		combined.ActualCost += result.DeepSeekTools.Cost()
+		return combined, nil
+	}
 	billingModel := firstUsageBillingModel(billingModels)
 	if result != nil && result.WebSearchCalls > 0 {
 		// Codex alpha/search 网页搜索按次计费：上游不返回 usage/token 字段，单价只取
@@ -835,6 +1000,10 @@ func (s *OpenAIGatewayService) calculateOpenAIVideoCost(
 	result *OpenAIForwardResult,
 	multiplier float64,
 ) *CostBreakdown {
+	if result.UpstreamRejectionReservationID != "" && result.VideoBasePricePerSecond != nil && result.VideoFinalPricePerSecond != nil {
+		units := float64(max(1, result.VideoCount) * NormalizeVideoBillingDurationSecondsOrDefault(result.VideoDurationSeconds))
+		return &CostBreakdown{TotalCost: *result.VideoBasePricePerSecond * units, ActualCost: *result.VideoFinalPricePerSecond * units, BillingMode: string(BillingModeVideo)}
+	}
 	videoCount := result.VideoCount
 	if videoCount <= 0 {
 		videoCount = 1

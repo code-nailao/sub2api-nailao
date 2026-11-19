@@ -11,6 +11,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1102,6 +1103,22 @@ type GatewayConfig struct {
 	// 取反义命名是为了让零值安全：该开关会发布为进程级快照，未经 viper 加载而手工构造的
 	// Config（测试、工具）其零值必须落在「强制统一开启」这一侧，否则会静默丢掉这层保护。
 	DisableCodexIdentityEnforcement bool `mapstructure:"disable_codex_identity_enforcement"`
+	// UpstreamRejectionLegacyProfile is the content-rejection profile id that
+	// this deployment stored before the canonical id existed. It is read only
+	// from SourcesUpstreamRejectionLegacyProfileEnv, never from a config file, so
+	// a deployment-specific identifier stays out of shared configuration. Empty
+	// (the default) means new rows use the canonical id.
+	UpstreamRejectionLegacyProfile string `mapstructure:"-"`
+	// MediaEngineLegacyName is the name under which this deployment's media
+	// engine already wrote its task store, billing request ids, price models
+	// and object keys. It is read only from SourcesMediaEngineLegacyNameEnv,
+	// never from a config file, so the name stays out of shared configuration.
+	// Empty (the default) means a fresh install that uses the neutral name.
+	MediaEngineLegacyName string `mapstructure:"-"`
+	// MediaEngineLegacyTaskPrefix is the prefix of the task ids this deployment
+	// already stored and returned to clients. Environment only, like
+	// MediaEngineLegacyName, and set together with it.
+	MediaEngineLegacyTaskPrefix string `mapstructure:"-"`
 	// DisableCodexOriginatorNormalization: 已废弃，等价于 DisableCodexIdentityEnforcement。
 	// 保留以兼容既有配置文件；加载时会折叠进新键，不要在新代码里直接读取。
 	DisableCodexOriginatorNormalization bool `mapstructure:"disable_codex_originator_normalization"`
@@ -1955,6 +1972,9 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 		cfg.Security.ForwardedClientIPHeaders = normalizeStringSlice(strings.Split(forwardedClientIPHeadersEnv, ","))
 	}
 	cfg.Server.TrustedProxiesConfigured = trustedProxiesConfigured
+	cfg.Gateway.UpstreamRejectionLegacyProfile = os.Getenv(SourcesUpstreamRejectionLegacyProfileEnv)
+	cfg.Gateway.MediaEngineLegacyName = os.Getenv(SourcesMediaEngineLegacyNameEnv)
+	cfg.Gateway.MediaEngineLegacyTaskPrefix = os.Getenv(SourcesMediaEngineLegacyTaskPrefixEnv)
 	// Mirror viper's own precedence: an empty environment variable is ignored by
 	// viper, so it must not pin the static default either (e.g. Compose ${VAR:-}).
 	if !viper.InConfig("gateway.request_body_memory_budget_bytes") && os.Getenv("GATEWAY_REQUEST_BODY_MEMORY_BUDGET_BYTES") == "" {
@@ -2813,7 +2833,51 @@ func setEnvReachableDefaults() {
 	viper.SetDefault("dingtalk_connect.sync_corp_email_attr_name", "")
 }
 
+// SourcesUpstreamRejectionLegacyProfileEnv names the private environment
+// variable that carries gateway.UpstreamRejectionLegacyProfile.
+const SourcesUpstreamRejectionLegacyProfileEnv = "SOURCES_UPSTREAM_REJECTION_LEGACY_PROFILE"
+
+// upstreamRejectionLegacyProfilePattern is deliberately narrow: the value is
+// written verbatim into billing evidence, so anything that is not a plain
+// identifier is a misconfiguration rather than something to normalize.
+var upstreamRejectionLegacyProfilePattern = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
+
+// SourcesMediaEngineLegacyNameEnv names the private environment variable that
+// carries gateway.MediaEngineLegacyName.
+const SourcesMediaEngineLegacyNameEnv = "SOURCES_MEDIA_ENGINE_LEGACY_NAME"
+
+// mediaEngineLegacyNamePattern matches the media engine module's own check: the
+// value is substituted into store identities, money idempotency keys and
+// object keys, so anything but a short plain name is a misconfiguration.
+var mediaEngineLegacyNamePattern = regexp.MustCompile(`^[a-z0-9]{2,32}$`)
+
+// SourcesMediaEngineLegacyTaskPrefixEnv names the private environment variable
+// that carries gateway.MediaEngineLegacyTaskPrefix.
+const SourcesMediaEngineLegacyTaskPrefixEnv = "SOURCES_MEDIA_ENGINE_LEGACY_TASK_PREFIX"
+
+// mediaEngineLegacyTaskPrefixPattern matches the media engine module's check;
+// the prefix starts stored task ids and ledger batch ids.
+var mediaEngineLegacyTaskPrefixPattern = regexp.MustCompile(`^[a-z0-9]{2,16}$`)
+
 func (c *Config) Validate() error {
+	// "sub2api" is the image-engine registry's other engine value.
+	if n := c.Gateway.MediaEngineLegacyName; n != "" && (!mediaEngineLegacyNamePattern.MatchString(n) || n == "sub2api") {
+		// Fail closed: a mistyped value would refuse the existing task store at
+		// best and fork the billing idempotency keys at worst.
+		return fmt.Errorf("%s must match %s", SourcesMediaEngineLegacyNameEnv, mediaEngineLegacyNamePattern.String())
+	}
+	if p := c.Gateway.MediaEngineLegacyTaskPrefix; p != "" && !mediaEngineLegacyTaskPrefixPattern.MatchString(p) {
+		return fmt.Errorf("%s must match %s", SourcesMediaEngineLegacyTaskPrefixEnv, mediaEngineLegacyTaskPrefixPattern.String())
+	}
+	if (c.Gateway.MediaEngineLegacyName == "") != (c.Gateway.MediaEngineLegacyTaskPrefix == "") {
+		// Both describe one existing deployment; half of it would refuse the
+		// stored tasks or mint ids the stored data does not use.
+		return fmt.Errorf("%s and %s must be set together or both left unset", SourcesMediaEngineLegacyNameEnv, SourcesMediaEngineLegacyTaskPrefixEnv)
+	}
+	if p := c.Gateway.UpstreamRejectionLegacyProfile; p != "" && !upstreamRejectionLegacyProfilePattern.MatchString(p) {
+		// Fail closed: a mistyped value would silently stop matching stored rows.
+		return fmt.Errorf("%s must match %s", SourcesUpstreamRejectionLegacyProfileEnv, upstreamRejectionLegacyProfilePattern.String())
+	}
 	if c.Gateway.MinOutputTokens < 16 {
 		return fmt.Errorf("gateway.min_output_tokens must be at least 16")
 	}

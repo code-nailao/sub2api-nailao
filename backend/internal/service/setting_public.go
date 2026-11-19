@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
 )
@@ -429,9 +430,11 @@ func clampChannelMonitorInterval(v int) int {
 // ChannelMonitorRuntime is the lightweight view of the channel monitor feature
 // consumed by the runner, V2 aggregator, and user-facing handlers.
 type ChannelMonitorRuntime struct {
-	Enabled                bool
-	Mode                   string // ChannelMonitorModeV1 or ChannelMonitorModeV2
-	DefaultIntervalSeconds int
+	Enabled                  bool
+	Mode                     string // ChannelMonitorModeV1 or ChannelMonitorModeV2
+	DefaultIntervalSeconds   int
+	DegradedThresholdSeconds int
+	RequestTimeoutSeconds    int
 	// HideThroughput: when true, user-facing V2 APIs omit RPM/TPM scale signals.
 	HideThroughput bool
 	// ShowQuota: when true, user-facing monitor views keep the quota/balance
@@ -458,35 +461,44 @@ func (r ChannelMonitorRuntime) PassiveAggregationAllowed() bool {
 func (s *SettingService) GetChannelMonitorRuntime(ctx context.Context) ChannelMonitorRuntime {
 	if s == nil || s.settingRepo == nil {
 		return ChannelMonitorRuntime{
-			Enabled:                true,
-			Mode:                   defaultChannelMonitorMode,
-			DefaultIntervalSeconds: channelMonitorIntervalFallback,
-			HideThroughput:         true,
+			Enabled:                  true,
+			Mode:                     defaultChannelMonitorMode,
+			DefaultIntervalSeconds:   channelMonitorIntervalFallback,
+			DegradedThresholdSeconds: int(monitorDegradedThreshold / time.Second),
+			RequestTimeoutSeconds:    int(monitorRequestTimeout / time.Second),
+			HideThroughput:           true,
 		}
 	}
 	vals, err := s.settingRepo.GetMultiple(ctx, []string{
 		SettingKeyChannelMonitorEnabled,
 		SettingKeyChannelMonitorMode,
 		SettingKeyChannelMonitorDefaultIntervalSeconds,
+		SettingKeyChannelMonitorDegradedThresholdSeconds,
+		SettingKeyChannelMonitorRequestTimeoutSeconds,
 		SettingKeyChannelMonitorHideThroughput,
 		SettingKeyChannelMonitorShowQuota,
 		SettingKeyChannelMonitorHideUserRanking,
 	})
 	if err != nil {
 		return ChannelMonitorRuntime{
-			Enabled:                true,
-			Mode:                   defaultChannelMonitorMode,
-			DefaultIntervalSeconds: channelMonitorIntervalFallback,
-			HideThroughput:         true,
+			Enabled:                  true,
+			Mode:                     defaultChannelMonitorMode,
+			DefaultIntervalSeconds:   channelMonitorIntervalFallback,
+			DegradedThresholdSeconds: int(monitorDegradedThreshold / time.Second),
+			RequestTimeoutSeconds:    int(monitorRequestTimeout / time.Second),
+			HideThroughput:           true,
 		}
 	}
+	timing := parseChannelMonitorProbeTiming(vals)
 	return ChannelMonitorRuntime{
-		Enabled:                !isFalseSettingValue(vals[SettingKeyChannelMonitorEnabled]),
-		Mode:                   normalizeChannelMonitorMode(vals[SettingKeyChannelMonitorMode]),
-		DefaultIntervalSeconds: parseChannelMonitorInterval(vals[SettingKeyChannelMonitorDefaultIntervalSeconds]),
-		HideThroughput:         !isFalseSettingValue(vals[SettingKeyChannelMonitorHideThroughput]),
-		ShowQuota:              vals[SettingKeyChannelMonitorShowQuota] == "true",
-		HideUserRanking:        isTrueSettingValue(vals[SettingKeyChannelMonitorHideUserRanking]),
+		DegradedThresholdSeconds: int(timing.DegradedThreshold / time.Second),
+		RequestTimeoutSeconds:    int(timing.RequestTimeout / time.Second),
+		Enabled:                  !isFalseSettingValue(vals[SettingKeyChannelMonitorEnabled]),
+		Mode:                     normalizeChannelMonitorMode(vals[SettingKeyChannelMonitorMode]),
+		DefaultIntervalSeconds:   parseChannelMonitorInterval(vals[SettingKeyChannelMonitorDefaultIntervalSeconds]),
+		HideThroughput:           !isFalseSettingValue(vals[SettingKeyChannelMonitorHideThroughput]),
+		ShowQuota:                vals[SettingKeyChannelMonitorShowQuota] == "true",
+		HideUserRanking:          isTrueSettingValue(vals[SettingKeyChannelMonitorHideUserRanking]),
 	}
 }
 

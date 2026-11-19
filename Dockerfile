@@ -40,6 +40,8 @@ RUN --mount=type=cache,id=sub2api-pnpm-store,target=/root/.local/share/pnpm/stor
 # in the image (WORKDIR /app/frontend -> resolves to /app/docs/legal/*.md).
 # Copy only that subtree to keep the build dependency minimal.
 COPY frontend/ ./
+# Shared static brand tokens; no extension runtime is embedded into Sub.
+COPY extensions/sources-brand/ /app/extensions/sources-brand/
 COPY docs/legal/ /app/docs/legal/
 RUN pnpm run build
 
@@ -72,6 +74,7 @@ WORKDIR /app/backend
 
 # Copy go mod files first (better caching)
 COPY backend/go.mod backend/go.sum ./
+COPY extensions/sources-media-engine/ /app/extensions/sources-media-engine/
 # Cache mount keeps the module cache across builds so a transient CDN blip on
 # retry resumes instead of re-fetching every zip from scratch.
 RUN --mount=type=cache,id=sub2api-gomod,target=/go/pkg/mod \
@@ -108,9 +111,10 @@ FROM ${POSTGRES_IMAGE} AS pg-client
 FROM ${ALPINE_IMAGE}
 
 # Labels
-LABEL maintainer="Wei-Shaw <github.com/Wei-Shaw>"
-LABEL description="Sub2API - AI API Gateway Platform"
-LABEL org.opencontainers.image.source="https://github.com/Wei-Shaw/sub2api"
+LABEL maintainer="code-nailao <github.com/code-nailao>"
+LABEL description="Sources - a fork of Sub2API (github.com/Wei-Shaw/sub2api), an AI API gateway platform"
+LABEL org.opencontainers.image.source="https://github.com/code-nailao/sub2api-nailao"
+LABEL org.opencontainers.image.licenses="LGPL-3.0"
 
 # Install runtime dependencies
 RUN apk add --no-cache \

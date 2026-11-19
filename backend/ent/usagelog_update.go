@@ -249,6 +249,18 @@ func (_u *UsageLogUpdate) ClearBillingTier() *UsageLogUpdate {
 	return _u
 }
 
+// SetBillingSnapshot sets the "billing_snapshot" field.
+func (_u *UsageLogUpdate) SetBillingSnapshot(v map[string]interface{}) *UsageLogUpdate {
+	_u.mutation.SetBillingSnapshot(v)
+	return _u
+}
+
+// ClearBillingSnapshot clears the value of the "billing_snapshot" field.
+func (_u *UsageLogUpdate) ClearBillingSnapshot() *UsageLogUpdate {
+	_u.mutation.ClearBillingSnapshot()
+	return _u
+}
+
 // SetBillingMode sets the "billing_mode" field.
 func (_u *UsageLogUpdate) SetBillingMode(v string) *UsageLogUpdate {
 	_u.mutation.SetBillingMode(v)
@@ -1228,6 +1240,12 @@ func (_u *UsageLogUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if _u.mutation.BillingTierCleared() {
 		_spec.ClearField(usagelog.FieldBillingTier, field.TypeString)
 	}
+	if value, ok := _u.mutation.BillingSnapshot(); ok {
+		_spec.SetField(usagelog.FieldBillingSnapshot, field.TypeJSON, value)
+	}
+	if _u.mutation.BillingSnapshotCleared() {
+		_spec.ClearField(usagelog.FieldBillingSnapshot, field.TypeJSON)
+	}
 	if value, ok := _u.mutation.BillingMode(); ok {
 		_spec.SetField(usagelog.FieldBillingMode, field.TypeString, value)
 	}
@@ -1814,6 +1832,18 @@ func (_u *UsageLogUpdateOne) SetNillableBillingTier(v *string) *UsageLogUpdateOn
 // ClearBillingTier clears the value of the "billing_tier" field.
 func (_u *UsageLogUpdateOne) ClearBillingTier() *UsageLogUpdateOne {
 	_u.mutation.ClearBillingTier()
+	return _u
+}
+
+// SetBillingSnapshot sets the "billing_snapshot" field.
+func (_u *UsageLogUpdateOne) SetBillingSnapshot(v map[string]interface{}) *UsageLogUpdateOne {
+	_u.mutation.SetBillingSnapshot(v)
+	return _u
+}
+
+// ClearBillingSnapshot clears the value of the "billing_snapshot" field.
+func (_u *UsageLogUpdateOne) ClearBillingSnapshot() *UsageLogUpdateOne {
+	_u.mutation.ClearBillingSnapshot()
 	return _u
 }
 
@@ -2825,6 +2855,12 @@ func (_u *UsageLogUpdateOne) sqlSave(ctx context.Context) (_node *UsageLog, err 
 	}
 	if _u.mutation.BillingTierCleared() {
 		_spec.ClearField(usagelog.FieldBillingTier, field.TypeString)
+	}
+	if value, ok := _u.mutation.BillingSnapshot(); ok {
+		_spec.SetField(usagelog.FieldBillingSnapshot, field.TypeJSON, value)
+	}
+	if _u.mutation.BillingSnapshotCleared() {
+		_spec.ClearField(usagelog.FieldBillingSnapshot, field.TypeJSON)
 	}
 	if value, ok := _u.mutation.BillingMode(); ok {
 		_spec.SetField(usagelog.FieldBillingMode, field.TypeString, value)

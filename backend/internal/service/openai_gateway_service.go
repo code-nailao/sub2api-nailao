@@ -239,8 +239,18 @@ type OpenAIUsage struct {
 
 // OpenAIForwardResult represents the result of forwarding
 type OpenAIForwardResult struct {
-	RequestID  string
-	ResponseID string
+	// FixedUpstreamRequestTier is the trusted tier selected by the API Key.
+	// The supplier credential fixes this tier; response default cannot lower it.
+	FixedUpstreamRequestTier string
+	RequestID                string
+	ResponseID               string
+	// UpstreamRejection records a supplier-billable terminal refusal. It remains
+	// available even when forwarding also returns an HTTP/stream error; callers
+	// must settle this outcome before considering ordinary failover.
+	UpstreamRejection *UpstreamRejectionEvidence
+	// UpstreamRejectionReservationID is server-owned and independent of any
+	// client-supplied request ID. The admission layer snapshots the fee here.
+	UpstreamRejectionReservationID string
 	// UpstreamHeaders 是直接上游的响应头，用于按账户配置解析上游请求标识。
 	UpstreamHeaders http.Header
 	Usage           OpenAIUsage
@@ -266,7 +276,8 @@ type OpenAIForwardResult struct {
 	// ServiceTier is the final tier sent upstream after policy rewriting.
 	// The upstream response declaration remains separate above and is reconciled
 	// at usage-recording time, where the credential protocol is available.
-	ServiceTier *string
+	ServiceTier          *string
+	RequestedServiceTier *string
 	// ReasoningEffort is extracted from request body (reasoning.effort) or derived from model suffix
 	// after group policy rewriting and model-family remapping.
 	// Stored for usage records display; nil means not provided / not applicable.
@@ -276,32 +287,38 @@ type OpenAIForwardResult struct {
 	RequestedReasoningEffort *string
 	Stream                   bool
 	OpenAIWSMode             bool
-	// UpstreamTerminalEvent is the normalized terminal event observed on an
-	// upstream Responses WebSocket turn. Empty preserves legacy/non-WS success.
+	// UpstreamTerminalEvent records a parsed completion on Responses WebSocket
+	// turns and rejection-profile HTTP/SSE calls. For the latter, an empty value
+	// cannot release a financial hold as a successful normal text request.
+	// Accounts outside that profile retain their legacy HTTP behavior.
 	UpstreamTerminalEvent string
 	ResponseHeaders       http.Header
 	Duration              time.Duration
 	FirstTokenMs          *int
 	ClientDisconnect      bool
 	ImageCount            int
-	// ImageEndpoint 标记请求来自专用图片端点；分组 image_count_billing 开关
-	// 只对这类请求生效，混合 Responses/Chat/WS 请求仍按 token 计费。
-	ImageEndpoint      bool
-	ImageSize          string
-	ImageInputSize     string
-	ImageOutputSize    string
-	ImageOutputSizes   []string
-	ImageSizeSource    string
-	ImageSizeBreakdown map[string]int
-	VideoCount         int
-	VideoResolution    string
+	// ImageEndpoint gates group image_count_billing to dedicated image endpoints.
+	ImageEndpoint            bool
+	ImageSize                string
+	ImageInputSize           string
+	ImageOutputSize          string
+	ImageOutputSizes         []string
+	ImageSizeSource          string
+	ImageSizeBreakdown       map[string]int
+	VideoBasePricePerSecond  *float64
+	VideoFinalPricePerSecond *float64
+	VideoCount               int
+	VideoResolution          string
 	// VideoDurationSeconds 是提交时请求的生成时长（xAI 按输出秒数计费），已归一化到 1-15 秒。
 	VideoDurationSeconds int
 	// WebSearchCalls 是 Codex alpha/search 网页搜索调用次数（每次成功请求为 1）。
 	// 上游不返回 usage 字段，>0 时走按次计费（分组单价 × 次数 × 倍率）。
 	WebSearchCalls int
 	// SearchCount is Grok-native web_search / tool search call count (per 1k pricing).
-	SearchCount int
+	SearchCount        int
+	DeepSeekTools      *DeepSeekToolUsage
+	DeepSeekModelTurns []OpenAIForwardResult
+	deepSeekBilling    *deepSeekBillingState
 	// AudioUsage carries Voice billing units when present.
 	AudioUsage *AudioUsage
 
@@ -314,6 +331,9 @@ type OpenAIForwardResult struct {
 // that may clear model-scoped transient state. The zero value remains a success
 // for existing non-WS callers.
 func (r *OpenAIForwardResult) SucceededForScheduling() bool {
+	if r != nil && r.UpstreamRejection != nil {
+		return false
+	}
 	if r == nil || !r.OpenAIWSMode || r.UpstreamTerminalEvent == "" {
 		return true
 	}
@@ -548,6 +568,10 @@ func NewOpenAIGatewayService(
 	// 拿不到配置，故在此发布进程级开关快照。配置取反义，零值即「强制统一出口开启」。
 	if cfg != nil {
 		SetCodexIdentityEnforcementEnabled(!cfg.Gateway.DisableCodexIdentityEnforcement)
+		// Same reason: account and evidence helpers cannot reach the config.
+		SetUpstreamRejectionLegacyProfile(cfg.Gateway.UpstreamRejectionLegacyProfile)
+		// The handler and ledger repository check media engine ids the same way.
+		SetSourcesMediaEngineLegacy(cfg.Gateway.MediaEngineLegacyName, cfg.Gateway.MediaEngineLegacyTaskPrefix)
 	}
 	svc := &OpenAIGatewayService{
 		accountRepo:         accountRepo,

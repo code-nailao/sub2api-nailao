@@ -50,7 +50,7 @@
       <template #actions>
         <div class="flex justify-end gap-3">
           <button
-            @click="loadApiKeys"
+            @click="refreshKeys"
             :disabled="loading"
             class="btn btn-secondary"
             :title="t('common.refresh')"
@@ -142,8 +142,11 @@
           </template>
 
           <template #cell-name="{ value, row }">
-            <div class="flex items-center gap-1.5">
-              <span class="font-medium text-gray-900 dark:text-white">{{ value }}</span>
+            <div class="flex min-w-0 items-center gap-1.5">
+              <span class="min-w-0 truncate font-medium text-gray-900 dark:text-white">{{ value }}</span>
+              <span v-if="keyRequestSpeed(row)" class="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium" :class="keyRequestSpeed(row) === 'fast' ? 'bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'" :title="t('requestSpeed.badgeTitle', { tier: requestSpeedLabel(keyRequestSpeed(row)!) })" data-testid="key-request-speed-badge">
+                <Icon name="bolt" size="xs" aria-hidden="true" />{{ requestSpeedLabel(keyRequestSpeed(row)!) }}
+              </span>
               <Icon
                 v-if="row.ip_whitelist?.length > 0 || row.ip_blacklist?.length > 0"
                 name="shield"
@@ -482,6 +485,15 @@
       @close="closeModals"
     >
       <form id="key-form" @submit.prevent="handleSubmit" class="space-y-5">
+        <label v-if="formGroupOptions.find(g => g.value === formData.group_id)?.platform === 'deepseek'" class="input-label">
+          {{ t('deepseekTools.keyMode') }}
+          <select v-model="formData.deepseek_tool_mode" class="input mt-1">
+            <option value="inherit">{{ t('deepseekTools.inherit') }}</option>
+            <option value="enabled">{{ t('deepseekTools.keyEnabled') }}</option>
+            <option value="disabled">{{ t('deepseekTools.keyDisabled') }}</option>
+          </select>
+          <span class="mt-1 block text-xs text-gray-500">{{ t('deepseekTools.keyHint') }}</span>
+        </label>
         <div>
           <label class="input-label">{{ t('keys.nameLabel') }}</label>
           <input
@@ -588,6 +600,14 @@
             </template>
           </Select>
         </div>
+
+        <RequestSpeedSelector
+          v-if="selectedRequestSpeedGroup?.request_speed_selection_enabled"
+          v-model="requestSpeedTier"
+          :default-tier="selectedRequestSpeedGroup.default_request_speed_tier || 'ultrafast'"
+          :available-tiers="selectedRequestSpeedGroup.available_request_speed_tiers || []"
+        />
+        <p v-if="requestSpeedError" role="alert" class="rounded-lg bg-red-50 p-3 text-xs leading-5 text-red-700 dark:bg-red-950/30 dark:text-red-300">{{ requestSpeedError }}</p>
 
         <!-- Custom Key Section (only for create) -->
         <div v-if="!showEditModal" class="space-y-3">
@@ -1220,6 +1240,7 @@ import { keysAPI, authAPI, usageAPI, userGroupsAPI } from '@/api'
 import AppLayout from '@/components/layout/AppLayout.vue'
 import TablePageLayout from '@/components/layout/TablePageLayout.vue'
 import BulkEditKeysModal from '@/components/keys/BulkEditKeysModal.vue'
+import RequestSpeedSelector from '@/components/keys/RequestSpeedSelector.vue'
 	import DataTable from '@/components/common/DataTable.vue'
 	import Pagination from '@/components/common/Pagination.vue'
 	import BaseDialog from '@/components/common/BaseDialog.vue'
@@ -1232,7 +1253,7 @@ import BulkEditKeysModal from '@/components/keys/BulkEditKeysModal.vue'
 	import EndpointPopover from '@/components/keys/EndpointPopover.vue'
 	import GroupBadge from '@/components/common/GroupBadge.vue'
 	import GroupOptionItem from '@/components/common/GroupOptionItem.vue'
-	import type { ApiKey, Group, PublicSettings, SubscriptionType, GroupPlatform, UpdateApiKeyRequest } from '@/types'
+	import type { ApiKey, Group, PublicSettings, SubscriptionType, GroupPlatform, UpdateApiKeyRequest, RequestSpeedTier } from '@/types'
 import type { Column } from '@/components/common/types'
 import type { BatchApiKeyUsageStats } from '@/api/usage'
 import { formatDateTime } from '@/utils/format'
@@ -1441,6 +1462,7 @@ const setGroupButtonRef = (keyId: number, el: Element | ComponentPublicInstance 
 
 const formData = ref({
   name: '',
+  deepseek_tool_mode: 'inherit' as 'inherit' | 'enabled' | 'disabled',
   group_id: null as number | null,
   status: 'active' as 'active' | 'inactive',
   use_custom_key: false,
@@ -1460,6 +1482,32 @@ const formData = ref({
   expiration_preset: '30' as '7' | '30' | '90' | 'custom',
   expiration_date: ''
 })
+
+const requestSpeedTier = ref<RequestSpeedTier | null>(null)
+const requestSpeedError = ref('')
+const requestSpeedLabel = (tier: RequestSpeedTier) => tier === 'fast' ? 'Fast' : 'Ultrafast'
+const keyRequestSpeed = (key: ApiKey): RequestSpeedTier | null => {
+  if (key.group_id === null) return null
+  const group = groups.value.find(group => group.id === key.group_id) || key.group
+  if (group?.platform !== 'openai' || !group.request_speed_selection_enabled) return null
+  return key.request_speed_tier || 'ultrafast'
+}
+const selectedRequestSpeedGroup = computed(() => {
+  const group = groups.value.find(group => group.id === formData.value.group_id)
+  return group?.platform === 'openai' ? group : undefined
+})
+watch([() => formData.value.group_id, showCreateModal, showEditModal, () => selectedRequestSpeedGroup.value?.request_speed_selection_enabled], () => {
+  requestSpeedError.value = ''
+  const group = selectedRequestSpeedGroup.value
+  if (!group?.request_speed_selection_enabled) { requestSpeedTier.value = null; return }
+  requestSpeedTier.value = showEditModal.value && selectedKey.value?.group_id === group.id
+    ? selectedKey.value.request_speed_tier || 'ultrafast'
+    : group.default_request_speed_tier || 'ultrafast'
+})
+const refreshKeys = () => {
+  void loadApiKeys()
+  void loadGroups()
+}
 
 // 自定义Key验证
 const customKeyError = computed(() => {
@@ -1718,6 +1766,7 @@ const editKey = (key: ApiKey) => {
   const hasExpiration = !!key.expires_at
   formData.value = {
     name: key.name,
+    deepseek_tool_mode: key.deepseek_tool_mode || 'inherit',
     group_id: key.group_id,
     status: key.status === 'quota_exhausted' || key.status === 'expired' ? 'inactive' : key.status,
     use_custom_key: false,
@@ -1789,6 +1838,11 @@ const changeGroup = async (key: ApiKey, newGroupId: number | null) => {
   groupSelectorKeyId.value = null
   dropdownPosition.value = null
   if (key.group_id === newGroupId) return
+  if (keyRequestSpeed(key) || groups.value.find(group => group.id === newGroupId)?.request_speed_selection_enabled) {
+    editKey(key)
+    formData.value.group_id = newGroupId
+    return
+  }
 
   try {
     await keysAPI.update(key.id, { group_id: newGroupId })
@@ -1817,9 +1871,20 @@ const confirmDelete = (key: ApiKey) => {
 }
 
 const handleSubmit = async () => {
+  requestSpeedError.value = ''
   // Validate group_id is required
   if (formData.value.group_id === null) {
     appStore.showError(t('keys.groupRequired'))
+    return
+  }
+
+  const speedGroup = selectedRequestSpeedGroup.value
+  const speedChanged = !showEditModal.value || selectedKey.value?.group_id !== formData.value.group_id ||
+    requestSpeedTier.value !== (selectedKey.value?.request_speed_tier || 'ultrafast')
+  const submitRequestSpeed = speedGroup?.request_speed_selection_enabled && speedChanged
+  if (submitRequestSpeed && (!requestSpeedTier.value || !speedGroup.available_request_speed_tiers?.includes(requestSpeedTier.value))) {
+    requestSpeedError.value = t('requestSpeed.selectedUnavailable')
+    appStore.showError(requestSpeedError.value)
     return
   }
 
@@ -1874,6 +1939,7 @@ const handleSubmit = async () => {
   try {
     if (showEditModal.value && selectedKey.value) {
       const updates: UpdateApiKeyRequest = {
+        deepseek_tool_mode: formData.value.deepseek_tool_mode,
         name: formData.value.name,
         group_id: formData.value.group_id,
         ip_whitelist: ipWhitelist,
@@ -1884,6 +1950,7 @@ const handleSubmit = async () => {
         rate_limit_1d: rateLimitData.rate_limit_1d,
         rate_limit_7d: rateLimitData.rate_limit_7d,
       }
+      if (submitRequestSpeed) updates.request_speed_tier = requestSpeedTier.value
       if (shouldSubmitEditStatus(selectedKey.value, formData.value.status)) {
         updates.status = formData.value.status
       }
@@ -1899,7 +1966,9 @@ const handleSubmit = async () => {
         ipBlacklist,
         quota,
         expiresInDays,
-        rateLimitData
+        rateLimitData,
+        formData.value.deepseek_tool_mode,
+        submitRequestSpeed ? requestSpeedTier.value : undefined
       )
       appStore.showSuccess(t('keys.keyCreatedSuccess'))
       // Only advance tour if active, on submit step, and creation succeeded
@@ -1910,7 +1979,11 @@ const handleSubmit = async () => {
     closeModals()
     loadApiKeys()
   } catch (error: any) {
-    const errorMsg = error.response?.data?.detail || t('keys.failedToSave')
+    const detail = error.response?.data || error
+    const speedFailure = typeof detail.reason === 'string' && detail.reason.startsWith('REQUEST_SPEED_')
+    const errorMsg = speedFailure && typeof detail.message === 'string'
+      ? detail.message : error.response?.data?.detail || t('keys.failedToSave')
+    if (speedFailure) requestSpeedError.value = errorMsg
     appStore.showError(errorMsg)
     // Don't advance tour on error
   } finally {
@@ -1939,11 +2012,14 @@ const handleDelete = async () => {
 }
 
 const closeModals = () => {
+  requestSpeedTier.value = null
+  requestSpeedError.value = ''
   showCreateModal.value = false
   showEditModal.value = false
   selectedKey.value = null
   formData.value = {
     name: '',
+    deepseek_tool_mode: 'inherit',
     group_id: null,
     status: 'active',
     use_custom_key: false,

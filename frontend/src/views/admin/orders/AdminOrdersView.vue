@@ -30,9 +30,12 @@
               <Icon name="x" size="sm" />
               {{ t('payment.orders.cancel') }}
             </button>
-            <button v-if="row.status === 'FAILED'" @click="handleRetryOrder(row)" class="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-900/20">
+            <button v-if="row.status === 'FAILED' || (row.status === 'PAYMENT_REVIEW' && (row.provider_key !== 'bepusdt' || row.payment_trade_no))" @click="handleRetryOrder(row)" class="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-900/20">
               <Icon name="refresh" size="sm" />
-              {{ t('payment.admin.retry') }}
+              {{ t(row.status === 'PAYMENT_REVIEW' ? 'payment.admin.reviewPayment' : 'payment.admin.retry') }}
+            </button>
+            <button v-if="row.provider_key === 'bepusdt' && !row.payment_trade_no && ['PENDING', 'FAILED', 'PAYMENT_REVIEW'].includes(row.status)" @click="handleReconcileOrder(row)" class="rounded-md px-2 py-1 text-xs font-medium text-blue-600 dark:text-blue-400">
+              {{ t('payment.admin.reconcileTrade') }}
             </button>
             <template v-if="row.status === 'REFUND_REQUESTED'">
               <span v-if="row.refund_amount" class="rounded-full bg-purple-100 px-1.5 py-0.5 text-xs font-medium text-purple-700 dark:bg-purple-900/30 dark:text-purple-300">{{ creditedAmountSymbol }}{{ row.refund_amount.toFixed(2) }}</span>
@@ -191,6 +194,7 @@ const statusFilterOptions = computed(() => [
   { value: '', label: t('payment.admin.allStatuses') },
   { value: 'PENDING', label: t('payment.status.pending') },
   { value: 'PAID', label: t('payment.status.paid') },
+  { value: 'PAYMENT_REVIEW', label: t('payment.status.payment_review') },
   { value: 'COMPLETED', label: t('payment.status.completed') },
   { value: 'EXPIRED', label: t('payment.status.expired') },
   { value: 'CANCELLED', label: t('payment.status.cancelled') },
@@ -233,7 +237,15 @@ async function handleCancelOrder(order: PaymentOrder) {
 }
 
 async function handleRetryOrder(order: PaymentOrder) {
+  if (order.status === 'PAYMENT_REVIEW' && !window.confirm(t('payment.admin.reviewPaymentConfirm'))) return
   try { await adminPaymentAPI.retryRecharge(order.id); appStore.showSuccess(t('payment.admin.retrySuccess')); loadOrders() }
+  catch (err: unknown) { appStore.showError(extractI18nErrorMessage(err, t, 'payment.errors', t('common.error'))) }
+}
+
+async function handleReconcileOrder(order: PaymentOrder) {
+  const tradeId = window.prompt(t('payment.admin.reconcileTradePrompt'))?.trim()
+  if (!tradeId) return
+  try { await adminPaymentAPI.reconcileUSDT(order.id, tradeId); appStore.showSuccess(t('payment.admin.reconcileTradeSuccess')); await loadOrders() }
   catch (err: unknown) { appStore.showError(extractI18nErrorMessage(err, t, 'payment.errors', t('common.error'))) }
 }
 

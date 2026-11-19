@@ -62,6 +62,9 @@ export interface RefundResult {
 }
 
 export const adminPaymentAPI = {
+  reconcileUSDT(orderId: number, tradeId: string) {
+    return apiClient.post(`/admin/payment/orders/${orderId}/reconcile-usdt`, { trade_id: tradeId })
+  },
   // ==================== Config ====================
 
   /** Get payment configuration (admin view) */

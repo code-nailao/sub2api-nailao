@@ -17,6 +17,10 @@
             @create="showCreate = true"
           >
             <template #after>
+              <button type="button" class="btn btn-secondary px-2 md:px-3" :title="t('sourcesBalance.refreshPage')" :aria-label="t('sourcesBalance.refreshPage')" :disabled="balances.refreshing.value || !balances.supportsRefresh.value" @click="balances.refreshPage">
+                <Icon name="refresh" size="sm" :class="{ 'animate-spin': balances.refreshing.value }" />
+                <span class="hidden md:inline">{{ t(balances.refreshing.value ? 'sourcesBalance.refreshing' : 'sourcesBalance.refreshPage') }}</span>
+              </button>
               <!-- Auto Refresh Dropdown -->
               <div class="relative" ref="autoRefreshDropdownRef">
                 <button
@@ -286,6 +290,9 @@
           <template #cell-capacity="{ row }">
             <AccountCapacityCell :account="row" />
           </template>
+          <template #cell-upstream_balance="{ row }">
+            <AccountBalanceCell :summary="balances.summaries.value[row.id]" :supported="balances.supported(row)" :loading="balances.loading.value" :unavailable="balances.unavailable.value" @configure="balanceAccount = row" />
+          </template>
           <template #cell-status="{ row }">
             <div class="flex items-center gap-1.5">
               <AccountStatusIndicator :account="row" @show-temp-unsched="handleShowTempUnsched" />
@@ -454,6 +461,11 @@
       </template>
       <template #pagination><Pagination v-if="pagination.total > 0" :page="pagination.page" :total="pagination.total" :page-size="pagination.page_size" @update:page="handlePageChange" @update:pageSize="handlePageSizeChange" /></template>
     </TablePageLayout>
+    <p v-if="balances.unavailable.value || balances.refreshFailed.value" role="status" class="mt-3 text-sm text-amber-700 dark:text-amber-300">
+      {{ t(balances.unavailable.value ? 'sourcesBalance.loadingFailure' : 'sourcesBalance.pageRefreshFailure') }}
+      <button type="button" class="ml-2 underline" @click="balances.load">{{ t('sourcesBalance.loadRetry') }}</button>
+    </p>
+    <BalanceDrawer :account="balanceAccount" :summary="balanceAccount ? balances.summaries.value[balanceAccount.id] : undefined" @close="balanceAccount = null" @changed="onWalletSettingsChanged" />
     <CreateAccountModal :show="showCreate" :proxies="proxies" :groups="groups" @close="showCreate = false" @created="reload" />
     <EditAccountModal :show="showEdit" :account="edAcc" :proxies="proxies" :groups="groups" @close="showEdit = false" @updated="handleAccountUpdated" />
     <ReAuthAccountModal :show="showReAuth" :account="reAuthAcc" @close="closeReAuthModal" @reauthorized="handleAccountUpdated" />
@@ -539,6 +551,10 @@ import { sanitizeUrl } from '@/utils/url'
 import { getFloatingPanelPosition } from '@/utils/floatingPanel'
 import { formatMultiplier } from '@/utils/formatters'
 import type { Account, AccountListItem, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, Proxy as AccountProxy, AdminGroup, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
+import AccountBalanceCell from '@/features/sources/balances/AccountBalanceCell.vue'
+import BalanceDrawer from '@/features/sources/balances/WalletManagementDrawer.vue'
+import { useAccountBalances } from '@/features/sources/balances/useAccountBalances'
+import type { AccountBalance } from '@/features/sources/balances/types'
 
 const { t } = useI18n()
 const appStore = useAppStore()
@@ -616,6 +632,7 @@ const creatingShadowAcc = ref<Account | null>(null)
 const reAuthAcc = ref<Account | null>(null)
 const testingAcc = ref<Account | null>(null)
 const statsAcc = ref<Account | null>(null)
+const balanceAccount = ref<AccountListItem | null>(null)
 const showSchedulePanel = ref(false)
 const scheduleAcc = ref<Account | null>(null)
 const scheduleModelOptions = ref<SelectOption[]>([])
@@ -1122,6 +1139,10 @@ const {
   }
 })
 
+const balances = useAccountBalances(accounts, () => authStore.user?.id)
+const onWalletSettingsChanged = (summary: AccountBalance) => { balances.apply(summary); void balances.load() }
+watch(() => authStore.user?.id, () => { balanceAccount.value = null })
+
 const {
   selectedSet,
   selectedIds: selIds,
@@ -1523,6 +1544,7 @@ const handleManualRefresh = async () => {
   await Promise.all([load(), loadUpstreamBillingProbeGlobalState()])
   // Force usage cells to refetch /usage on explicit user refresh.
   usageManualRefreshToken.value += 1
+  void balances.load()
 }
 
 const loadUpstreamBillingProbeGlobalState = async () => {
@@ -1836,6 +1858,7 @@ const allColumns = computed(() => {
     c.push({ key: 'groups', label: t('admin.accounts.columns.groups'), sortable: false })
   }
   c.push({ key: 'usage', label: t('admin.accounts.columns.usageWindows'), sortable: false })
+  c.push({ key: 'upstream_balance', label: t('sourcesBalance.column'), sortable: false })
   c.push(
     { key: 'proxy', label: t('admin.accounts.columns.proxy'), sortable: false },
     { key: 'priority', label: t('admin.accounts.columns.priority'), sortable: true },

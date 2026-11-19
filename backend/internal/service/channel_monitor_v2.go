@@ -43,6 +43,8 @@ type ChannelMonitorV2Config struct {
 	Platforms              []ChannelMonitorV2PlatformConfig `json:"platforms"`
 	GroupIDs               []int64                          `json:"group_ids"`
 	HealthThresholds       ChannelMonitorV2HealthThresholds `json:"health_thresholds"`
+	// Omitted by older clients: retain the existing presentation preferences.
+	DisplayOrder *ChannelMonitorV2DisplayOrder `json:"display_order,omitempty"`
 	// IgnoredErrorCategories are excluded from error_rate / health scoring.
 	// They still appear in the error breakdown with ignored=true (greyed in UI).
 	// Unknown categories always roll into "other" via the taxonomy classifier.
@@ -89,9 +91,12 @@ type ChannelMonitorV2Filter struct {
 }
 
 type ChannelMonitorV2Metric struct {
-	SuccessRequests          int64                   `json:"success_requests"`
-	ErrorRequests            int64                   `json:"error_requests"`
-	RequestCount             int64                   `json:"request_count"`
+	SuccessRequests int64 `json:"success_requests"`
+	ErrorRequests   int64 `json:"error_requests"`
+	RequestCount    int64 `json:"request_count"`
+	// Presence survives public count redaction, distinguishing missing data from 0%.
+	HasRequests              bool                    `json:"has_requests"`
+	HasCacheInput            bool                    `json:"has_cache_input"`
 	InputTokens              int64                   `json:"input_tokens"`
 	OutputTokens             int64                   `json:"output_tokens"`
 	CacheCreationTokens      int64                   `json:"cache_creation_tokens"`
@@ -494,6 +499,7 @@ func (s *ChannelMonitorV2Service) Snapshot(ctx context.Context, filter ChannelMo
 		return nil, err
 	}
 	if !admin && snap != nil {
+		snap.Config.DisplayOrder = channelMonitorV2DisplayOrderForViewer(snap.Config.DisplayOrder, filter, cfg.GroupIDs)
 		redactChannelMonitorV2Snapshot(snap, s.hideThroughputForViewer(ctx, admin))
 	}
 	return snap, nil
@@ -638,6 +644,8 @@ func redactChannelMonitorV2Metric(m *ChannelMonitorV2Metric, hideThroughput bool
 	if m == nil {
 		return
 	}
+	m.HasRequests = m.HasRequests || m.RequestCount > 0
+	m.HasCacheInput = m.HasCacheInput || m.CacheRateDenominator > 0
 	m.SuccessRequests = 0
 	m.ErrorRequests = 0
 	m.RequestCount = 0
@@ -756,6 +764,10 @@ func normalizeChannelMonitorV2Config(cfg *ChannelMonitorV2Config) error {
 	}
 	var err error
 	cfg.GroupIDs, err = normalizeChannelMonitorV2GroupIDs(cfg.GroupIDs)
+	if err != nil {
+		return err
+	}
+	cfg.DisplayOrder, err = NormalizeChannelMonitorV2DisplayOrder(cfg.DisplayOrder)
 	if err != nil {
 		return err
 	}

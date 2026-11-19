@@ -32,7 +32,7 @@ func (r *runtimeCleanupReloader) Reload(context.Context) error {
 
 func newRuntimeSettingRepoStub() *runtimeSettingRepoStub {
 	return &runtimeSettingRepoStub{
-		values:  map[string]string{},
+		values:  map[string]string{SettingKeyExternalLogCleanupEnabled: "false"},
 		deleted: map[string]bool{},
 	}
 }

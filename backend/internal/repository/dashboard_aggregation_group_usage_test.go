@@ -67,7 +67,7 @@ func expectGroupRollupRound(
 	mock.ExpectBegin()
 	mock.ExpectQuery(groupRollupBeginQuery).WillReturnRows(begin)
 	if minCreatedAt != nil {
-		mock.ExpectQuery(`(?s)SELECT MIN\(created_at\)\s+FROM usage_logs\s+WHERE created_at >= \$1`).
+		mock.ExpectQuery(`(?s)SELECT LEAST\(.*FROM usage_logs.*created_at >= \$1.*FROM usage_cleanup_group_daily.*>= \$1`).
 			WithArgs(minCreatedAfter).
 			WillReturnRows(minCreatedAt)
 	}

@@ -92,7 +92,7 @@ func (r *usageLogRepository) GetUserUsageTrend(ctx context.Context, startTime, e
 	query := fmt.Sprintf(`
 		WITH top_users AS (
 			SELECT user_id
-			FROM usage_logs
+			FROM usage_cleanup_admin_source
 			WHERE created_at >= $1 AND created_at < $2
 			GROUP BY user_id
 			ORDER BY %s DESC, user_id ASC
@@ -103,11 +103,11 @@ func (r *usageLogRepository) GetUserUsageTrend(ctx context.Context, startTime, e
 			u.user_id,
 			COALESCE(us.email, '') as email,
 			COALESCE(us.username, '') as username,
-			COUNT(*) as requests,
+			SUM(u.requests) as requests,
 			COALESCE(SUM(u.input_tokens + u.output_tokens + u.cache_creation_tokens + u.cache_read_tokens), 0) as tokens,
 			COALESCE(SUM(u.total_cost), 0) as cost,
 			COALESCE(SUM(u.actual_cost), 0) as actual_cost
-		FROM usage_logs u
+		FROM usage_cleanup_admin_source u
 		LEFT JOIN users us ON u.user_id = us.id
 		WHERE u.user_id IN (SELECT user_id FROM top_users)
 		  AND u.created_at >= $4 AND u.created_at < $5
@@ -156,9 +156,9 @@ func (r *usageLogRepository) GetUserSpendingRanking(ctx context.Context, startTi
 				COALESCE(us.email, '') as email,
 				COALESCE(us.username, '') as username,
 				COALESCE(SUM(u.actual_cost), 0) as actual_cost,
-				COUNT(*) as requests,
+				SUM(u.requests) as requests,
 				COALESCE(SUM(u.input_tokens + u.output_tokens + u.cache_creation_tokens + u.cache_read_tokens), 0) as tokens
-			FROM usage_logs u
+			FROM usage_cleanup_admin_source u
 			LEFT JOIN users us ON u.user_id = us.id
 			WHERE u.created_at >= $1 AND u.created_at < $2
 			GROUP BY u.user_id, us.email, us.username
@@ -290,11 +290,15 @@ func (r *usageLogRepository) getUsageTrendWithFilters(ctx context.Context, start
 	}
 
 	dateFormat := safeDateFormat(granularity)
+	sourceTable, requestCount := "usage_logs", "COUNT(*)"
+	if shouldUsePreaggregatedTrend(granularity, userID, apiKeyID, accountID, groupID, model, requestType, stream, billingType, billingMode, upstreamModelMismatch, nativeCompactionV2) {
+		sourceTable, requestCount = "usage_cleanup_admin_source", "SUM(requests)"
+	}
 
 	query := fmt.Sprintf(`
 		SELECT
 			TO_CHAR(created_at, '%s') as date,
-			COUNT(*) as requests,
+			%s as requests,
 			COALESCE(SUM(input_tokens), 0) as input_tokens,
 			COALESCE(SUM(output_tokens), 0) as output_tokens,
 			COALESCE(SUM(cache_creation_tokens), 0) as cache_creation_tokens,
@@ -302,9 +306,9 @@ func (r *usageLogRepository) getUsageTrendWithFilters(ctx context.Context, start
 			COALESCE(SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens), 0) as total_tokens,
 			COALESCE(SUM(total_cost), 0) as cost,
 			COALESCE(SUM(actual_cost), 0) as actual_cost
-		FROM usage_logs
+		FROM %s
 		WHERE created_at >= $1 AND created_at < $2
-	`, dateFormat)
+	`, dateFormat, requestCount, sourceTable)
 
 	args := []any{startTime, endTime}
 	if userID > 0 {
@@ -449,6 +453,9 @@ func (r *usageLogRepository) GetModelStatsWithUsageFiltersBySource(ctx context.C
 }
 
 func (r *usageLogRepository) getModelStatsWithFiltersBySource(ctx context.Context, startTime, endTime time.Time, userID, apiKeyID, accountID, groupID int64, model string, requestType *int16, stream *bool, billingType *int8, source string, billingMode string, upstreamModelMismatch *bool, nativeCompactionV2 *bool) (results []ModelStat, err error) {
+	if userID == 0 && apiKeyID == 0 && accountID == 0 && groupID == 0 && model == "" && requestType == nil && stream == nil && billingType == nil && billingMode == "" && upstreamModelMismatch == nil && nativeCompactionV2 == nil {
+		return r.getAdminHomeModelHistory(ctx, startTime, endTime, source)
+	}
 	modelExpr := resolveModelDimensionExpression(source)
 
 	query := fmt.Sprintf(`

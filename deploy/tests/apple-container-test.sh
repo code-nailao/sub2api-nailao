@@ -34,7 +34,11 @@ export SUB2API_ENV_FILE="${ENV_FILE}"
 mkdir -p "${STATE_DIR}"
 
 "${SCRIPT}" init
-[[ "$(stat -f '%Lp' "${ENV_FILE}")" == "600" ]] || fail "init did not create a mode-600 env file"
+# GNU stat reads -f as "filesystem" and prints a block report for '%Lp', so probe
+# by output shape rather than by exit status.
+env_mode="$(stat -c '%a' "${ENV_FILE}" 2>/dev/null || true)"
+[[ "${env_mode}" =~ ^[0-7]+$ ]] || env_mode="$(stat -f '%Lp' "${ENV_FILE}" 2>/dev/null || true)"
+[[ "${env_mode}" == "600" ]] || fail "init did not create a mode-600 env file"
 grep -q '^POSTGRES_PASSWORD=change_this_secure_password$' "${ENV_FILE}" && fail "init retained the placeholder password"
 
 chmod 644 "${ENV_FILE}"

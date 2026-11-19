@@ -252,6 +252,7 @@ func TestGetPublicOrderByResumeTokenChecksUpstreamForPendingOrder(t *testing.T) 
 		resumeService:   resumeSvc,
 		providersLoaded: true,
 	}
+	bindPaymentOrderProviderFixture(t, svc, provider)
 
 	got, err := svc.GetPublicOrderByResumeToken(ctx, token)
 	require.NoError(t, err)
@@ -297,6 +298,7 @@ func TestVerifyOrderPublicDoesNotCheckUpstreamForPendingOrder(t *testing.T) {
 		registry:        registry,
 		providersLoaded: true,
 	}
+	bindPaymentOrderProviderFixture(t, svc, provider)
 
 	got, err := svc.VerifyOrderPublic(ctx, order.OutTradeNo)
 	require.NoError(t, err)

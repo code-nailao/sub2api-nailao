@@ -779,6 +779,16 @@ func checkBillingModeRequirements(p ChannelModelPricing) error {
 }
 
 func checkPricesNotNegative(p ChannelModelPricing) error {
+	if p.UltrafastMultiplier != nil {
+		if p.BillingMode != "" && p.BillingMode != BillingModeToken {
+			return infraerrors.BadRequest("UNSUPPORTED_ULTRAFAST_MODEL", "Ultrafast multipliers require token billing")
+		}
+		for _, model := range p.Models {
+			if !supportsGroupUltrafastModel(model) {
+				return infraerrors.BadRequest("UNSUPPORTED_ULTRAFAST_MODEL", "Ultrafast multipliers support only gpt-6-astra, gpt-6.1-sol, gpt-6.2-sol and gpt-6.2-astra")
+			}
+		}
+	}
 	checks := []struct {
 		field string
 		val   *float64
@@ -803,8 +813,8 @@ func checkPricesNotNegative(p ChannelModelPricing) error {
 		val   *float64
 	}{
 		{"fast_multiplier", p.FastMultiplier},
-		{"flex_multiplier", p.FlexMultiplier},
 		{"ultrafast_multiplier", p.UltrafastMultiplier},
+		{"flex_multiplier", p.FlexMultiplier},
 	} {
 		if c.val != nil && *c.val <= 0 {
 			return infraerrors.BadRequest("INVALID_MULTIPLIER", fmt.Sprintf("%s must be > 0", c.field))

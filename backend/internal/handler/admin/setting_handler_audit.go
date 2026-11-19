@@ -579,6 +579,12 @@ func diffSettings(before *service.SystemSettings, after *service.SystemSettings,
 	if before.ChannelMonitorEnabled != after.ChannelMonitorEnabled {
 		changed = append(changed, "channel_monitor_enabled")
 	}
+	if before.ChannelMonitorDegradedThresholdSeconds != after.ChannelMonitorDegradedThresholdSeconds {
+		changed = append(changed, "channel_monitor_degraded_threshold_seconds")
+	}
+	if before.ChannelMonitorRequestTimeoutSeconds != after.ChannelMonitorRequestTimeoutSeconds {
+		changed = append(changed, "channel_monitor_request_timeout_seconds")
+	}
 	if before.ChannelMonitorDefaultIntervalSeconds != after.ChannelMonitorDefaultIntervalSeconds {
 		changed = append(changed, "channel_monitor_default_interval_seconds")
 	}

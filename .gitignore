@@ -166,3 +166,18 @@ issues/
 .vite/
 # 本地闭源插件开发目录及构建产物不进入 Sub2API 仓库
 /plugins/
+
+extensions/sources-portal/webapp/node_modules/
+extensions/sources-portal/internal/portal/homeweb/
+
+# Reviewed clean-core extensions: track their contracts and validation tools.
+!/docs/sources/
+!/scripts/
+/scripts/*
+!/scripts/sources_baseline.py
+!/scripts/sources_extensions/
+!/scripts/sources_validation/
+!/scripts/sources_release/
+/scripts/sources_release/__pycache__/
+/scripts/sources_extensions/__pycache__/
+/scripts/sources_validation/__pycache__/

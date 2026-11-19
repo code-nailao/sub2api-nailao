@@ -26,6 +26,7 @@ import (
 
 type Application struct {
 	Server        *http.Server
+	Settings      *service.SettingService
 	PromptAudit   *securityaudit.PromptService
 	PluginManager *service.PluginManager
 	Cleanup       func()
@@ -58,7 +59,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 		provideCleanup,
 
 		// Application struct
-		wire.Struct(new(Application), "Server", "PromptAudit", "PluginManager", "Cleanup"),
+		wire.Struct(new(Application), "Server", "Settings", "PromptAudit", "PluginManager", "Cleanup"),
 	)
 	return nil, nil
 }
@@ -82,6 +83,8 @@ func providePluginHostInfo(buildInfo handler.BuildInfo) service.PluginHostInfo {
 }
 
 func provideCleanup(
+	sourcesMediaEngine *service.SourcesMediaEngine,
+	accountWallet *service.AccountWalletReader,
 	entClient *ent.Client,
 	rdb *redis.Client,
 	opsMetricsCollector *service.OpsMetricsCollector,
@@ -107,6 +110,8 @@ func provideCleanup(
 	geminiCachedContent *service.GeminiCachedContentService,
 	batchImageCleanup *service.BatchImageCleanupService,
 	batchImageWorker *service.BatchImageWorkerRuntime,
+	upstreamRejectionRecovery *service.UpstreamRejectionRecovery,
+	deepSeekUsageRecovery *service.DeepSeekUsageRecovery,
 	pricing *service.PricingService,
 	emailQueue *service.EmailQueueService,
 	billingCache *service.BillingCacheService,
@@ -136,8 +141,8 @@ func provideCleanup(
 	pluginManager *service.PluginManager,
 ) func() {
 	return func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+		ctx := context.Background()
+		started := time.Now()
 
 		type cleanupStep struct {
 			name string
@@ -146,6 +151,25 @@ func provideCleanup(
 
 		// 应用层清理步骤可并行执行，基础设施资源（Redis/Ent）最后按顺序关闭。
 		parallelSteps := []cleanupStep{
+			{"DeepSeekUsageRecovery", func() error {
+				if deepSeekUsageRecovery != nil {
+					deepSeekUsageRecovery.Stop()
+				}
+				return nil
+			}},
+			{"UpstreamRejectionRecovery", func() error {
+				if upstreamRejectionRecovery != nil {
+					upstreamRejectionRecovery.Stop()
+				}
+				return nil
+			}},
+			{"AccountWalletRefresh", func() error {
+				if accountWallet != nil {
+					accountWallet.Stop()
+				}
+				return nil
+			}},
+			{"SourcesMediaEngine", func() error { sourcesMediaEngine.Stop(); return nil }},
 			{"DigestSessionStore", func() error {
 				if digestSessions != nil {
 					digestSessions.Close()
@@ -333,7 +357,9 @@ func provideCleanup(
 				return nil
 			}},
 			{"UsageBillingLaneCombiner", func() error {
-				usageBillingLanes.Stop()
+				if usageBillingLanes != nil {
+					usageBillingLanes.Stop()
+				}
 				return nil
 			}},
 			{"OAuthService", func() error {
@@ -463,15 +489,35 @@ func provideCleanup(
 			}
 		}
 
-		runParallel(parallelSteps)
-		runSequential(infraSteps)
-
-		// Check if context timed out
-		select {
-		case <-ctx.Done():
-			log.Printf("[Cleanup] Warning: cleanup timed out after 10 seconds")
-		default:
-			log.Printf("[Cleanup] All cleanup steps completed")
+		// Background operations can still settle usage and publish invalidations
+		// while stopping. Their dependencies must outlive them. Drain the usage
+		// pool before its billing cache, then close sinks and infrastructure.
+		localOrder := []string{
+			"PluginManager", "PricingService", "SubscriptionService",
+			"OAuthService", "OpenAIOAuthService", "GeminiOAuthService", "AntigravityOAuthService", "GrokOAuthService", "OpenAIWSPool",
+			"UsageRecordWorkerPool", "UsageBillingLaneCombiner", "BalanceNotifyService", "BillingCacheService", "EmailQueueService", "DigestSessionStore",
+			"AuthCacheInvalidationSubscriber", "OpsRuntimeSettingsRefresh", "OpsIngressRejectAggregator",
+			"AuditLogService", "OpsSystemLogSink",
 		}
+		local := make(map[string]cleanupStep, len(localOrder))
+		for _, name := range localOrder {
+			local[name] = cleanupStep{}
+		}
+		background := make([]cleanupStep, 0, len(parallelSteps))
+		for _, step := range parallelSteps {
+			if _, later := local[step.name]; later {
+				local[step.name] = step
+			} else {
+				background = append(background, step)
+			}
+		}
+		runParallel(background)
+		for _, name := range localOrder {
+			if step := local[name]; step.fn != nil {
+				runSequential([]cleanupStep{step})
+			}
+		}
+		runSequential(infraSteps)
+		log.Printf("[Cleanup] All cleanup steps completed in %s", time.Since(started))
 	}
 }

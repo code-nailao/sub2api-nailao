@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
@@ -186,12 +187,14 @@ func (s *SettingService) InitializeDefaultSettings(ctx context.Context) error {
 		SettingKeyOpsMetricsIntervalSeconds:    "60",
 
 		// Channel monitor defaults (enabled, 60s)
-		SettingKeyChannelMonitorEnabled:                "true",
-		SettingKeyChannelMonitorMode:                   ChannelMonitorModeV1,
-		SettingKeyChannelMonitorDefaultIntervalSeconds: "60",
-		SettingKeyChannelMonitorHideThroughput:         "true",
-		SettingKeyChannelMonitorShowQuota:              "false",
-		SettingKeyChannelMonitorHideUserRanking:        "false",
+		SettingKeyChannelMonitorEnabled:                  "true",
+		SettingKeyChannelMonitorMode:                     ChannelMonitorModeV1,
+		SettingKeyChannelMonitorDefaultIntervalSeconds:   "60",
+		SettingKeyChannelMonitorDegradedThresholdSeconds: "20",
+		SettingKeyChannelMonitorRequestTimeoutSeconds:    "60",
+		SettingKeyChannelMonitorHideThroughput:           "true",
+		SettingKeyChannelMonitorShowQuota:                "false",
+		SettingKeyChannelMonitorHideUserRanking:          "false",
 
 		// Grok compatibility defaults: cross-client mapping stays enabled unless
 		// operators explicitly disable it.
@@ -801,6 +804,9 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	}
 
 	// Channel monitor feature (default: enabled, 60s)
+	timing := parseChannelMonitorProbeTiming(settings)
+	result.ChannelMonitorDegradedThresholdSeconds = int(timing.DegradedThreshold / time.Second)
+	result.ChannelMonitorRequestTimeoutSeconds = int(timing.RequestTimeout / time.Second)
 	result.ChannelMonitorEnabled = !isFalseSettingValue(settings[SettingKeyChannelMonitorEnabled])
 	result.ChannelMonitorMode = normalizeChannelMonitorMode(settings[SettingKeyChannelMonitorMode])
 	result.ChannelMonitorDefaultIntervalSeconds = parseChannelMonitorInterval(

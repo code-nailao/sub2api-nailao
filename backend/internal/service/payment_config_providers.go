@@ -98,6 +98,7 @@ func (s *PaymentConfigService) decryptAndMaskConfig(providerKey, encrypted strin
 
 // pendingOrderStatuses are order statuses considered "in progress".
 var pendingOrderStatuses = []string{
+	OrderStatusPaymentReview,
 	payment.OrderStatusPending,
 	payment.OrderStatusPaid,
 	payment.OrderStatusRecharging,
@@ -111,6 +112,7 @@ var pendingOrderStatuses = []string{
 // Key matching is case-insensitive. Non-listed keys (e.g. appId, notifyUrl,
 // stripe publishableKey) are returned in plaintext by the admin GET API.
 var providerSensitiveConfigFields = map[string]map[string]struct{}{
+	payment.TypeBEPusdt:   {"apitoken": {}},
 	payment.TypeEasyPay:   {"pkey": {}},
 	payment.TypeAlipay:    {"privatekey": {}, "publickey": {}, "alipaypublickey": {}},
 	payment.TypeWxpay:     {"privatekey": {}, "apiv3key": {}, "publickey": {}},
@@ -123,6 +125,7 @@ var providerSensitiveConfigFields = map[string]map[string]struct{}{
 // all provider identity fields that are snapshotted into orders or used by
 // webhook/refund verification.
 var providerPendingOrderProtectedConfigFields = map[string]map[string]struct{}{
+	payment.TypeBEPusdt:   {"apitoken": {}, "apibase": {}, "notifyurl": {}, "returnurl": {}},
 	payment.TypeEasyPay:   {"pkey": {}, "pid": {}},
 	payment.TypeAlipay:    {"privatekey": {}, "publickey": {}, "alipaypublickey": {}, "appid": {}},
 	payment.TypeWxpay:     {"privatekey": {}, "apiv3key": {}, "publickey": {}, "appid": {}, "mpappid": {}, "mchid": {}, "publickeyid": {}, "certserial": {}},
@@ -178,10 +181,21 @@ func (s *PaymentConfigService) countPendingOrdersByPlan(ctx context.Context, pla
 }
 
 var validProviderKeys = map[string]bool{
+	payment.TypeBEPusdt: true,
 	payment.TypeEasyPay: true, payment.TypeAlipay: true, payment.TypeWxpay: true, payment.TypeStripe: true, payment.TypeAirwallex: true,
 }
 
 func (s *PaymentConfigService) CreateProviderInstance(ctx context.Context, req CreateProviderInstanceRequest) (*dbent.PaymentProviderInstance, error) {
+	if req.ProviderKey == payment.TypeBEPusdt {
+		req.Enabled = false
+		req.RefundEnabled = false
+		req.AllowUserRefund = false
+		req.PaymentMode = "redirect"
+		req.Config = payment.NativeBEPConfig(req.Config)
+		if err := validateNativeProviderConfig(req.Config, req.SupportedTypes); err != nil {
+			return nil, err
+		}
+	}
 	typesStr := joinTypes(req.SupportedTypes)
 	if err := validateProviderRequest(req.ProviderKey, req.Name, typesStr); err != nil {
 		return nil, err
@@ -293,6 +307,16 @@ func (s *PaymentConfigService) UpdateProviderInstance(ctx context.Context, id in
 	if err != nil {
 		return nil, fmt.Errorf("load provider instance: %w", err)
 	}
+	if current.ProviderKey == payment.TypeBEPusdt {
+		no := false
+		mode := "redirect"
+		req.RefundEnabled = &no
+		req.AllowUserRefund = &no
+		req.PaymentMode = &mode
+		if req.Config != nil {
+			req.Config = payment.NativeBEPConfig(req.Config)
+		}
+	}
 	var pendingOrderCount *int
 	getPendingOrderCount := func() (int, error) {
 		if pendingOrderCount != nil {
@@ -337,7 +361,7 @@ func (s *PaymentConfigService) UpdateProviderInstance(ctx context.Context, id in
 			}
 		}
 	}
-	if req.Enabled != nil && !*req.Enabled {
+	if req.Enabled != nil && !*req.Enabled && current.ProviderKey != payment.TypeBEPusdt {
 		count, err := getPendingOrderCount()
 		if err != nil {
 			return nil, err
@@ -352,6 +376,13 @@ func (s *PaymentConfigService) UpdateProviderInstance(ctx context.Context, id in
 		configToValidate, err = s.decryptConfig(current.Config)
 		if err != nil {
 			return nil, fmt.Errorf("decrypt existing config: %w", err)
+		}
+	}
+	if current.ProviderKey == payment.TypeBEPusdt {
+		configToValidate = payment.NativeBEPConfig(configToValidate)
+		mergedConfig = configToValidate
+		if err := validateNativeProviderConfig(configToValidate, strings.Split(nextSupportedTypes, ",")); err != nil {
+			return nil, err
 		}
 	}
 	if current.ProviderKey == payment.TypeEasyPay {
@@ -522,6 +553,19 @@ func (s *PaymentConfigService) decryptConfig(stored string) (map[string]string, 
 }
 
 func (s *PaymentConfigService) DeleteProviderInstance(ctx context.Context, id int64) error {
+	inst, err := s.entClient.PaymentProviderInstance.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if inst.ProviderKey == payment.TypeBEPusdt {
+		n, err := s.entClient.PaymentOrder.Query().Where(paymentorder.ProviderInstanceIDEQ(strconv.FormatInt(id, 10))).Count(ctx)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			return infraerrors.Conflict("HISTORICAL_ORDERS", "disable new checkouts; keep historical payment identity")
+		}
+	}
 	count, err := s.countPendingOrders(ctx, id)
 	if err != nil {
 		return fmt.Errorf("check pending orders: %w", err)

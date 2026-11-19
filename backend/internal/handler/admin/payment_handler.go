@@ -426,7 +426,9 @@ func (h *PaymentHandler) CreateProvider(c *gin.Context) {
 		return
 	}
 	h.paymentService.RefreshProviders(c.Request.Context())
-	response.Created(c, inst)
+	public := *inst
+	public.Config = "" // write responses never echo stored merchant credentials
+	response.Created(c, &public)
 }
 
 // UpdateProvider updates an existing payment provider instance.
@@ -447,7 +449,9 @@ func (h *PaymentHandler) UpdateProvider(c *gin.Context) {
 		return
 	}
 	h.paymentService.RefreshProviders(c.Request.Context())
-	response.Success(c, inst)
+	public := *inst
+	public.Config = ""
+	response.Success(c, &public)
 }
 
 // DeleteProvider deletes a payment provider instance.
@@ -502,4 +506,24 @@ func (h *PaymentHandler) UpdateConfig(c *gin.Context) {
 		return
 	}
 	response.Success(c, gin.H{"message": "updated"})
+}
+
+// ReconcileNativePayment queries the pinned BE gateway before linking a trade.
+func (h *PaymentHandler) ReconcileNativePayment(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	var req struct {
+		TradeID string `json:"trade_id" binding:"required,max=128"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "invalid trade reference")
+		return
+	}
+	if err := h.paymentService.ReconcileNativePayment(c.Request.Context(), id, req.TradeID); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, gin.H{"message": "gateway trade verified"})
 }

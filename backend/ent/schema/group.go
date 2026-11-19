@@ -168,6 +168,17 @@ func (Group) Fields() []ent.Field {
 			SchemaType(map[string]string{dialect.Postgres: "decimal(20,8)"}).
 			Comment("Codex alpha/search 网页搜索单次价格（USD/次）；nil 表示使用默认价 0.01（官方 $10/1000 次）"),
 
+		field.Bool("upstream_rejection_billing_enabled").
+			Default(false).
+			Comment("Enable fixed final billing for verified upstream safety rejections"),
+		field.Float("upstream_rejection_price").
+			Default(0.1).
+			Min(0).
+			SchemaType(map[string]string{dialect.Postgres: "decimal(20,8)"}).
+			Comment("Fixed final wallet amount, independent of every multiplier"),
+
+		field.JSON("deepseek_tools", domain.DeepSeekToolsConfig{}).Optional(),
+
 		// 搜索/工具调用显式定价（per 1k calls），用于 Grok web_search 等。
 		field.Float("search_price_per_1k").
 			Optional().
@@ -250,6 +261,9 @@ func (Group) Fields() []ent.Field {
 		field.Bool("allow_live").
 			Default(false).
 			Comment("是否允许此 OpenAI 分组访问 Live 接口"),
+		field.String("openai_service_tier_policy").Optional().MaxLen(24).Comment("OpenAI service tier policy; empty preserves legacy force_fast behavior"),
+		field.Bool("request_speed_selection_enabled").Default(false),
+		field.String("default_request_speed_tier").Default("ultrafast"),
 		field.Bool("force_openai_fast").
 			Default(false).
 			Comment("是否强制此 OpenAI/Composite 分组请求使用 service_tier=priority"),

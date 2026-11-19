@@ -90,6 +90,16 @@ func GroupID(v int64) predicate.APIKey {
 	return predicate.APIKey(sql.FieldEQ(FieldGroupID, v))
 }
 
+// DeepseekToolMode applies equality check predicate on the "deepseek_tool_mode" field. It's identical to DeepseekToolModeEQ.
+func DeepseekToolMode(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldEQ(FieldDeepseekToolMode, v))
+}
+
+// RequestSpeedTier applies equality check predicate on the "request_speed_tier" field. It's identical to RequestSpeedTierEQ.
+func RequestSpeedTier(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldEQ(FieldRequestSpeedTier, v))
+}
+
 // Status applies equality check predicate on the "status" field. It's identical to StatusEQ.
 func Status(v string) predicate.APIKey {
 	return predicate.APIKey(sql.FieldEQ(FieldStatus, v))
@@ -468,6 +478,146 @@ func GroupIDIsNil() predicate.APIKey {
 // GroupIDNotNil applies the NotNil predicate on the "group_id" field.
 func GroupIDNotNil() predicate.APIKey {
 	return predicate.APIKey(sql.FieldNotNull(FieldGroupID))
+}
+
+// DeepseekToolModeEQ applies the EQ predicate on the "deepseek_tool_mode" field.
+func DeepseekToolModeEQ(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldEQ(FieldDeepseekToolMode, v))
+}
+
+// DeepseekToolModeNEQ applies the NEQ predicate on the "deepseek_tool_mode" field.
+func DeepseekToolModeNEQ(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldNEQ(FieldDeepseekToolMode, v))
+}
+
+// DeepseekToolModeIn applies the In predicate on the "deepseek_tool_mode" field.
+func DeepseekToolModeIn(vs ...string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldIn(FieldDeepseekToolMode, vs...))
+}
+
+// DeepseekToolModeNotIn applies the NotIn predicate on the "deepseek_tool_mode" field.
+func DeepseekToolModeNotIn(vs ...string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldNotIn(FieldDeepseekToolMode, vs...))
+}
+
+// DeepseekToolModeGT applies the GT predicate on the "deepseek_tool_mode" field.
+func DeepseekToolModeGT(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldGT(FieldDeepseekToolMode, v))
+}
+
+// DeepseekToolModeGTE applies the GTE predicate on the "deepseek_tool_mode" field.
+func DeepseekToolModeGTE(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldGTE(FieldDeepseekToolMode, v))
+}
+
+// DeepseekToolModeLT applies the LT predicate on the "deepseek_tool_mode" field.
+func DeepseekToolModeLT(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldLT(FieldDeepseekToolMode, v))
+}
+
+// DeepseekToolModeLTE applies the LTE predicate on the "deepseek_tool_mode" field.
+func DeepseekToolModeLTE(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldLTE(FieldDeepseekToolMode, v))
+}
+
+// DeepseekToolModeContains applies the Contains predicate on the "deepseek_tool_mode" field.
+func DeepseekToolModeContains(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldContains(FieldDeepseekToolMode, v))
+}
+
+// DeepseekToolModeHasPrefix applies the HasPrefix predicate on the "deepseek_tool_mode" field.
+func DeepseekToolModeHasPrefix(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldHasPrefix(FieldDeepseekToolMode, v))
+}
+
+// DeepseekToolModeHasSuffix applies the HasSuffix predicate on the "deepseek_tool_mode" field.
+func DeepseekToolModeHasSuffix(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldHasSuffix(FieldDeepseekToolMode, v))
+}
+
+// DeepseekToolModeEqualFold applies the EqualFold predicate on the "deepseek_tool_mode" field.
+func DeepseekToolModeEqualFold(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldEqualFold(FieldDeepseekToolMode, v))
+}
+
+// DeepseekToolModeContainsFold applies the ContainsFold predicate on the "deepseek_tool_mode" field.
+func DeepseekToolModeContainsFold(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldContainsFold(FieldDeepseekToolMode, v))
+}
+
+// RequestSpeedTierEQ applies the EQ predicate on the "request_speed_tier" field.
+func RequestSpeedTierEQ(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldEQ(FieldRequestSpeedTier, v))
+}
+
+// RequestSpeedTierNEQ applies the NEQ predicate on the "request_speed_tier" field.
+func RequestSpeedTierNEQ(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldNEQ(FieldRequestSpeedTier, v))
+}
+
+// RequestSpeedTierIn applies the In predicate on the "request_speed_tier" field.
+func RequestSpeedTierIn(vs ...string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldIn(FieldRequestSpeedTier, vs...))
+}
+
+// RequestSpeedTierNotIn applies the NotIn predicate on the "request_speed_tier" field.
+func RequestSpeedTierNotIn(vs ...string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldNotIn(FieldRequestSpeedTier, vs...))
+}
+
+// RequestSpeedTierGT applies the GT predicate on the "request_speed_tier" field.
+func RequestSpeedTierGT(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldGT(FieldRequestSpeedTier, v))
+}
+
+// RequestSpeedTierGTE applies the GTE predicate on the "request_speed_tier" field.
+func RequestSpeedTierGTE(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldGTE(FieldRequestSpeedTier, v))
+}
+
+// RequestSpeedTierLT applies the LT predicate on the "request_speed_tier" field.
+func RequestSpeedTierLT(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldLT(FieldRequestSpeedTier, v))
+}
+
+// RequestSpeedTierLTE applies the LTE predicate on the "request_speed_tier" field.
+func RequestSpeedTierLTE(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldLTE(FieldRequestSpeedTier, v))
+}
+
+// RequestSpeedTierContains applies the Contains predicate on the "request_speed_tier" field.
+func RequestSpeedTierContains(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldContains(FieldRequestSpeedTier, v))
+}
+
+// RequestSpeedTierHasPrefix applies the HasPrefix predicate on the "request_speed_tier" field.
+func RequestSpeedTierHasPrefix(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldHasPrefix(FieldRequestSpeedTier, v))
+}
+
+// RequestSpeedTierHasSuffix applies the HasSuffix predicate on the "request_speed_tier" field.
+func RequestSpeedTierHasSuffix(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldHasSuffix(FieldRequestSpeedTier, v))
+}
+
+// RequestSpeedTierIsNil applies the IsNil predicate on the "request_speed_tier" field.
+func RequestSpeedTierIsNil() predicate.APIKey {
+	return predicate.APIKey(sql.FieldIsNull(FieldRequestSpeedTier))
+}
+
+// RequestSpeedTierNotNil applies the NotNil predicate on the "request_speed_tier" field.
+func RequestSpeedTierNotNil() predicate.APIKey {
+	return predicate.APIKey(sql.FieldNotNull(FieldRequestSpeedTier))
+}
+
+// RequestSpeedTierEqualFold applies the EqualFold predicate on the "request_speed_tier" field.
+func RequestSpeedTierEqualFold(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldEqualFold(FieldRequestSpeedTier, v))
+}
+
+// RequestSpeedTierContainsFold applies the ContainsFold predicate on the "request_speed_tier" field.
+func RequestSpeedTierContainsFold(v string) predicate.APIKey {
+	return predicate.APIKey(sql.FieldContainsFold(FieldRequestSpeedTier, v))
 }
 
 // StatusEQ applies the EQ predicate on the "status" field.

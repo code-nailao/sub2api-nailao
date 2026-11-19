@@ -15,13 +15,19 @@ type OpenAIMessagesDispatchModelConfig = domain.OpenAIMessagesDispatchModelConfi
 type GroupCodexModelsManifestConfig = domain.GroupCodexModelsManifestConfig
 type ReasoningEffortMapping = domain.ReasoningEffortMapping
 
+type DeepSeekToolsConfig = domain.DeepSeekToolsConfig
+
 type Group struct {
-	ID             int64
-	Name           string
-	Description    string
-	I18n           GroupI18n // 名称与描述的界面语言译文；缺失的语言沿用 Name/Description
-	Platform       string
-	RateMultiplier float64
+	RequestSpeedSelectionEnabled bool
+	DefaultRequestSpeedTier      string
+	AvailableRequestSpeedTiers   []string
+	DeepSeekTools                DeepSeekToolsConfig
+	ID                           int64
+	Name                         string
+	Description                  string
+	I18n                         GroupI18n // 名称与描述的界面语言译文；缺失的语言沿用 Name/Description
+	Platform                     string
+	RateMultiplier               float64
 	// 高峰时段倍率：peak_rate_enabled 为 true 且当前时刻处于 [PeakStart, PeakEnd) 时，
 	// token 计费倍率额外乘以 PeakRateMultiplier。详见 PeakMultiplierAt。
 	PeakRateEnabled    bool
@@ -65,6 +71,10 @@ type Group struct {
 	// nil 表示使用默认价 defaultWebSearchPricePerCall（官方 $10/1000 次）。
 	WebSearchPricePerCall *float64
 
+	// Fixed final charge for a verified upstream safety rejection; no rate multiplier.
+	UpstreamRejectionBillingEnabled bool
+	UpstreamRejectionPrice          float64
+
 	// 搜索工具显式定价（per 1k calls）。
 	SearchPricePer1k *float64
 	// Grok Voice 显式定价（分组级，不按文本 RateMultiplier）。
@@ -103,6 +113,7 @@ type Group struct {
 	AllowMessagesDispatch       bool
 	AllowLive                   bool
 	ForceOpenAIFast             bool // 强制 OpenAI 网关请求使用 service_tier=priority
+	OpenAIServiceTierPolicy     string
 	ForceOpenAIUltrafast        bool // 对支持 Ultrafast 的模型强制 service_tier=ultrafast，优先于 ForceOpenAIFast
 	FreeOpenAIFast              bool // OpenAI Fast 请求按 Standard 价格向用户计费
 	RequireOAuthOnly            bool // 仅允许非 apikey 类型账号关联（OpenAI/Antigravity/Anthropic/Gemini）

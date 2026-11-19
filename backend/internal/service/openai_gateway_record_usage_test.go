@@ -2336,6 +2336,7 @@ func TestOpenAIGatewayServiceRecordUsage_ImageIndependentMultiplierUsesImageRate
 	require.InDelta(t, 0.2, usageRepo.lastLog.TotalCost, 1e-12)
 	require.InDelta(t, 0.2, usageRepo.lastLog.ActualCost, 1e-12)
 	require.InDelta(t, 1.0, usageRepo.lastLog.RateMultiplier, 1e-12)
+	require.Nil(t, usageRepo.lastLog.BillingSnapshot, "new tier snapshots exclude media")
 	require.NotNil(t, usageRepo.lastLog.BillingMode)
 	require.Equal(t, string(BillingModeImage), *usageRepo.lastLog.BillingMode)
 }
@@ -2388,6 +2389,7 @@ func TestGrokVideoBillingUsesSeparateVideoRateMultiplier(t *testing.T) {
 	require.InDelta(t, 0.08, usageRepo.lastLog.TotalCost, 1e-12)
 	require.InDelta(t, 0.02, usageRepo.lastLog.ActualCost, 1e-12)
 	require.InDelta(t, 0.25, usageRepo.lastLog.RateMultiplier, 1e-12)
+	require.Nil(t, usageRepo.lastLog.BillingSnapshot, "new tier snapshots exclude media")
 	require.NotNil(t, usageRepo.lastLog.BillingMode)
 	require.Equal(t, string(BillingModeVideo), *usageRepo.lastLog.BillingMode)
 	require.Equal(t, 1, usageRepo.lastLog.VideoCount)

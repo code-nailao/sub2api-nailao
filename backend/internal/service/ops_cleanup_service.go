@@ -48,6 +48,7 @@ type OpsCleanupService struct {
 	cfg               *config.Config
 	channelMonitorSvc *ChannelMonitorService
 	settingRepo       SettingRepository
+	externalCleanup   externalCleanupOwnership
 
 	instanceID string
 
@@ -323,6 +324,10 @@ func (s *OpsCleanupService) runCleanupOnce(ctx context.Context) (opsCleanupDelet
 	}
 
 	effective := s.snapshotEffective()
+	external, ownershipErr := s.externalCleanup.read(ctx, s.settingRepo)
+	if ownershipErr != nil {
+		logger.LegacyPrintf("service.ops_cleanup", "[OpsCleanup] controlled log retention skipped: %v", ownershipErr)
+	}
 	now := time.Now().UTC()
 
 	targets := []opsCleanupTarget{
@@ -337,6 +342,9 @@ func (s *OpsCleanupService) runCleanupOnce(ctx context.Context) (opsCleanupDelet
 	}
 
 	for _, t := range targets {
+		if external && externallyManagedOpsTable(t.table) {
+			continue
+		}
 		cutoff, truncate, ok := opsCleanupPlan(now, t.retentionDays)
 		if !ok {
 			continue

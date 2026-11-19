@@ -111,6 +111,9 @@ func (s *PaymentService) CreateOrder(ctx context.Context, req CreateOrderRequest
 	}
 	resp, err := s.invokeProvider(ctx, order, req, cfg, limitAmount, payAmountStr, payAmount, plan, sel)
 	if err != nil {
+		if verifiedPaymentProvider(sel.ProviderKey) && errors.Is(err, payment.ErrPaymentOutcomeUnknown) {
+			return &CreateOrderResponse{VerificationPending: true, OrderID: order.ID, OutTradeNo: order.OutTradeNo, Amount: order.Amount, PayAmount: order.PayAmount, Status: OrderStatusPending, PaymentType: order.PaymentType, ExpiresAt: order.ExpiresAt}, nil
+		}
 		_, _ = s.entClient.PaymentOrder.UpdateOneID(order.ID).
 			SetStatus(OrderStatusFailed).
 			Save(ctx)
@@ -180,7 +183,19 @@ func (s *PaymentService) createOrderInTx(ctx context.Context, req CreateOrderReq
 	if err != nil {
 		return nil, err
 	}
+	if sel != nil && sel.ProviderKey == payment.TypeBEPusdt {
+		if req.OrderType != payment.OrderTypeBalance {
+			return nil, fmt.Errorf("native USDT accepts balance orders only")
+		}
+		if tm < 4 || tm > 60 {
+			return nil, fmt.Errorf("native USDT timeout must be 4..60 minutes")
+		}
+		outTradeNo = payment.BEPusdtOrderPrefix + strings.TrimPrefix(outTradeNo, orderIDPrefix)
+	}
 	providerSnapshot := buildPaymentOrderProviderSnapshot(sel, req)
+	if err := s.pinVerifiedProvider(ctx, tx.Client(), sel, providerSnapshot); err != nil {
+		return nil, err
+	}
 	selectedInstanceID := ""
 	selectedProviderKey := ""
 	if sel != nil {
@@ -426,7 +441,12 @@ func (s *PaymentService) invokeProvider(ctx context.Context, order *dbent.Paymen
 	}
 	subject := s.buildPaymentSubject(plan, limitAmount, cfg, sel)
 	outTradeNo := order.OutTradeNo
-	canonicalReturnURL, err := CanonicalizeReturnURL(req.ReturnURL, req.SrcHost, req.SrcURL)
+	var canonicalReturnURL string
+	if verifiedPaymentProvider(sel.ProviderKey) {
+		canonicalReturnURL, err = verifiedReturnURL(sel)
+	} else {
+		canonicalReturnURL, err = CanonicalizeReturnURL(req.ReturnURL, req.SrcHost, req.SrcURL)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -457,6 +477,7 @@ func (s *PaymentService) invokeProvider(ctx context.Context, order *dbent.Paymen
 		IsMobile:    req.IsMobile,
 		ReturnURL:   providerReturnURL,
 	}, sel, outTradeNo, payAmountStr, subject)
+	providerReq.ExpiresAt = order.ExpiresAt
 	providerReq.AlipayMobilePrecreate = shouldUseAlipayMobilePrecreate(req, cfg, sel)
 	finishProviderCall := servertiming.ObserveDependency(ctx, "payment")
 	pr, err := prov.CreatePayment(ctx, providerReq)
@@ -466,19 +487,30 @@ func (s *PaymentService) invokeProvider(ctx context.Context, order *dbent.Paymen
 		if appErr := new(infraerrors.ApplicationError); errors.As(err, &appErr) {
 			return nil, appErr
 		}
+		if errors.Is(err, payment.ErrPaymentOutcomeUnknown) {
+			return nil, err
+		}
 		return nil, classifyCreatePaymentError(req, sel.ProviderKey, err)
 	}
-	sanitizeCreatePaymentResponseDetails(pr)
-	_, err = s.entClient.PaymentOrder.UpdateOneID(order.ID).
-		SetNillablePaymentTradeNo(psNilIfEmpty(pr.TradeNo)).
-		SetNillablePayURL(psNilIfEmpty(pr.PayURL)).
-		SetNillableQrCode(psNilIfEmpty(pr.QRCode)).
-		SetNillableProviderInstanceID(psNilIfEmpty(sel.InstanceID)).
-		SetNillableProviderKey(psNilIfEmpty(sel.ProviderKey)).
-		Save(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("update order with payment details: %w", err)
+	if nativeUSDTOrder(order) {
+		if err := s.storeNativePaymentCreation(ctx, order, pr); err != nil {
+			return nil, fmt.Errorf("%w: persist native checkout", payment.ErrPaymentOutcomeUnknown)
+		}
 	}
+	sanitizeCreatePaymentResponseDetails(pr)
+	if !nativeUSDTOrder(order) {
+		_, err = s.entClient.PaymentOrder.UpdateOneID(order.ID).
+			SetNillablePaymentTradeNo(psNilIfEmpty(pr.TradeNo)).
+			SetNillablePayURL(psNilIfEmpty(pr.PayURL)).
+			SetNillableQrCode(psNilIfEmpty(pr.QRCode)).
+			SetNillableProviderInstanceID(psNilIfEmpty(sel.InstanceID)).
+			SetNillableProviderKey(psNilIfEmpty(sel.ProviderKey)).
+			Save(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("update order with payment details: %w", err)
+		}
+	}
+
 	s.writeAuditLog(ctx, order.ID, "ORDER_CREATED", fmt.Sprintf("user:%d", req.UserID), map[string]any{
 		"paymentAmount":  req.Amount,
 		"creditedAmount": order.Amount,

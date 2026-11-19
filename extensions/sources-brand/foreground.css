@@ -1,0 +1,21 @@
+/* Keep primary actions readable across every palette; never recolor semantic
+   success/error badges, logos, model/provider identities, or neutral surfaces. */
+.btn-primary {
+  background-image: linear-gradient(to right, var(--sources-button-from), var(--sources-button-to));
+  color: var(--sources-button-foreground);
+}
+.btn-primary:hover {
+  background-image: linear-gradient(to right, var(--sources-button-hover-from), var(--sources-button-hover-to));
+  color: var(--sources-button-hover-foreground);
+}
+:is(button, a).bg-primary-500, .bg-primary-500.text-white, .bg-primary-500.text-slate-950 {
+  color: var(--color-primary-500-contrast);
+}
+:is(button, a).bg-primary-600, .bg-primary-600.text-white, .bg-primary-600.text-slate-950 {
+  color: var(--color-primary-600-contrast);
+}
+:is(button, a).hover\:bg-primary-600:hover { color: var(--color-primary-600-contrast); }
+:is(button, a).hover\:bg-primary-700:hover { color: var(--color-primary-700-contrast); }
+.dark :is(button, a).dark\:bg-primary-500 { color: var(--color-primary-500-contrast); }
+.dark :is(button, a).dark\:hover\:bg-primary-400:hover { color: var(--color-primary-400-contrast); }
+/* Text and icon accents retain the original palette shade, like sidebar selection. */

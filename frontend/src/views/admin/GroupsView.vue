@@ -1505,11 +1505,21 @@
             <span><span class="block text-sm text-gray-700 dark:text-gray-300">{{ t("admin.groups.modelPricing.longContext") }}</span><span class="block text-xs text-gray-500">{{ t("admin.groups.modelPricing.longContextHint") }}</span></span>
           </label>
           <div class="mt-3 space-y-2">
-            <PricingEntryCard v-for="(entry, index) in createForm.model_pricing" :key="index" :entry="entry" :platform="createForm.platform" hide-token-intervals @update="createForm.model_pricing[index] = $event" @remove="createForm.model_pricing.splice(index, 1)" />
+            <PricingEntryCard v-for="(entry, index) in createForm.model_pricing" :key="index" :entry="entry" :platform="createForm.platform" hide-token-intervals :enable-service-tiers="supportsGroupOpenAIFast(createForm.platform)" @update="createForm.model_pricing[index] = $event" @remove="createForm.model_pricing.splice(index, 1)" />
           </div>
         </div>
 
-        <!-- Grok Voice 显式定价（仅 grok 平台） -->
+        <!-- 上游拒绝固定费：独立于普通用量价格及倍率 -->
+        <DeepSeekToolsFields v-if="createForm.platform === 'deepseek'" v-model="createForm.deepseek_tools" v-model:search-price="createForm.search_price_per_1k" :eligible="createForm.subscription_type === 'standard'" />
+
+        <UpstreamRejectionBillingFields
+          v-if="createForm.platform === 'grok' || createForm.upstream_rejection_billing_enabled"
+          v-model:enabled="createForm.upstream_rejection_billing_enabled"
+          v-model:price="createForm.upstream_rejection_price"
+          :eligible="createForm.platform === 'grok' && createForm.subscription_type === 'standard'"
+          id-prefix="create"
+        />
+
         <div
           v-if="createForm.platform === 'grok'"
           class="border-t border-gray-200 dark:border-dark-400 pt-4 mt-4"
@@ -1579,32 +1589,49 @@
           <h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">
             {{ t("admin.groups.openaiFast.title") }}
           </h4>
-          <div class="flex items-center justify-between gap-4">
-            <label class="text-sm text-gray-600 dark:text-gray-400">
-              {{ t("admin.groups.openaiFast.force") }}
-            </label>
-            <Toggle
-              data-testid="create-force-openai-fast"
-              :aria-label="t('admin.groups.openaiFast.force')"
-              v-model="createForm.force_openai_fast"
-            />
-          </div>
-          <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-            {{ t("admin.groups.openaiFast.hint") }}
-          </p>
-          <div class="flex items-center justify-between gap-4 mt-4">
-            <label class="text-sm text-gray-600 dark:text-gray-400">
-              {{ t("admin.groups.openaiFast.forceUltrafast") }}
-            </label>
-            <Toggle
-              data-testid="create-force-openai-ultrafast"
-              :aria-label="t('admin.groups.openaiFast.forceUltrafast')"
-              v-model="createForm.force_openai_ultrafast"
-            />
-          </div>
-          <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-            {{ t("admin.groups.openaiFast.ultrafastHint") }}
-          </p>
+          <RequestSpeedGroupFields
+            v-if="createForm.platform === 'openai'"
+            v-model:enabled="createForm.request_speed_selection_enabled"
+            v-model:default-tier="createForm.default_request_speed_tier"
+            prefix="create"
+            :error="createRequestSpeedError"
+          />
+          <template v-if="!(createForm.platform === 'openai' && createForm.request_speed_selection_enabled)">
+            <label class="block text-sm text-gray-600 dark:text-gray-400 mb-1">{{ t('admin.groups.openaiFast.policy') }}</label>
+            <select v-model="createForm.openai_service_tier_policy" class="input" data-testid="create-service-tier-policy" :aria-label="t('admin.groups.openaiFast.policy')">
+              <option value="">{{ t('admin.groups.openaiFast.legacy') }}</option>
+              <option value="passthrough">{{ t('admin.groups.openaiFast.passthrough') }}</option>
+              <option value="force_fast">{{ t('admin.groups.openaiFast.force') }}</option>
+              <option value="force_ultrafast">{{ t('admin.groups.openaiFast.forceUltrafast') }}</option>
+            </select>
+            <p class="text-xs text-gray-500 mt-1">{{ t('admin.groups.openaiFast.policyHint') }}</p>
+            <div v-if="!createForm.openai_service_tier_policy" class="flex items-center justify-between gap-4 mt-3">
+              <label class="text-sm text-gray-600 dark:text-gray-400">
+                {{ t("admin.groups.openaiFast.force") }}
+              </label>
+              <Toggle
+                data-testid="create-force-openai-fast"
+                :aria-label="t('admin.groups.openaiFast.force')"
+                v-model="createForm.force_openai_fast"
+              />
+            </div>
+            <p v-if="!createForm.openai_service_tier_policy" class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              {{ t("admin.groups.openaiFast.hint") }}
+            </p>
+            <div v-if="!createForm.openai_service_tier_policy" class="flex items-center justify-between gap-4 mt-4">
+              <label class="text-sm text-gray-600 dark:text-gray-400">
+                {{ t("admin.groups.openaiFast.forceUltrafast") }}
+              </label>
+              <Toggle
+                data-testid="create-force-openai-ultrafast"
+                :aria-label="t('admin.groups.openaiFast.forceUltrafast')"
+                v-model="createForm.force_openai_ultrafast"
+              />
+            </div>
+            <p v-if="!createForm.openai_service_tier_policy" class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              {{ t("admin.groups.openaiFast.ultrafastHint") }}
+            </p>
+          </template>
           <div class="flex items-center justify-between gap-4 mt-4">
             <label class="text-sm text-gray-600 dark:text-gray-400">
               {{ t("admin.groups.openaiFast.free") }}
@@ -3182,11 +3209,21 @@
             <span><span class="block text-sm text-gray-700 dark:text-gray-300">{{ t("admin.groups.modelPricing.longContext") }}</span><span class="block text-xs text-gray-500">{{ t("admin.groups.modelPricing.longContextHint") }}</span></span>
           </label>
           <div class="mt-3 space-y-2">
-            <PricingEntryCard v-for="(entry, index) in editForm.model_pricing" :key="index" :entry="entry" :platform="editForm.platform" hide-token-intervals @update="editForm.model_pricing[index] = $event" @remove="editForm.model_pricing.splice(index, 1)" />
+            <PricingEntryCard v-for="(entry, index) in editForm.model_pricing" :key="index" :entry="entry" :platform="editForm.platform" hide-token-intervals :enable-service-tiers="supportsGroupOpenAIFast(editForm.platform)" @update="editForm.model_pricing[index] = $event" @remove="editForm.model_pricing.splice(index, 1)" />
           </div>
         </div>
 
-        <!-- Grok Voice 显式定价（仅 grok 平台） -->
+        <!-- 上游拒绝固定费：独立于普通用量价格及倍率 -->
+        <DeepSeekToolsFields v-if="editForm.platform === 'deepseek'" v-model="editForm.deepseek_tools" v-model:search-price="editForm.search_price_per_1k" :eligible="editForm.subscription_type === 'standard'" />
+
+        <UpstreamRejectionBillingFields
+          v-if="editForm.platform === 'grok' || editForm.upstream_rejection_billing_enabled"
+          v-model:enabled="editForm.upstream_rejection_billing_enabled"
+          v-model:price="editForm.upstream_rejection_price"
+          :eligible="editForm.platform === 'grok' && editForm.subscription_type === 'standard'"
+          id-prefix="edit"
+        />
+
         <div
           v-if="editForm.platform === 'grok'"
           class="border-t border-gray-200 dark:border-dark-400 pt-4 mt-4"
@@ -3256,32 +3293,49 @@
           <h4 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">
             {{ t("admin.groups.openaiFast.title") }}
           </h4>
-          <div class="flex items-center justify-between gap-4">
-            <label class="text-sm text-gray-600 dark:text-gray-400">
-              {{ t("admin.groups.openaiFast.force") }}
-            </label>
-            <Toggle
-              data-testid="edit-force-openai-fast"
-              :aria-label="t('admin.groups.openaiFast.force')"
-              v-model="editForm.force_openai_fast"
-            />
-          </div>
-          <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-            {{ t("admin.groups.openaiFast.hint") }}
-          </p>
-          <div class="flex items-center justify-between gap-4 mt-4">
-            <label class="text-sm text-gray-600 dark:text-gray-400">
-              {{ t("admin.groups.openaiFast.forceUltrafast") }}
-            </label>
-            <Toggle
-              data-testid="edit-force-openai-ultrafast"
-              :aria-label="t('admin.groups.openaiFast.forceUltrafast')"
-              v-model="editForm.force_openai_ultrafast"
-            />
-          </div>
-          <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-            {{ t("admin.groups.openaiFast.ultrafastHint") }}
-          </p>
+          <RequestSpeedGroupFields
+            v-if="editForm.platform === 'openai'"
+            v-model:enabled="editForm.request_speed_selection_enabled"
+            v-model:default-tier="editForm.default_request_speed_tier"
+            prefix="edit"
+            :error="editRequestSpeedError"
+          />
+          <template v-if="!(editForm.platform === 'openai' && editForm.request_speed_selection_enabled)">
+            <label class="block text-sm text-gray-600 dark:text-gray-400 mb-1">{{ t('admin.groups.openaiFast.policy') }}</label>
+            <select v-model="editForm.openai_service_tier_policy" class="input" data-testid="edit-service-tier-policy" :aria-label="t('admin.groups.openaiFast.policy')">
+              <option value="">{{ t('admin.groups.openaiFast.legacy') }}</option>
+              <option value="passthrough">{{ t('admin.groups.openaiFast.passthrough') }}</option>
+              <option value="force_fast">{{ t('admin.groups.openaiFast.force') }}</option>
+              <option value="force_ultrafast">{{ t('admin.groups.openaiFast.forceUltrafast') }}</option>
+            </select>
+            <p class="text-xs text-gray-500 mt-1">{{ t('admin.groups.openaiFast.policyHint') }}</p>
+            <div v-if="!editForm.openai_service_tier_policy" class="flex items-center justify-between gap-4 mt-3">
+              <label class="text-sm text-gray-600 dark:text-gray-400">
+                {{ t("admin.groups.openaiFast.force") }}
+              </label>
+              <Toggle
+                data-testid="edit-force-openai-fast"
+                :aria-label="t('admin.groups.openaiFast.force')"
+                v-model="editForm.force_openai_fast"
+              />
+            </div>
+            <p v-if="!editForm.openai_service_tier_policy" class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              {{ t("admin.groups.openaiFast.hint") }}
+            </p>
+            <div v-if="!editForm.openai_service_tier_policy" class="flex items-center justify-between gap-4 mt-4">
+              <label class="text-sm text-gray-600 dark:text-gray-400">
+                {{ t("admin.groups.openaiFast.forceUltrafast") }}
+              </label>
+              <Toggle
+                data-testid="edit-force-openai-ultrafast"
+                :aria-label="t('admin.groups.openaiFast.forceUltrafast')"
+                v-model="editForm.force_openai_ultrafast"
+              />
+            </div>
+            <p v-if="!editForm.openai_service_tier_policy" class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              {{ t("admin.groups.openaiFast.ultrafastHint") }}
+            </p>
+          </template>
           <div class="flex items-center justify-between gap-4 mt-4">
             <label class="text-sm text-gray-600 dark:text-gray-400">
               {{ t("admin.groups.openaiFast.free") }}
@@ -4360,6 +4414,11 @@ import GroupRPMOverridesModal from "@/components/admin/group/GroupRPMOverridesMo
 import GroupCapacityBadge from "@/components/common/GroupCapacityBadge.vue";
 import ReasoningEffortPolicyFields from "@/components/admin/group/ReasoningEffortPolicyFields.vue";
 import CodexManifestAccountsField from "@/components/admin/group/CodexManifestAccountsField.vue";
+import RequestSpeedGroupFields from "@/components/admin/group/RequestSpeedGroupFields.vue";
+import DeepSeekToolsFields from '@/components/admin/group/DeepSeekToolsFields.vue';
+import { defaultDeepSeekTools } from '@/utils/deepseekTools';
+import UpstreamRejectionBillingFields from "@/components/admin/group/UpstreamRejectionBillingFields.vue";
+import { isValidRejectionAmount } from "@/utils/upstreamRejection";
 import PricingEntryCard from "@/components/admin/channel/PricingEntryCard.vue";
 import type { PricingFormEntry } from "@/components/admin/channel/types";
 import {
@@ -4375,7 +4434,7 @@ import {
 import type { ChannelModelPricing } from "@/api/admin/channels";
 import { VueDraggable } from "vue-draggable-plus";
 import { createStableObjectKeyResolver } from "@/utils/stableObjectKey";
-import { extractApiErrorMessage } from "@/utils/apiError";
+import { extractApiErrorCode, extractApiErrorMessage } from "@/utils/apiError";
 import { useKeyedDebouncedSearch } from "@/composables/useKeyedDebouncedSearch";
 import { getPersistedPageSize } from "@/composables/usePersistedPageSize";
 import {
@@ -4438,6 +4497,13 @@ import {
 const supportsLivePlatform = (platform: string): boolean =>
   platform === "openai" || platform === "composite";
 
+const optionalTierMultiplier = (value: number | string | null | undefined): number | null => {
+  if (value == null || value === "") return null;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) throw new Error(t("admin.channels.form.tierMultiplierInvalid"));
+  return number;
+};
+
 const emptyGroupPricing = (): PricingFormEntry => ({
   models: [],
   billing_mode: "token",
@@ -4447,6 +4513,9 @@ const emptyGroupPricing = (): PricingFormEntry => ({
   cache_write_1h_price: null,
   cache_write_12h_price: null,
   cache_read_price: null,
+  fast_multiplier: null,
+  ultrafast_multiplier: null,
+  flex_multiplier: null,
   reasoning_effort_multipliers: null,
   image_input_price: null,
   image_output_price: null,
@@ -4470,6 +4539,9 @@ const groupPricingFromAPI = (
     cache_write_1h_price: perTokenToMTok(entry.cache_write_1h_price),
     cache_write_12h_price: perTokenToMTok(entry.cache_write_12h_price),
     cache_read_price: perTokenToMTok(entry.cache_read_price),
+    fast_multiplier: entry.fast_multiplier,
+    ultrafast_multiplier: entry.ultrafast_multiplier,
+    flex_multiplier: entry.flex_multiplier,
     reasoning_effort_multipliers: entry.reasoning_effort_multipliers
       ? { ...entry.reasoning_effort_multipliers }
       : null,
@@ -4496,6 +4568,9 @@ const groupPricingToAPI = (
       cache_write_1h_price: mTokToPerToken(entry.cache_write_1h_price),
       cache_write_12h_price: mTokToPerToken(entry.cache_write_12h_price),
       cache_read_price: mTokToPerToken(entry.cache_read_price),
+      fast_multiplier: optionalTierMultiplier(entry.fast_multiplier),
+      ultrafast_multiplier: optionalTierMultiplier(entry.ultrafast_multiplier),
+      flex_multiplier: optionalTierMultiplier(entry.flex_multiplier),
       reasoning_effort_multipliers: formReasoningEffortMultipliersToAPI(
         entry.reasoning_effort_multipliers,
       ),
@@ -4897,6 +4972,8 @@ const showSortModal = ref(false);
 const submitting = ref(false);
 const sortSubmitting = ref(false);
 const editingGroup = ref<AdminGroup | null>(null);
+const createRequestSpeedError = ref("");
+const editRequestSpeedError = ref("");
 const deletingGroup = ref<AdminGroup | null>(null);
 const duplicatingGroupIds = reactive(new Set<number>());
 const showRateMultipliersModal = ref(false);
@@ -5009,9 +5086,14 @@ const createForm = reactive({
   daily_limit_usd: null as number | null,
   weekly_limit_usd: null as number | null,
   monthly_limit_usd: null as number | null,
+  upstream_rejection_billing_enabled: false,
+  upstream_rejection_price: 0.1 as number | string,
   long_context_pricing_enabled: true,
   force_openai_fast: false,
+  openai_service_tier_policy: "",
   force_openai_ultrafast: false,
+  request_speed_selection_enabled: false,
+  default_request_speed_tier: "ultrafast" as "fast" | "ultrafast",
   free_openai_fast: false,
   model_pricing: [] as PricingFormEntry[],
   // 图片生成计费配置
@@ -5034,6 +5116,7 @@ const createForm = reactive({
   video_model_prices: createVideoModelPricesForm(),
   // Codex 网页搜索按次计费（仅 openai 平台使用）；null = 使用默认价 0.01
   web_search_price_per_call: null as number | null,
+  deepseek_tools: defaultDeepSeekTools(),
   search_price_per_1k: null as number | null,
   audio_realtime_price_per_min: null as number | null,
   audio_tts_price_per_million_chars: null as number | null,
@@ -5377,9 +5460,14 @@ const editForm = reactive({
   daily_limit_usd: null as number | null,
   weekly_limit_usd: null as number | null,
   monthly_limit_usd: null as number | null,
+  upstream_rejection_billing_enabled: false,
+  upstream_rejection_price: 0.1 as number | string,
   long_context_pricing_enabled: true,
   force_openai_fast: false,
+  openai_service_tier_policy: "",
   force_openai_ultrafast: false,
+  request_speed_selection_enabled: false,
+  default_request_speed_tier: "ultrafast" as "fast" | "ultrafast",
   free_openai_fast: false,
   model_pricing: [] as PricingFormEntry[],
   // 图片生成计费配置
@@ -5402,6 +5490,7 @@ const editForm = reactive({
   video_model_prices: createVideoModelPricesForm(),
   // Codex 网页搜索按次计费（仅 openai 平台使用）；null = 使用默认价 0.01
   web_search_price_per_call: null as number | null,
+  deepseek_tools: defaultDeepSeekTools(),
   search_price_per_1k: null as number | null,
   audio_realtime_price_per_min: null as number | null,
   audio_tts_price_per_million_chars: null as number | null,
@@ -5834,6 +5923,7 @@ const handleSort = (key: string, order: 'asc' | 'desc') => {
 };
 
 const openCreateModal = () => {
+  createRequestSpeedError.value = "";
   showCreateModal.value = true;
   loadModelAllowlistCandidates("create", 0, createForm.platform);
 };
@@ -5870,12 +5960,19 @@ const closeCreateModal = () => {
   createForm.video_price_720p = null;
   createForm.video_price_1080p = null;
   createForm.video_model_prices = createVideoModelPricesForm();
+  createForm.upstream_rejection_billing_enabled = false;
+  createForm.upstream_rejection_price = 0.1;
   createForm.long_context_pricing_enabled = true;
   createForm.force_openai_fast = false;
+  createForm.openai_service_tier_policy = "";
   createForm.force_openai_ultrafast = false;
+  createForm.request_speed_selection_enabled = false;
+  createForm.default_request_speed_tier = "ultrafast";
+  createRequestSpeedError.value = "";
   createForm.free_openai_fast = false;
   createForm.model_pricing = [];
   createForm.web_search_price_per_call = null;
+  createForm.deepseek_tools = defaultDeepSeekTools();
   createForm.search_price_per_1k = null;
   createForm.audio_realtime_price_per_min = null;
   createForm.audio_tts_price_per_million_chars = null;
@@ -5960,6 +6057,7 @@ const validateGroupReasoningMultipliers = (pricing: PricingFormEntry[]): boolean
 };
 
 const handleCreateGroup = async () => {
+  createRequestSpeedError.value = "";
   if (!createForm.name.trim()) {
     appStore.showError(t("admin.groups.nameRequired"));
     return;
@@ -5972,6 +6070,15 @@ const handleCreateGroup = async () => {
     return;
   }
   if (!validateProfitControlForm(createForm)) {
+    return;
+  }
+  if (createForm.upstream_rejection_billing_enabled && (createForm.platform !== "grok" || createForm.subscription_type !== "standard")) {
+    appStore.showError(t("upstreamRejection.eligibleOnly"));
+    return;
+  }
+  if (!isValidRejectionAmount(createForm.upstream_rejection_price, createForm.upstream_rejection_billing_enabled)) {
+    appStore.showError(t("upstreamRejection.invalidPrice"));
+    document.getElementById("create-rejection-price")?.focus();
     return;
   }
   if (!validateGroupReasoningMultipliers(createForm.model_pricing)) return;
@@ -5995,9 +6102,13 @@ const handleCreateGroup = async () => {
     // 构建请求数据，包含模型路由配置
     const requestData = {
       ...createGroupForm,
+      upstream_rejection_billing_enabled: createForm.upstream_rejection_billing_enabled,
+      upstream_rejection_price: Number(createForm.upstream_rejection_price),
       force_openai_fast: normalizeGroupOpenAIFast(
         createForm.platform,
-        createForm.force_openai_fast,
+        createForm.request_speed_selection_enabled
+          ? createForm.force_openai_fast
+          : (createForm.openai_service_tier_policy ? createForm.openai_service_tier_policy === "force_fast" : createForm.force_openai_fast),
       ),
       force_openai_ultrafast: normalizeGroupOpenAIFast(
         createForm.platform,
@@ -6055,6 +6166,10 @@ const handleCreateGroup = async () => {
         createForm.profit_safety_buffer_percent,
       ),
     };
+    if (createForm.platform !== "openai") {
+      delete (requestData as Record<string, unknown>).request_speed_selection_enabled;
+      delete (requestData as Record<string, unknown>).default_request_speed_tier;
+    }
     delete (requestData as Record<string, unknown>).profit_min_margin_percent;
     delete (requestData as Record<string, unknown>).profit_safety_buffer_percent;
     // v-model.number 清空输入框时产生 ""，转为 null 让后端设为无限制
@@ -6121,9 +6236,11 @@ const handleCreateGroup = async () => {
       onboardingStore.nextStep(500);
     }
   } catch (error: any) {
-    appStore.showError(
-      extractApiErrorMessage(error, t("admin.groups.failedToCreate")),
-    );
+    const message = extractApiErrorMessage(error, t("admin.groups.failedToCreate"));
+    if (extractApiErrorCode(error)?.startsWith("REQUEST_SPEED_")) {
+      createRequestSpeedError.value = message;
+    }
+    appStore.showError(message);
     console.error("Error creating group:", error);
     // Don't advance tour on error
   } finally {
@@ -6132,6 +6249,7 @@ const handleCreateGroup = async () => {
 };
 
 const handleEdit = async (group: AdminGroup) => {
+  editRequestSpeedError.value = "";
   editingGroup.value = group;
   editForm.name = group.name;
   editForm.description = group.description || "";
@@ -6141,6 +6259,8 @@ const handleEdit = async (group: AdminGroup) => {
       { ...text },
     ]),
   );
+  editForm.upstream_rejection_billing_enabled = group.upstream_rejection_billing_enabled ?? false;
+  editForm.upstream_rejection_price = group.upstream_rejection_price ?? 0.1;
   editForm.platform = group.platform;
   editForm.rate_multiplier = group.rate_multiplier;
   editForm.is_exclusive = group.is_exclusive;
@@ -6152,7 +6272,10 @@ const handleEdit = async (group: AdminGroup) => {
   editForm.long_context_pricing_enabled =
     group.long_context_pricing_enabled ?? true;
   editForm.force_openai_fast = group.force_openai_fast ?? false;
+  editForm.openai_service_tier_policy = group.openai_service_tier_policy ?? "";
   editForm.force_openai_ultrafast = group.force_openai_ultrafast ?? false;
+  editForm.request_speed_selection_enabled = group.request_speed_selection_enabled ?? false;
+  editForm.default_request_speed_tier = group.default_request_speed_tier ?? "ultrafast";
   editForm.free_openai_fast = group.free_openai_fast ?? false;
   editForm.model_pricing = groupPricingFromAPI(group.model_pricing);
   editForm.allow_image_generation = group.allow_image_generation ?? false;
@@ -6176,6 +6299,7 @@ const handleEdit = async (group: AdminGroup) => {
     group.video_model_prices,
   );
   editForm.web_search_price_per_call = group.web_search_price_per_call ?? null;
+  editForm.deepseek_tools = { ...defaultDeepSeekTools(), ...group.deepseek_tools };
   editForm.search_price_per_1k = group.search_price_per_1k ?? null;
   editForm.audio_realtime_price_per_min = group.audio_realtime_price_per_min ?? null;
   editForm.audio_tts_price_per_million_chars = group.audio_tts_price_per_million_chars ?? null;
@@ -6286,12 +6410,19 @@ const closeEditModal = () => {
   editForm.video_price_720p = null;
   editForm.video_price_1080p = null;
   editForm.video_model_prices = createVideoModelPricesForm();
+  editForm.upstream_rejection_billing_enabled = false;
+  editForm.upstream_rejection_price = 0.1;
   editForm.long_context_pricing_enabled = true;
   editForm.force_openai_fast = false;
+  editForm.openai_service_tier_policy = "";
   editForm.force_openai_ultrafast = false;
+  editForm.request_speed_selection_enabled = false;
+  editForm.default_request_speed_tier = "ultrafast";
+  editRequestSpeedError.value = "";
   editForm.free_openai_fast = false;
   editForm.model_pricing = [];
   editForm.web_search_price_per_call = null;
+  editForm.deepseek_tools = defaultDeepSeekTools();
   editForm.search_price_per_1k = null;
   editForm.audio_realtime_price_per_min = null;
   editForm.audio_tts_price_per_million_chars = null;
@@ -6305,6 +6436,7 @@ const closeEditModal = () => {
 };
 
 const handleUpdateGroup = async () => {
+  editRequestSpeedError.value = "";
   if (!editingGroup.value) return;
   if (!editForm.name.trim()) {
     appStore.showError(t("admin.groups.nameRequired"));
@@ -6318,6 +6450,15 @@ const handleUpdateGroup = async () => {
     return;
   }
   if (!validateProfitControlForm(editForm)) {
+    return;
+  }
+  if (editForm.upstream_rejection_billing_enabled && (editForm.platform !== "grok" || editForm.subscription_type !== "standard")) {
+    appStore.showError(t("upstreamRejection.eligibleOnly"));
+    return;
+  }
+  if (!isValidRejectionAmount(editForm.upstream_rejection_price, editForm.upstream_rejection_billing_enabled)) {
+    appStore.showError(t("upstreamRejection.invalidPrice"));
+    document.getElementById("edit-rejection-price")?.focus();
     return;
   }
   if (!validateGroupReasoningMultipliers(editForm.model_pricing)) return;
@@ -6345,9 +6486,13 @@ const handleUpdateGroup = async () => {
     // 转换 fallback_group_id: null -> 0 (后端使用 0 表示清除)
     const payload = {
       ...editForm,
+      upstream_rejection_billing_enabled: editForm.upstream_rejection_billing_enabled,
+      upstream_rejection_price: Number(editForm.upstream_rejection_price),
       force_openai_fast: normalizeGroupOpenAIFast(
         editForm.platform,
-        editForm.force_openai_fast,
+        (editForm.request_speed_selection_enabled || editingGroup.value.request_speed_selection_enabled)
+          ? editForm.force_openai_fast
+          : (editForm.openai_service_tier_policy ? editForm.openai_service_tier_policy === "force_fast" : editForm.force_openai_fast),
       ),
       force_openai_ultrafast: normalizeGroupOpenAIFast(
         editForm.platform,
@@ -6418,6 +6563,10 @@ const handleUpdateGroup = async () => {
         editForm.profit_safety_buffer_percent,
       ),
     };
+    if (editForm.platform !== "openai") {
+      delete (payload as Record<string, unknown>).request_speed_selection_enabled;
+      delete (payload as Record<string, unknown>).default_request_speed_tier;
+    }
     delete (payload as Record<string, unknown>).profit_min_margin_percent;
     delete (payload as Record<string, unknown>).profit_safety_buffer_percent;
     // v-model.number 清空输入框时产生 ""，转为 null 让后端设为无限制
@@ -6481,9 +6630,11 @@ const handleUpdateGroup = async () => {
     closeEditModal();
     loadGroups();
   } catch (error: any) {
-    appStore.showError(
-      extractApiErrorMessage(error, t("admin.groups.failedToUpdate")),
-    );
+    const message = extractApiErrorMessage(error, t("admin.groups.failedToUpdate"));
+    if (extractApiErrorCode(error)?.startsWith("REQUEST_SPEED_")) {
+      editRequestSpeedError.value = message;
+    }
+    appStore.showError(message);
     console.error("Error updating group:", error);
   } finally {
     submitting.value = false;
@@ -6779,6 +6930,7 @@ watch(
 watch(
   () => createForm.platform,
   (newVal) => {
+    if (newVal !== "deepseek") createForm.deepseek_tools.enabled = false;
     if (!["anthropic", "antigravity"].includes(newVal)) {
       createForm.fallback_group_id_on_invalid_request = null;
     }
@@ -6837,6 +6989,7 @@ watch(
 watch(
   () => editForm.platform,
   (newVal) => {
+    if (newVal !== "deepseek") editForm.deepseek_tools.enabled = false;
     if (!["anthropic", "antigravity"].includes(newVal)) {
       editForm.fallback_group_id_on_invalid_request = null;
     }

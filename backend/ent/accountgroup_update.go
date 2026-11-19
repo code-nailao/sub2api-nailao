@@ -9,6 +9,7 @@ import (
 
 	"entgo.io/ent/dialect/sql"
 	"entgo.io/ent/dialect/sql/sqlgraph"
+	"entgo.io/ent/dialect/sql/sqljson"
 	"entgo.io/ent/schema/field"
 	"github.com/Wei-Shaw/sub2api/ent/account"
 	"github.com/Wei-Shaw/sub2api/ent/accountgroup"
@@ -54,6 +55,18 @@ func (_u *AccountGroupUpdate) SetNillableGroupID(v *int64) *AccountGroupUpdate {
 	if v != nil {
 		_u.SetGroupID(*v)
 	}
+	return _u
+}
+
+// SetRequestSpeedTiers sets the "request_speed_tiers" field.
+func (_u *AccountGroupUpdate) SetRequestSpeedTiers(v []string) *AccountGroupUpdate {
+	_u.mutation.SetRequestSpeedTiers(v)
+	return _u
+}
+
+// AppendRequestSpeedTiers appends value to the "request_speed_tiers" field.
+func (_u *AccountGroupUpdate) AppendRequestSpeedTiers(v []string) *AccountGroupUpdate {
+	_u.mutation.AppendRequestSpeedTiers(v)
 	return _u
 }
 
@@ -154,6 +167,14 @@ func (_u *AccountGroupUpdate) sqlSave(ctx context.Context) (_node int, err error
 				ps[i](selector)
 			}
 		}
+	}
+	if value, ok := _u.mutation.RequestSpeedTiers(); ok {
+		_spec.SetField(accountgroup.FieldRequestSpeedTiers, field.TypeJSON, value)
+	}
+	if value, ok := _u.mutation.AppendedRequestSpeedTiers(); ok {
+		_spec.AddModifier(func(u *sql.UpdateBuilder) {
+			sqljson.Append(u, accountgroup.FieldRequestSpeedTiers, value)
+		})
 	}
 	if value, ok := _u.mutation.Priority(); ok {
 		_spec.SetField(accountgroup.FieldPriority, field.TypeInt, value)
@@ -264,6 +285,18 @@ func (_u *AccountGroupUpdateOne) SetNillableGroupID(v *int64) *AccountGroupUpdat
 	if v != nil {
 		_u.SetGroupID(*v)
 	}
+	return _u
+}
+
+// SetRequestSpeedTiers sets the "request_speed_tiers" field.
+func (_u *AccountGroupUpdateOne) SetRequestSpeedTiers(v []string) *AccountGroupUpdateOne {
+	_u.mutation.SetRequestSpeedTiers(v)
+	return _u
+}
+
+// AppendRequestSpeedTiers appends value to the "request_speed_tiers" field.
+func (_u *AccountGroupUpdateOne) AppendRequestSpeedTiers(v []string) *AccountGroupUpdateOne {
+	_u.mutation.AppendRequestSpeedTiers(v)
 	return _u
 }
 
@@ -396,6 +429,14 @@ func (_u *AccountGroupUpdateOne) sqlSave(ctx context.Context) (_node *AccountGro
 				ps[i](selector)
 			}
 		}
+	}
+	if value, ok := _u.mutation.RequestSpeedTiers(); ok {
+		_spec.SetField(accountgroup.FieldRequestSpeedTiers, field.TypeJSON, value)
+	}
+	if value, ok := _u.mutation.AppendedRequestSpeedTiers(); ok {
+		_spec.AddModifier(func(u *sql.UpdateBuilder) {
+			sqljson.Append(u, accountgroup.FieldRequestSpeedTiers, value)
+		})
 	}
 	if value, ok := _u.mutation.Priority(); ok {
 		_spec.SetField(accountgroup.FieldPriority, field.TypeInt, value)

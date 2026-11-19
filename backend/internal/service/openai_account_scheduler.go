@@ -384,6 +384,12 @@ func (s *defaultOpenAIAccountScheduler) Select(
 	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
 ) (selection *AccountSelectionResult, decision OpenAIAccountScheduleDecision, err error) {
+	ctx = withRequestSpeedCompactRouting(ctx, req.RequireCompact)
+	if s != nil && s.service != nil {
+		if err := s.service.ValidatePreviousResponseRequestSpeed(ctx, req.GroupID, req.PreviousResponseID); err != nil {
+			return nil, decision, err
+		}
+	}
 	if s != nil && s.service != nil && s.service.openAIGroupRequiresPrivacySet(ctx, req.GroupID) {
 		req.RequirePrivacySet = true
 	}
@@ -1774,6 +1780,12 @@ func (s *defaultOpenAIAccountScheduler) isAccountRequestCompatibleReason(ctx con
 	if account == nil {
 		return false, "account_nil"
 	}
+	if !AccountSupportsRequestSpeed(ctx, account, req.GroupID) {
+		return false, "request_speed_mismatch"
+	}
+	if ValidateRequestSpeedModel(ctx, requestSpeedSchedulingModel(ctx, account, req.RequestedModel, req.RequireCompact)) != nil {
+		return false, "request_speed_model_unsupported"
+	}
 	if source, ok := CompositeRouteSourceFromContext(ctx); ok && source == CompositeRouteSourceAccount {
 		if publicModel, modelOK := RequestedPublicModelFromContext(ctx); modelOK && !explicitModelMappingClaims(*account, publicModel) {
 			return false, "account_model_not_owned"
@@ -2176,6 +2188,10 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 	previousResponseCanMove bool,
 	useUpstreamTokenCost bool,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
+	ctx = withRequestSpeedCompactRouting(ctx, requireCompact)
+	if err := s.ValidatePreviousResponseRequestSpeed(ctx, groupID, previousResponseID); err != nil {
+		return nil, OpenAIAccountScheduleDecision{}, err
+	}
 	selection, decision, err := s.selectAccountWithSchedulerBySize(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost)
 	if err == nil || openAIProxyStreamQuarantineBypassed(ctx) {
 		return selection, decision, err

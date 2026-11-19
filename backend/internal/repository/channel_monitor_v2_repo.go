@@ -22,16 +22,18 @@ func NewChannelMonitorV2Repository(db *sql.DB) service.ChannelMonitorV2Repositor
 func (r *channelMonitorV2Repository) GetConfig(ctx context.Context) (*service.ChannelMonitorV2Config, error) {
 	var cfg service.ChannelMonitorV2Config
 	var platforms, thresholds []byte
+	var displayOrder string
 	err := r.db.QueryRowContext(ctx, `
 		SELECT version, enabled, refresh_interval_seconds, platforms, group_ids,
 		       COALESCE(ignored_error_categories, '{}'),
 		       COALESCE(health_thresholds, '{}'::jsonb),
-		       updated_at, updated_by
-		FROM channel_monitor_v2_config WHERE id = 1`).Scan(
+		       updated_at, updated_by,
+		       COALESCE((SELECT value FROM settings WHERE key = $1), 'null')
+		FROM channel_monitor_v2_config WHERE id = 1`, channelMonitorV2DisplayOrderSettingKey).Scan(
 		&cfg.Version, &cfg.Enabled, &cfg.RefreshIntervalSeconds, &platforms,
 		pq.Array(&cfg.GroupIDs), pq.Array(&cfg.IgnoredErrorCategories),
 		&thresholds,
-		&cfg.UpdatedAt, &cfg.UpdatedBy,
+		&cfg.UpdatedAt, &cfg.UpdatedBy, &displayOrder,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("get channel monitor v2 config: %w", err)
@@ -47,6 +49,7 @@ func (r *channelMonitorV2Repository) GetConfig(ctx context.Context) (*service.Ch
 		_ = json.Unmarshal(thresholds, &cfg.HealthThresholds)
 	}
 	cfg.HealthThresholds = service.NormalizeChannelMonitorV2HealthThresholds(cfg.HealthThresholds)
+	cfg.DisplayOrder = decodeChannelMonitorV2DisplayOrder(displayOrder)
 	return &cfg, nil
 }
 
@@ -63,9 +66,24 @@ func (r *channelMonitorV2Repository) UpdateConfig(ctx context.Context, cfg servi
 	if err != nil {
 		return nil, err
 	}
+	var displayOrder []byte
+	if cfg.DisplayOrder != nil {
+		displayOrder, err = json.Marshal(cfg.DisplayOrder)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Presentation preferences share the existing version lock. A stale editor
+	// must not overwrite another editor's order, and either both writes commit
+	// or neither does. This uses the existing settings table without a migration.
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin channel monitor v2 config update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	var updated service.ChannelMonitorV2Config
 	var raw, rawThresholds []byte
-	err = r.db.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 		UPDATE channel_monitor_v2_config
 		SET version = version + 1, enabled = $1, refresh_interval_seconds = $2,
 		    platforms = $3, group_ids = $4, ignored_error_categories = $5,
@@ -96,6 +114,24 @@ func (r *channelMonitorV2Repository) UpdateConfig(ctx context.Context, cfg servi
 	updated.HealthThresholds = service.DefaultChannelMonitorV2HealthThresholds()
 	_ = json.Unmarshal(rawThresholds, &updated.HealthThresholds)
 	updated.HealthThresholds = service.NormalizeChannelMonitorV2HealthThresholds(updated.HealthThresholds)
+	if cfg.DisplayOrder != nil {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
+			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+			channelMonitorV2DisplayOrderSettingKey, string(displayOrder))
+		if err != nil {
+			return nil, fmt.Errorf("save channel monitor v2 display order: %w", err)
+		}
+	}
+	// Omission by old clients preserves the stored preference. Explicit {} resets.
+	var rawDisplayOrder string
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT value FROM settings WHERE key = $1), 'null')`, channelMonitorV2DisplayOrderSettingKey).Scan(&rawDisplayOrder); err != nil {
+		return nil, fmt.Errorf("read channel monitor v2 display order: %w", err)
+	}
+	updated.DisplayOrder = decodeChannelMonitorV2DisplayOrder(rawDisplayOrder)
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit channel monitor v2 config update: %w", err)
+	}
 	return &updated, nil
 }
 
@@ -1348,6 +1384,8 @@ func (a *metricAccumulator) metric(minutes float64, admin bool) service.ChannelM
 		minutes = 1
 	}
 	m := service.ChannelMonitorV2Metric{SuccessRequests: a.success, ErrorRequests: a.errors, RequestCount: requests, InputTokens: a.input, OutputTokens: a.output, CacheCreationTokens: a.cacheCreation, CacheReadTokens: a.cacheRead, TokenCount: tokens, RPM: float64(requests) / minutes, TPM: float64(tokens) / minutes, CacheRateNumerator: a.cacheRead, CacheRateDenominator: denom, TTFT: latencyMetric(a.ttftSum, a.ttftCount, a.hist["ttft"]), Duration: latencyMetric(a.durationSum, a.durationCount, a.hist["duration"])}
+	m.HasRequests = requests > 0
+	m.HasCacheInput = denom > 0
 	if requests > 0 {
 		m.ErrorRate = float64(a.errors) / float64(requests)
 		m.SuccessRate = float64(a.success) / float64(requests)

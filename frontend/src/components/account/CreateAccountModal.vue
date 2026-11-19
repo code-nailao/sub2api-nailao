@@ -3232,6 +3232,7 @@
         <ProxySelector v-model="form.proxy_id" :proxies="proxies" />
       </div>
 
+      <DeepSeekToolAccountFields v-if="form.platform === 'deepseek' && accountCategory === 'apikey'" v-model="deepSeekToolSettings" :base-url="apiKeyBaseUrl" />
       <UpstreamRequestIdHeaderField
         v-model="upstreamRequestIdHeader"
         :platform="form.platform"
@@ -3779,6 +3780,12 @@
           :mixed-scheduling="mixedScheduling"
           data-tour="account-form-groups"
         />
+        <AccountRequestSpeedFields
+          v-if="form.platform === 'openai' && accountCategory === 'apikey'"
+          v-model="requestSpeedMappings"
+          :groups="requestSpeedGroups"
+          :error="requestSpeedError"
+        />
       </div>
 
     </form>
@@ -4176,6 +4183,8 @@ import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import Select from '@/components/common/Select.vue'
 import HelpTooltip from '@/components/common/HelpTooltip.vue'
+import DeepSeekToolAccountFields from '@/components/account/DeepSeekToolAccountFields.vue'
+import { deepSeekToolAccountForm } from '@/utils/deepseekTools'
 import UpstreamRequestIdHeaderField from '@/components/account/UpstreamRequestIdHeaderField.vue'
 import OpenAIImageSizeTiersField from '@/components/account/OpenAIImageSizeTiersField.vue'
 import {
@@ -4188,6 +4197,8 @@ import Icon from '@/components/icons/Icon.vue'
 import ProxySelector from '@/components/common/ProxySelector.vue'
 import ProxyAdBanner from '@/components/common/ProxyAdBanner.vue'
 import GroupSelector from '@/components/common/GroupSelector.vue'
+import AccountRequestSpeedFields from './AccountRequestSpeedFields.vue'
+import type { RequestSpeedTier } from '@/types'
 import ModelWhitelistSelector from '@/components/account/ModelWhitelistSelector.vue'
 import QuotaLimitCard from '@/components/account/QuotaLimitCard.vue'
 import Toggle from '@/components/common/Toggle.vue'
@@ -4275,6 +4286,7 @@ const oauthStepTitle = computed(() => {
 
 // Platform-specific hints for API Key type
 // 上游ID：直接上游声明请求标识的响应头名，留空不记录。
+const deepSeekToolSettings = ref(deepSeekToolAccountForm())
 const upstreamRequestIdHeader = ref('')
 const withUpstreamRequestIdHeader = <T extends Record<string, unknown> | undefined>(extra: T): T | Record<string, unknown> => {
   const name = upstreamRequestIdHeader.value.trim()
@@ -4607,19 +4619,31 @@ watch(accountMode, (mode, previousMode) => {
     apiKeyBaseUrl.value = adaptiveBaseUrls.value.chat_completions
     return
   }
-  apiKeyBaseUrl.value = defaultCNBaseUrl(form.platform, mode, apiProtocol.value)
+  const previousDefault = defaultCNBaseUrl(form.platform, previousMode, apiProtocol.value)
+  if (form.platform !== 'deepseek' || !apiKeyBaseUrl.value || apiKeyBaseUrl.value === previousDefault) {
+    apiKeyBaseUrl.value = defaultCNBaseUrl(form.platform, mode, apiProtocol.value)
+  }
 })
-watch(apiProtocol, (protocol) => {
+watch(apiProtocol, (protocol, previousProtocol) => {
   if (!isMultiProtocolPlatform.value) return
   if (protocol === 'adaptive') {
     const defaults = defaultCNAdaptiveBaseUrls(adaptivePresetPlatform.value, currentOpenCodeOrCNMode())
+    const previousDefault = defaultCNBaseUrl(form.platform, currentOpenCodeOrCNMode(), previousProtocol)
+    const customDeepSeekURL = form.platform === 'deepseek' && apiKeyBaseUrl.value && apiKeyBaseUrl.value !== previousDefault ? apiKeyBaseUrl.value : ''
     for (const item of cnAdaptiveProtocolOptions.value) {
-      if (!adaptiveBaseUrls.value[item.value]) adaptiveBaseUrls.value[item.value] = defaults[item.value]
+      if (!adaptiveBaseUrls.value[item.value] || adaptiveBaseUrls.value[item.value] === defaults[item.value]) {
+        adaptiveBaseUrls.value[item.value] = customDeepSeekURL || defaults[item.value]
+      }
     }
     apiKeyBaseUrl.value = adaptiveBaseUrls.value.chat_completions
     return
   }
-  apiKeyBaseUrl.value = defaultCNBaseUrl(form.platform, currentOpenCodeOrCNMode(), protocol)
+  const previousDefault = defaultCNBaseUrl(form.platform, currentOpenCodeOrCNMode(), previousProtocol)
+  if (form.platform === 'deepseek' && previousProtocol === 'adaptive') {
+    apiKeyBaseUrl.value = adaptiveBaseUrls.value[protocol] || defaultCNBaseUrl(form.platform, currentOpenCodeOrCNMode(), protocol)
+  } else if (form.platform !== 'deepseek' || !apiKeyBaseUrl.value || apiKeyBaseUrl.value === previousDefault) {
+    apiKeyBaseUrl.value = defaultCNBaseUrl(form.platform, currentOpenCodeOrCNMode(), protocol)
+  }
 })
 // 点击预设端点：同时回填 base url、账号类型与协议。
 function onCnPresetSelect(preset: { mode: CnAccountMode; protocol: CnApiProtocol; url: string }) {
@@ -5064,6 +5088,13 @@ const form = reactive({
   group_ids: [] as number[],
   expires_at: null as number | null
 })
+
+const requestSpeedMappings = ref<Record<string, RequestSpeedTier[]>>({})
+const requestSpeedError = ref('')
+const requestSpeedGroups = computed(() => props.groups.filter(group =>
+  form.group_ids.includes(group.id) && group.platform === 'openai' &&
+  group.request_speed_selection_enabled === true
+))
 
 // Helper to check if current type needs OAuth flow
 const isOAuthFlow = computed(() => {
@@ -5587,9 +5618,18 @@ const ensureAntigravityMixedChannelConfirmed = async (onConfirm: () => Promise<v
 }
 
 const submitCreateAccount = async (payload: CreateAccountRequest) => {
+  requestSpeedError.value = ''
+  const requestPayload = { ...payload }
+  if (payload.platform === 'openai' && payload.type === 'apikey') {
+    const enabledGroupIDs = new Set(requestSpeedGroups.value.map(group => String(group.id)))
+    const mappings = Object.fromEntries(Object.entries(requestSpeedMappings.value).filter(([groupID]) =>
+      (payload.group_ids || []).includes(Number(groupID)) && enabledGroupIDs.has(groupID)
+    ))
+    if (Object.keys(mappings).length) requestPayload.request_speed_tiers_by_group = mappings
+  }
   submitting.value = true
   try {
-    const account = await adminAPI.accounts.create(withAntigravityConfirmFlag(payload))
+    const account = await adminAPI.accounts.create(withAntigravityConfirmFlag(requestPayload))
     const modelMapping = payload.credentials.model_mapping
     const hasConcreteMappedTarget = payload.type === 'apikey' &&
       typeof modelMapping === 'object' &&
@@ -5634,7 +5674,11 @@ const submitCreateAccount = async (payload: CreateAccountRequest) => {
       })
       return
     }
-    appStore.showError(error.response?.data?.message || error.response?.data?.detail || t('admin.accounts.failedToCreate'))
+    const message = error.response?.data?.message || error.response?.data?.detail || error.message || t('admin.accounts.failedToCreate')
+    if (String(error.reason || error.response?.data?.reason || '').startsWith('REQUEST_SPEED_')) {
+      requestSpeedError.value = message
+    }
+    appStore.showError(message)
   } finally {
     submitting.value = false
   }
@@ -5642,6 +5686,8 @@ const submitCreateAccount = async (payload: CreateAccountRequest) => {
 
 // Methods
 const resetForm = () => {
+  requestSpeedMappings.value = {}
+  requestSpeedError.value = ''
   step.value = 1
   form.name = ''
   form.notes = ''
@@ -5664,6 +5710,7 @@ const resetForm = () => {
   adaptiveBaseUrls.value = { chat_completions: '', anthropic: '', responses: '' }
   apiKeyBaseUrl.value = 'https://api.anthropic.com'
   apiKeyValue.value = ''
+  deepSeekToolSettings.value = deepSeekToolAccountForm()
   upstreamRequestIdHeader.value = ''
   upstreamBillingAutoProbeEnabled.value = true
   editQuotaLimit.value = null
@@ -6257,7 +6304,7 @@ const handleSubmit = async () => {
   }
 
   form.credentials = credentials
-  const extra = buildAnthropicExtra(buildOpenAIExtra())
+  const extra = { ...buildAnthropicExtra(buildOpenAIExtra()), ...(form.platform === 'deepseek' ? deepSeekToolSettings.value : {}) }
 
   await doCreateAccount({
     ...form,

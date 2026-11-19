@@ -21,6 +21,7 @@ var (
 	errUsageBillingBatchNilCommand       = errors.New("usage billing batch contains nil command")
 	errUsageBillingBatchDedupRowMissing  = errors.New("usage billing dedup row missing after claim conflict")
 	errUsageBillingBatchNonFiniteAmount  = errors.New("usage billing batch contains non-finite amount")
+	errUsageBillingBatchPrivateEffects   = errors.New("usage billing batch cannot process private transactional effects")
 )
 
 type usageBillingRequestKey struct {
@@ -99,6 +100,14 @@ func (r *usageBillingRepository) ApplyBatch(ctx context.Context, cmds []*service
 
 // validateUsageBillingBatch 规范化命令并校验：非空、request_id 非空、同一用户、(request_id, api_key_id) 互不相同。
 func validateUsageBillingBatch(cmds []*service.UsageBillingCommand) (int64, error) {
+	// Inspect the entire batch before normalizing any command. These effects
+	// have dedicated transactional handling in Apply or the durable journals;
+	// rejecting here preserves the batch's all-or-nothing contract.
+	for _, cmd := range cmds {
+		if service.HasPrivateUsageBillingEffects(cmd) {
+			return 0, errUsageBillingBatchPrivateEffects
+		}
+	}
 	var userID int64
 	seen := make(map[usageBillingRequestKey]struct{}, len(cmds))
 	for i, cmd := range cmds {

@@ -24,10 +24,12 @@ const (
 
 // UsageCleanupService 负责创建与执行使用记录清理任务
 type UsageCleanupService struct {
-	repo        UsageCleanupRepository
-	timingWheel *TimingWheelService
-	dashboard   *DashboardAggregationService
-	cfg         *config.Config
+	repo            UsageCleanupRepository
+	timingWheel     *TimingWheelService
+	dashboard       *DashboardAggregationService
+	cfg             *config.Config
+	settingRepo     SettingRepository
+	externalCleanup externalCleanupOwnership
 
 	running   int32
 	startOnce sync.Once
@@ -39,7 +41,7 @@ type UsageCleanupService struct {
 
 func NewUsageCleanupService(repo UsageCleanupRepository, timingWheel *TimingWheelService, dashboard *DashboardAggregationService, cfg *config.Config) *UsageCleanupService {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
-	return &UsageCleanupService{
+	svc := &UsageCleanupService{
 		repo:         repo,
 		timingWheel:  timingWheel,
 		dashboard:    dashboard,
@@ -47,6 +49,10 @@ func NewUsageCleanupService(repo UsageCleanupRepository, timingWheel *TimingWhee
 		workerCtx:    workerCtx,
 		workerCancel: workerCancel,
 	}
+	if dashboard != nil {
+		svc.settingRepo = dashboard.settingRepo
+	}
+	return svc
 }
 
 func describeUsageCleanupFilters(filters UsageCleanupFilters) string {
@@ -129,6 +135,11 @@ func (s *UsageCleanupService) CreateTask(ctx context.Context, filters UsageClean
 	if s.cfg != nil && !s.cfg.UsageCleanup.Enabled {
 		return nil, infraerrors.New(http.StatusServiceUnavailable, "USAGE_CLEANUP_DISABLED", "usage cleanup is disabled")
 	}
+	if external, err := s.externalCleanup.read(ctx, s.settingRepo); err != nil {
+		return nil, infraerrors.New(http.StatusServiceUnavailable, "CLEANUP_OWNERSHIP_UNAVAILABLE", "cleanup ownership could not be verified")
+	} else if external {
+		return nil, infraerrors.New(http.StatusConflict, "EXTERNAL_LOG_CLEANUP_MANAGED", "log cleanup is managed by the maintenance console")
+	}
 	if createdBy <= 0 {
 		return nil, infraerrors.BadRequest("USAGE_CLEANUP_INVALID_CREATOR", "invalid creator")
 	}
@@ -171,6 +182,9 @@ func (s *UsageCleanupService) runOnce() {
 	}
 	ctx, cancel := context.WithTimeout(parent, svc.taskTimeout())
 	defer cancel()
+	if external, err := svc.externalCleanup.read(ctx, svc.settingRepo); external || err != nil {
+		return
+	}
 
 	task, err := svc.repo.ClaimNextPendingTask(ctx, int64(svc.taskTimeout().Seconds()))
 	if err != nil {
@@ -198,6 +212,10 @@ func (s *UsageCleanupService) executeTask(ctx context.Context, task *UsageCleanu
 	var batchNum int
 
 	for {
+		if external, err := s.externalCleanup.read(ctx, s.settingRepo); external || err != nil {
+			s.markTaskFailed(task.ID, deletedTotal, fmt.Errorf("log cleanup belongs to the maintenance operator or ownership is unavailable"))
+			return
+		}
 		if ctx != nil && ctx.Err() != nil {
 			logger.LegacyPrintf("service.usage_cleanup", "[UsageCleanup] task interrupted: task=%d err=%v", task.ID, ctx.Err())
 			return

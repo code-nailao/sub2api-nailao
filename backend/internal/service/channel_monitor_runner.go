@@ -214,7 +214,7 @@ func (r *ChannelMonitorRunner) Unschedule(id int64) {
 	}
 }
 
-// Stop 优雅停止：取消所有任务、关闭池。
+// Stop 优雅停止：取消所有任务和正在进行的探测、关闭池，并等待 runOne 全部返回。
 func (r *ChannelMonitorRunner) Stop() {
 	if r == nil {
 		return
@@ -299,8 +299,16 @@ func (r *ChannelMonitorRunner) releaseInFlight(id int64) {
 
 // runOne 执行单个监控的检测。普通错误只记日志；API key 解密失败会撤销任务。
 // 任务结束时（含 panic recover）必须释放 in-flight 槽。
+//
+// 检测上下文挂在 runner 的 parentCtx 下：Stop 会取消正在进行的探测，而不是等它
+// 跑满预算（最长约 6 分钟），让后台进程交接时尽快退出。被取消的检测写库同样
+// 使用已取消的上下文，不会留下一条"失败"历史；Stop 仍等待 runOne 返回。
 func (r *ChannelMonitorRunner) runOne(id int64, name string) {
-	ctx, cancel := context.WithTimeout(context.Background(), monitorRequestTimeout+monitorPingTimeout+monitorRunOneBuffer)
+	parent := r.parentCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, monitorMaxRequestTimeout+monitorQuotaFetchTimeout+monitorPingTimeout+monitorRunOneBuffer)
 	defer cancel()
 
 	defer r.releaseInFlight(id)

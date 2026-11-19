@@ -28,6 +28,10 @@ export default {
           modeV1Hint: 'Default: runs scheduled upstream health checks for configured channel monitors (probe traffic).',
           defaultInterval: 'Default check interval (seconds)',
           defaultIntervalHint: 'V1 only: default interval for new monitors (overridable per monitor). Range 15 – 3600 seconds.',
+          degradedThreshold: 'Yellow threshold (seconds)',
+          requestTimeout: 'Probe total timeout (seconds)',
+          timingHint: 'V1 active probes turn yellow when a successful request reaches the threshold. Total timeout includes headers and response reading; failures stay red. Saved values apply to the next probe without a restart. In-flight probes and history stay unchanged. Ping, connect, TLS and quota checks have separate timeouts.',
+          timingRangeError: 'Yellow threshold must be an integer of at least 1 second and below total timeout. Total timeout must be an integer between 2 and 300 seconds.',
           hideThroughput: 'Hide throughput rates from users (RPM / TPM)',
           hideThroughputHint:
             'When on, the user Channel Monitor page and user APIs omit RPM and TPM so fleet volume cannot be reverse-estimated from rates × window. Admins still see full metrics. Error rates, latency, and cache rates remain visible.',
@@ -1187,6 +1191,7 @@ export default {
         commonPatterns: 'Common patterns'
       },
       openaiFastPolicy: {
+      groupTierPoliciesEnabled: 'Enable group tier policies (forced Ultrafast groups reject requests while disabled)',
         title: 'OpenAI Fast/Flex Policy',
         description: 'Intercept, filter, or pass OpenAI fast(priority), ultrafast, or flex requests based on the request body service_tier field. Applies to the OpenAI gateway only. "All tier values" includes explicitly sent tiers only.',
         empty: 'No rules configured. Click the button below to add one.',

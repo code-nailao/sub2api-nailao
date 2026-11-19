@@ -17,10 +17,21 @@ var ErrUsageBillingRequestConflict = errors.New("usage billing request fingerpri
 
 // UsageBillingCommand describes one billable request that must be applied at most once.
 type UsageBillingCommand struct {
-	RequestID          string
-	APIKeyID           int64
-	RequestFingerprint string
-	RequestPayloadHash string
+	DeepSeekToolFingerprint string
+	ToolAccountID           int64
+	ToolAccountQuotaCost    float64
+	ToolAccountDailyQuota   bool
+	ToolAccountWeeklyQuota  bool
+	RequestID               string
+	APIKeyID                int64
+	RequestFingerprint      string
+	RequestPayloadHash      string
+	// Optional durable rejection-fee hold. Ordinary successful billing releases
+	// exactly this request's hold in the same transaction as the existing bill.
+	UpstreamRejectionReservationID string
+	// UpstreamRequestID is the supplier's request identifier, kept only for
+	// reconciliation of a late result. It is not part of the fingerprint.
+	UpstreamRequestID string
 
 	UserID              int64
 	AccountID           int64
@@ -91,6 +102,7 @@ func (c *UsageBillingCommand) quantizeMonetaryFields() {
 	c.APIKeyQuotaCost = QuantizeUsageBillingAmount(c.APIKeyQuotaCost)
 	c.APIKeyRateLimitCost = QuantizeUsageBillingAmount(c.APIKeyRateLimitCost)
 	c.AccountQuotaCost = QuantizeUsageBillingAmount(c.AccountQuotaCost)
+	c.ToolAccountQuotaCost = QuantizeUsageBillingAmount(c.ToolAccountQuotaCost)
 }
 
 // QuantizeUsageBillingAmount 把金额舍入到 UsageBillingMonetaryScale 位小数，
@@ -136,6 +148,12 @@ func buildUsageBillingFingerprint(c *UsageBillingCommand) string {
 	)
 	if payloadHash := strings.TrimSpace(c.RequestPayloadHash); payloadHash != "" {
 		raw += "|" + payloadHash
+	}
+	if c.DeepSeekToolFingerprint != "" {
+		raw += "|deepseek-tools:" + c.DeepSeekToolFingerprint
+	}
+	if c.UpstreamRejectionReservationID != "" {
+		raw += "|rejection-hold:" + c.UpstreamRejectionReservationID
 	}
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])

@@ -80,6 +80,7 @@ func RegisterPaymentRoutes(
 	webhook := v1.Group("/payment/webhook")
 	{
 		// EasyPay sends GET callbacks with query params
+		webhook.POST("/bepusdt", webhookHandler.BEPusdtNotify)
 		webhook.GET("/easypay", webhookHandler.EasyPayNotify)
 		webhook.POST("/easypay", webhookHandler.EasyPayNotify)
 		webhook.POST("/alipay", webhookHandler.AlipayNotify)
@@ -109,6 +110,7 @@ func RegisterPaymentRoutes(
 			adminOrders.GET("/:id", adminPaymentHandler.GetOrderDetail)
 			adminOrders.POST("/:id/cancel", adminPaymentHandler.CancelOrder)
 			adminOrders.POST("/:id/retry", adminPaymentHandler.RetryFulfillment)
+			adminOrders.POST("/:id/reconcile-usdt", adminPaymentHandler.ReconcileNativePayment)
 			adminOrders.POST("/:id/refund", adminPaymentHandler.ProcessRefund)
 			adminOrders.POST("/:id/refund/query", adminPaymentHandler.QueryAndFinalizeRefund)
 		}

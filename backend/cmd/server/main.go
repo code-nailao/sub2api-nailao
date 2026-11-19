@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/handler"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/setup"
 	"github.com/Wei-Shaw/sub2api/internal/web"
@@ -59,11 +61,35 @@ func main() {
 	// Parse command line flags
 	setupMode := flag.Bool("setup", false, "Run setup wizard in CLI mode")
 	showVersion := flag.Bool("version", false, "Show version information")
+	migrateOnly := flag.String("migrate-only", "", "Apply exactly these reviewed pending migration filenames (comma separated), then exit without starting Main")
 	flag.Parse()
+
+	if runSourcesDeployCommand(*setupMode || *showVersion || sourcesMigrationRequested(flag.CommandLine)) {
+		return
+	}
+	if sourcesMigrationRequested(flag.CommandLine) {
+		if *setupMode || *showVersion {
+			log.Fatal("Migration-only cannot be combined with setup or version")
+		}
+		if err := runSourcesMigrationsOnly(*migrateOnly); err != nil {
+			log.Fatalf("Migration-only failed: %v", err)
+		}
+		log.Println("Reviewed migrations applied; no Main process or background services were started")
+		return
+	}
 
 	if *showVersion {
 		log.Printf("Sub2API %s (commit: %s, built: %s)\n", Version, Commit, Date)
 		return
+	}
+	runtime, err := processrole.Initialize()
+	if err != nil {
+		log.Fatalf("Invalid native process role or background ownership: %v", err)
+	}
+	// Ownership precedes setup too: auto-setup applies migrations and may create
+	// an administrator before normal dependency construction starts.
+	if !processrole.BackgroundEnabled() && (*setupMode || setup.NeedsSetup()) {
+		log.Fatal("Serving requires an already initialized database and deployment configuration; setup belongs to the background owner")
 	}
 
 	// CLI setup mode
@@ -91,7 +117,7 @@ func main() {
 	}
 
 	// Normal server mode
-	runMainServer()
+	runMainServer(runtime)
 }
 
 func runSetupServer() {
@@ -131,13 +157,15 @@ func runSetupServer() {
 	}
 }
 
-func runMainServer() {
+func runMainServer(runtime *processrole.Runtime) {
+	// The owner descriptor is deliberately released only by process exit, after
+	// every native goroutine and Cleanup step is gone. Never unlock on TERM.
 	cfg, err := config.LoadForBootstrap()
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		fatalStartupError("load config", err)
 	}
 	if err := logger.Init(logger.OptionsFromConfig(cfg.Log)); err != nil {
-		log.Fatalf("Failed to initialize logger: %v", err)
+		fatalStartupError("initialize logger", err)
 	}
 	if cfg.RunMode == config.RunModeSimple {
 		log.Println("⚠️  WARNING: Running in SIMPLE mode - billing and quota checks are DISABLED")
@@ -150,9 +178,12 @@ func runMainServer() {
 
 	app, err := initializeApplication(buildInfo)
 	if err != nil {
-		log.Fatalf("Failed to initialize application: %v", err)
+		fatalStartupError("initialize application", err)
 	}
 	defer app.Cleanup()
+	stopSettingsRefresh := app.Settings.StartSourcesSettingsRefresh()
+	defer stopSettingsRefresh()
+	app.Server.Handler = runtime.Wrap(app.Server.Handler)
 	if app.PluginManager != nil {
 		if err := app.PluginManager.Start(context.Background()); err != nil {
 			log.Printf("Plugin manager started in degraded state: %v", err)
@@ -171,11 +202,12 @@ func runMainServer() {
 	// 启动服务器
 	go func() {
 		if err := app.Server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("Failed to start server: %v", err)
+			fatalStartupError("start server", err)
 		}
 	}()
 
 	log.Printf("Server started on %s", app.Server.Addr)
+	runtime.Ready()
 
 	// 等待中断信号
 	quit := make(chan os.Signal, 1)
@@ -183,13 +215,24 @@ func runMainServer() {
 	<-quit
 
 	log.Println("Shutting down server...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := app.Server.Shutdown(ctx); err != nil {
-		log.Printf("Server forced to shutdown: %v", err)
+	runtime.Drain()
+	// A release removes this generation from routing before TERM. Keep active
+	// streams alive; the operator must never escalate a slow drain to SIGKILL.
+	if err := app.Server.Shutdown(context.Background()); err != nil {
+		log.Printf("Server shutdown: %v", err)
+	}
+	// net/http does not wait for native 202 image tasks or hijacked connections.
+	// Their result persistence must finish before native queues/clients close.
+	if err := runtime.Wait(context.Background()); err != nil {
+		log.Printf("Instance drain: %v", err)
 	}
 
 	log.Println("Server exited")
+}
+
+func fatalStartupError(stage string, err error) {
+	// Runtime logging settings can suppress the standard log bridge. Startup
+	// failures must reach stderr before Exit, which also skips deferred Sync.
+	fmt.Fprintf(os.Stderr, "Failed to %s: %v\n", stage, err)
+	os.Exit(1)
 }

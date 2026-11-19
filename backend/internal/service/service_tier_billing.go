@@ -13,6 +13,9 @@ type ServiceTierBillingResolution struct {
 	Observed   string // tier declared by the upstream response ("" when none)
 	Billing    string // tier used for billing and the usage log
 	Downgraded bool   // Billing is cheaper than Requested
+	// FixedUpstreamTier identifies a supplier credential with a fixed service
+	// level. No service_tier parameter was forwarded for this route.
+	FixedUpstreamTier string
 }
 
 // ResolveBillingServiceTier picks the tier to bill. The upstream declaration is
@@ -91,6 +94,13 @@ func ApplyOpenAIServiceTierBillingResolution(account *Account, result *OpenAIFor
 	if result == nil {
 		return ServiceTierBillingResolution{}
 	}
+	if account != nil && account.Platform == PlatformOpenAI && account.Type == AccountTypeAPIKey {
+		if resolution, ok := fixedUpstreamServiceTierBilling(result.FixedUpstreamRequestTier, result.UpstreamResponseServiceTier); ok {
+			tier := resolution.Billing
+			result.ServiceTier = &tier
+			return resolution
+		}
+	}
 	resolution := ResolveOpenAIServiceTierBilling(account, optionalStringValue(result.ServiceTier), result.UpstreamResponseServiceTier)
 	if resolution.Downgraded {
 		billing := resolution.Billing
@@ -105,12 +115,31 @@ func ApplyForwardServiceTierBillingResolution(result *ForwardResult) ServiceTier
 	if result == nil {
 		return ServiceTierBillingResolution{}
 	}
+	if resolution, ok := fixedUpstreamServiceTierBilling(result.FixedUpstreamRequestTier, result.UpstreamResponseServiceTier); ok {
+		tier := resolution.Billing
+		result.ServiceTier = &tier
+		return resolution
+	}
 	resolution := ResolveBillingServiceTier(optionalStringValue(result.ServiceTier), result.UpstreamResponseServiceTier)
 	if resolution.Downgraded {
 		billing := resolution.Billing
 		result.ServiceTier = &billing
 	}
 	return resolution
+}
+
+// A fixed supplier Key determines the served tier, so its generic response
+// service_tier is audit evidence rather than authority to change the price.
+// Only canonical internal values are accepted; legacy requests keep their
+// existing response-based downgrade semantics.
+func fixedUpstreamServiceTierBilling(tier, observed string) (ServiceTierBillingResolution, bool) {
+	if tier != OpenAIFastTierPriority && tier != OpenAIFastTierUltrafast {
+		return ServiceTierBillingResolution{}, false
+	}
+	return ServiceTierBillingResolution{
+		Observed: normalizeBillingServiceTier(observed), Billing: tier,
+		FixedUpstreamTier: tier,
+	}, true
 }
 
 // logServiceTierBillingDowngrade leaves an audit trail for every request billed

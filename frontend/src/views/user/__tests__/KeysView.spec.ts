@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { nextTick } from 'vue'
 
-import type { ApiKey } from '@/types'
+import type { ApiKey, RequestSpeedTier } from '@/types'
 import { keysAPI } from '@/api'
 import KeysView from '../KeysView.vue'
 
@@ -173,6 +173,7 @@ const DataTableStub = {
           <slot name="cell-id" :value="row.id" :row="row" />
         </div>
         <slot name="cell-name" :value="row.name" :row="row" />
+        <slot name="cell-key" :value="row.key" :row="row" />
         <slot name="cell-actions" :row="row" />
         <div data-test="current-concurrency">
           <slot name="cell-current_concurrency" :value="row.current_concurrency" :row="row" />
@@ -298,6 +299,58 @@ describe('user KeysView column settings', () => {
     getAvailableGroups.mockResolvedValue([])
     getUserGroupRates.mockResolvedValue({})
     isCurrentStep.mockReturnValue(false)
+  })
+
+  it('opens the native use-key dialog while keeping key creation and copy', async () => {
+    getPublicSettings.mockResolvedValue({ hide_ccs_import_button: false })
+    const wrapper = await mountView()
+    await getButtonByText(wrapper, 'keys.useKey').trigger('click')
+    const useKeyModal = wrapper.findComponent({ name: 'UseKeyModal' })
+    expect(useKeyModal.props('show')).toBe(true)
+    expect(useKeyModal.props('apiKey')).toBe('sk-test-key')
+    useKeyModal.vm.$emit('close')
+    await nextTick()
+    expect(useKeyModal.props('show')).toBe(false)
+    expect(getButtonByText(wrapper, 'keys.importToCcSwitch').exists()).toBe(true)
+    expect(getButtonByText(wrapper, 'Create API Key').exists()).toBe(true)
+    const copyButton = wrapper.find('button[title="keys.copyToClipboard"]')
+    expect(copyButton.exists()).toBe(true)
+    await copyButton.trigger('click')
+    expect(copyToClipboard).toHaveBeenCalledWith('sk-test-key', 'keys.copied')
+    wrapper.unmount()
+  })
+
+  it('uses the upstream CC Switch deeplink and configured public endpoint', async () => {
+    getPublicSettings.mockResolvedValue({
+      hide_ccs_import_button: false,
+      api_base_url: 'https://api.example.test',
+      site_name: 'Sources',
+    })
+    const open = vi.spyOn(window, 'open').mockReturnValue(null)
+    const wrapper = await mountView()
+    await getButtonByText(wrapper, 'keys.importToCcSwitch').trigger('click')
+    expect(open).toHaveBeenCalledTimes(1)
+    const [target, browsingContext] = open.mock.calls[0]!
+    const url = new URL(String(target))
+    expect(url.protocol).toBe('ccswitch:')
+    expect(url.hostname).toBe('v1')
+    expect(url.pathname).toBe('/import')
+    expect(url.searchParams.get('resource')).toBe('provider')
+    expect(url.searchParams.get('app')).toBe('claude')
+    expect(url.searchParams.get('endpoint')).toBe('https://api.example.test')
+    expect(url.searchParams.get('apiKey')).toBe('sk-test-key')
+    expect(url.searchParams.get('name')).toBe('Sources')
+    expect(browsingContext).toBe('_self')
+    wrapper.unmount()
+    open.mockRestore()
+  })
+
+  it('honors the native hide-CCS setting without hiding use-key', async () => {
+    getPublicSettings.mockResolvedValue({ hide_ccs_import_button: true })
+    const wrapper = await mountView()
+    expect(getButtonByText(wrapper, 'keys.useKey').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('keys.importToCcSwitch')
+    wrapper.unmount()
   })
 
   it.each([
@@ -655,6 +708,218 @@ describe('user KeysView column settings', () => {
       await getButtonByText(wrapper, 'common.edit').trigger('click')
       expect(wrapper.find('[data-tour="key-form-provider"]').exists()).toBe(false)
       expect(optionIds(wrapper)).toHaveLength(12)
+    })
+  })
+
+  describe('native per-Key request tiers', () => {
+    const speedGroup = (overrides: Record<string, unknown> = {}) => ({
+      id: 42,
+      name: 'Speed-enabled group',
+      platform: 'openai',
+      rate_multiplier: 0.15,
+      subscription_type: 'standard',
+      request_speed_selection_enabled: true,
+      default_request_speed_tier: 'ultrafast' as RequestSpeedTier,
+      available_request_speed_tiers: ['fast', 'ultrafast'] as RequestSpeedTier[],
+      ...overrides,
+    })
+    const ordinaryGroup = {
+      id: 43,
+      name: 'Ordinary group',
+      platform: 'openai',
+      rate_multiplier: 0.1,
+      subscription_type: 'standard',
+      request_speed_selection_enabled: false,
+    }
+    const selectFormGroup = async (wrapper: VueWrapper, id: number) => {
+      wrapper.findComponent('[data-tour="key-form-group"]').vm.$emit('update:modelValue', id)
+      await nextTick()
+    }
+    const seedKey = (overrides: Partial<ApiKey> = {}) => {
+      const key = { ...createApiKey(), group_id: 42, ...overrides }
+      listKeys.mockResolvedValue({ items: [key], total: 1, page: 1, page_size: 20, pages: 1 })
+      updateKey.mockResolvedValue(key)
+      return key
+    }
+    const openCreate = async () => {
+      const wrapper = await mountView()
+      await wrapper.get('[data-tour="keys-create-btn"]').trigger('click')
+      await wrapper.get('[data-tour="key-form-name"]').setValue('New speed key')
+      await selectFormGroup(wrapper, 42)
+      return wrapper
+    }
+    const radio = (wrapper: VueWrapper, value: RequestSpeedTier) =>
+      wrapper.get<HTMLInputElement>(`input[name="request-speed"][value="${value}"]`)
+
+    beforeEach(() => {
+      getAvailableGroups.mockResolvedValue([speedGroup(), ordinaryGroup])
+      vi.mocked(keysAPI.create).mockResolvedValue({ ...createApiKey(), group_id: 42 })
+    })
+
+    it('keeps the tier in the enabled Key name and adds no table column', async () => {
+      listKeys.mockResolvedValue({ items: [
+        { ...createApiKey(), id: 1, group_id: 42, request_speed_tier: 'fast' },
+        { ...createApiKey(), id: 2, group_id: 42, request_speed_tier: null },
+        // An unrelated group cannot expose a stale explicit tier.
+        { ...createApiKey(), id: 3, group_id: 43, request_speed_tier: 'fast' },
+      ], total: 3, page: 1, page_size: 20, pages: 1 })
+      const wrapper = await mountView()
+      const badges = wrapper.findAll('[data-testid="key-request-speed-badge"]')
+      expect(badges).toHaveLength(2)
+      expect(badges[0].text()).toContain('Fast')
+      expect(badges[1].text()).toContain('Ultrafast')
+      expect(badges.every(badge => badge.classes().includes('whitespace-nowrap'))).toBe(true)
+      expect(visibleColumnKeys(wrapper)).not.toContain('request_speed_tier')
+      wrapper.unmount()
+    })
+
+    it('creates a new Key with the group default in its single native request', async () => {
+      getAvailableGroups.mockResolvedValue([speedGroup({ default_request_speed_tier: 'fast' })])
+      const wrapper = await openCreate()
+      expect(radio(wrapper, 'fast').element.checked).toBe(true)
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      expect(keysAPI.create).toHaveBeenCalledOnce()
+      expect(vi.mocked(keysAPI.create).mock.calls[0][9]).toBe('fast')
+      expect(updateKey).not.toHaveBeenCalled()
+      expect(wrapper.find('#key-form').exists()).toBe(false)
+      wrapper.unmount()
+    })
+
+    it('omits the tier for an ordinary group and hides the selector immediately', async () => {
+      const wrapper = await openCreate()
+      expect(wrapper.find('[data-testid="request-speed-selector"]').exists()).toBe(true)
+      await selectFormGroup(wrapper, 43)
+      expect(wrapper.find('[data-testid="request-speed-selector"]').exists()).toBe(false)
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      expect(keysAPI.create).toHaveBeenCalledOnce()
+      expect(vi.mocked(keysAPI.create).mock.calls[0][1]).toBe(43)
+      expect(vi.mocked(keysAPI.create).mock.calls[0][9]).toBeUndefined()
+      wrapper.unmount()
+    })
+
+    it('disables an unavailable tier and rejects a currently unavailable default before create', async () => {
+      getAvailableGroups.mockResolvedValue([speedGroup({
+        default_request_speed_tier: 'fast', available_request_speed_tiers: ['ultrafast'],
+      })])
+      const wrapper = await openCreate()
+      expect(radio(wrapper, 'fast').element.disabled).toBe(true)
+      expect(radio(wrapper, 'ultrafast').element.disabled).toBe(false)
+      await wrapper.get('#key-form').trigger('submit')
+      expect(keysAPI.create).not.toHaveBeenCalled()
+      expect(wrapper.get('[role="alert"]').text()).toBe('requestSpeed.selectedUnavailable')
+      await radio(wrapper, 'ultrafast').setValue()
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      expect(vi.mocked(keysAPI.create).mock.calls[0][9]).toBe('ultrafast')
+      wrapper.unmount()
+    })
+
+    it('preserves an existing null Key as Ultrafast when the new-Key default becomes Fast', async () => {
+      seedKey({ request_speed_tier: null })
+      getAvailableGroups.mockResolvedValue([speedGroup({ default_request_speed_tier: 'fast' })])
+      const wrapper = await mountView()
+      await getButtonByText(wrapper, 'common.edit').trigger('click')
+      expect(radio(wrapper, 'ultrafast').element.checked).toBe(true)
+      await wrapper.get('[data-tour="key-form-name"]').setValue('Rename old key')
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      expect(updateKey).toHaveBeenCalledOnce()
+      expect(updateKey.mock.calls[0][1]).not.toHaveProperty('request_speed_tier')
+      expect(updateKey.mock.calls[0][1].name).toBe('Rename old key')
+      wrapper.unmount()
+    })
+
+    it('updates a chosen tier together with native Key fields in one request', async () => {
+      seedKey({ request_speed_tier: 'ultrafast' })
+      const wrapper = await mountView()
+      await getButtonByText(wrapper, 'common.edit').trigger('click')
+      await radio(wrapper, 'fast').setValue()
+      await wrapper.get('[data-tour="key-form-name"]').setValue('Fast project')
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      expect(updateKey).toHaveBeenCalledOnce()
+      expect(updateKey.mock.calls[0]).toEqual([1, expect.objectContaining({
+        group_id: 42, name: 'Fast project', request_speed_tier: 'fast',
+      })])
+      expect(keysAPI.create).not.toHaveBeenCalled()
+      wrapper.unmount()
+    })
+
+    it('allows an unchanged temporarily unavailable tier to retain a Key while renaming it', async () => {
+      seedKey({ request_speed_tier: 'fast' })
+      getAvailableGroups.mockResolvedValue([speedGroup({ available_request_speed_tiers: ['ultrafast'] })])
+      const wrapper = await mountView()
+      await getButtonByText(wrapper, 'common.edit').trigger('click')
+      expect(radio(wrapper, 'fast').element.checked).toBe(true)
+      expect(radio(wrapper, 'fast').element.disabled).toBe(true)
+      await wrapper.get('[data-tour="key-form-name"]').setValue('Keep existing Fast')
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      expect(updateKey).toHaveBeenCalledOnce()
+      expect(updateKey.mock.calls[0][1]).not.toHaveProperty('request_speed_tier')
+      wrapper.unmount()
+    })
+
+    it('resolves the new group default on a native Key group change', async () => {
+      seedKey({ group_id: 43, request_speed_tier: null })
+      getAvailableGroups.mockResolvedValue([speedGroup({ default_request_speed_tier: 'fast' }), ordinaryGroup])
+      const wrapper = await mountView()
+      await getButtonByText(wrapper, 'common.edit').trigger('click')
+      expect(wrapper.find('[data-testid="request-speed-selector"]').exists()).toBe(false)
+      await selectFormGroup(wrapper, 42)
+      expect(radio(wrapper, 'fast').element.checked).toBe(true)
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      expect(updateKey).toHaveBeenCalledOnce()
+      expect(updateKey.mock.calls[0][1]).toMatchObject({ group_id: 42, request_speed_tier: 'fast' })
+      wrapper.unmount()
+    })
+
+    it('does not carry an old tier into a normal group update', async () => {
+      seedKey({ request_speed_tier: 'fast' })
+      const wrapper = await mountView()
+      await getButtonByText(wrapper, 'common.edit').trigger('click')
+      await selectFormGroup(wrapper, 43)
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      expect(updateKey).toHaveBeenCalledOnce()
+      expect(updateKey.mock.calls[0][1]).toMatchObject({ group_id: 43 })
+      expect(updateKey.mock.calls[0][1]).not.toHaveProperty('request_speed_tier')
+      wrapper.unmount()
+    })
+
+    it('keeps the selected tier and form when the native save returns a tier error', async () => {
+      const wrapper = await openCreate()
+      await radio(wrapper, 'fast').setValue()
+      vi.mocked(keysAPI.create).mockRejectedValueOnce({
+        status: 400, reason: 'REQUEST_SPEED_UNAVAILABLE', message: 'Fast currently has no configured upstream',
+      })
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      expect(keysAPI.create).toHaveBeenCalledOnce()
+      expect(wrapper.get('[role="alert"]').text()).toBe('Fast currently has no configured upstream')
+      expect(radio(wrapper, 'fast').element.checked).toBe(true)
+      expect(showSuccess).not.toHaveBeenCalled()
+      expect(updateKey).not.toHaveBeenCalled()
+      wrapper.unmount()
+    })
+
+    it('refreshes both native Key data and the latest group tier availability', async () => {
+      getAvailableGroups.mockResolvedValue([speedGroup({ available_request_speed_tiers: ['ultrafast'] })])
+      const wrapper = await mountView()
+      getAvailableGroups.mockResolvedValue([speedGroup()])
+      listKeys.mockClear()
+      getAvailableGroups.mockClear()
+      await wrapper.get('button[title="Refresh"]').trigger('click')
+      await flushPromises()
+      expect(listKeys).toHaveBeenCalledOnce()
+      expect(getAvailableGroups).toHaveBeenCalledOnce()
+      await wrapper.get('[data-tour="keys-create-btn"]').trigger('click')
+      await selectFormGroup(wrapper, 42)
+      expect(radio(wrapper, 'fast').element.disabled).toBe(false)
+      wrapper.unmount()
     })
   })
 

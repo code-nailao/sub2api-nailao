@@ -52,6 +52,8 @@ func TestProvideCleanup_WithMinimalDependencies_NoPanic(t *testing.T) {
 	opsSystemLogSinkSvc := service.NewOpsSystemLogSink(nil)
 
 	cleanup := provideCleanup(
+		nil,
+		nil, // accountWallet
 		nil, // entClient
 		nil, // redis
 		&service.OpsMetricsCollector{},
@@ -77,6 +79,8 @@ func TestProvideCleanup_WithMinimalDependencies_NoPanic(t *testing.T) {
 		service.NewGeminiCachedContentService(nil, nil, cfg),
 		&service.BatchImageCleanupService{},
 		nil, // batchImageWorker
+		nil, // upstreamRejectionRecovery
+		nil, // deepSeekUsageRecovery
 		pricingSvc,
 		emailQueueSvc,
 		billingCacheSvc,

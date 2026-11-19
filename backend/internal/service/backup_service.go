@@ -31,6 +31,11 @@ const (
 	settingKeyBackupRecords  = "backup_records"
 
 	backupObjectCleanupTimeout = 2 * time.Minute
+	backupExecutionTimeout     = 2 * time.Hour
+	backupRestoreTimeout       = 30 * time.Minute
+	backupInterruptedGrace     = 5 * time.Minute
+	backupRecordUpdateTimeout  = 30 * time.Minute
+	backupRecordUpdateLockTTL  = backupRecordUpdateTimeout + backupInterruptedGrace
 
 	// backupScheduledLeaderLockKey gates the scheduled full-database backup so
 	// that only one instance in a clustered deployment performs the
@@ -43,9 +48,9 @@ const (
 	backupScheduledLeaderLockKey = "backup:scheduled:leader"
 	// backupScheduledLeaderLockTTL bounds crash recovery only; the lock is
 	// released as soon as the backup finishes. It must exceed the job's
-	// worst-case runtime (the scheduled backup context is bounded at 30m) so the
+	// worst-case runtime (the scheduled backup context is bounded at 2h) so the
 	// lock cannot expire mid-dump and let a peer start a second backup.
-	backupScheduledLeaderLockTTL = 35 * time.Minute
+	backupScheduledLeaderLockTTL = backupExecutionTimeout + backupInterruptedGrace
 )
 
 var (
@@ -82,6 +87,7 @@ type DBDumper interface {
 type BackupObjectStore interface {
 	Upload(ctx context.Context, key string, body io.Reader, contentType string) (sizeBytes int64, err error)
 	UploadFile(ctx context.Context, key string, filePath string, contentType string) (sizeBytes int64, err error)
+	UploadFileRange(ctx context.Context, key string, filePath string, offset, length int64, contentType string) (sizeBytes int64, err error)
 	Download(ctx context.Context, key string) (io.ReadCloser, error)
 	Delete(ctx context.Context, key string) error
 	PresignURL(ctx context.Context, key string, expiry time.Duration) (string, error)
@@ -272,7 +278,7 @@ func (s *BackupService) recoverStaleRecords() {
 	changed := false
 	var stale []int
 	for i := range records {
-		if records[i].Status == "running" && records[i].MonthlyArchive == nil && backupOperationExpired(records[i].StartedAt, now) {
+		if records[i].Status == "running" && records[i].MonthlyArchive == nil && backupOperationExpired(records[i].StartedAt, now, backupExecutionTimeout) {
 			records[i].Status = "failed"
 			records[i].ErrorMsg = "interrupted by server restart"
 			records[i].Progress = ""
@@ -288,7 +294,7 @@ func (s *BackupService) recoverStaleRecords() {
 				changed = true
 				continue
 			}
-			if !backupOperationExpired(records[i].RestoreStartedAt, now) {
+			if !backupOperationExpired(records[i].RestoreStartedAt, now, backupRestoreTimeout) {
 				continue
 			}
 			records[i].RestoreStatus = "failed"
@@ -316,9 +322,9 @@ func (s *BackupService) recoverStaleRecords() {
 	}
 }
 
-func backupOperationExpired(started string, now time.Time) bool {
+func backupOperationExpired(started string, now time.Time, executionTimeout time.Duration) bool {
 	at, err := time.Parse(time.RFC3339, started)
-	return err == nil && now.Sub(at) > backupScheduledLeaderLockTTL
+	return err == nil && now.Sub(at) > executionTimeout+backupInterruptedGrace
 }
 
 func (s *BackupService) cleanupStaleBackupObjects(ctx context.Context, record *BackupRecord) error {
@@ -547,7 +553,7 @@ func (s *BackupService) runScheduledBackup() {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
-	ctx, cancel := context.WithTimeout(s.bgCtx, 30*time.Minute)
+	ctx, cancel := context.WithTimeout(s.bgCtx, backupExecutionTimeout)
 	defer cancel()
 
 	// 多实例保护: 集群部署时只让 leader 执行定时备份, 避免每个实例各自对同一个
@@ -776,7 +782,7 @@ func (s *BackupService) StartBackup(ctx context.Context, triggeredBy string, exp
 
 // executeBackup 后台执行备份（独立于 HTTP context）
 func (s *BackupService) executeBackup(record *BackupRecord, objectStore BackupObjectStore, s3Cfg *BackupS3Config) {
-	ctx, cancel := context.WithTimeout(s.bgCtx, 30*time.Minute)
+	ctx, cancel := context.WithTimeout(s.bgCtx, backupExecutionTimeout)
 	defer cancel()
 
 	// 阶段1: pg_dump -> gzip 临时文件
@@ -871,17 +877,10 @@ func (s *BackupService) uploadBackupArchive(ctx context.Context, record *BackupR
 		return nil
 	}
 
-	localParts, err := splitBackupFile(archivePath, partSize)
+	localParts, err := planBackupFileParts(ctx, archivePath, partSize)
 	if err != nil {
-		return fmt.Errorf("split backup archive: %w", err)
+		return fmt.Errorf("plan backup archive parts: %w", err)
 	}
-	defer func() {
-		paths := make([]string, 0, len(localParts))
-		for _, part := range localParts {
-			paths = append(paths, part.Path)
-		}
-		_ = cleanupBackupFiles(paths...)
-	}()
 	if cfg == nil {
 		return errors.New("backup S3 config is unavailable for split upload")
 	}
@@ -901,7 +900,7 @@ func (s *BackupService) uploadBackupArchive(ctx context.Context, record *BackupR
 		return fmt.Errorf("save split backup plan: %w", err)
 	}
 	for i, part := range localParts {
-		if _, err := objectStore.UploadFile(ctx, record.Parts[i].S3Key, part.Path, "application/octet-stream"); err != nil {
+		if _, err := objectStore.UploadFileRange(ctx, record.Parts[i].S3Key, archivePath, part.Offset, part.SizeBytes, "application/octet-stream"); err != nil {
 			// PUT 可能已经在对象存储端成功、但客户端因超时收到错误；
 			// 因此失败时清理整份分卷计划，而不只清理此前返回成功的卷。
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), backupObjectCleanupTimeout)
@@ -1055,7 +1054,7 @@ func (s *BackupService) StartRestore(ctx context.Context, backupID string) (*Bac
 
 // executeRestore 后台执行恢复
 func (s *BackupService) executeRestore(record *BackupRecord, objectStore BackupObjectStore) {
-	ctx, cancel := context.WithTimeout(s.bgCtx, 30*time.Minute)
+	ctx, cancel := context.WithTimeout(s.bgCtx, backupRestoreTimeout)
 	defer cancel()
 
 	if len(record.Parts) > 0 {

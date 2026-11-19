@@ -64,6 +64,9 @@ export interface ModelPlazaGroup {
   /** 'standard' | 'subscription' */
   subscription_type: string
   rate_multiplier: number
+  /** Final fixed rejection fee, independent of all normal usage multipliers. */
+  upstream_rejection_billing_enabled?: boolean
+  upstream_rejection_price?: number
   /** 登录且管理员为该用户配了专属倍率时返回；生效倍率 = user_rate ?? rate_multiplier。 */
   user_rate_multiplier?: number
   peak_rate_enabled: boolean

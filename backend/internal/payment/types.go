@@ -102,15 +102,16 @@ func GetBasePaymentType(t string) string {
 
 // CreatePaymentRequest holds the parameters for creating a new payment.
 type CreatePaymentRequest struct {
-	OrderID     string // Internal order ID
-	Amount      string // 支付金额，按服务商实例配置的币种解释
-	PaymentType string // e.g. "alipay", "wxpay", "stripe"
-	Subject     string // Product description
-	NotifyURL   string // Webhook callback URL
-	ReturnURL   string // Browser redirect URL after payment
-	OpenID      string // WeChat JSAPI payer OpenID when available
-	ClientIP    string // Payer's IP address
-	IsMobile    bool   // Whether the request comes from a mobile device
+	ExpiresAt   time.Time // Fixed local order deadline for native asynchronous checkout.
+	OrderID     string    // Internal order ID
+	Amount      string    // 支付金额，按服务商实例配置的币种解释
+	PaymentType string    // e.g. "alipay", "wxpay", "stripe"
+	Subject     string    // Product description
+	NotifyURL   string    // Webhook callback URL
+	ReturnURL   string    // Browser redirect URL after payment
+	OpenID      string    // WeChat JSAPI payer OpenID when available
+	ClientIP    string    // Payer's IP address
+	IsMobile    bool      // Whether the request comes from a mobile device
 	// AlipayMobilePrecreate routes a mobile Alipay request through
 	// alipay.trade.precreate instead of alipay.trade.wap.pay.
 	AlipayMobilePrecreate bool
@@ -148,26 +149,33 @@ type WechatJSAPIPayload struct {
 
 // CreatePaymentResponse is returned after successfully initiating a payment.
 type CreatePaymentResponse struct {
-	TradeNo      string                  // Third-party transaction ID
-	PayURL       string                  // H5 payment URL (alipay/wxpay)
-	QRCode       string                  // QR code content for scanning
-	ClientSecret string                  // Stripe PaymentIntent 客户端密钥
-	IntentID     string                  // 前端 SDK 需要的服务商支付意图 ID
-	Currency     string                  // 服务商支付币种
-	CountryCode  string                  // 服务商收银台国家/地区代码
-	PaymentEnv   string                  // 服务商前端环境标识
-	ResultType   CreatePaymentResultType // Typed result contract for frontend flows
-	OAuth        *WechatOAuthInfo        // WeChat OAuth bootstrap payload when required
-	JSAPI        *WechatJSAPIPayload     // WeChat JSAPI invocation payload when ready
+	CryptoPayment *CryptoPaymentDetails
+	TradeNo       string                  // Third-party transaction ID
+	PayURL        string                  // H5 payment URL (alipay/wxpay)
+	QRCode        string                  // QR code content for scanning
+	ClientSecret  string                  // Stripe PaymentIntent 客户端密钥
+	IntentID      string                  // 前端 SDK 需要的服务商支付意图 ID
+	Currency      string                  // 服务商支付币种
+	CountryCode   string                  // 服务商收银台国家/地区代码
+	PaymentEnv    string                  // 服务商前端环境标识
+	ResultType    CreatePaymentResultType // Typed result contract for frontend flows
+	OAuth         *WechatOAuthInfo        // WeChat OAuth bootstrap payload when required
+	JSAPI         *WechatJSAPIPayload     // WeChat JSAPI invocation payload when ready
 }
 
 // QueryOrderResponse describes the payment status from the upstream provider.
 type QueryOrderResponse struct {
-	TradeNo  string
-	Status   string  // "pending", "paid", "failed", "refunded"
-	Amount   float64 // 按服务商返回币种解释的金额
-	PaidAt   string  // RFC3339 timestamp or empty
-	Metadata map[string]string
+	OrderID       string
+	Currency      string
+	AmountExact   string
+	PaymentType   string
+	PayURL        string
+	CryptoPayment *CryptoPaymentDetails
+	TradeNo       string
+	Status        string  // "pending", "paid", "failed", "refunded"
+	Amount        float64 // 按服务商返回币种解释的金额
+	PaidAt        string  // RFC3339 timestamp or empty
+	Metadata      map[string]string
 }
 
 // PaymentNotification is the parsed result of a webhook/notify callback.
@@ -261,3 +269,6 @@ type CancelableProvider interface {
 type MerchantIdentityProvider interface {
 	MerchantIdentityMetadata() map[string]string
 }
+
+// PaymentMethodMatcher maps a configured visible method to its upstream identity.
+type PaymentMethodMatcher interface{ MatchesPaymentMethod(string, string) bool }

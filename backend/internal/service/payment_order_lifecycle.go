@@ -11,6 +11,7 @@ import (
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/ent/paymentauditlog"
 	"github.com/Wei-Shaw/sub2api/ent/paymentorder"
+	"github.com/Wei-Shaw/sub2api/ent/paymentproviderinstance"
 	"github.com/Wei-Shaw/sub2api/internal/payment"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/servertiming"
@@ -123,7 +124,11 @@ func (s *PaymentService) AdminCancelOrder(ctx context.Context, orderID int64) (s
 
 func (s *PaymentService) cancelCore(ctx context.Context, o *dbent.PaymentOrder, fs, op, ad string) (string, error) {
 	if o.PaymentTradeNo != "" || o.PaymentType != "" {
-		if s.checkPaid(ctx, o) == checkPaidResultAlreadyPaid {
+		outcome := s.checkPaid(ctx, o)
+		if outcome == paymentVerificationPending {
+			return outcome, fmt.Errorf("payment outcome is unknown; retry verification")
+		}
+		if outcome == checkPaidResultAlreadyPaid {
 			return checkPaidResultAlreadyPaid, nil
 		}
 	}
@@ -138,6 +143,18 @@ func (s *PaymentService) cancelCore(ctx context.Context, o *dbent.PaymentOrder, 
 		}
 		s.writeAuditLog(ctx, o.ID, auditAction, op, map[string]any{"detail": ad})
 	}
+	if c == 0 {
+		fresh, err := s.entClient.PaymentOrder.Get(ctx, o.ID)
+		if err != nil {
+			return paymentVerificationPending, err
+		}
+		if fresh.PaidAt != nil || fresh.Status == OrderStatusCompleted || fresh.Status == OrderStatusPaymentReview {
+			return checkPaidResultAlreadyPaid, nil
+		}
+		if fresh.Status != OrderStatusCancelled && fresh.Status != OrderStatusExpired {
+			return paymentVerificationPending, fmt.Errorf("payment state changed during cancellation")
+		}
+	}
 	return checkPaidResultCancelled, nil
 }
 
@@ -150,6 +167,9 @@ func (s *PaymentService) reconcilePaid(ctx context.Context, o *dbent.PaymentOrde
 }
 
 func (s *PaymentService) checkPaidWithOptions(ctx context.Context, o *dbent.PaymentOrder, opts checkPaidOptions) string {
+	if verifiedPaymentOrder(o) {
+		return s.checkVerifiedPayment(ctx, o, opts.cancelIfUnpaid)
+	}
 	prov, err := s.getOrderProvider(ctx, o)
 	if err != nil {
 		return ""
@@ -249,12 +269,12 @@ func paymentOrderQueryReference(order *dbent.PaymentOrder, prov payment.Provider
 
 	switch payment.GetBasePaymentType(providerKey) {
 	case payment.TypeAlipay, payment.TypeEasyPay, payment.TypeWxpay:
-		return strings.TrimSpace(order.OutTradeNo)
+		return paymentBusinessOrderID(order)
 	default:
 		if tradeNo := strings.TrimSpace(order.PaymentTradeNo); tradeNo != "" {
 			return tradeNo
 		}
-		return strings.TrimSpace(order.OutTradeNo)
+		return paymentBusinessOrderID(order)
 	}
 }
 
@@ -306,6 +326,17 @@ func (s *PaymentService) VerifyOrderByOutTradeNo(ctx context.Context, outTradeNo
 // ReconcilePendingPaymentOrders actively checks recent pending Alipay and WeChat
 // orders so missed provider notifications do not wait until order expiry to fulfill.
 func (s *PaymentService) ReconcilePendingPaymentOrders(ctx context.Context) (int, error) {
+	defer func() {
+		budget, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = s.reconcilePaymentPostCommit(budget)
+	}()
+	if err := s.reconcileVerifiedPayments(ctx); err != nil {
+		return 0, err
+	}
+	if _, err := s.reconcileVerifiedPaymentOrders(ctx); err != nil {
+		return 0, err
+	}
 	now := time.Now()
 	orders, err := s.entClient.PaymentOrder.Query().
 		Where(
@@ -399,8 +430,12 @@ func (s *PaymentService) ExpireTimedOutOrders(ctx context.Context) (int, error) 
 }
 
 // getOrderProvider creates a provider using the order's original instance config.
-// Falls back to registry lookup if instance ID is missing (legacy orders).
+// Unbound legacy orders require one current database provider supporting their
+// payment type; another process's admin changes must not leave cached credentials.
 func (s *PaymentService) getOrderProvider(ctx context.Context, o *dbent.PaymentOrder) (payment.Provider, error) {
+	if p, known, err := s.resolveVerifiedProvider(ctx, o); known {
+		return p, err
+	}
 	inst, err := s.getOrderProviderInstance(ctx, o)
 	if err != nil {
 		return nil, fmt.Errorf("load order provider instance: %w", err)
@@ -408,21 +443,25 @@ func (s *PaymentService) getOrderProvider(ctx context.Context, o *dbent.PaymentO
 	if inst != nil {
 		return s.createProviderFromInstance(ctx, inst)
 	}
-	if !paymentOrderAllowsRegistryFallback(o) {
+	if !paymentOrderAllowsCurrentProviderFallback(o) {
 		return nil, fmt.Errorf("order %d provider instance is unresolved", o.ID)
 	}
-	providerKey := paymentOrderFallbackProviderKey(s.registry, o)
-	if providerKey == "" {
-		return nil, fmt.Errorf("order %d provider fallback key is missing", o.ID)
+	instances, err := s.entClient.PaymentProviderInstance.Query().
+		Where(paymentproviderinstance.EnabledEQ(true)).All(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load legacy order providers: %w", err)
 	}
-	if !s.webhookRegistryFallbackAllowed(ctx, providerKey) {
-		return nil, fmt.Errorf("order %d provider fallback is ambiguous for %s", o.ID, providerKey)
+	matched := psFilterLegacyOrderProviderInstances(o.PaymentType, instances)
+	if len(matched) == 0 {
+		return nil, payment.ErrProviderNotFound
 	}
-	s.EnsureProviders(ctx)
-	return s.registry.GetProvider(o.PaymentType)
+	if len(matched) != 1 {
+		return nil, fmt.Errorf("order %d provider fallback is ambiguous for %s", o.ID, o.PaymentType)
+	}
+	return s.createProviderFromInstance(ctx, matched[0])
 }
 
-func paymentOrderAllowsRegistryFallback(order *dbent.PaymentOrder) bool {
+func paymentOrderAllowsCurrentProviderFallback(order *dbent.PaymentOrder) bool {
 	if order == nil {
 		return false
 	}
@@ -436,18 +475,6 @@ func paymentOrderAllowsRegistryFallback(order *dbent.PaymentOrder) bool {
 		return false
 	}
 	return true
-}
-
-func paymentOrderFallbackProviderKey(registry *payment.Registry, order *dbent.PaymentOrder) string {
-	if order == nil {
-		return ""
-	}
-	if registry != nil {
-		if key := strings.TrimSpace(registry.GetProviderKey(payment.PaymentType(order.PaymentType))); key != "" {
-			return key
-		}
-	}
-	return strings.TrimSpace(payment.GetBasePaymentType(strings.TrimSpace(order.PaymentType)))
 }
 
 func (s *PaymentService) createProviderFromInstance(ctx context.Context, inst *dbent.PaymentProviderInstance) (payment.Provider, error) {

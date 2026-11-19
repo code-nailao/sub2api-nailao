@@ -677,7 +677,10 @@ type AudioUsage struct {
 }
 
 type ForwardResult struct {
-	RequestID string
+	// FixedUpstreamRequestTier is the trusted tier selected by the API Key.
+	// The supplier credential fixes this tier; response default cannot lower it.
+	FixedUpstreamRequestTier string
+	RequestID                string
 	// UpstreamHeaders 是直接上游的响应头，用于按账户配置解析上游请求标识。
 	UpstreamHeaders http.Header
 	Usage           ClaudeUsage

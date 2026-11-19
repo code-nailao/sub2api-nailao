@@ -190,7 +190,8 @@ func TestImageStorageSettingsOwnCredentialsAreEncryptedAndMasked(t *testing.T) {
 	})
 	require.NoError(t, err)
 	svc.resolve()
-	require.Equal(t, "super-secret", (*built)[1].SecretAccessKey)
+	require.Len(t, *built, 1, "saving unchanged effective credentials reuses the client")
+	require.Equal(t, "super-secret", (*built)[0].SecretAccessKey)
 }
 
 // Persisting the service's own S3 secret must be refused when the encryption key

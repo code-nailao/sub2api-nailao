@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -11,6 +12,9 @@ import (
 )
 
 const scheduledTestDefaultMaxWorkers = 10
+
+// scheduledTestRunDelay lands execution at ~:10 of each minute instead of :00.
+const scheduledTestRunDelay = 10 * time.Second
 
 // ScheduledTestRunnerService periodically scans due test plans and executes them.
 type ScheduledTestRunnerService struct {
@@ -23,6 +27,11 @@ type ScheduledTestRunnerService struct {
 	cron      *cron.Cron
 	startOnce sync.Once
 	stopOnce  sync.Once
+	// stopCtx is cancelled when Stop begins so in-flight tests end promptly.
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
+	// runDelay is a test seam; production uses scheduledTestRunDelay.
+	runDelay time.Duration
 }
 
 // NewScheduledTestRunnerService creates a new runner.
@@ -33,12 +42,15 @@ func NewScheduledTestRunnerService(
 	rateLimitSvc *RateLimitService,
 	cfg *config.Config,
 ) *ScheduledTestRunnerService {
+	stopCtx, stopCancel := context.WithCancel(context.Background())
 	return &ScheduledTestRunnerService{
 		planRepo:       planRepo,
 		scheduledSvc:   scheduledSvc,
 		accountTestSvc: accountTestSvc,
 		rateLimitSvc:   rateLimitSvc,
 		cfg:            cfg,
+		stopCtx:        stopCtx,
+		stopCancel:     stopCancel,
 	}
 }
 
@@ -73,22 +85,39 @@ func (s *ScheduledTestRunnerService) Stop() {
 		return
 	}
 	s.stopOnce.Do(func() {
+		// Cancel in-flight tests instead of letting them run to the 5-minute
+		// budget. An interrupted run saves no result and does not advance the
+		// plan, so it stays due and the next owner runs it once.
+		if s.stopCancel != nil {
+			s.stopCancel()
+		}
 		if s.cron != nil {
 			ctx := s.cron.Stop()
-			select {
-			case <-ctx.Done():
-			case <-time.After(3 * time.Second):
-				logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] cron stop timed out")
-			}
+			// No test from this process may outlive Stop: the next background
+			// owner starts only after this one exited.
+			<-ctx.Done()
 		}
 	})
 }
 
 func (s *ScheduledTestRunnerService) runScheduled() {
-	// Delay 10s so execution lands at ~:10 of each minute instead of :00.
-	time.Sleep(10 * time.Second)
+	parent := s.stopCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	wait := scheduledTestRunDelay
+	if s.runDelay > 0 {
+		wait = s.runDelay
+	}
+	delay := time.NewTimer(wait)
+	select {
+	case <-delay.C:
+	case <-parent.Done():
+		delay.Stop()
+		return
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
 	defer cancel()
 
 	now := time.Now()
@@ -121,6 +150,12 @@ func (s *ScheduledTestRunnerService) runScheduled() {
 
 func (s *ScheduledTestRunnerService) runOnePlan(ctx context.Context, plan *ScheduledTestPlan) {
 	result, err := s.accountTestSvc.RunTestBackground(ctx, plan.AccountID, plan.ModelID)
+	if errors.Is(ctx.Err(), context.Canceled) {
+		// Stopped mid-test: the outcome says nothing about the account. Save
+		// nothing and keep the plan due for the next owner.
+		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d interrupted by shutdown", plan.ID)
+		return
+	}
 	if err != nil {
 		logger.LegacyPrintf("service.scheduled_test_runner", "[ScheduledTestRunner] plan=%d RunTestBackground error: %v", plan.ID, err)
 		return

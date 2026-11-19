@@ -230,6 +230,16 @@ func WebSearchPricePerCall(v float64) predicate.Group {
 	return predicate.Group(sql.FieldEQ(FieldWebSearchPricePerCall, v))
 }
 
+// UpstreamRejectionBillingEnabled applies equality check predicate on the "upstream_rejection_billing_enabled" field. It's identical to UpstreamRejectionBillingEnabledEQ.
+func UpstreamRejectionBillingEnabled(v bool) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldUpstreamRejectionBillingEnabled, v))
+}
+
+// UpstreamRejectionPrice applies equality check predicate on the "upstream_rejection_price" field. It's identical to UpstreamRejectionPriceEQ.
+func UpstreamRejectionPrice(v float64) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldUpstreamRejectionPrice, v))
+}
+
 // SearchPricePer1k applies equality check predicate on the "search_price_per_1k" field. It's identical to SearchPricePer1kEQ.
 func SearchPricePer1k(v float64) predicate.Group {
 	return predicate.Group(sql.FieldEQ(FieldSearchPricePer1k, v))
@@ -293,6 +303,21 @@ func AllowMessagesDispatch(v bool) predicate.Group {
 // AllowLive applies equality check predicate on the "allow_live" field. It's identical to AllowLiveEQ.
 func AllowLive(v bool) predicate.Group {
 	return predicate.Group(sql.FieldEQ(FieldAllowLive, v))
+}
+
+// OpenaiServiceTierPolicy applies equality check predicate on the "openai_service_tier_policy" field. It's identical to OpenaiServiceTierPolicyEQ.
+func OpenaiServiceTierPolicy(v string) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldOpenaiServiceTierPolicy, v))
+}
+
+// RequestSpeedSelectionEnabled applies equality check predicate on the "request_speed_selection_enabled" field. It's identical to RequestSpeedSelectionEnabledEQ.
+func RequestSpeedSelectionEnabled(v bool) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldRequestSpeedSelectionEnabled, v))
+}
+
+// DefaultRequestSpeedTier applies equality check predicate on the "default_request_speed_tier" field. It's identical to DefaultRequestSpeedTierEQ.
+func DefaultRequestSpeedTier(v string) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldDefaultRequestSpeedTier, v))
 }
 
 // ForceOpenaiFast applies equality check predicate on the "force_openai_fast" field. It's identical to ForceOpenaiFastEQ.
@@ -1885,6 +1910,66 @@ func WebSearchPricePerCallNotNil() predicate.Group {
 	return predicate.Group(sql.FieldNotNull(FieldWebSearchPricePerCall))
 }
 
+// UpstreamRejectionBillingEnabledEQ applies the EQ predicate on the "upstream_rejection_billing_enabled" field.
+func UpstreamRejectionBillingEnabledEQ(v bool) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldUpstreamRejectionBillingEnabled, v))
+}
+
+// UpstreamRejectionBillingEnabledNEQ applies the NEQ predicate on the "upstream_rejection_billing_enabled" field.
+func UpstreamRejectionBillingEnabledNEQ(v bool) predicate.Group {
+	return predicate.Group(sql.FieldNEQ(FieldUpstreamRejectionBillingEnabled, v))
+}
+
+// UpstreamRejectionPriceEQ applies the EQ predicate on the "upstream_rejection_price" field.
+func UpstreamRejectionPriceEQ(v float64) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldUpstreamRejectionPrice, v))
+}
+
+// UpstreamRejectionPriceNEQ applies the NEQ predicate on the "upstream_rejection_price" field.
+func UpstreamRejectionPriceNEQ(v float64) predicate.Group {
+	return predicate.Group(sql.FieldNEQ(FieldUpstreamRejectionPrice, v))
+}
+
+// UpstreamRejectionPriceIn applies the In predicate on the "upstream_rejection_price" field.
+func UpstreamRejectionPriceIn(vs ...float64) predicate.Group {
+	return predicate.Group(sql.FieldIn(FieldUpstreamRejectionPrice, vs...))
+}
+
+// UpstreamRejectionPriceNotIn applies the NotIn predicate on the "upstream_rejection_price" field.
+func UpstreamRejectionPriceNotIn(vs ...float64) predicate.Group {
+	return predicate.Group(sql.FieldNotIn(FieldUpstreamRejectionPrice, vs...))
+}
+
+// UpstreamRejectionPriceGT applies the GT predicate on the "upstream_rejection_price" field.
+func UpstreamRejectionPriceGT(v float64) predicate.Group {
+	return predicate.Group(sql.FieldGT(FieldUpstreamRejectionPrice, v))
+}
+
+// UpstreamRejectionPriceGTE applies the GTE predicate on the "upstream_rejection_price" field.
+func UpstreamRejectionPriceGTE(v float64) predicate.Group {
+	return predicate.Group(sql.FieldGTE(FieldUpstreamRejectionPrice, v))
+}
+
+// UpstreamRejectionPriceLT applies the LT predicate on the "upstream_rejection_price" field.
+func UpstreamRejectionPriceLT(v float64) predicate.Group {
+	return predicate.Group(sql.FieldLT(FieldUpstreamRejectionPrice, v))
+}
+
+// UpstreamRejectionPriceLTE applies the LTE predicate on the "upstream_rejection_price" field.
+func UpstreamRejectionPriceLTE(v float64) predicate.Group {
+	return predicate.Group(sql.FieldLTE(FieldUpstreamRejectionPrice, v))
+}
+
+// DeepseekToolsIsNil applies the IsNil predicate on the "deepseek_tools" field.
+func DeepseekToolsIsNil() predicate.Group {
+	return predicate.Group(sql.FieldIsNull(FieldDeepseekTools))
+}
+
+// DeepseekToolsNotNil applies the NotNil predicate on the "deepseek_tools" field.
+func DeepseekToolsNotNil() predicate.Group {
+	return predicate.Group(sql.FieldNotNull(FieldDeepseekTools))
+}
+
 // SearchPricePer1kEQ applies the EQ predicate on the "search_price_per_1k" field.
 func SearchPricePer1kEQ(v float64) predicate.Group {
 	return predicate.Group(sql.FieldEQ(FieldSearchPricePer1k, v))
@@ -2303,6 +2388,156 @@ func AllowLiveEQ(v bool) predicate.Group {
 // AllowLiveNEQ applies the NEQ predicate on the "allow_live" field.
 func AllowLiveNEQ(v bool) predicate.Group {
 	return predicate.Group(sql.FieldNEQ(FieldAllowLive, v))
+}
+
+// OpenaiServiceTierPolicyEQ applies the EQ predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyEQ(v string) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldOpenaiServiceTierPolicy, v))
+}
+
+// OpenaiServiceTierPolicyNEQ applies the NEQ predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyNEQ(v string) predicate.Group {
+	return predicate.Group(sql.FieldNEQ(FieldOpenaiServiceTierPolicy, v))
+}
+
+// OpenaiServiceTierPolicyIn applies the In predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyIn(vs ...string) predicate.Group {
+	return predicate.Group(sql.FieldIn(FieldOpenaiServiceTierPolicy, vs...))
+}
+
+// OpenaiServiceTierPolicyNotIn applies the NotIn predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyNotIn(vs ...string) predicate.Group {
+	return predicate.Group(sql.FieldNotIn(FieldOpenaiServiceTierPolicy, vs...))
+}
+
+// OpenaiServiceTierPolicyGT applies the GT predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyGT(v string) predicate.Group {
+	return predicate.Group(sql.FieldGT(FieldOpenaiServiceTierPolicy, v))
+}
+
+// OpenaiServiceTierPolicyGTE applies the GTE predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyGTE(v string) predicate.Group {
+	return predicate.Group(sql.FieldGTE(FieldOpenaiServiceTierPolicy, v))
+}
+
+// OpenaiServiceTierPolicyLT applies the LT predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyLT(v string) predicate.Group {
+	return predicate.Group(sql.FieldLT(FieldOpenaiServiceTierPolicy, v))
+}
+
+// OpenaiServiceTierPolicyLTE applies the LTE predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyLTE(v string) predicate.Group {
+	return predicate.Group(sql.FieldLTE(FieldOpenaiServiceTierPolicy, v))
+}
+
+// OpenaiServiceTierPolicyContains applies the Contains predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyContains(v string) predicate.Group {
+	return predicate.Group(sql.FieldContains(FieldOpenaiServiceTierPolicy, v))
+}
+
+// OpenaiServiceTierPolicyHasPrefix applies the HasPrefix predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyHasPrefix(v string) predicate.Group {
+	return predicate.Group(sql.FieldHasPrefix(FieldOpenaiServiceTierPolicy, v))
+}
+
+// OpenaiServiceTierPolicyHasSuffix applies the HasSuffix predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyHasSuffix(v string) predicate.Group {
+	return predicate.Group(sql.FieldHasSuffix(FieldOpenaiServiceTierPolicy, v))
+}
+
+// OpenaiServiceTierPolicyIsNil applies the IsNil predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyIsNil() predicate.Group {
+	return predicate.Group(sql.FieldIsNull(FieldOpenaiServiceTierPolicy))
+}
+
+// OpenaiServiceTierPolicyNotNil applies the NotNil predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyNotNil() predicate.Group {
+	return predicate.Group(sql.FieldNotNull(FieldOpenaiServiceTierPolicy))
+}
+
+// OpenaiServiceTierPolicyEqualFold applies the EqualFold predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyEqualFold(v string) predicate.Group {
+	return predicate.Group(sql.FieldEqualFold(FieldOpenaiServiceTierPolicy, v))
+}
+
+// OpenaiServiceTierPolicyContainsFold applies the ContainsFold predicate on the "openai_service_tier_policy" field.
+func OpenaiServiceTierPolicyContainsFold(v string) predicate.Group {
+	return predicate.Group(sql.FieldContainsFold(FieldOpenaiServiceTierPolicy, v))
+}
+
+// RequestSpeedSelectionEnabledEQ applies the EQ predicate on the "request_speed_selection_enabled" field.
+func RequestSpeedSelectionEnabledEQ(v bool) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldRequestSpeedSelectionEnabled, v))
+}
+
+// RequestSpeedSelectionEnabledNEQ applies the NEQ predicate on the "request_speed_selection_enabled" field.
+func RequestSpeedSelectionEnabledNEQ(v bool) predicate.Group {
+	return predicate.Group(sql.FieldNEQ(FieldRequestSpeedSelectionEnabled, v))
+}
+
+// DefaultRequestSpeedTierEQ applies the EQ predicate on the "default_request_speed_tier" field.
+func DefaultRequestSpeedTierEQ(v string) predicate.Group {
+	return predicate.Group(sql.FieldEQ(FieldDefaultRequestSpeedTier, v))
+}
+
+// DefaultRequestSpeedTierNEQ applies the NEQ predicate on the "default_request_speed_tier" field.
+func DefaultRequestSpeedTierNEQ(v string) predicate.Group {
+	return predicate.Group(sql.FieldNEQ(FieldDefaultRequestSpeedTier, v))
+}
+
+// DefaultRequestSpeedTierIn applies the In predicate on the "default_request_speed_tier" field.
+func DefaultRequestSpeedTierIn(vs ...string) predicate.Group {
+	return predicate.Group(sql.FieldIn(FieldDefaultRequestSpeedTier, vs...))
+}
+
+// DefaultRequestSpeedTierNotIn applies the NotIn predicate on the "default_request_speed_tier" field.
+func DefaultRequestSpeedTierNotIn(vs ...string) predicate.Group {
+	return predicate.Group(sql.FieldNotIn(FieldDefaultRequestSpeedTier, vs...))
+}
+
+// DefaultRequestSpeedTierGT applies the GT predicate on the "default_request_speed_tier" field.
+func DefaultRequestSpeedTierGT(v string) predicate.Group {
+	return predicate.Group(sql.FieldGT(FieldDefaultRequestSpeedTier, v))
+}
+
+// DefaultRequestSpeedTierGTE applies the GTE predicate on the "default_request_speed_tier" field.
+func DefaultRequestSpeedTierGTE(v string) predicate.Group {
+	return predicate.Group(sql.FieldGTE(FieldDefaultRequestSpeedTier, v))
+}
+
+// DefaultRequestSpeedTierLT applies the LT predicate on the "default_request_speed_tier" field.
+func DefaultRequestSpeedTierLT(v string) predicate.Group {
+	return predicate.Group(sql.FieldLT(FieldDefaultRequestSpeedTier, v))
+}
+
+// DefaultRequestSpeedTierLTE applies the LTE predicate on the "default_request_speed_tier" field.
+func DefaultRequestSpeedTierLTE(v string) predicate.Group {
+	return predicate.Group(sql.FieldLTE(FieldDefaultRequestSpeedTier, v))
+}
+
+// DefaultRequestSpeedTierContains applies the Contains predicate on the "default_request_speed_tier" field.
+func DefaultRequestSpeedTierContains(v string) predicate.Group {
+	return predicate.Group(sql.FieldContains(FieldDefaultRequestSpeedTier, v))
+}
+
+// DefaultRequestSpeedTierHasPrefix applies the HasPrefix predicate on the "default_request_speed_tier" field.
+func DefaultRequestSpeedTierHasPrefix(v string) predicate.Group {
+	return predicate.Group(sql.FieldHasPrefix(FieldDefaultRequestSpeedTier, v))
+}
+
+// DefaultRequestSpeedTierHasSuffix applies the HasSuffix predicate on the "default_request_speed_tier" field.
+func DefaultRequestSpeedTierHasSuffix(v string) predicate.Group {
+	return predicate.Group(sql.FieldHasSuffix(FieldDefaultRequestSpeedTier, v))
+}
+
+// DefaultRequestSpeedTierEqualFold applies the EqualFold predicate on the "default_request_speed_tier" field.
+func DefaultRequestSpeedTierEqualFold(v string) predicate.Group {
+	return predicate.Group(sql.FieldEqualFold(FieldDefaultRequestSpeedTier, v))
+}
+
+// DefaultRequestSpeedTierContainsFold applies the ContainsFold predicate on the "default_request_speed_tier" field.
+func DefaultRequestSpeedTierContainsFold(v string) predicate.Group {
+	return predicate.Group(sql.FieldContainsFold(FieldDefaultRequestSpeedTier, v))
 }
 
 // ForceOpenaiFastEQ applies the EQ predicate on the "force_openai_fast" field.

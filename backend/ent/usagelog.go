@@ -47,6 +47,8 @@ type UsageLog struct {
 	ModelMappingChain *string `json:"model_mapping_chain,omitempty"`
 	// 计费层级标签
 	BillingTier *string `json:"billing_tier,omitempty"`
+	// Immutable per-request billing evidence
+	BillingSnapshot map[string]interface{} `json:"billing_snapshot,omitempty"`
 	// 计费模式：token/per_request/image
 	BillingMode *string `json:"billing_mode,omitempty"`
 	// GroupID holds the value of the "group_id" field.
@@ -204,7 +206,7 @@ func (*UsageLog) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
-		case usagelog.FieldImageSizeBreakdown:
+		case usagelog.FieldBillingSnapshot, usagelog.FieldImageSizeBreakdown:
 			values[i] = new([]byte)
 		case usagelog.FieldUpstreamModelMismatch, usagelog.FieldLongContextBillingApplied, usagelog.FieldStream, usagelog.FieldCacheTTLOverridden:
 			values[i] = new(sql.NullBool)
@@ -315,6 +317,14 @@ func (_m *UsageLog) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.BillingTier = new(string)
 				*_m.BillingTier = value.String
+			}
+		case usagelog.FieldBillingSnapshot:
+			if value, ok := values[i].(*[]byte); !ok {
+				return fmt.Errorf("unexpected type %T for field billing_snapshot", values[i])
+			} else if value != nil && len(*value) > 0 {
+				if err := json.Unmarshal(*value, &_m.BillingSnapshot); err != nil {
+					return fmt.Errorf("unmarshal field billing_snapshot: %w", err)
+				}
 			}
 		case usagelog.FieldBillingMode:
 			if value, ok := values[i].(*sql.NullString); !ok {
@@ -664,6 +674,9 @@ func (_m *UsageLog) String() string {
 		builder.WriteString("billing_tier=")
 		builder.WriteString(*v)
 	}
+	builder.WriteString(", ")
+	builder.WriteString("billing_snapshot=")
+	builder.WriteString(fmt.Sprintf("%v", _m.BillingSnapshot))
 	builder.WriteString(", ")
 	if v := _m.BillingMode; v != nil {
 		builder.WriteString("billing_mode=")

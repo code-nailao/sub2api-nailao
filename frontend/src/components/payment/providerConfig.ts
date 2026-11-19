@@ -37,6 +37,7 @@ export interface CallbackPaths {
 
 /** Maps provider key → available payment types. */
 export const PROVIDER_SUPPORTED_TYPES: Record<string, string[]> = {
+  bepusdt: ['usdt_bsc', 'usdt_arbitrum', 'usdt_tron', 'usdt_xlayer'],
   easypay: ['alipay', 'wxpay'],
   alipay: ['alipay'],
   wxpay: ['wxpay'],
@@ -105,6 +106,7 @@ export function getPaymentPopupFeatures(): string {
 
 /** Webhook paths for each provider (relative to origin). */
 export const WEBHOOK_PATHS: Record<string, string> = {
+  bepusdt: '/api/v1/payment/webhook/bepusdt',
   easypay: '/api/v1/payment/webhook/easypay',
   alipay: '/api/v1/payment/webhook/alipay',
   wxpay: '/api/v1/payment/webhook/wxpay',
@@ -116,6 +118,7 @@ export const RETURN_PATH = '/payment/result'
 
 /** Fixed callback paths per provider — displayed as read-only after base URL. */
 export const PROVIDER_CALLBACK_PATHS: Record<string, CallbackPaths> = {
+  bepusdt: { notifyUrl: WEBHOOK_PATHS.bepusdt, returnUrl: RETURN_PATH },
   easypay: { notifyUrl: WEBHOOK_PATHS.easypay, returnUrl: RETURN_PATH },
   alipay: { notifyUrl: WEBHOOK_PATHS.alipay, returnUrl: RETURN_PATH },
   wxpay: { notifyUrl: WEBHOOK_PATHS.wxpay },
@@ -125,6 +128,12 @@ export const PROVIDER_CALLBACK_PATHS: Record<string, CallbackPaths> = {
 
 /** Per-provider config fields (excludes notifyUrl/returnUrl which are handled separately). */
 export const PROVIDER_CONFIG_FIELDS: Record<string, ConfigFieldDef[]> = {
+  bepusdt: [
+    { key: 'apiBase', label: 'BEpusdt URL', sensitive: false },
+    { key: 'apiToken', label: 'API Token', sensitive: true },
+    { key: 'walletAddresses', label: 'USDT wallet addresses (JSON)', sensitive: false, optional: true },
+    { key: 'rateSource', label: 'USDT quote reference', sensitive: false, defaultValue: 'gateway', options: [{ value: 'gateway', label: 'BEpusdt' }, { value: 'binance_reference', label: 'Binance CNY/USD reference' }] },
+  ],
   easypay: [
     { key: 'pid', label: 'PID', sensitive: false },
     { key: 'pkey', label: 'PKey', sensitive: true },

@@ -8,6 +8,7 @@ export type OrderStatus =
   | 'PENDING'
   | 'PAID'
   | 'RECHARGING'
+  | 'PAYMENT_REVIEW'
   | 'COMPLETED'
   | 'EXPIRED'
   | 'CANCELLED'
@@ -118,6 +119,8 @@ export interface PaymentOrder {
   refund_request_reason?: string
   plan_id?: number
   provider_instance_id?: string
+  provider_key?: string
+  payment_trade_no?: string
 }
 
 // ==================== Plans & Channels ====================
@@ -213,6 +216,7 @@ export interface WechatJSAPIPayload {
 }
 
 export interface CreateOrderResult {
+  verification_pending?: boolean
   order_id: number
   amount: number
   pay_url?: string

@@ -65,9 +65,14 @@ export async function create(
   ipBlacklist?: string[],
   quota?: number,
   expiresInDays?: number,
-  rateLimitData?: { rate_limit_5h?: number; rate_limit_1d?: number; rate_limit_7d?: number }
+  rateLimitData?: { rate_limit_5h?: number; rate_limit_1d?: number; rate_limit_7d?: number },
+  deepSeekToolMode?: CreateApiKeyRequest['deepseek_tool_mode'],
+  requestSpeedTier?: CreateApiKeyRequest['request_speed_tier']
 ): Promise<ApiKey> {
-  const payload: CreateApiKeyRequest = { name }
+  const payload: CreateApiKeyRequest = { name, ...(deepSeekToolMode ? { deepseek_tool_mode: deepSeekToolMode } : {}) }
+  if (requestSpeedTier !== undefined) {
+    payload.request_speed_tier = requestSpeedTier
+  }
   if (groupId !== undefined) {
     payload.group_id = groupId
   }

@@ -86,6 +86,7 @@ func RegisterUserRoutes(
 			keys.GET("/:id", h.APIKey.GetByID)
 			keys.POST("", h.APIKey.Create)
 			keys.PUT("/:id", h.APIKey.Update)
+			keys.PATCH("/:id/name", h.APIKey.RenameName)
 			keys.DELETE("/:id", h.APIKey.Delete)
 		}
 
@@ -109,6 +110,7 @@ func RegisterUserRoutes(
 			usage.GET("", h.Usage.List)
 			usage.GET("/errors", h.Usage.ListErrors)
 			usage.GET("/errors/:id", h.Usage.GetErrorDetail)
+			usage.GET("/pending-charges", h.UpstreamRejection.ListPending)
 			usage.GET("/:id", h.Usage.GetByID)
 			usage.GET("/stats", h.Usage.Stats)
 			// User dashboard endpoints

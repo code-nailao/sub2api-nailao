@@ -14,7 +14,7 @@
         :title="methodLabel(method)"
         :disabled="!method.available"
         :class="[
-          'relative flex h-[60px] min-w-0 flex-col items-center justify-center rounded-lg border px-3 transition-all',
+          'relative flex min-h-[84px] min-w-0 flex-col items-center justify-center rounded-lg border px-2 py-2 transition-all sm:min-h-[60px] sm:px-3',
           !method.available
             ? 'cursor-not-allowed border-gray-200 bg-gray-50 opacity-50 dark:border-dark-700 dark:bg-dark-800/50'
             : selected === method.type
@@ -23,10 +23,10 @@
         ]"
         @click="method.available && emit('select', method.type)"
       >
-        <span class="flex w-full min-w-0 items-center justify-center gap-2">
+        <span class="flex w-full min-w-0 flex-col items-center justify-center gap-1 sm:flex-row sm:gap-2">
           <img :src="methodIcon(method.type)" :alt="methodLabel(method)" class="h-7 w-7 shrink-0 object-contain" />
-          <span class="flex min-w-0 flex-col items-start leading-none">
-            <span data-testid="payment-method-label" class="block w-full truncate text-base font-semibold">
+          <span class="flex w-full min-w-0 flex-col items-center sm:w-auto sm:items-start">
+            <span data-testid="payment-method-label" class="block w-full break-words text-center text-sm font-semibold leading-snug sm:text-left sm:text-base">
               {{ methodLabel(method) }}
             </span>
             <span

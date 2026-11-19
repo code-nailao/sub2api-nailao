@@ -237,18 +237,20 @@ type AdminBoundAuthIdentityChannel struct {
 }
 
 type CreateGroupInput struct {
-	Name                      string
-	Description               string
-	I18n                      GroupI18n // 名称与描述的界面语言译文
-	Platform                  string
-	RateMultiplier            float64
-	IsExclusive               bool
-	SubscriptionType          string   // standard/subscription
-	DailyLimitUSD             *float64 // 日限额 (USD)
-	WeeklyLimitUSD            *float64 // 周限额 (USD)
-	MonthlyLimitUSD           *float64 // 月限额 (USD)
-	LongContextPricingEnabled bool
-	ModelPricing              []ChannelModelPricing
+	RequestSpeedSelectionEnabled bool
+	DefaultRequestSpeedTier      string
+	Name                         string
+	Description                  string
+	I18n                         GroupI18n // 名称与描述的界面语言译文
+	Platform                     string
+	RateMultiplier               float64
+	IsExclusive                  bool
+	SubscriptionType             string   // standard/subscription
+	DailyLimitUSD                *float64 // 日限额 (USD)
+	WeeklyLimitUSD               *float64 // 周限额 (USD)
+	MonthlyLimitUSD              *float64 // 月限额 (USD)
+	LongContextPricingEnabled    bool
+	ModelPricing                 []ChannelModelPricing
 	// 图片生成计费配置（仅 antigravity 平台使用）
 	AllowImageGeneration         bool
 	AllowBatchImageGeneration    bool
@@ -273,8 +275,11 @@ type CreateGroupInput struct {
 	// VideoModelPrices 可选按模型族×分辨率覆盖视频每秒单价。
 	VideoModelPrices map[string]map[string]float64
 	// Codex alpha/search 网页搜索单次价格（USD/次，仅 openai 平台使用）；nil/负数按默认价 0.01 处理
-	WebSearchPricePerCall *float64
+	WebSearchPricePerCall           *float64
+	UpstreamRejectionBillingEnabled bool
+	UpstreamRejectionPrice          *float64
 	// 搜索工具单价 per 1k
+	DeepSeekTools    *DeepSeekToolsConfig
 	SearchPricePer1k *float64
 	// Grok Voice 显式定价（分组级）
 	AudioRealtimePricePerMin     *float64
@@ -294,6 +299,7 @@ type CreateGroupInput struct {
 	AllowMessagesDispatch       bool
 	AllowLive                   bool
 	ForceOpenAIFast             bool
+	OpenAIServiceTierPolicy     string
 	ForceOpenAIUltrafast        bool
 	FreeOpenAIFast              bool
 	DefaultMappedModel          string
@@ -320,19 +326,21 @@ type CreateGroupInput struct {
 }
 
 type UpdateGroupInput struct {
-	Name                      string
-	Description               *string
-	I18n                      *GroupI18n // nil 表示不修改；非 nil 整体替换
-	Platform                  string
-	RateMultiplier            *float64 // 使用指针以支持设置为0
-	IsExclusive               *bool
-	Status                    string
-	SubscriptionType          string   // standard/subscription
-	DailyLimitUSD             *float64 // 日限额 (USD)
-	WeeklyLimitUSD            *float64 // 周限额 (USD)
-	MonthlyLimitUSD           *float64 // 月限额 (USD)
-	LongContextPricingEnabled *bool
-	ModelPricing              *[]ChannelModelPricing
+	RequestSpeedSelectionEnabled *bool
+	DefaultRequestSpeedTier      *string
+	Name                         string
+	Description                  *string
+	I18n                         *GroupI18n // nil 表示不修改；非 nil 整体替换
+	Platform                     string
+	RateMultiplier               *float64 // 使用指针以支持设置为0
+	IsExclusive                  *bool
+	Status                       string
+	SubscriptionType             string   // standard/subscription
+	DailyLimitUSD                *float64 // 日限额 (USD)
+	WeeklyLimitUSD               *float64 // 周限额 (USD)
+	MonthlyLimitUSD              *float64 // 月限额 (USD)
+	LongContextPricingEnabled    *bool
+	ModelPricing                 *[]ChannelModelPricing
 	// 图片生成计费配置（仅 antigravity 平台使用）
 	AllowImageGeneration         *bool
 	AllowBatchImageGeneration    *bool
@@ -357,8 +365,11 @@ type UpdateGroupInput struct {
 	// VideoModelPrices 可选按模型族×分辨率覆盖；nil 表示不修改，空 map 表示清除。
 	VideoModelPrices map[string]map[string]float64
 	// Codex alpha/search 网页搜索单次价格（USD/次）；nil 表示不修改，负数表示清除回默认价 0.01
-	WebSearchPricePerCall *float64
+	WebSearchPricePerCall           *float64
+	UpstreamRejectionBillingEnabled *bool
+	UpstreamRejectionPrice          *float64
 	// 搜索工具单价；nil 不修改，负数清除
+	DeepSeekTools    *DeepSeekToolsConfig
 	SearchPricePer1k *float64
 	// Grok Voice 显式定价；nil 表示不修改，负数表示清除
 	AudioRealtimePricePerMin     *float64
@@ -378,6 +389,7 @@ type UpdateGroupInput struct {
 	AllowMessagesDispatch       *bool
 	AllowLive                   *bool
 	ForceOpenAIFast             *bool
+	OpenAIServiceTierPolicy     *string
 	ForceOpenAIUltrafast        *bool
 	FreeOpenAIFast              *bool
 	DefaultMappedModel          *string
@@ -404,22 +416,23 @@ type UpdateGroupInput struct {
 }
 
 type CreateAccountInput struct {
-	ProxyMode          string // 受限写入在验权后选择代理。
-	Name               string
-	Notes              *string
-	Platform           string
-	Type               string
-	Credentials        map[string]any
-	Extra              map[string]any
-	ProxyID            *int64
-	Concurrency        int
-	Priority           int
-	RateMultiplier     *float64 // 账号计费倍率（>=0，允许 0）
-	LoadFactor         *int
-	GroupIDs           []int64
-	ExpiresAt          *int64
-	AutoPauseOnExpired *bool
-	ProbeEnabled       *bool
+	RequestSpeedTiersByGroup map[string][]string
+	ProxyMode                string // 受限写入在验权后选择代理。
+	Name                     string
+	Notes                    *string
+	Platform                 string
+	Type                     string
+	Credentials              map[string]any
+	Extra                    map[string]any
+	ProxyID                  *int64
+	Concurrency              int
+	Priority                 int
+	RateMultiplier           *float64 // 账号计费倍率（>=0，允许 0）
+	LoadFactor               *int
+	GroupIDs                 []int64
+	ExpiresAt                *int64
+	AutoPauseOnExpired       *bool
+	ProbeEnabled             *bool
 	// SkipDefaultGroupBind prevents auto-binding to platform default group when GroupIDs is empty.
 	SkipDefaultGroupBind bool
 	// SkipMixedChannelCheck skips the mixed channel risk check when binding groups.
@@ -437,24 +450,25 @@ type ShadowOptions struct {
 }
 
 type UpdateAccountInput struct {
-	ProxyMode             string // 受限写入在验权后选择代理。
-	Name                  string
-	Notes                 *string
-	Type                  string // Account type: oauth, setup-token, apikey
-	Credentials           map[string]any
-	Extra                 map[string]any
-	ProxyID               *int64
-	Concurrency           *int     // 使用指针区分"未提供"和"设置为0"
-	Priority              *int     // 使用指针区分"未提供"和"设置为0"
-	RateMultiplier        *float64 // 账号计费倍率（>=0，允许 0）
-	LoadFactor            *int
-	Status                string
-	GroupIDs              *[]int64
-	ExpiresAt             *int64
-	AutoPauseOnExpired    *bool
-	ProbeEnabled          *bool
-	RateSyncEnabled       *bool
-	SkipMixedChannelCheck bool // 跳过混合渠道检查（用户已确认风险）
+	RequestSpeedTiersByGroup *map[string][]string
+	ProxyMode                string // 受限写入在验权后选择代理。
+	Name                     string
+	Notes                    *string
+	Type                     string // Account type: oauth, setup-token, apikey
+	Credentials              map[string]any
+	Extra                    map[string]any
+	ProxyID                  *int64
+	Concurrency              *int     // 使用指针区分"未提供"和"设置为0"
+	Priority                 *int     // 使用指针区分"未提供"和"设置为0"
+	RateMultiplier           *float64 // 账号计费倍率（>=0，允许 0）
+	LoadFactor               *int
+	Status                   string
+	GroupIDs                 *[]int64
+	ExpiresAt                *int64
+	AutoPauseOnExpired       *bool
+	ProbeEnabled             *bool
+	RateSyncEnabled          *bool
+	SkipMixedChannelCheck    bool // 跳过混合渠道检查（用户已确认风险）
 }
 
 // BulkUpdateAccountsInput describes the payload for bulk updating accounts.

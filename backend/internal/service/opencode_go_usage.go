@@ -23,6 +23,8 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
+
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 )
 
 const (
@@ -390,7 +392,7 @@ func ProvideOpenCodeGoUsageService(
 	svc := NewOpenCodeGoUsageService(accountRepo, httpUpstream, settingService)
 	svc.lockCache = lockCache
 	svc.db = db
-	svc.Start()
+	processrole.StartBackground("OpenCodeGoUsage", svc.Start)
 	return svc
 }
 

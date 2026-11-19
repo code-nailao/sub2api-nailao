@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -66,6 +67,10 @@ func runCheckForModel(ctx context.Context, provider, endpoint, apiKey, model str
 	challenge := generateChallenge()
 	mode := bodyOverrideMode(opts)
 
+	timing := channelMonitorProbeTimingFromContext(ctx)
+	ctx = withChannelMonitorProbeTiming(ctx, timing)
+	ctx, cancel := context.WithTimeout(ctx, timing.RequestTimeout)
+	defer cancel()
 	start := time.Now()
 	respText, rawBody, statusCode, err := callProvider(ctx, provider, endpoint, apiKey, model, challenge.Prompt, opts)
 	latency := time.Since(start)
@@ -95,7 +100,7 @@ func runCheckForModel(ctx context.Context, provider, endpoint, apiKey, model str
 			res.Message = truncateMessage("replace-mode: upstream returned 2xx with empty text")
 			return res
 		}
-		return finalizeOperationalOrDegraded(res, latency, latencyMs)
+		return finalizeOperationalOrDegraded(res, latency, latencyMs, timing.DegradedThreshold)
 	}
 
 	if !validateChallenge(respText, challenge.Expected) {
@@ -104,13 +109,13 @@ func runCheckForModel(ctx context.Context, provider, endpoint, apiKey, model str
 		return res
 	}
 
-	return finalizeOperationalOrDegraded(res, latency, latencyMs)
+	return finalizeOperationalOrDegraded(res, latency, latencyMs, timing.DegradedThreshold)
 }
 
 // finalizeOperationalOrDegraded 负责走到最后一步的 operational/degraded 判定。
 // 拆出来是为了让 runCheckForModel 不超过 30 行。
-func finalizeOperationalOrDegraded(res *CheckResult, latency time.Duration, latencyMs int) *CheckResult {
-	if latency >= monitorDegradedThreshold {
+func finalizeOperationalOrDegraded(res *CheckResult, latency time.Duration, latencyMs int, threshold time.Duration) *CheckResult {
+	if latency >= threshold {
 		res.Status = MonitorStatusDegraded
 		res.Message = truncateMessage(fmt.Sprintf("slow response: %dms", latencyMs))
 		return res
@@ -296,16 +301,23 @@ func callProvider(ctx context.Context, provider, endpoint, apiKey, model, prompt
 	if err != nil {
 		return "", "", 0, err
 	}
+	stream, err := newMonitorStreamDecoder(provider, apiMode, body)
+	if err != nil {
+		return "", "", 0, err
+	}
 	headers := mergeHeaders(adapter.buildHeaders(apiKey), opts)
 	full := joinURL(endpoint, monitorRequestPath(provider, endpoint, adapter, model))
-	respBytes, status, err := postRawJSON(ctx, full, body, headers)
+	reply, err := postMonitorRequest(ctx, full, body, headers, stream)
 	if err != nil {
-		return "", "", status, err
+		return "", "", reply.status, err
+	}
+	if stream != nil && reply.status >= 200 && reply.status < 300 {
+		return reply.text, "", reply.status, nil
 	}
 	if provider == MonitorProviderOpenAI && apiMode == MonitorAPIModeResponses {
-		return extractOpenAIResponsesText(respBytes), string(respBytes), status, nil
+		return extractOpenAIResponsesText(reply.body), string(reply.body), reply.status, nil
 	}
-	return extractMonitorResponseText(adapter, respBytes), string(respBytes), status, nil
+	return extractMonitorResponseText(adapter, reply.body), string(reply.body), reply.status, nil
 }
 
 func extractMonitorResponseText(adapter providerAdapter, respBytes []byte) string {
@@ -403,7 +415,7 @@ func mergeHeaders(base map[string]string, opts *CheckOptions) map[string]string 
 //     bodyMergeKeyDenyList[provider] 的 key 会被静默丢弃，避免破坏 challenge / model 路由
 //   - replace: 直接 marshal BodyOverride 作为完整 body
 //
-// 任何 mode 返回的 []byte 都已经是合法 JSON，可直接送入 postRawJSON。
+// 任何 mode 返回的 []byte 都已经是合法 JSON，可直接送入 postMonitorRequest。
 func buildRequestBody(adapter providerAdapter, provider, apiMode, model, prompt string, opts *CheckOptions) ([]byte, error) {
 	mode := bodyOverrideMode(opts)
 
@@ -530,30 +542,55 @@ func hasNonEmptyBodyValue(v any) bool {
 	}
 }
 
-// postRawJSON 发送 POST + 已序列化好的 JSON 字节，限制响应体大小，返回响应字节、HTTP status、错误。
-// adapter 自行 marshal 是为了精确控制字段顺序与类型，所以这里直接收 []byte 而不是 any。
-func postRawJSON(ctx context.Context, fullURL string, payload []byte, headers map[string]string) ([]byte, int, error) {
+type monitorHTTPReply struct {
+	body   []byte // 非流式响应或非2xx错误响应，保留原有错误脱敏路径。
+	text   string // 已校验正常结束的流式文本。
+	status int
+}
+
+// postMonitorRequest keeps both response modes within the same client, deadline,
+// SSRF protection and response-size budget. A completed stream need not close HTTP.
+func postMonitorRequest(ctx context.Context, fullURL string, payload []byte, headers map[string]string, stream *monitorStreamDecoder) (monitorHTTPReply, error) {
+	var reply monitorHTTPReply
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(payload))
 	if err != nil {
-		return nil, 0, fmt.Errorf("build request: %w", err)
+		return reply, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if stream != nil {
+		req.Header.Set("Accept", "text/event-stream")
+	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 
-	resp, err := monitorHTTPClient.Do(req)
+	// 按请求复制Client，仅替换Timeout，不修改共享Transport/连接池。
+	client := *monitorHTTPClient
+	if timing, ok := ctx.Value(channelMonitorProbeTimingContextKey{}).(channelMonitorProbeTiming); ok {
+		client.Timeout = timing.RequestTimeout
+	}
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("do request: %w", err)
+		return reply, fmt.Errorf("do request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	reply.status = resp.StatusCode
+	if stream != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		contentType, _, parseErr := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+		if parseErr != nil || contentType != "text/event-stream" {
+			return reply, fmt.Errorf("streaming probe: expected text/event-stream response")
+		}
+		reply.text, err = stream.read(resp.Body)
+		return reply, err
+	}
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, monitorResponseMaxBytes))
 	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("read body: %w", err)
+		return reply, fmt.Errorf("read body: %w", err)
 	}
-	return respBody, resp.StatusCode, nil
+	reply.body = respBody
+	return reply, nil
 }
 
 // monitorRequestPath 返回探测请求路径。智谱按 endpoint 区分：

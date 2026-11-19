@@ -1,0 +1,261 @@
+{
+  "site_name": "Sources Code",
+  "logo_light": "/home-assets/logo-light.png",
+  "logo_dark": "/home-assets/logo-dark.png",
+  "doc_url": "https://fcnwn775mx01.feishu.cn/wiki/VaXaw76Q2iQv47k26LacNKASnvg",
+  "welfare_path": "/custom/5da06ce8b7b5e5d3",
+  "brand": {
+    "hero_badge": "加入官方售后服务群，领取试用额度。",
+    "hero_title": "一个账号，一键接入",
+    "hero_subtitle": "统一接入 Claude Code、Codex 与 OpenClaw",
+    "primary_cta_label": "立即体验",
+    "secondary_cta_label": "查看定价",
+    "secondary_cta_url": "#pricing",
+    "experience_title": "为您提供极简的开发体验",
+    "features": [
+      {
+        "icon": "zap",
+        "title": "极速无缝接入",
+        "description": "完全兼容主流协议规范。5 分钟内即可在各类 IDE 或 Agent 框架中完成配置平替。"
+      },
+      {
+        "icon": "route",
+        "title": "企业级稳定链路",
+        "description": "采用稳定网关与智能路由。自动处理并发限制、超时重试，大幅降低请求失败率。"
+      },
+      {
+        "icon": "pie-chart",
+        "title": "透明可视化计费",
+        "description": "每一次 API 调用的耗时、Token 消耗及费用都精确记录，拒绝黑盒收费。"
+      },
+      {
+        "icon": "blocks",
+        "title": "纯粹的基础设施",
+        "description": "不做臃肿对话界面和社区应用，仅提供干净可靠的底层模型调用渠道。"
+      }
+    ],
+    "stats": [
+      {
+        "value": "邀测制",
+        "label": "官方纯血 GPT 账号池"
+      },
+      {
+        "value": "25.6s",
+        "label": "平均耗时"
+      },
+      {
+        "value": "99.9%",
+        "label": "服务可用率"
+      }
+    ],
+    "footer_groups": [
+      {
+        "title": "产品",
+        "links": [
+          {
+            "label": "Sources Code 介绍",
+            "url": "/home"
+          },
+          {
+            "label": "价格方案",
+            "url": "#pricing"
+          },
+          {
+            "label": "登录",
+            "url": "/login"
+          }
+        ]
+      },
+      {
+        "title": "资源",
+        "links": [
+          {
+            "label": "使用教程",
+            "url": "/login"
+          },
+          {
+            "label": "品牌故事",
+            "url": "/home"
+          }
+        ]
+      },
+      {
+        "title": "模型矩阵",
+        "links": [
+          {
+            "label": "GPT 5.5",
+            "url": "#pricing"
+          },
+          {
+            "label": "GPT 5.4",
+            "url": "#pricing"
+          },
+          {
+            "label": "GPT 5.4-mini",
+            "url": "#pricing"
+          },
+          {
+            "label": "GPT Image 2",
+            "url": "#pricing"
+          }
+        ]
+      },
+      {
+        "title": "服务承诺",
+        "links": [
+          {
+            "label": "透明定价",
+            "url": "#pricing"
+          },
+          {
+            "label": "服务状态",
+            "url": "#status"
+          },
+          {
+            "label": "隐私保护",
+            "url": "/login"
+          },
+          {
+            "label": "安全合规",
+            "url": "/login"
+          }
+        ]
+      },
+      {
+        "title": "解决方案",
+        "links": [
+          {
+            "label": "AI 编程助手",
+            "url": "#experience"
+          },
+          {
+            "label": "IDE 协同集成",
+            "url": "#experience"
+          },
+          {
+            "label": "技术支持",
+            "url": "/login"
+          }
+        ]
+      },
+      {
+        "title": "关于",
+        "links": [
+          {
+            "label": "关于我们",
+            "url": "/home"
+          },
+          {
+            "label": "联系我们",
+            "url": "/login"
+          }
+        ]
+      }
+    ],
+    "announcement": {
+      "enabled": true,
+      "text": "【推广】SEO Agent协助您完成独立站SEO运营：www.seoagent.vip"
+    },
+    "highlights": [
+      {
+        "label": "群内签到领额度"
+      },
+      {
+        "label": "活跃健康的AI交流社区"
+      },
+      {
+        "label": "丰富的功能生态"
+      }
+    ],
+    "contacts": [
+      {
+        "name": "QQ 交流群",
+        "account": "1104288301",
+        "logo": "/home-assets/home/qq_logo.png",
+        "qr_image": "/home-assets/home/qq_qr.png"
+      },
+      {
+        "name": "Telegram 交流群",
+        "logo": "/home-assets/home/telegram_logo.png",
+        "qr_image": "/home-assets/home/telegram_qr.png",
+        "url": "https://t.me/+E_ha2LzkNSg2NzNl"
+      }
+    ],
+    "pricing_table": {
+      "headings": [
+        "模型名",
+        "分组",
+        "倍率",
+        "输入（¥）",
+        "输出（¥）",
+        "官方（¥）",
+        "折扣"
+      ],
+      "rows": [
+        {
+          "model": "GPT 5.6 Sol",
+          "group": "Codex Plus",
+          "multiplier": "0.06x",
+          "input": "¥0.3",
+          "output": "¥1.8",
+          "official": "¥35/¥210",
+          "discount": "0.09折"
+        },
+        {
+          "model": "GPT 5.6 Terra",
+          "group": "Codex Plus",
+          "multiplier": "0.06x",
+          "input": "¥0.15",
+          "output": "¥0.09",
+          "official": "¥17.5/¥105",
+          "discount": "0.09折"
+        },
+        {
+          "model": "GPT 5.6 Sol",
+          "group": "Codex Pro",
+          "multiplier": "0.15x",
+          "input": "¥0.75",
+          "output": "¥4.5",
+          "official": "¥35/¥210",
+          "discount": "0.21折"
+        },
+        {
+          "model": "GPT 5.6 Terra",
+          "group": "Codex Pro",
+          "multiplier": "0.15x",
+          "input": "¥0.38",
+          "output": "¥2.25",
+          "official": "¥17.5/¥105",
+          "discount": "0.21折"
+        },
+        {
+          "model": "GPT Image 2",
+          "spec": "1k / 2k / 4k",
+          "group": "GPT Image 2",
+          "multiplier": "1x",
+          "input": "¥0.05",
+          "output": "¥0.05",
+          "official": "¥0.35/¥0.35",
+          "discount": "1.4折"
+        },
+        {
+          "model": "GPT Image 2 Adobe",
+          "spec": "2k / 4k",
+          "group": "GPT Image 2 Adobe",
+          "multiplier": "1x",
+          "input": "¥0.07",
+          "output": "¥0.07",
+          "official": "¥1.4/¥1.4",
+          "discount": "0.5折"
+        }
+      ]
+    },
+    "sections": {
+      "contacts": true,
+      "pricing": true,
+      "features": true,
+      "stats": true
+    },
+    "primary_cta_url": "/dashboard"
+  }
+}

@@ -1043,6 +1043,10 @@
             </div>
             <div class="space-y-5 p-6">
               <!-- Empty state -->
+              <label class="flex items-center gap-3 mb-4 text-sm">
+                <input v-model="openaiFastPolicyForm.group_tier_policies_enabled" type="checkbox" data-testid="group-tier-policies-enabled" />
+                <span>{{ t('admin.settings.openaiFastPolicy.groupTierPoliciesEnabled') }}</span>
+              </label>
               <div
                 v-if="openaiFastPolicyForm.rules.length === 0"
                 class="rounded-lg border border-dashed border-gray-200 p-6 text-center text-sm text-gray-500 dark:border-dark-600 dark:text-gray-400"
@@ -7216,6 +7220,34 @@
                 </p>
               </div>
 
+              <div v-if="form.channel_monitor_mode === 'v1'" class="space-y-3">
+                <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <div>
+                    <label for="channel-monitor-degraded-seconds" class="input-label">
+                      {{ t('admin.settings.features.channelMonitor.degradedThreshold') }}
+                    </label>
+                    <input
+                      id="channel-monitor-degraded-seconds"
+                      v-model.number="form.channel_monitor_degraded_threshold_seconds"
+                      type="number" min="1" max="299" step="1" class="input"
+                    />
+                  </div>
+                  <div>
+                    <label for="channel-monitor-timeout-seconds" class="input-label">
+                      {{ t('admin.settings.features.channelMonitor.requestTimeout') }}
+                    </label>
+                    <input
+                      id="channel-monitor-timeout-seconds"
+                      v-model.number="form.channel_monitor_request_timeout_seconds"
+                      type="number" min="2" max="300" step="1" class="input"
+                    />
+                  </div>
+                </div>
+                <p class="text-xs text-gray-400 dark:text-gray-500">
+                  {{ t('admin.settings.features.channelMonitor.timingHint') }}
+                </p>
+              </div>
+
               <div v-if="form.channel_monitor_mode === 'v2'" class="space-y-4">
                 <div class="flex items-start justify-between gap-4">
                   <div class="min-w-0">
@@ -9241,6 +9273,7 @@ const betaPolicyForm = reactive({
 
 // OpenAI Fast/Flex Policy 状态
 const openaiFastPolicyForm = reactive({
+  group_tier_policies_enabled: false,
   rules: [] as OpenAIFastPolicyRule[],
 });
 // 标记 openai_fast_policy_settings 是否已成功从后端加载，
@@ -10018,6 +10051,8 @@ const form = reactive<SettingsForm>({
   channel_monitor_enabled: true,
   channel_monitor_mode: 'v1' as 'v1' | 'v2',
   channel_monitor_default_interval_seconds: 60,
+  channel_monitor_degraded_threshold_seconds: 20,
+  channel_monitor_request_timeout_seconds: 60,
   channel_monitor_hide_throughput: false,
   channel_monitor_show_quota: false,
   channel_monitor_hide_user_ranking: false,
@@ -11173,6 +11208,7 @@ async function loadSettings() {
       settings.openai_fast_policy_settings &&
       Array.isArray(settings.openai_fast_policy_settings.rules)
     ) {
+      openaiFastPolicyForm.group_tier_policies_enabled = settings.openai_fast_policy_settings.group_tier_policies_enabled ?? false;
       openaiFastPolicyForm.rules =
         settings.openai_fast_policy_settings.rules.map((rule) => ({
           ...rule,
@@ -11285,6 +11321,14 @@ const siteBillingModeHint = computed(() =>
 async function saveSettings() {
   saving.value = true;
   try {
+    const monitorDegradedSeconds = Number(form.channel_monitor_degraded_threshold_seconds);
+    const monitorTimeoutSeconds = Number(form.channel_monitor_request_timeout_seconds);
+    if (!Number.isInteger(monitorDegradedSeconds) || !Number.isInteger(monitorTimeoutSeconds) ||
+        monitorDegradedSeconds < 1 || monitorTimeoutSeconds < 2 || monitorTimeoutSeconds > 300 ||
+        monitorDegradedSeconds >= monitorTimeoutSeconds) {
+      appStore.showError(t("admin.settings.features.channelMonitor.timingRangeError"));
+      return;
+    }
     const normalizedTableDefaultPageSize = Math.floor(
       Number(form.table_default_page_size),
     );
@@ -11753,6 +11797,8 @@ async function saveSettings() {
       channel_monitor_mode: form.channel_monitor_mode === 'v1' ? 'v1' : 'v2',
       channel_monitor_default_interval_seconds:
         Number(form.channel_monitor_default_interval_seconds) || 60,
+      channel_monitor_degraded_threshold_seconds: monitorDegradedSeconds,
+      channel_monitor_request_timeout_seconds: monitorTimeoutSeconds,
       channel_monitor_hide_throughput: Boolean(form.channel_monitor_hide_throughput),
       channel_monitor_show_quota: Boolean(form.channel_monitor_show_quota),
       channel_monitor_hide_user_ranking: Boolean(form.channel_monitor_hide_user_ranking),
@@ -11774,6 +11820,7 @@ async function saveSettings() {
     // 否则省略整个字段，让后端保留既有规则（含默认值）。
     if (openaiFastPolicyLoaded.value) {
       payload.openai_fast_policy_settings = {
+        group_tier_policies_enabled: openaiFastPolicyForm.group_tier_policies_enabled,
         rules: openaiFastPolicyForm.rules.map((rule) => {
           const whitelist = (rule.model_whitelist || [])
             .map((p) => p.trim())
@@ -11876,6 +11923,7 @@ async function saveSettings() {
       updated.openai_fast_policy_settings &&
       Array.isArray(updated.openai_fast_policy_settings.rules)
     ) {
+      openaiFastPolicyForm.group_tier_policies_enabled = updated.openai_fast_policy_settings.group_tier_policies_enabled ?? false;
       openaiFastPolicyForm.rules =
         updated.openai_fast_policy_settings.rules.map((rule) => ({
           ...rule,
@@ -12528,6 +12576,7 @@ async function saveBetaPolicySettings() {
 // ==================== Provider Management ====================
 
 const allPaymentTypes = computed(() => [
+  ...[{ value: "usdt_bsc", label: "USDT · BSC" }, { value: "usdt_arbitrum", label: "USDT · Arbitrum" }, { value: "usdt_tron", label: "USDT · TRON" }, { value: "usdt_xlayer", label: "USDT · X Layer" }],
   { value: "easypay", label: t("payment.methods.easypay") },
   { value: "alipay", label: t("payment.methods.alipay") },
   { value: "wxpay", label: t("payment.methods.wxpay") },
@@ -12585,6 +12634,7 @@ const providerDialogRef = ref<InstanceType<
 > | null>(null);
 
 const providerKeyOptions = computed(() => [
+  { value: "bepusdt", label: "BEpusdt" },
   { value: "easypay", label: t("admin.settings.payment.providerEasypay") },
   { value: "alipay", label: t("admin.settings.payment.providerAlipay") },
   { value: "wxpay", label: t("admin.settings.payment.providerWxpay") },
@@ -12594,7 +12644,7 @@ const providerKeyOptions = computed(() => [
 
 const enabledProviderKeyOptions = computed(() => {
   const enabled = form.payment_enabled_types;
-  return providerKeyOptions.value.filter((opt) => enabled.includes(opt.value));
+  return providerKeyOptions.value.filter((opt) => enabled.includes(opt.value) || (opt.value === "bepusdt" && enabled.some((type) => type.startsWith("usdt_"))));
 });
 
 const loadBalanceOptions = computed(() => [

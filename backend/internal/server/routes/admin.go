@@ -33,6 +33,9 @@ func RegisterAdminRoutes(
 	// 受限密钥的账户操作走独立资源校验，普通管理员保持原处理器。
 	admin.Use(h.Admin.Account.ScopedAdminKeyAccounts)
 	{
+		// Media engine reconciliation is isolated from normal gateway/account administration.
+		admin.GET("/sources/image-tasks", h.AsyncImage.SourcesMediaEngineReview)
+		admin.POST("/sources/image-tasks/:task_id/resolve", gin.HandlerFunc(stepUpAuth), h.AsyncImage.SourcesMediaEngineResolve)
 		// 部署与运营合规确认
 		registerAdminComplianceRoutes(admin, h)
 
@@ -363,6 +366,19 @@ func registerAccountRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAu
 	accounts := admin.Group("/accounts")
 	{
 		accounts.GET("", h.Admin.Account.List)
+		accounts.GET("/balance-identities", h.Admin.Account.GetBalanceIdentities)
+		accounts.GET("/balance-auto", h.Admin.Account.GetAutomaticWallet)
+		accounts.GET("/wallet-settings", h.Admin.Account.GetManagedWallet)
+		accounts.PUT("/wallet-settings", h.Admin.Account.SaveManagedWallet)
+		accounts.DELETE("/wallet-settings", h.Admin.Account.UnlinkManagedWallet)
+		accounts.POST("/wallet-settings/preview", h.Admin.Account.PreviewWalletMail)
+		accounts.POST("/wallet-settings/verify-channel", h.Admin.Account.VerifyWalletChannel)
+		accounts.GET("/wallet-summaries", h.Admin.Account.ManagedWalletSummaries)
+		accounts.PUT("/wallet-source-binding", h.Admin.Account.BindManagedWalletSource)
+		accounts.POST("/wallet-source-deletion", h.Admin.Account.ReserveManagedWalletSourceDeletion)
+		accounts.GET("/balance-config", h.Admin.Account.GetWalletConfiguration)
+		accounts.POST("/balance-config/test", h.Admin.Account.TestWalletConfiguration)
+		accounts.PUT("/balance-config", h.Admin.Account.SaveWalletConfiguration)
 		accounts.GET("/upstream-billing-rates", h.Admin.Account.GetUpstreamBillingRates)
 		accounts.GET("/upstream-billing-probe/settings", h.Admin.Account.GetUpstreamBillingProbeSettings)
 		accounts.PUT("/upstream-billing-probe/settings", h.Admin.Account.UpdateUpstreamBillingProbeSettings)
@@ -805,6 +821,7 @@ func registerChannelMonitorRoutes(admin *gin.RouterGroup, h *handler.Handlers, s
 	{
 		monitors.GET("", h.Admin.ChannelMonitor.List)
 		monitors.POST("", h.Admin.ChannelMonitor.Create)
+		monitors.PUT("/sort-order", h.Admin.ChannelMonitor.UpdateSortOrder)
 		monitors.GET("/:id", h.Admin.ChannelMonitor.Get)
 		monitors.POST("/:id/duplicate", h.Admin.ChannelMonitor.Duplicate)
 		monitors.PUT("/:id", h.Admin.ChannelMonitor.Update)

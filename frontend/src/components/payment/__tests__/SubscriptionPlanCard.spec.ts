@@ -1,33 +1,15 @@
 import { mount } from "@vue/test-utils";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createPinia } from "pinia";
-import { createI18n } from "vue-i18n";
 import type { SubscriptionPlan } from "@/types/payment";
 import SubscriptionPlanCard from "../SubscriptionPlanCard.vue";
 
-const i18n = createI18n({
-  legacy: false,
-  locale: "en",
-  fallbackWarn: false,
-  missingWarn: false,
-  messages: {
-    en: {
-      payment: {
-        days: "days",
-        weeks: "weeks",
-        months: "months",
-        perMonth: "month",
-        models: "Models",
-        planCard: {
-          quota: "Quota",
-          rate: "Rate",
-          unlimited: "Unlimited",
-        },
-        subscribeNow: "Subscribe now",
-      },
-    },
-  },
-});
+// Assert the card's translation-key choices independently of the i18n compiler.
+// Keep other exports real for modules imported through the app store.
+vi.mock("vue-i18n", async (importOriginal) => ({
+  ...await importOriginal<typeof import("vue-i18n")>(),
+  useI18n: () => ({ t: (key: string) => key }),
+}));
 
 const mountPlanCard = (groupPlatform: string, overrides: Partial<SubscriptionPlan> = {}) =>
   mount(SubscriptionPlanCard, {
@@ -48,7 +30,7 @@ const mountPlanCard = (groupPlatform: string, overrides: Partial<SubscriptionPla
         ...overrides,
       },
     },
-    global: { plugins: [i18n, createPinia()] },
+    global: { plugins: [createPinia()] },
   });
 
 describe("SubscriptionPlanCard", () => {
@@ -69,13 +51,12 @@ describe("SubscriptionPlanCard", () => {
   });
 
   // #4607：管理端保存的单位是复数（months/weeks），此前用户侧只匹配单数
-  // 'month'，「1 个月」的套餐卡片被显示成「1天」。按上方测试消息渲染出的
-  // 单位文案断言各分支。
+  // 'month'，「1 个月」的套餐卡片被显示成「1天」。按显式 mock 的 key 断言单位分支。
   it("renders plural admin-form validity units instead of mislabeled days (#4607)", () => {
-    expect(mountPlanCard("openai", { validity_days: 1, validity_unit: "months" }).text()).toContain("/ month");
-    expect(mountPlanCard("openai", { validity_days: 3, validity_unit: "months" }).text()).toContain("/ 3months");
-    expect(mountPlanCard("openai", { validity_days: 2, validity_unit: "weeks" }).text()).toContain("/ 2weeks");
-    expect(mountPlanCard("openai", { validity_days: 30, validity_unit: "day" }).text()).toContain("/ 30days");
+    expect(mountPlanCard("openai", { validity_days: 1, validity_unit: "months" }).text()).toContain("/ payment.perMonth");
+    expect(mountPlanCard("openai", { validity_days: 3, validity_unit: "months" }).text()).toContain("/ 3payment.months");
+    expect(mountPlanCard("openai", { validity_days: 2, validity_unit: "weeks" }).text()).toContain("/ 2payment.weeks");
+    expect(mountPlanCard("openai", { validity_days: 30, validity_unit: "day" }).text()).toContain("/ 30payment.days");
   });
 
   it("uses the configured currency symbol while preserving USD for legacy plans", () => {
@@ -126,11 +107,11 @@ describe("SubscriptionPlanCard", () => {
       "items-center",
       "justify-end",
     ]));
-    expect(badge?.element.parentElement?.textContent).toContain("/ 30days");
+    expect(badge?.element.parentElement?.textContent).toContain("/ 30payment.days");
     expect(badge?.element.parentElement?.parentElement?.classList).toContain("shrink-0");
     expect(price?.element.parentElement?.parentElement?.classList).toContain("shrink-0");
     expect(wrapper.get("p").text()).toBe("Includes advanced models and priority support.");
-    expect(wrapper.get("button").text()).toBe("Subscribe now");
+    expect(wrapper.get("button").text()).toBe("payment.subscribeNow");
   });
 
   it("keeps short plan titles compact and aligned", () => {
@@ -146,6 +127,6 @@ describe("SubscriptionPlanCard", () => {
       "items-center",
       "justify-end",
     ]));
-    expect(badge?.element.parentElement?.textContent).toContain("/ 30days");
+    expect(badge?.element.parentElement?.textContent).toContain("/ 30payment.days");
   });
 });

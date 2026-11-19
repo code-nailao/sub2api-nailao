@@ -446,6 +446,74 @@ func getOpenAIGroupIDFromContext(c *gin.Context) int64 {
 
 // SelectAccountByPreviousResponseID 按 previous_response_id 命中账号粘连。
 // 未命中或账号不可用时返回 (nil, nil)，由调用方继续走常规调度。
+// ValidatePreviousResponseRequestSpeed prevents a saved response chain from
+// being silently moved to the other supplier credential after a Key changes
+// speed. Keep the binding: the caller must start a new conversation instead.
+func (s *OpenAIGatewayService) ValidatePreviousResponseRequestSpeed(ctx context.Context, groupID *int64, previousResponseID string) error {
+	if RequestSpeedFromContext(ctx) == "" || strings.TrimSpace(previousResponseID) == "" {
+		return nil
+	}
+	if s == nil {
+		return ErrRequestSpeedContinuationMismatch
+	}
+	store := s.getOpenAIWSStateStore()
+	if store == nil {
+		return ErrRequestSpeedContinuationMismatch
+	}
+	boundGroupID := derefGroupID(groupID)
+	if groupID == nil {
+		boundGroupID = RequestSpeedGroupIDFromContext(ctx)
+	}
+	if boundGroupID <= 0 || boundGroupID != RequestSpeedGroupIDFromContext(ctx) {
+		return ErrRequestSpeedContinuationMismatch
+	}
+	accountID, err := store.GetResponseAccount(ctx, boundGroupID, strings.TrimSpace(previousResponseID))
+	if err != nil {
+		return ErrRequestSpeedContinuationMismatch
+	}
+	if accountID <= 0 {
+		// The supplier's continuation belongs to credentials, not merely a
+		// group. A missing/expired binding cannot authorize moving it to a
+		// different fixed-tier Key, even when no mismatch is observable.
+		return ErrRequestSpeedContinuationMismatch
+	}
+	var account *Account
+	if s.accountRepo != nil {
+		account, err = s.accountRepo.GetByID(ctx, accountID)
+	} else {
+		account, err = s.getSchedulableAccount(ctx, accountID)
+	}
+	if err != nil || account == nil || !AccountSupportsRequestSpeed(ctx, account, groupID) {
+		return ErrRequestSpeedContinuationMismatch
+	}
+	return nil
+}
+
+// A WebSocket keeps its selected credential for its lifetime. Re-read the
+// association before each turn so removal/disable cannot leave a cached
+// connection serving the old speed. Do not switch accounts within the session.
+func (s *OpenAIGatewayService) validateFixedRequestSpeedAccount(ctx context.Context, account *Account, model string) *OpenAIFastBlockedError {
+	if blocked := ValidateRequestSpeedConfiguration(ctx); blocked != nil {
+		return blocked
+	}
+	if RequestSpeedFromContext(ctx) == "" {
+		return nil
+	}
+	if blocked := ValidateRequestSpeedModel(ctx, model); blocked != nil {
+		return blocked
+	}
+	if account == nil || !account.IsSchedulable() || !AccountSupportsRequestSpeed(ctx, account, nil) {
+		return &OpenAIFastBlockedError{Message: "the selected account no longer supports this request speed; start a new conversation"}
+	}
+	if s != nil && s.accountRepo != nil {
+		latest, err := s.accountRepo.GetByID(ctx, account.ID)
+		if err != nil || latest == nil || !latest.IsSchedulable() || !AccountSupportsRequestSpeed(ctx, latest, nil) {
+			return &OpenAIFastBlockedError{Message: "the selected account no longer supports this request speed; start a new conversation"}
+		}
+	}
+	return nil
+}
+
 func (s *OpenAIGatewayService) SelectAccountByPreviousResponseID(
 	ctx context.Context,
 	groupID *int64,
@@ -471,6 +539,9 @@ func (s *OpenAIGatewayService) selectAccountByPreviousResponseIDForCapability(
 ) (*AccountSelectionResult, error) {
 	if s == nil {
 		return nil, nil
+	}
+	if err := s.ValidatePreviousResponseRequestSpeed(ctx, groupID, previousResponseID); err != nil {
+		return nil, err
 	}
 	accountID, account, responseID, store := s.resolveAccountByPreviousResponseIDForCapability(ctx, groupID, previousResponseID, requestedModel, excludedIDs, requiredCapability, requireCompact)
 	if accountID <= 0 || account == nil || store == nil {
@@ -571,6 +642,9 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 		_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
 		return 0, nil, "", nil
 	}
+	if !AccountSupportsRequestSpeed(ctx, account, groupID) {
+		return 0, nil, "", nil
+	}
 	if requestedModel != "" && !supportsOpenAIRequestModel(account, requestedModel, requireCompact) {
 		return 0, nil, "", nil
 	}
@@ -590,7 +664,7 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 	if vetoed, _ := openAIProfitControlVetoReason(ctx, account); vetoed {
 		return 0, nil, "", nil
 	}
-	if s.schedulerSnapshot != nil && s.accountRepo != nil {
+	if (s.schedulerSnapshot != nil || RequestSpeedFromContext(ctx) != "") && s.accountRepo != nil {
 		latest, latestErr := s.accountRepo.GetByID(ctx, account.ID)
 		if latestErr != nil || latest == nil {
 			_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
@@ -598,6 +672,9 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 		}
 		if shouldClearStickySession(latest, requestedModel) || !latest.IsOpenAI() || !latest.IsSchedulable() {
 			_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
+			return 0, nil, "", nil
+		}
+		if !AccountSupportsRequestSpeed(ctx, latest, groupID) {
 			return 0, nil, "", nil
 		}
 		if !s.openAIAccountMatchesSchedulingGroup(latest, groupID) {

@@ -725,6 +725,39 @@ describe("admin SettingsView payment visible method controls", () => {
     adminSettingsFetch.mockResolvedValue(undefined);
   });
 
+  it("loads and saves hot channel monitor timing", async () => {
+    getSettings.mockResolvedValue({ ...baseSettingsResponse,
+      channel_monitor_mode: "v1", channel_monitor_degraded_threshold_seconds: 20,
+      channel_monitor_request_timeout_seconds: 60 });
+    const wrapper = mountView();
+    await flushPromises();
+    const vm = wrapper.vm as unknown as { form: Record<string, unknown>; saveSettings: () => Promise<void> };
+    expect(vm.form.channel_monitor_degraded_threshold_seconds).toBe(20);
+    expect(vm.form.channel_monitor_request_timeout_seconds).toBe(60);
+    vm.form.channel_monitor_degraded_threshold_seconds = 25;
+    vm.form.channel_monitor_request_timeout_seconds = 90;
+    await vm.saveSettings();
+    expect(updateSettings).toHaveBeenCalledWith(expect.objectContaining({
+      channel_monitor_degraded_threshold_seconds: 25,
+      channel_monitor_request_timeout_seconds: 90,
+    }));
+    wrapper.unmount();
+  });
+
+  it.each([[0, 60], [20, 20], [20, 301], [1.5, 60], [20, 60.5]])(
+    "rejects invalid monitor timing %s/%s before saving", async (yellow, timeout) => {
+      const wrapper = mountView();
+      await flushPromises();
+      const vm = wrapper.vm as unknown as { form: Record<string, unknown>; saveSettings: () => Promise<void> };
+      vm.form.channel_monitor_degraded_threshold_seconds = yellow;
+      vm.form.channel_monitor_request_timeout_seconds = timeout;
+      await vm.saveSettings();
+      expect(updateSettings).not.toHaveBeenCalled();
+      expect(showError).toHaveBeenCalled();
+      wrapper.unmount();
+    },
+  );
+
   it("loads and saves the open button visibility for each custom menu", async () => {
     const menuItems = [
       { id: "docs", label: "Docs", url: "https://example.com/docs", icon_svg: "", visibility: "user", sort_order: 0 },

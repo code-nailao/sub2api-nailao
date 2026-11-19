@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 )
 
 type PromptService struct {
@@ -63,7 +65,8 @@ func (s *PromptService) Start(ctx context.Context) error {
 	s.background, s.cancel = background, cancel
 	s.lifecycleMu.Unlock()
 	configErr := s.config.Start(background)
-	workerErr := s.runner.Start(background)
+	var workerErr error
+	processrole.StartBackground("PromptAuditRunner", func() { workerErr = s.runner.Start(background) })
 	return errors.Join(configErr, workerErr)
 }
 

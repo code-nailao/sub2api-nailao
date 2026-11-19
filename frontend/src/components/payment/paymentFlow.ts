@@ -243,6 +243,11 @@ export function decidePaymentLaunch(
     return { kind: 'redirect_waiting', paymentState: baseState, recovery: baseState }
   }
 
+  // An unknown native submission keeps the original order visible for polling;
+  // it must not turn into an error that invites another paid submission.
+  if (result.verification_pending && baseState.orderId > 0) {
+    return { kind: 'redirect_waiting', paymentState: baseState, recovery: baseState }
+  }
   return { kind: 'unhandled', paymentState: baseState, recovery: baseState }
 }
 

@@ -354,6 +354,24 @@ func openAICompactSupportTier(account *Account) int {
 	return 0
 }
 
+// Fixed supplier tier validation must use the original compact route even when
+// intermediate scheduler checks intentionally defer compact capability checks.
+type requestSpeedCompactRoutingContextKey struct{}
+
+func withRequestSpeedCompactRouting(ctx context.Context, requireCompact bool) context.Context {
+	if RequestSpeedFromContext(ctx) == "" || !requireCompact {
+		return ctx
+	}
+	return context.WithValue(ctx, requestSpeedCompactRoutingContextKey{}, true)
+}
+
+func requestSpeedSchedulingModel(ctx context.Context, account *Account, requestedModel string, requireCompact bool) string {
+	if inherited, _ := ctx.Value(requestSpeedCompactRoutingContextKey{}).(bool); inherited {
+		requireCompact = true
+	}
+	return resolveOpenAIAccountUpstreamModelForRequest(account, requestedModel, requireCompact)
+}
+
 // isOpenAICompatibleAccountEligibleForRequest 判断 OpenAI 兼容账号是否满足本次请求的调度条件。
 // 检查内容包括：平台匹配、账号可用性、quota 自动暂停、spark 路由限制、模型支持及端点能力。
 //
@@ -390,6 +408,16 @@ func openAICompatibleAccountEligibilityFailureReasonBeforeProfit(ctx context.Con
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 	if account == nil {
 		return "account_nil"
+	}
+	// This common gate covers priority/LRU, load-aware and sticky legacy paths.
+	// A nil explicit group uses the trusted request-speed group in the context.
+	if !AccountSupportsRequestSpeed(ctx, account, nil) {
+		return "request_speed_mismatch"
+	}
+	// Model aliases are account-owned; evaluate the actual forwarded model,
+	// including passthrough's intentionally ignored account mapping targets.
+	if ValidateRequestSpeedModel(ctx, requestSpeedSchedulingModel(ctx, account, requestedModel, requireCompact)) != nil {
+		return "request_speed_model_unsupported"
 	}
 	// account_model composite routes publish an alias that only accounts with an
 	// explicit model mapping own. Both scheduler modes (advanced and legacy) must
@@ -906,6 +934,7 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 // selectAccountForModelWithExclusionsStickyHit 与 selectAccountForModelWithExclusions 相同，
 // 另返回账号是否来自粘性会话命中。
 func (s *OpenAIGatewayService) selectAccountForModelWithExclusionsStickyHit(ctx context.Context, groupID *int64, platform string, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, stickyAccountID int64, requiredCapability OpenAIEndpointCapability, preferLowUpstreamRate bool) (*Account, bool, error) {
+	ctx = withRequestSpeedCompactRouting(ctx, requireCompact)
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
 		slog.Warn("channel pricing restriction blocked request",
@@ -1140,6 +1169,7 @@ func (s *OpenAIGatewayService) SelectAccountWithLoadAwareness(ctx context.Contex
 }
 
 func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Context, groupID *int64, platform string, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, requiredCapability OpenAIEndpointCapability, useUpstreamTokenCost bool) (*AccountSelectionResult, error) {
+	ctx = withRequestSpeedCompactRouting(ctx, requireCompact)
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
 		slog.Warn("channel pricing restriction blocked request",
@@ -1615,7 +1645,14 @@ func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDBBeforeProfit(ct
 		return nil
 	}
 	platform = NormalizeOpenAICompatiblePlatform(platform)
-	if s.schedulerSnapshot == nil || s.accountRepo == nil {
+	fixedSpeed := RequestSpeedFromContext(ctx) != ""
+	// Enabled speed routing must re-read the account-group mapping even without
+	// the snapshot scheduler. An unavailable repository is not permission to use
+	// a stale mapping; legacy groups retain their existing lightweight path.
+	if fixedSpeed && s.accountRepo == nil {
+		return nil
+	}
+	if (!fixedSpeed && s.schedulerSnapshot == nil) || s.accountRepo == nil {
 		if s.openAIGroupRequiresPrivacySet(ctx, groupID) && !account.IsPrivacySet() {
 			return nil
 		}
@@ -1638,7 +1675,7 @@ func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDBBeforeProfit(ct
 	if err != nil || latest == nil {
 		return nil
 	}
-	if !s.openAIAccountMatchesSchedulingGroup(latest, groupID) {
+	if !s.openAIAccountMatchesSchedulingGroup(latest, groupID) || !AccountSupportsRequestSpeed(ctx, latest, groupID) {
 		return nil
 	}
 	if s.openAIGroupRequiresPrivacySet(ctx, groupID) && !latest.IsPrivacySet() {
@@ -1726,6 +1763,22 @@ func (s *OpenAIGatewayService) isOpenAIAccountBlockedBySchedulingThreshold(ctx c
 }
 
 func (s *OpenAIGatewayService) hydrateSelectedAccount(ctx context.Context, account *Account) (*Account, error) {
+	if account != nil && RequestSpeedFromContext(ctx) != "" {
+		// Do not replace the just-checked native mapping with an older scheduler
+		// snapshot during hydration. Fixed supplier credentials are part of the
+		// selected tier's identity, so re-read and fail closed on mapping removal.
+		if s.accountRepo == nil {
+			return nil, ErrNoAvailableAccounts
+		}
+		latest, err := s.accountRepo.GetByID(ctx, account.ID)
+		if err != nil {
+			return nil, err
+		}
+		if !AccountSupportsRequestSpeed(ctx, latest, nil) {
+			return nil, ErrNoAvailableAccounts
+		}
+		return latest, nil
+	}
 	if account == nil || s.schedulerSnapshot == nil {
 		return account, nil
 	}

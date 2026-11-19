@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -224,5 +225,22 @@ func TestEasyPayCreatePaymentKeepsUpstreamAbsoluteAndOpaqueValues(t *testing.T) 
 	}
 	if resp.QRCode != deepLink {
 		t.Fatalf("QRCode = %q, want %q unchanged", resp.QRCode, deepLink)
+	}
+}
+
+func TestEasyPayUnknownSubmissionDoesNotBecomeRejection(t *testing.T) {
+	for _, response := range []string{"not-json", ""} {
+		t.Run(response, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(response)) }))
+			defer server.Close()
+			p, err := NewEasyPay("test", map[string]string{"pid": "1", "pkey": "test", "apiBase": server.URL, "notifyUrl": "https://main.example/notify", "returnUrl": "https://main.example/return"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = p.createAPIPayment(context.Background(), payment.CreatePaymentRequest{OrderID: "original", Amount: "10", PaymentType: "alipay"})
+			if !errors.Is(err, payment.ErrPaymentOutcomeUnknown) {
+				t.Fatalf("expected unknown original submission, got %v", err)
+			}
+		})
 	}
 }

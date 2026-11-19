@@ -208,6 +208,7 @@ type UsageTokens struct {
 
 // CostBreakdown 费用明细
 type CostBreakdown struct {
+	ServiceTierMultiplier     float64 // metadata only; never multiply costs a second time
 	InputCost                 float64 // 文本输入费用（不含图片输入，图片输入单独记入 ImageInputCost）
 	ImageInputCost            float64 // 图片输入 token 费用（如 gpt-image-2 图片编辑）
 	OutputCost                float64
@@ -1799,6 +1800,7 @@ func (s *BillingService) calculateTokenCost(resolved *ResolvedPricing, input Cos
 	// 默认价卡（Source=LiteLLM）应用 DeepSeek 官方价强制覆盖（幂等，GetModelPricing
 	// 内部已强制过）；分组/渠道自定义定价保留运营者配置，不强制覆盖官方价。
 	pricing = s.applyModelSpecificPricingPolicyEx(input.Model, pricing, resolved.Source == PricingSourceLiteLLM, pricingAt)
+	pricing = keepSourcesGPT62CardUltrafastDefault(input.Model, pricing, resolved.Source)
 
 	// DeepSeek 模型默认价卡按官方峰谷口径调整：高峰时段（01:00–04:00 与
 	// 06:00–10:00 UTC，仅工作日；北京时间周末全天低谷）按 2× 低谷价计费。
@@ -1897,7 +1899,7 @@ func (s *BillingService) computeTokenBreakdown(
 		cacheCreationMultiplier = longCtxInputMultiplier
 	}
 
-	bd := &CostBreakdown{}
+	bd := &CostBreakdown{ServiceTierMultiplier: describedServiceTierMultiplier(pricing, serviceTier)}
 	// 分离图片输入 token 与文本输入 token（多模态 embedding、图片编辑等图文不同价场景）。
 	// InputCost 仅计文本输入，图片输入费用单独记入 ImageInputCost，便于对账；总额不变。
 	// ImageInputTokens 为 0 时（绝大多数 chat/vision 流量）走原始单价路径，行为不变。
@@ -2673,4 +2675,27 @@ func openAIUltrafastMultiplier(model string, at time.Time) float64 {
 		return 3
 	}
 	return 6
+}
+
+// sourcesGPT62CardUltrafastMultiplier is the Ultra Fast multiplier the fork
+// already charges on GPT-6.2 price cards whose Ultra Fast value is empty.
+const sourcesGPT62CardUltrafastMultiplier = 6.0
+
+// keepSourcesGPT62CardUltrafastDefault is a deliberate Sources deviation from
+// upstream. Upstream defaults GPT-6.2 Ultra Fast to 3x before 2027-03-01
+// 08:00 UTC and 6x after (openAIUltrafastMultiplier). Existing group and
+// channel price cards for GPT-6.2 leave the Ultra Fast value empty and are
+// already sold at 6x, so following upstream would silently halve those prices.
+// Cards therefore keep 6x at every date. An operator who wants upstream's
+// schedule sets the Ultra Fast value on the price card, which always wins.
+// Requests without a card use upstream's catalogue pricing unchanged.
+func keepSourcesGPT62CardUltrafastDefault(model string, pricing *ModelPricing, source string) *ModelPricing {
+	if pricing == nil || pricing.UltrafastMultiplierOverride != nil ||
+		(source != PricingSourceChannel && source != PricingSourceGroup) ||
+		openai.GPT62ModelID(normalizeKnownOpenAICodexModel(model)) == "" {
+		return pricing
+	}
+	cloned := *pricing
+	cloned.UltrafastMultiplier = sourcesGPT62CardUltrafastMultiplier
+	return &cloned
 }

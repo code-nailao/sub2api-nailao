@@ -34,6 +34,9 @@ export interface LatencyMetric {
 }
 
 export interface MonitorMetric {
+  /** Presence flags survive user-volume redaction; omitted by older servers. */
+  has_requests?: boolean
+  has_cache_input?: boolean
   success_requests: number
   error_requests: number
   request_count: number
@@ -98,6 +101,15 @@ export interface MonitorCoverage {
   bootstrap?: MonitorBootstrap | null
 }
 
+export type MonitorCategory = 'openai' | 'anthropic' | 'grok' | 'gemini' | 'domestic' | 'image' | 'other'
+export interface MonitorDisplayOrder {
+  categories?: MonitorCategory[]
+  groups?: Partial<Record<MonitorCategory, number[]>>
+  group_categories?: Record<string, MonitorCategory>
+  /** Missing means separate; explicit per-group categories always take precedence. */
+  image_grouping?: 'separate' | 'provider'
+}
+
 export interface MonitorConfig {
   version: number
   enabled: boolean
@@ -119,6 +131,8 @@ export interface MonitorConfig {
   }
   /** Categories excluded from error_rate / health; still listed in error breakdown. */
   ignored_error_categories?: string[]
+  /** Optional administrator-owned card layout; public snapshots contain visible IDs only. */
+  display_order?: MonitorDisplayOrder | null
 }
 
 /** Ordered taxonomy mirrored from backend ChannelMonitorV2ErrorCategories. */

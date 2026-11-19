@@ -55,8 +55,9 @@ const (
 	activeIndexCleanupBatchSize  = 1000
 	activeIndexPipelineChunkSize = 500
 
-	// 一次性迁移 marker：活跃索引机制上线前遗留的等待计数键无法被索引发现，
-	// 且有流量时 TTL 会被不断刷新，必须清扫一次。marker 存在即代表已完成。
+	// Kept for upstream declaration continuity. The startup path no longer calls
+	// the legacy sweep because multiple live processes share Redis in production.
+	//nolint:unused // Preserved for upstream declaration continuity.
 	legacyWaitSweepMarkerKey = "concurrency:startup:legacy_wait_sweep:v1"
 )
 
@@ -330,9 +331,9 @@ var (
 		return 1
 	`)
 
-	// startupCleanupSlotScript 清理单个槽位 key 中非当前进程前缀的成员，避免 Redis Cluster CROSSSLOT。
-	// KEYS[1] 是有序集合键，ARGV[1] 是当前进程前缀，ARGV[2] 是槽位 TTL。
-	// 返回 {清除数量, 剩余成员数}，Go 侧据剩余数决定索引 member 去留，无需再回读槽位。
+	// Kept as an upstream compatibility declaration. The production startup path
+	// uses timestamp/TTL reconciliation and never executes this prefix-based script.
+	//nolint:unused // Preserved for upstream declaration continuity.
 	startupCleanupSlotScript = redis.NewScript(`
 		local key = KEYS[1]
 		local activePrefix = ARGV[1]
@@ -1138,42 +1139,25 @@ func (c *concurrencyCache) reconcileExpiredIndexCandidates(ctx context.Context, 
 	return nil
 }
 
-// CleanupStaleProcessSlots 启动时清理非当前进程前缀的槽位。
-// 清理范围来自活跃索引（含 score 已过期的成员——它们往往正是崩溃进程留下的残留），
-// 避免在 Redis 上 SCAN 全部 concurrency:* 键；另有一次性迁移清扫兜底索引机制上线前的遗留等待计数。
-// API Key 槽位（concurrency:api_key:*）是 stats-only 数据：每次 Track/读取都会按分数
-// 裁剪过期成员，key 自带 TTL，可在一个 slot TTL 内自愈，因此不参与启动清理。
+// CleanupStaleProcessSlots reconciles expired account/user index candidates.
+// Other processes may still be serving requests, including while this process
+// later fails to initialize. A different request prefix is not proof of death.
+// Reuse bounded TTL cleanup, preserving recent slots and all live wait counters.
+// Unindexed legacy counters recover through their own key TTL, without a sweep.
+//
+// activeRequestPrefix remains in the interface for compatibility. It is only
+// validated here; it must never be used as an exclusive ownership token.
 func (c *concurrencyCache) CleanupStaleProcessSlots(ctx context.Context, activeRequestPrefix string) error {
 	if activeRequestPrefix == "" {
 		return nil
 	}
-	if err := c.sweepLegacyWaitKeysOnce(ctx); err != nil {
-		return err
-	}
-	now, err := c.redisUnixSeconds(ctx)
-	if err != nil {
-		return err
-	}
-
-	accountMembers, err := c.allIndexMembers(ctx, accountActiveIndexKey)
-	if err != nil {
-		return err
-	}
-	if err := c.cleanupStaleProcessSlotsForIndex(ctx, accountSlotIndex, accountMembers, activeRequestPrefix, now); err != nil {
-		return err
-	}
-
-	userMembers, err := c.allIndexMembers(ctx, userActiveIndexKey)
-	if err != nil {
-		return err
-	}
-	return c.cleanupStaleProcessSlotsForIndex(ctx, userSlotIndex, userMembers, activeRequestPrefix, now)
+	return c.CleanupExpiredAccountSlotKeys(ctx)
 }
 
-// sweepLegacyWaitKeysOnce 一次性清扫活跃索引机制上线前遗留的等待计数键。
-// 等待计数在有流量时会不断刷新 TTL、无法自然过期，而索引不认识旧键，
-// 因此这里例外地做一次 SCAN，用 marker 键保证整个 Redis 数据生命周期内只执行一次。
-// 先清扫后写 marker：清扫失败时下次启动会重试；并发实例重复清扫是幂等的。
+// sweepLegacyWaitKeysOnce is retained for upstream declaration continuity only.
+// CleanupStaleProcessSlots intentionally does not call it in a shared Redis deployment.
+//
+//nolint:unused // Calling this during blue-green deployment is intentionally forbidden.
 func (c *concurrencyCache) sweepLegacyWaitKeysOnce(ctx context.Context) error {
 	exists, err := c.rdb.Exists(ctx, legacyWaitSweepMarkerKey).Result()
 	if err != nil {
@@ -1206,8 +1190,9 @@ func (c *concurrencyCache) sweepLegacyWaitKeysOnce(ctx context.Context) error {
 	return nil
 }
 
-// allIndexMembers 返回索引中全部 member（含 score 已过期的）。
-// 启动清理必须覆盖过期成员：长时间停机后 score 过期的候选恰恰最可能持有死进程残留。
+// allIndexMembers is retained for upstream declaration continuity only.
+//
+//nolint:unused // Production cleanup uses bounded index reads instead.
 func (c *concurrencyCache) allIndexMembers(ctx context.Context, indexKey string) ([]string, error) {
 	members, err := c.rdb.ZRange(ctx, indexKey, 0, -1).Result()
 	if err != nil {
@@ -1216,9 +1201,10 @@ func (c *concurrencyCache) allIndexMembers(ctx context.Context, indexKey string)
 	return members, nil
 }
 
-// cleanupStaleProcessSlotsForIndex 逐个处理索引中的账号/用户。
-// Lua 脚本一次只碰一个槽位 key，兼容 Redis Cluster，随后删除重启后已失效的等待计数；
-// 索引 member 的去留由脚本返回的剩余槽位数决定，最后批量写回。
+// cleanupStaleProcessSlotsForIndex is retained for upstream declaration continuity only.
+// Calling it in a blue-green deployment would remove live slots owned by another process.
+//
+//nolint:unused // Preserved to avoid deleting the original shared-Redis implementation.
 func (c *concurrencyCache) cleanupStaleProcessSlotsForIndex(
 	ctx context.Context,
 	spec slotIndexSpec,
@@ -1239,7 +1225,6 @@ func (c *concurrencyCache) cleanupStaleProcessSlotsForIndex(
 		if err != nil {
 			return fmt.Errorf("cleanup stale process slots %s: %w", spec.slotKey(id), err)
 		}
-		// 等待计数属于已死进程，直接删除；剩余槽位（当前进程前缀）决定索引 member 去留。
 		if err := c.rdb.Del(ctx, spec.waitKey(id)).Err(); err != nil {
 			return fmt.Errorf("delete stale wait key %s: %w", spec.waitKey(id), err)
 		}

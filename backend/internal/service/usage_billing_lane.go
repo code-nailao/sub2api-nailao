@@ -20,6 +20,21 @@ const (
 
 var errUsageBillingLaneBatchOutcomeMismatch = errors.New("usage billing batch outcome count mismatch")
 
+var (
+	errUsageBillingLaneDeepSeekJournalUnavailable     = errors.New("usage billing repository does not support the DeepSeek usage journal")
+	errUsageBillingLaneRejectionRepositoryUnavailable = errors.New("usage billing repository does not support upstream rejection billing")
+	errUsageBillingLaneImageLedgerUnavailable         = errors.New("usage billing repository does not support the atomic Sources image ledger")
+	errUsageBillingLaneUserPendingReaderUnavailable   = errors.New("usage billing repository does not support user pending upstream rejections")
+)
+
+var (
+	_ DeepSeekUsageJournal               = (*UsageBillingLaneCombiner)(nil)
+	_ UpstreamRejectionBillingRepository = (*UsageBillingLaneCombiner)(nil)
+	_ SourcesImageLedger                 = (*UsageBillingLaneCombiner)(nil)
+	_ UserPendingUpstreamRejectionReader = (*UsageBillingLaneCombiner)(nil)
+	_ UpstreamRejectionDueSource         = (*UsageBillingLaneCombiner)(nil)
+)
+
 // UsageBillingLaneCombiner 是按用户合并计费事务的 UsageBillingRepository。
 //
 // 每个用户一条通道：通道空闲时命令立即按单条 Apply 结算；结算进行中到达的命令排队，
@@ -90,6 +105,12 @@ func (c *UsageBillingLaneCombiner) Apply(ctx context.Context, cmd *UsageBillingC
 	if cmd == nil {
 		return c.repo.Apply(ctx, cmd)
 	}
+	// These commands use private transactional effects that ApplyBatch does not
+	// implement. Delegate before normalization: the rejection repository must
+	// inspect raw amounts before quantization could erase a negative value.
+	if HasPrivateUsageBillingEffects(cmd) {
+		return c.repo.Apply(ctx, cmd)
+	}
 	cmd.Normalize()
 	if cmd.RequestID == "" {
 		return c.repo.Apply(ctx, cmd)
@@ -104,6 +125,189 @@ func (c *UsageBillingLaneCombiner) Apply(ctx context.Context, cmd *UsageBillingC
 	// 入队后命令可能已在执行中的事务里，必须等到结果，不能以单条 Apply 另行结算。
 	out := <-req.done
 	return out.Result, out.Err
+}
+
+// HasPrivateUsageBillingEffects identifies commands whose private
+// effects must remain in the original transaction rather than the native batch.
+func HasPrivateUsageBillingEffects(cmd *UsageBillingCommand) bool {
+	return cmd != nil && (cmd.UpstreamRejectionReservationID != "" ||
+		cmd.DeepSeekToolFingerprint != "" || cmd.ToolAccountID != 0 ||
+		cmd.ToolAccountQuotaCost != 0 || cmd.ToolAccountDailyQuota || cmd.ToolAccountWeeklyQuota)
+}
+
+func (c *UsageBillingLaneCombiner) deepSeekJournal() (DeepSeekUsageJournal, error) {
+	if c != nil {
+		if repo, ok := c.repo.(DeepSeekUsageJournal); ok {
+			return repo, nil
+		}
+	}
+	return nil, errUsageBillingLaneDeepSeekJournalUnavailable
+}
+
+func (c *UsageBillingLaneCombiner) BeginDeepSeekUsage(ctx context.Context, requestID string, keyID, userID, accountID int64, deadline time.Time) error {
+	repo, err := c.deepSeekJournal()
+	if err != nil {
+		return err
+	}
+	return repo.BeginDeepSeekUsage(ctx, requestID, keyID, userID, accountID, deadline)
+}
+
+func (c *UsageBillingLaneCombiner) SaveDeepSeekUsage(ctx context.Context, checkpoint *DeepSeekUsageCheckpoint) error {
+	repo, err := c.deepSeekJournal()
+	if err != nil {
+		return err
+	}
+	return repo.SaveDeepSeekUsage(ctx, checkpoint)
+}
+
+func (c *UsageBillingLaneCombiner) SettleDeepSeekUsage(ctx context.Context, requestID string, keyID int64) (*DeepSeekUsageSettlement, error) {
+	repo, err := c.deepSeekJournal()
+	if err != nil {
+		return nil, err
+	}
+	return repo.SettleDeepSeekUsage(ctx, requestID, keyID)
+}
+
+func (c *UsageBillingLaneCombiner) ListPendingDeepSeekUsage(ctx context.Context, limit int) ([]DeepSeekUsageIdentity, error) {
+	repo, err := c.deepSeekJournal()
+	if err != nil {
+		return nil, err
+	}
+	return repo.ListPendingDeepSeekUsage(ctx, limit)
+}
+
+func (c *UsageBillingLaneCombiner) rejectionRepository() (UpstreamRejectionBillingRepository, error) {
+	if c != nil {
+		if repo, ok := c.repo.(UpstreamRejectionBillingRepository); ok {
+			return repo, nil
+		}
+	}
+	return nil, errUsageBillingLaneRejectionRepositoryUnavailable
+}
+
+func (c *UsageBillingLaneCombiner) ReserveUpstreamRejection(ctx context.Context, cmd *UpstreamRejectionReserveCommand) (*UpstreamRejectionBillingResult, error) {
+	repo, err := c.rejectionRepository()
+	if err != nil {
+		return nil, err
+	}
+	return repo.ReserveUpstreamRejection(ctx, cmd)
+}
+
+func (c *UsageBillingLaneCombiner) MarkUpstreamRejectionSent(ctx context.Context, requestID string, keyID int64) (*UpstreamRejectionBillingResult, error) {
+	repo, err := c.rejectionRepository()
+	if err != nil {
+		return nil, err
+	}
+	return repo.MarkUpstreamRejectionSent(ctx, requestID, keyID)
+}
+
+func (c *UsageBillingLaneCombiner) FinalizeUpstreamRejection(ctx context.Context, cmd *UpstreamRejectionFinalizeCommand) (*UpstreamRejectionBillingResult, error) {
+	repo, err := c.rejectionRepository()
+	if err != nil {
+		return nil, err
+	}
+	return repo.FinalizeUpstreamRejection(ctx, cmd)
+}
+
+func (c *UsageBillingLaneCombiner) GetUpstreamRejection(ctx context.Context, requestID string, keyID int64) (*UpstreamRejectionReservation, error) {
+	repo, err := c.rejectionRepository()
+	if err != nil {
+		return nil, err
+	}
+	return repo.GetUpstreamRejection(ctx, requestID, keyID)
+}
+
+func (c *UsageBillingLaneCombiner) ListPendingUpstreamRejections(ctx context.Context, limit int) ([]UpstreamRejectionReservation, error) {
+	repo, err := c.rejectionRepository()
+	if err != nil {
+		return nil, err
+	}
+	return repo.ListPendingUpstreamRejections(ctx, limit)
+}
+
+func (c *UsageBillingLaneCombiner) ListPendingUpstreamRejectionsPage(ctx context.Context, query *UpstreamRejectionPendingQuery) (*UpstreamRejectionPendingPage, error) {
+	repo, err := c.rejectionRepository()
+	if err != nil {
+		return nil, err
+	}
+	return repo.ListPendingUpstreamRejectionsPage(ctx, query)
+}
+
+func (c *UsageBillingLaneCombiner) ListUnprojectedUpstreamRejectionsPage(ctx context.Context, query *UpstreamRejectionPendingQuery) (*UpstreamRejectionPendingPage, error) {
+	repo, err := c.rejectionRepository()
+	if err != nil {
+		return nil, err
+	}
+	return repo.ListUnprojectedUpstreamRejectionsPage(ctx, query)
+}
+
+func (c *UsageBillingLaneCombiner) MarkUpstreamRejectionUsageProjected(ctx context.Context, requestID string, keyID int64) error {
+	repo, err := c.rejectionRepository()
+	if err != nil {
+		return err
+	}
+	return repo.MarkUpstreamRejectionUsageProjected(ctx, requestID, keyID)
+}
+
+func (c *UsageBillingLaneCombiner) BindUpstreamRejectionTask(ctx context.Context, binding *UpstreamRejectionTaskBinding) error {
+	repo, err := c.rejectionRepository()
+	if err != nil {
+		return err
+	}
+	return repo.BindUpstreamRejectionTask(ctx, binding)
+}
+
+func (c *UsageBillingLaneCombiner) GetUpstreamRejectionByTask(ctx context.Context, userID, keyID int64, taskID string) (*UpstreamRejectionReservation, error) {
+	repo, err := c.rejectionRepository()
+	if err != nil {
+		return nil, err
+	}
+	return repo.GetUpstreamRejectionByTask(ctx, userID, keyID, taskID)
+}
+
+func (c *UsageBillingLaneCombiner) ListUserPendingUpstreamRejections(ctx context.Context, userID int64, cursor string, pageSize int) (*UserPendingUpstreamRejectionsPage, error) {
+	if c != nil {
+		if repo, ok := c.repo.(UserPendingUpstreamRejectionReader); ok {
+			return repo.ListUserPendingUpstreamRejections(ctx, userID, cursor, pageSize)
+		}
+	}
+	return nil, errUsageBillingLaneUserPendingReaderUnavailable
+}
+
+func (c *UsageBillingLaneCombiner) ListDueUpstreamRejectionsPage(ctx context.Context, query *UpstreamRejectionDueQuery) (*UpstreamRejectionDuePage, error) {
+	if c != nil {
+		if repo, ok := c.repo.(UpstreamRejectionDueSource); ok {
+			return repo.ListDueUpstreamRejectionsPage(ctx, query)
+		}
+	}
+	return nil, ErrUpstreamRejectionBillingUnavailable
+}
+
+func (c *UsageBillingLaneCombiner) sourcesImageLedger() (SourcesImageLedger, error) {
+	if c != nil {
+		if repo, ok := c.repo.(SourcesImageLedger); ok {
+			return repo, nil
+		}
+	}
+	return nil, errUsageBillingLaneImageLedgerUnavailable
+}
+
+// Keep the image hold and terminal billing operation in the original atomic
+// repository transaction; neither operation may enter the usage batch lane.
+func (c *UsageBillingLaneCombiner) SettleSourcesImage(ctx context.Context, hold *BatchImageBalanceHoldCommand, bill *UsageBillingCommand) (*UsageBillingApplyResult, error) {
+	repo, err := c.sourcesImageLedger()
+	if err != nil {
+		return nil, err
+	}
+	return repo.SettleSourcesImage(ctx, hold, bill)
+}
+
+func (c *UsageBillingLaneCombiner) ReleaseSourcesImage(ctx context.Context, hold *BatchImageBalanceHoldCommand) error {
+	repo, err := c.sourcesImageLedger()
+	if err != nil {
+		return err
+	}
+	return repo.ReleaseSourcesImage(ctx, hold)
 }
 
 func (c *UsageBillingLaneCombiner) ReserveBatchImageBalance(ctx context.Context, cmd *BatchImageBalanceHoldCommand) (*BatchImageBalanceHoldResult, error) {

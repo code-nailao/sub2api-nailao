@@ -735,6 +735,8 @@ export interface SystemSettings {
   channel_monitor_enabled: boolean;
   channel_monitor_mode?: 'v1' | 'v2';
   channel_monitor_default_interval_seconds: number;
+  channel_monitor_degraded_threshold_seconds: number;
+  channel_monitor_request_timeout_seconds: number;
   channel_monitor_hide_throughput?: boolean;
   channel_monitor_show_quota?: boolean;
   channel_monitor_hide_user_ranking?: boolean;
@@ -1047,6 +1049,8 @@ export interface UpdateSettingsRequest {
   channel_monitor_enabled?: boolean;
   channel_monitor_mode?: 'v1' | 'v2';
   channel_monitor_default_interval_seconds?: number;
+  channel_monitor_degraded_threshold_seconds?: number;
+  channel_monitor_request_timeout_seconds?: number;
   channel_monitor_hide_throughput?: boolean;
   channel_monitor_show_quota?: boolean;
   channel_monitor_hide_user_ranking?: boolean;
@@ -1504,6 +1508,7 @@ export interface OpenAIFastPolicyRule {
  * OpenAI fast/flex policy settings interface.
  */
 export interface OpenAIFastPolicySettings {
+  group_tier_policies_enabled?: boolean;
   rules: OpenAIFastPolicyRule[];
 }
 

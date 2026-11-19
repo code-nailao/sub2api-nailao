@@ -27,15 +27,19 @@ import (
 
 // openaiStreamingResult streaming response result
 type openaiStreamingResult struct {
-	usage            *OpenAIUsage
-	firstTokenMs     *int
-	responseID       string
-	imageCount       int
-	imageOutputSizes []string
-	searchCount      int
+	upstreamTerminalEvent string
+	upstreamRejection     *UpstreamRejectionEvidence
+	usage                 *OpenAIUsage
+	firstTokenMs          *int
+	responseID            string
+	imageCount            int
+	imageOutputSizes      []string
+	searchCount           int
 }
 
 type openaiNonStreamingResult struct {
+	upstreamTerminalEvent string
+	upstreamRejection     *UpstreamRejectionEvidence
 	*OpenAIUsage
 	usage            *OpenAIUsage
 	responseID       string
@@ -48,7 +52,23 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 	return s.handleStreamingResponseWithReasoning(ctx, resp, c, account, startTime, originalModel, mappedModel, "")
 }
 
-func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, startTime time.Time, originalModel, mappedModel, reasoningEffort string) (*openaiStreamingResult, error) {
+func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, startTime time.Time, originalModel, mappedModel, reasoningEffort string) (result *openaiStreamingResult, resultErr error) {
+	rejectionObserver := newUpstreamRejectionSSEObserver(account, resp.StatusCode)
+	defer func() {
+		rejectionObserver.Finish()
+		if result != nil {
+			result.upstreamTerminalEvent = rejectionObserver.CompletionEvent()
+		}
+		if evidence := rejectionObserver.Evidence(); evidence != nil {
+			if result == nil {
+				result = &openaiStreamingResult{usage: &OpenAIUsage{}}
+			}
+			result.upstreamRejection = evidence
+			if resultErr != nil {
+				resultErr = &UpstreamRejectionError{Evidence: evidence}
+			}
+		}
+	}()
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
@@ -354,12 +374,13 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	streamSearchSeen := make(map[string]struct{})
 	resultWithUsage := func() *openaiStreamingResult {
 		return &openaiStreamingResult{
-			usage:            usage,
-			firstTokenMs:     firstTokenMs,
-			responseID:       responseID,
-			imageCount:       imageCounter.Count(),
-			imageOutputSizes: imageCounter.Sizes(),
-			searchCount:      searchCounter,
+			upstreamTerminalEvent: rejectionObserver.CompletionEvent(),
+			usage:                 usage,
+			firstTokenMs:          firstTokenMs,
+			responseID:            responseID,
+			imageCount:            imageCounter.Count(),
+			imageOutputSizes:      imageCounter.Sizes(),
+			searchCount:           searchCounter,
 		}
 	}
 	flushPending := func(disconnectMessage string) {
@@ -375,6 +396,10 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		lastDownstreamWriteAt = time.Now()
 	}
 	finalizeStream := func() (*openaiStreamingResult, error) {
+		if evidence := rejectionObserver.Evidence(); evidence != nil && !sawTerminalEvent {
+			flushPending("Client disconnected while forwarding a charged refusal")
+			return resultWithUsage(), &UpstreamRejectionError{Evidence: evidence}
+		}
 		if stageFirstOutput && eventInProgress {
 			// EOF dispatches the final SSE event even without a trailing blank line.
 			completeGuardedEvent(true)
@@ -420,6 +445,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	handleScanErr := func(scanErr error) (*openaiStreamingResult, error, bool) {
 		if scanErr == nil {
 			return nil, nil, false
+		}
+		if evidence := rejectionObserver.Evidence(); evidence != nil {
+			return resultWithUsage(), &UpstreamRejectionError{Evidence: evidence}, true
 		}
 		if errors.Is(scanErr, errOpenAIFirstOutputScannerLimit) && !firstOutputProgressObserved {
 			logger.LegacyPrintf("service.openai_gateway", "SSE token exceeded guarded first-output limit: account=%d limit=%d error=%v", account.ID, openAIFirstOutputStageMaxBytes+openAIFirstOutputScannerFramingAllowance, scanErr)
@@ -505,6 +533,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		}
 	}
 	processSSELine := func(line string, queueDrained bool) {
+		rejectionObserver.ObserveLine(line)
 		if streamEarlyErr != nil {
 			return
 		}
@@ -523,6 +552,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		if data, ok := extractOpenAISSEDataLine(line); ok {
 			dataBytes := []byte(data)
 			eventType := effectiveOpenAISSEEventType(dataBytes, pendingSSEEventType)
+			observeDeepSeekNativeSSE(c, dataBytes, eventType)
 			if keepaliveEventDirect || forwardsKeepaliveDirect(eventType) {
 				keepaliveEventDirect = true
 				eventInProgress = true
@@ -593,14 +623,14 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 					})
 				}
 				outputStarted := openAIStreamClientOutputStarted(c, clientOutputStarted)
-				if !outputStarted && !cyberHit {
+				if !outputStarted && !cyberHit && rejectionObserver.Evidence() == nil {
 					if compactErr := newOpenAICompactFallbackSignal(c, dataBytes, failedMessage); compactErr != nil {
 						sawFailedEvent = true
 						streamEarlyErr = compactErr
 						return
 					}
 				}
-				if outputStarted && !cyberHit {
+				if outputStarted && !cyberHit && rejectionObserver.Evidence() == nil {
 					if codexFailureTerminal && eventType == "error" {
 						// OpenAI commonly follows a bare error with response.failed.
 						// Defer account health updates so the pair is applied once.
@@ -618,7 +648,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				}
 				if !outputStarted {
 					shouldFailover := false
-					if !cyberHit {
+					if !cyberHit && rejectionObserver.Evidence() == nil {
 						if eventType == "error" {
 							shouldFailover = openAIStreamErrorEventShouldFailover(dataBytes, failedMessage)
 						} else {
@@ -630,7 +660,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 						streamEarlyErr = s.newOpenAIStreamFailoverErrorWithModel(c, account, false, upstreamRequestID, dataBytes, failedMessage, mappedModel, resp.Header)
 						return
 					}
-					if !cyberHit && !sawBareError {
+					if !cyberHit && rejectionObserver.Evidence() == nil && !sawBareError {
 						if status, errType, errMsg, matched := applyOpenAIStreamFailedErrorPassthroughRule(c, account.Platform, dataBytes, failedMessage); matched {
 							sawFailedEvent = true
 							// 命中透传规则也要记录 ops 上游错误事件（对齐 CC/Messages 与
@@ -743,7 +773,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			// is already unconditional.
 			if account != nil && (account.Platform == PlatformOpenAI || account.Platform == PlatformGrok) &&
 				(eventType == "response.completed" || eventType == "response.done") &&
-				!sawFailedEvent && !responsesSemanticOutputSeen && !clientOutputStarted &&
+				!sawFailedEvent && !responsesSemanticOutputSeen && !clientOutputStarted && rejectionObserver.Evidence() == nil &&
 				openAIResponsesCompletedEventIsEmpty(dataBytes, usage) {
 				sawTerminalEvent = true
 				streamEarlyErr = newOpenAIResponsesEmptyCompletedFailoverError(c, account, upstreamRequestID)
@@ -1707,11 +1737,27 @@ func openAICacheCreationTTLTokensFromUsage(value gjson.Result, aggregate int) (i
 	return 0, 0
 }
 
-func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, originalModel, mappedModel string) (*openaiNonStreamingResult, error) {
+func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, originalModel, mappedModel string) (result *openaiNonStreamingResult, resultErr error) {
 	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
 	if err != nil {
 		return nil, err
 	}
+	rejection := observeUpstreamRejectionBody(account, resp.StatusCode, body)
+	defer func() {
+		if rejection != nil {
+			if result == nil {
+				parsedUsage, _ := extractOpenAIUsageFromJSONBytes(body)
+				if bodyHasSSEFraming(body) {
+					parsedUsage = *s.parseSSEUsageFromBody(string(body))
+				}
+				result = &openaiNonStreamingResult{usage: &parsedUsage, OpenAIUsage: &parsedUsage}
+			}
+			result.upstreamRejection = rejection
+			if resultErr != nil {
+				resultErr = &UpstreamRejectionError{Evidence: rejection}
+			}
+		}
+	}()
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
@@ -1752,6 +1798,9 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	}
 
 	usageValue, usageOK := extractOpenAIUsageFromJSONBytes(body)
+	if rejection != nil {
+		usageOK = true
+	}
 	if !usageOK {
 		if bodyLooksLikeSSE {
 			return s.handleSSEToJSON(resp, c, account, body, originalModel, mappedModel)
@@ -1797,12 +1846,14 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	}
 
 	return &openaiNonStreamingResult{
-		OpenAIUsage:      usage,
-		usage:            usage,
-		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
-		imageCount:       countOpenAIResponseImageOutputsFromJSONBytes(body),
-		imageOutputSizes: collectOpenAIResponseImageOutputSizesFromJSONBytes(body),
-		searchCount:      countGrokNativeSearchCallsFromJSONBytes(body),
+		upstreamRejection:     rejection,
+		upstreamTerminalEvent: upstreamRejectionJSONCompletion(account, body),
+		OpenAIUsage:           usage,
+		usage:                 usage,
+		responseID:            extractOpenAIResponseIDFromJSONBytes(body),
+		imageCount:            countOpenAIResponseImageOutputsFromJSONBytes(body),
+		imageOutputSizes:      collectOpenAIResponseImageOutputSizesFromJSONBytes(body),
+		searchCount:           countGrokNativeSearchCallsFromJSONBytes(body),
 	}, nil
 }
 
@@ -1827,10 +1878,27 @@ func bodyHasSSEFraming(body []byte) bool {
 	return false
 }
 
-func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Context, account *Account, body []byte, originalModel, mappedModel string) (*openaiNonStreamingResult, error) {
+func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Context, account *Account, body []byte, originalModel, mappedModel string) (result *openaiNonStreamingResult, resultErr error) {
+	rejection := observeUpstreamRejectionBody(account, resp.StatusCode, body)
+	completion := upstreamRejectionSSECompletion(account, resp.StatusCode, body)
+	defer func() {
+		if rejection != nil {
+			if result == nil {
+				parsedUsage, _ := extractOpenAIUsageFromJSONBytes(body)
+				if bodyHasSSEFraming(body) {
+					parsedUsage = *s.parseSSEUsageFromBody(string(body))
+				}
+				result = &openaiNonStreamingResult{usage: &parsedUsage, OpenAIUsage: &parsedUsage}
+			}
+			result.upstreamRejection = rejection
+			if resultErr != nil {
+				resultErr = &UpstreamRejectionError{Evidence: rejection}
+			}
+		}
+	}()
 	bodyText := string(body)
 	terminalType, terminalPayload, terminalOK := extractOpenAISSETerminalEvent(bodyText)
-	if terminalOK && (terminalType == "response.failed" || terminalType == "error") {
+	if rejection == nil && terminalOK && (terminalType == "response.failed" || terminalType == "error") {
 		msg := extractOpenAISSEErrorMessage(terminalPayload)
 		if msg == "" {
 			msg = "Upstream compact response failed"
@@ -1912,12 +1980,14 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 	}
 
 	return &openaiNonStreamingResult{
-		OpenAIUsage:      usage,
-		usage:            usage,
-		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
-		imageCount:       countOpenAIImageOutputsFromSSEBody(bodyText),
-		imageOutputSizes: collectOpenAIImageOutputSizesFromSSEBody(bodyText),
-		searchCount:      countGrokNativeSearchCallsFromSSEBody(bodyText),
+		upstreamRejection:     rejection,
+		upstreamTerminalEvent: completion,
+		OpenAIUsage:           usage,
+		usage:                 usage,
+		responseID:            extractOpenAIResponseIDFromJSONBytes(body),
+		imageCount:            countOpenAIImageOutputsFromSSEBody(bodyText),
+		imageOutputSizes:      collectOpenAIImageOutputSizesFromSSEBody(bodyText),
+		searchCount:           countGrokNativeSearchCallsFromSSEBody(bodyText),
 	}, nil
 }
 

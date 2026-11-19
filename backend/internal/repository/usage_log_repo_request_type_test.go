@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,18 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/stretchr/testify/require"
 )
+
+func usageLogArgIndex(t *testing.T, column string) int {
+	t.Helper()
+	for i, name := range strings.Split(usageLogSelectColumns, ",") {
+		if strings.TrimSpace(name) == column {
+			require.Greater(t, i, 0)
+			return i - 1
+		}
+	}
+	t.Fatalf("usage column %s not found", column)
+	return -1
+}
 
 func TestUsageLogRepositoryCreateSyncRequestTypeAndLegacyFields(t *testing.T) {
 	db, mock := newSQLMock(t)
@@ -102,6 +115,7 @@ func TestUsageLogRepositoryCreateSyncRequestTypeAndLegacyFields(t *testing.T) {
 			sqlmock.AnyArg(), // upstream_request_id
 			sqlmock.AnyArg(), // session_id
 			log.NativeCompactionV2,
+			nil, // billing_snapshot remains absent on legacy records
 			log.CacheCreation30mTokens,
 			log.CacheCreation12hTokens,
 			createdAt,
@@ -199,6 +213,7 @@ func TestUsageLogRepositoryCreate_PersistsServiceTier(t *testing.T) {
 			sqlmock.AnyArg(), // upstream_request_id
 			sqlmock.AnyArg(), // session_id
 			log.NativeCompactionV2,
+			nil, // billing_snapshot remains absent on legacy records
 			log.CacheCreation30mTokens,
 			log.CacheCreation12hTokens,
 			createdAt,
@@ -282,8 +297,8 @@ func TestPrepareUsageLogInsert_PersistsNativeCompactionV2WithoutChangingRequestT
 	prepared := prepareUsageLogInsert(log)
 
 	require.Len(t, prepared.args, len(usageLogInsertArgTypes))
-	require.Equal(t, "boolean", usageLogInsertArgTypes[len(usageLogInsertArgTypes)-4])
-	require.Equal(t, true, prepared.args[len(prepared.args)-4])
+	require.Equal(t, "boolean", usageLogInsertArgTypes[usageLogArgIndex(t, "native_compaction_v2")])
+	require.Equal(t, true, prepared.args[usageLogArgIndex(t, "native_compaction_v2")])
 	require.Equal(t, int16(service.RequestTypeStream), prepared.args[30])
 	require.Equal(t, service.RequestTypeStream, log.RequestType)
 	require.True(t, log.Stream)
@@ -702,8 +717,8 @@ func TestUsageLogRepositoryGetModelStatsAccountCostColumn(t *testing.T) {
 	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	end := start.Add(24 * time.Hour)
 
-	mock.ExpectQuery("FROM usage_logs").
-		WithArgs(start, end).
+	mock.ExpectQuery("FROM usage_cleanup_model_source").
+		WithArgs(start, end, "requested").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"model", "requests", "input_tokens", "output_tokens",
 			"cache_creation_tokens", "cache_read_tokens", "total_tokens",
@@ -963,9 +978,10 @@ func TestScanUsageLogRequestTypeAndLegacyFallback(t *testing.T) {
 			sql.NullFloat64{},
 			sql.NullString{}, // upstream_request_id
 			sql.NullString{},
-			false, // native_compaction_v2
-			0,     // cache_creation_30m_tokens
-			0,     // cache_creation_12h_tokens
+			false,            // native_compaction_v2
+			sql.NullString{}, // billing_snapshot
+			0,                // cache_creation_30m_tokens
+			0,                // cache_creation_12h_tokens
 			now,
 		}})
 		require.NoError(t, err)
@@ -1046,6 +1062,7 @@ func TestScanUsageLogRequestTypeAndLegacyFallback(t *testing.T) {
 			sql.NullString{},  // upstream_request_id
 			sql.NullString{},  // session_id
 			false,             // native_compaction_v2
+			sql.NullString{},  // billing_snapshot
 			0,                 // cache_creation_30m_tokens
 			0,                 // cache_creation_12h_tokens
 			now,
@@ -1111,6 +1128,7 @@ func TestScanUsageLogRequestTypeAndLegacyFallback(t *testing.T) {
 			sql.NullString{},  // upstream_request_id
 			sql.NullString{},  // session_id
 			true,              // native_compaction_v2
+			sql.NullString{},  // billing_snapshot
 			0,                 // cache_creation_30m_tokens
 			0,                 // cache_creation_12h_tokens
 			now,
@@ -1177,6 +1195,7 @@ func TestScanUsageLogRequestTypeAndLegacyFallback(t *testing.T) {
 			sql.NullString{},  // upstream_request_id
 			sql.NullString{},  // session_id
 			false,             // native_compaction_v2
+			sql.NullString{},  // billing_snapshot
 			0,                 // cache_creation_30m_tokens
 			0,                 // cache_creation_12h_tokens
 			now,

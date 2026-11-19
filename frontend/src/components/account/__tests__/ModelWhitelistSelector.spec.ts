@@ -100,6 +100,19 @@ function findModelRow(wrapper: ReturnType<typeof mountSelector>, modelId: string
 }
 
 describe('ModelWhitelistSelector', () => {
+  it('filters supplier aliases only for the opted-in content restriction profile', async () => {
+    syncUpstreamModels.mockResolvedValue({ models: ['grok-4.7', 'xai/grok-4.7', 'grok-*', 'gpt-*', 'grok-imagine-image-2.0'] })
+    for (const unprefixedGrokOnly of [true, false]) {
+      const wrapper = mountSelector({ platform: 'grok', accountId: 46, unprefixedGrokOnly })
+      await wrapper.findAll('button').find(b => b.text() === 'admin.accounts.syncUpstreamModels')!.trigger('click')
+      await flushPromises()
+      expect(wrapper.emitted('update:modelValue')?.[0]?.[0]).toEqual(unprefixedGrokOnly
+        ? ['grok-4.7', 'grok-imagine-image-2.0']
+        : ['grok-4.7', 'xai/grok-4.7', 'grok-*', 'gpt-*', 'grok-imagine-image-2.0'])
+      wrapper.unmount()
+    }
+  })
+
   beforeEach(() => {
     copyToClipboard.mockClear()
     showError.mockReset()

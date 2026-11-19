@@ -17,6 +17,7 @@ import (
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 type openAIWSClientFrameConn struct {
@@ -134,6 +135,7 @@ func openAIWSPassthroughPolicyModelFromSessionFrame(account *Account, payload []
 
 type openAIWSPassthroughUsageMeta struct {
 	serviceTier              atomic.Pointer[string]
+	requestedServiceTier     atomic.Pointer[string]
 	reasoningEffort          atomic.Pointer[string]
 	requestedReasoningEffort atomic.Pointer[string]
 	requestModel             atomic.Pointer[string]
@@ -166,6 +168,8 @@ func (m *openAIWSPassthroughUsageMeta) captureRequestedReasoningEffort(originalB
 	if m == nil {
 		return
 	}
+	rawTier := gjson.GetBytes(originalBody, "service_tier").String()
+	m.requestedServiceTier.Store(&rawTier)
 	candidates := append([]string{m.sessionRequestModel}, modelCandidates...)
 	m.requestedReasoningEffort.Store(CanonicalRequestedReasoningEffort(originalBody, candidates...))
 }
@@ -768,6 +772,12 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	if accountScoped {
 		firstClientMessage = accountScopedFirst
 	}
+	if blocked := s.validateFixedRequestSpeedAccount(ctx, account, capturedSessionModel); blocked != nil {
+		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, blocked.Message, blocked)
+	}
+	if err := s.ValidatePreviousResponseRequestSpeed(ctx, nil, gjson.GetBytes(firstClientMessage, "previous_response_id").String()); err != nil {
+		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, err.Error(), err)
+	}
 	usageMeta := newOpenAIWSPassthroughUsageMeta(initialRequestModel, firstClientMessage)
 	updatedFirst, blocked, policyErr := s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, capturedSessionModel, firstClientMessage)
 	if policyErr != nil {
@@ -1095,6 +1105,25 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			if isResponseCreate && model != "" && model != strings.TrimSpace(gjson.GetBytes(payload, "model").String()) {
 				payload = s.ReplaceModelInBody(payload, model)
 			}
+			if isResponseCreate {
+				if blocked := s.validateFixedRequestSpeedAccount(ctx, account, model); blocked != nil {
+					return payload, blocked, nil
+				}
+				if err := s.ValidatePreviousResponseRequestSpeed(ctx, nil, gjson.GetBytes(payload, "previous_response_id").String()); err != nil {
+					return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, err.Error(), err)
+				}
+			}
+			if RequestSpeedFromContext(ctx) != "" && eventType == "session.update" {
+				var err error
+				payload, err = sjson.DeleteBytes(payload, "session.service_tier")
+				if err != nil {
+					return payload, nil, err
+				}
+				payload, err = sjson.DeleteBytes(payload, "service_tier")
+				if err != nil {
+					return payload, nil, err
+				}
+			}
 			out, blocked, policyErr := s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, model, payload)
 			// 多轮 passthrough usage：仅在成功（non-block / non-err）
 			// 的 response.create 帧上更新 usageMeta，使用
@@ -1219,7 +1248,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					UpstreamResponseModel:         turn.ResponseModel,
 					UpstreamResponseModelConflict: turn.ResponseModelConflict,
 					UpstreamResponseServiceTier:   normalizeObservedOpenAIServiceTier(turn.ResponseServiceTier),
+					FixedUpstreamRequestTier:      RequestSpeedServiceTierFromContext(ctx),
 					ServiceTier:                   usageMeta.serviceTier.Load(),
+					RequestedServiceTier:          usageMeta.requestedServiceTier.Load(),
 					ReasoningEffort:               usageMeta.reasoningEffort.Load(),
 					RequestedReasoningEffort:      usageMeta.requestedReasoningEffort.Load(),
 					Stream:                        true,
@@ -1361,7 +1392,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		UpstreamResponseModel:         relayResult.ResponseModel,
 		UpstreamResponseModelConflict: relayResult.ResponseModelConflict,
 		UpstreamResponseServiceTier:   normalizeObservedOpenAIServiceTier(relayResult.ResponseServiceTier),
+		FixedUpstreamRequestTier:      RequestSpeedServiceTierFromContext(ctx),
 		ServiceTier:                   usageMeta.serviceTier.Load(),
+		RequestedServiceTier:          usageMeta.requestedServiceTier.Load(),
 		ReasoningEffort:               usageMeta.reasoningEffort.Load(),
 		RequestedReasoningEffort:      usageMeta.requestedReasoningEffort.Load(),
 		Stream:                        true,

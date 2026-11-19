@@ -10,6 +10,7 @@ import (
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -32,7 +33,10 @@ var (
 // ImageTaskRecord is the private Redis representation of an asynchronous image
 // request. Ownership fields are intentionally omitted from the public view.
 type ImageTaskRecord struct {
-	ID          string          `json:"id"`
+	ID string `json:"id"`
+	// InstanceID is private drain evidence. Empty identifies legacy records;
+	// it never permits a replacement process to replay an accepted request.
+	InstanceID  string          `json:"instance_id,omitempty"`
 	UserID      int64           `json:"user_id"`
 	APIKeyID    int64           `json:"api_key_id"`
 	Status      string          `json:"status"`
@@ -156,12 +160,13 @@ func (s *ImageTaskService) Create(ctx context.Context, owner ImageTaskOwner) (*I
 	}
 	now := time.Now().UTC()
 	task := &ImageTaskRecord{
-		ID:        "imgtask_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
-		UserID:    owner.UserID,
-		APIKeyID:  owner.APIKeyID,
-		Status:    ImageTaskStatusProcessing,
-		CreatedAt: now.Unix(),
-		ExpiresAt: now.Add(s.ttl).Unix(),
+		ID:         "imgtask_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		InstanceID: processrole.Default().Status().InstanceID,
+		UserID:     owner.UserID,
+		APIKeyID:   owner.APIKeyID,
+		Status:     ImageTaskStatusProcessing,
+		CreatedAt:  now.Unix(),
+		ExpiresAt:  now.Add(s.ttl).Unix(),
 	}
 	if err := s.store.Save(ctx, task, s.ttl); err != nil {
 		return nil, ErrImageTaskUnavailable.WithCause(err)

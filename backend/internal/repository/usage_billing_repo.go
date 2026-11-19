@@ -27,6 +27,13 @@ func (r *usageBillingRepository) Apply(ctx context.Context, cmd *service.UsageBi
 		return nil, errors.New("usage billing repository db is nil")
 	}
 
+	if cmd.UpstreamRejectionReservationID != "" {
+		// Validate raw amounts before quantization can turn a tiny negative into
+		// zero. The legacy ordinary path is intentionally unchanged.
+		if err := validateUpstreamRejectionNormalCommand(cmd); err != nil {
+			return nil, err
+		}
+	}
 	cmd.Normalize()
 	if cmd.RequestID == "" {
 		return nil, service.ErrUsageBillingRequestIDRequired
@@ -42,6 +49,20 @@ func (r *usageBillingRepository) Apply(ctx context.Context, cmd *service.UsageBi
 		}
 	}()
 
+	if cmd.UpstreamRejectionReservationID != "" {
+		if err := r.releaseUpstreamRejectionForNormal(ctx, tx, cmd); err != nil {
+			if !errors.Is(err, service.ErrUpstreamRejectionWaived) {
+				return nil, err
+			}
+			// The hold was released at its deadline: commit only the late-result
+			// record. No bill is claimed, so nothing is charged.
+			if commitErr := tx.Commit(); commitErr != nil {
+				return nil, commitErr
+			}
+			tx = nil
+			return nil, err
+		}
+	}
 	applied, err := r.claimUsageBillingKey(ctx, tx, cmd)
 	if err != nil {
 		return nil, err
@@ -202,6 +223,12 @@ func (r *usageBillingRepository) applyUsageBillingEffects(ctx context.Context, t
 		}
 	}
 
+	if cmd.ToolAccountID > 0 && cmd.ToolAccountQuotaCost > 0 {
+		_, err := incrementUsageBillingAccountQuota(ctx, tx, cmd.ToolAccountID, cmd.ToolAccountQuotaCost, cmd.ToolAccountDailyQuota, cmd.ToolAccountWeeklyQuota)
+		if err != nil && !errors.Is(err, service.ErrAccountNotFound) {
+			return err
+		}
+	}
 	// 账号已不存在时跳过其配额计数，其余结算项不受影响。
 	if cmd.AccountQuotaCost > 0 && service.AccountTypeSupportsQuota(cmd.AccountType) {
 		quotaState, err := incrementUsageBillingAccountQuota(ctx, tx, cmd.AccountID, cmd.AccountQuotaCost, cmd.AccountQuotaHasDailyLimit, cmd.AccountQuotaHasWeeklyLimit)

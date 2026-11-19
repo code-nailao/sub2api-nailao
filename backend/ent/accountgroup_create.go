@@ -36,6 +36,12 @@ func (_c *AccountGroupCreate) SetGroupID(v int64) *AccountGroupCreate {
 	return _c
 }
 
+// SetRequestSpeedTiers sets the "request_speed_tiers" field.
+func (_c *AccountGroupCreate) SetRequestSpeedTiers(v []string) *AccountGroupCreate {
+	_c.mutation.SetRequestSpeedTiers(v)
+	return _c
+}
+
 // SetPriority sets the "priority" field.
 func (_c *AccountGroupCreate) SetPriority(v int) *AccountGroupCreate {
 	_c.mutation.SetPriority(v)
@@ -109,6 +115,10 @@ func (_c *AccountGroupCreate) ExecX(ctx context.Context) {
 
 // defaults sets the default values of the builder before save.
 func (_c *AccountGroupCreate) defaults() {
+	if _, ok := _c.mutation.RequestSpeedTiers(); !ok {
+		v := accountgroup.DefaultRequestSpeedTiers
+		_c.mutation.SetRequestSpeedTiers(v)
+	}
 	if _, ok := _c.mutation.Priority(); !ok {
 		v := accountgroup.DefaultPriority
 		_c.mutation.SetPriority(v)
@@ -126,6 +136,9 @@ func (_c *AccountGroupCreate) check() error {
 	}
 	if _, ok := _c.mutation.GroupID(); !ok {
 		return &ValidationError{Name: "group_id", err: errors.New(`ent: missing required field "AccountGroup.group_id"`)}
+	}
+	if _, ok := _c.mutation.RequestSpeedTiers(); !ok {
+		return &ValidationError{Name: "request_speed_tiers", err: errors.New(`ent: missing required field "AccountGroup.request_speed_tiers"`)}
 	}
 	if _, ok := _c.mutation.Priority(); !ok {
 		return &ValidationError{Name: "priority", err: errors.New(`ent: missing required field "AccountGroup.priority"`)}
@@ -162,6 +175,10 @@ func (_c *AccountGroupCreate) createSpec() (*AccountGroup, *sqlgraph.CreateSpec)
 		_spec = sqlgraph.NewCreateSpec(accountgroup.Table, nil)
 	)
 	_spec.OnConflict = _c.conflict
+	if value, ok := _c.mutation.RequestSpeedTiers(); ok {
+		_spec.SetField(accountgroup.FieldRequestSpeedTiers, field.TypeJSON, value)
+		_node.RequestSpeedTiers = value
+	}
 	if value, ok := _c.mutation.Priority(); ok {
 		_spec.SetField(accountgroup.FieldPriority, field.TypeInt, value)
 		_node.Priority = value
@@ -280,6 +297,18 @@ func (u *AccountGroupUpsert) UpdateGroupID() *AccountGroupUpsert {
 	return u
 }
 
+// SetRequestSpeedTiers sets the "request_speed_tiers" field.
+func (u *AccountGroupUpsert) SetRequestSpeedTiers(v []string) *AccountGroupUpsert {
+	u.Set(accountgroup.FieldRequestSpeedTiers, v)
+	return u
+}
+
+// UpdateRequestSpeedTiers sets the "request_speed_tiers" field to the value that was provided on create.
+func (u *AccountGroupUpsert) UpdateRequestSpeedTiers() *AccountGroupUpsert {
+	u.SetExcluded(accountgroup.FieldRequestSpeedTiers)
+	return u
+}
+
 // SetPriority sets the "priority" field.
 func (u *AccountGroupUpsert) SetPriority(v int) *AccountGroupUpsert {
 	u.Set(accountgroup.FieldPriority, v)
@@ -368,6 +397,20 @@ func (u *AccountGroupUpsertOne) SetGroupID(v int64) *AccountGroupUpsertOne {
 func (u *AccountGroupUpsertOne) UpdateGroupID() *AccountGroupUpsertOne {
 	return u.Update(func(s *AccountGroupUpsert) {
 		s.UpdateGroupID()
+	})
+}
+
+// SetRequestSpeedTiers sets the "request_speed_tiers" field.
+func (u *AccountGroupUpsertOne) SetRequestSpeedTiers(v []string) *AccountGroupUpsertOne {
+	return u.Update(func(s *AccountGroupUpsert) {
+		s.SetRequestSpeedTiers(v)
+	})
+}
+
+// UpdateRequestSpeedTiers sets the "request_speed_tiers" field to the value that was provided on create.
+func (u *AccountGroupUpsertOne) UpdateRequestSpeedTiers() *AccountGroupUpsertOne {
+	return u.Update(func(s *AccountGroupUpsert) {
+		s.UpdateRequestSpeedTiers()
 	})
 }
 
@@ -605,6 +648,20 @@ func (u *AccountGroupUpsertBulk) SetGroupID(v int64) *AccountGroupUpsertBulk {
 func (u *AccountGroupUpsertBulk) UpdateGroupID() *AccountGroupUpsertBulk {
 	return u.Update(func(s *AccountGroupUpsert) {
 		s.UpdateGroupID()
+	})
+}
+
+// SetRequestSpeedTiers sets the "request_speed_tiers" field.
+func (u *AccountGroupUpsertBulk) SetRequestSpeedTiers(v []string) *AccountGroupUpsertBulk {
+	return u.Update(func(s *AccountGroupUpsert) {
+		s.SetRequestSpeedTiers(v)
+	})
+}
+
+// UpdateRequestSpeedTiers sets the "request_speed_tiers" field to the value that was provided on create.
+func (u *AccountGroupUpsertBulk) UpdateRequestSpeedTiers() *AccountGroupUpsertBulk {
+	return u.Update(func(s *AccountGroupUpsert) {
+		s.UpdateRequestSpeedTiers()
 	})
 }
 

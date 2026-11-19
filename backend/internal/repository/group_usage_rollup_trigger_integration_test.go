@@ -460,6 +460,25 @@ func createGroupUsageRollupTriggerTestSchema(t *testing.T, ctx context.Context, 
 			require.NoError(t, err)
 		}
 	}
+	// This isolated schema deliberately does not use the global migrated schema.
+	// Add the source columns before applying the real retained-history migration.
+	_, err = tx.ExecContext(ctx, `ALTER TABLE usage_logs
+		ADD COLUMN model TEXT NOT NULL DEFAULT 'fixture',
+		ADD COLUMN requested_model TEXT,
+		ADD COLUMN upstream_model TEXT,
+		ADD COLUMN input_tokens BIGINT NOT NULL DEFAULT 0,
+		ADD COLUMN output_tokens BIGINT NOT NULL DEFAULT 0,
+		ADD COLUMN cache_creation_tokens BIGINT NOT NULL DEFAULT 0,
+		ADD COLUMN cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+		ADD COLUMN total_cost NUMERIC NOT NULL DEFAULT 0,
+		ADD COLUMN account_stats_cost NUMERIC,
+		ADD COLUMN account_rate_multiplier NUMERIC,
+		ADD COLUMN duration_ms BIGINT;`)
+	require.NoError(t, err)
+	retainedHistorySQL, err := migrations.FS.ReadFile("248_usage_cleanup_statistics.sql")
+	require.NoError(t, err)
+	_, err = tx.ExecContext(ctx, string(retainedHistorySQL))
+	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 
 	return schema

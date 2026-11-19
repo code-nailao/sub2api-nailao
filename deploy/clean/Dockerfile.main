@@ -1,0 +1,12 @@
+# A candidate wraps a fixed, previously built binary and the pinned upstream runtime.
+# Build inputs and source hashes are recorded by scripts/sources_release/build.sh.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG SOURCE_COMMIT
+LABEL org.opencontainers.image.revision=${SOURCE_COMMIT} \
+      org.opencontainers.image.source="https://github.com/code-nailao/sub2api-nailao" \
+      org.opencontainers.image.licenses="LGPL-3.0" \
+      org.opencontainers.image.description="Sub2API Main (fork of Wei-Shaw/sub2api)" \
+      maintainer="code-nailao <github.com/code-nailao>"
+COPY --chown=1000:1000 --chmod=0755 sub2api /app/sub2api
+COPY --chown=1000:1000 resources/ /app/resources/

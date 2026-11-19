@@ -298,12 +298,10 @@ func TestStop_DrainsAllGoroutines(t *testing.T) {
 	stoppedWithin(t, r, 3*time.Second)
 }
 
-// TestStop_WaitsForInFlightCheck 验证 Stop 会等待正在执行的 RunCheck 退出（pool.StopAndWait）。
-func TestStop_WaitsForInFlightCheck(t *testing.T) {
-	svc := &stubMonitorSvc{
-		runCalled:  make(chan int64, 1),
-		runHoldFor: 200 * time.Millisecond,
-	}
+// TestStop_CancelsInFlightCheckAndWaitsForIt 验证 Stop 会取消正在执行的 RunCheck，
+// 并且仍等待它返回（pool.StopAndWait）后才结束，避免后台交接时等满探测预算。
+func TestStop_CancelsInFlightCheckAndWaitsForIt(t *testing.T) {
+	svc := &cancelObservingMonitorSvc{stubMonitorSvc: stubMonitorSvc{runCalled: make(chan int64, 1)}}
 	r := newRunnerForTest(svc)
 	r.Start()
 	r.Schedule(&ChannelMonitor{ID: 1, Enabled: true, IntervalSeconds: 60})
@@ -314,12 +312,37 @@ func TestStop_WaitsForInFlightCheck(t *testing.T) {
 		t.Fatal("first fire never happened")
 	}
 
-	start := time.Now()
 	stoppedWithin(t, r, 3*time.Second)
-	elapsed := time.Since(start)
-	// Stop 必须等待 in-flight check 跑完（runHoldFor=200ms），耗时下界约 100ms。
-	if elapsed < 100*time.Millisecond {
-		t.Fatalf("Stop returned too fast (%v); did not wait for in-flight check", elapsed)
+	if !svc.sawCancel.Load() {
+		t.Fatal("in-flight check did not observe the stop")
+	}
+	if !svc.returned.Load() {
+		t.Fatal("Stop returned before the in-flight check returned")
+	}
+}
+
+// cancelObservingMonitorSvc holds RunCheck until its context ends and records
+// how the check finished.
+type cancelObservingMonitorSvc struct {
+	stubMonitorSvc
+	sawCancel atomic.Bool
+	returned  atomic.Bool
+}
+
+func (s *cancelObservingMonitorSvc) RunCheck(ctx context.Context, id int64) ([]*CheckResult, error) {
+	s.runCount.Add(1)
+	select {
+	case s.runCalled <- id:
+	default:
+	}
+	defer s.returned.Store(true)
+	select {
+	case <-ctx.Done():
+		s.sawCancel.Store(true)
+		time.Sleep(50 * time.Millisecond)
+		return nil, ctx.Err()
+	case <-time.After(10 * time.Second):
+		return nil, nil
 	}
 }
 

@@ -90,6 +90,9 @@ func createGroupRecord(ctx context.Context, client *dbent.Client, groupIn *servi
 	if groupIn == nil {
 		return errors.New("group is nil")
 	}
+	if err := service.ValidateGroupRequestSpeed(groupIn); err != nil {
+		return err
+	}
 	modelPricing, err := json.Marshal(groupIn.ModelPricing)
 	if err != nil {
 		return fmt.Errorf("marshal group model pricing: %w", err)
@@ -122,7 +125,10 @@ func createGroupRecord(ctx context.Context, client *dbent.Client, groupIn *servi
 		SetNillableVideoPrice720p(groupIn.VideoPrice720P).
 		SetNillableVideoPrice1080p(groupIn.VideoPrice1080P).
 		SetVideoModelPrices(service.NormalizeVideoModelPrices(groupIn.VideoModelPrices)).
+		SetUpstreamRejectionBillingEnabled(groupIn.UpstreamRejectionBillingEnabled).
+		SetUpstreamRejectionPrice(groupIn.UpstreamRejectionPrice).
 		SetNillableWebSearchPricePerCall(groupIn.WebSearchPricePerCall).
+		SetDeepseekTools(groupIn.DeepSeekTools).
 		SetNillableSearchPricePer1k(groupIn.SearchPricePer1k).
 		SetNillableAudioRealtimePricePerMin(groupIn.AudioRealtimePricePerMin).
 		SetNillableAudioTtsPricePerMillionChars(groupIn.AudioTTSPricePerMillionChars).
@@ -138,6 +144,9 @@ func createGroupRecord(ctx context.Context, client *dbent.Client, groupIn *servi
 		SetAllowMessagesDispatch(groupIn.AllowMessagesDispatch).
 		SetAllowLive(groupIn.AllowLive).
 		SetForceOpenaiFast(groupIn.ForceOpenAIFast).
+		SetRequestSpeedSelectionEnabled(groupIn.RequestSpeedSelectionEnabled).
+		SetDefaultRequestSpeedTier(groupIn.DefaultRequestSpeedTier).
+		SetOpenaiServiceTierPolicy(groupIn.OpenAIServiceTierPolicy).
 		SetForceOpenaiUltrafast(groupIn.ForceOpenAIUltrafast).
 		SetFreeOpenaiFast(groupIn.FreeOpenAIFast).
 		SetRequireOauthOnly(groupIn.RequireOAuthOnly).
@@ -221,13 +230,16 @@ func (r *groupRepository) CreateFromSource(ctx context.Context, groupIn *service
 		txClient = r.client
 	}
 
+	if _, err := txClient.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtextextended('sources_request_speed_config', 0))"); err != nil {
+		return err
+	}
 	if err := createGroupRecord(ctx, txClient, groupIn); err != nil {
 		return err
 	}
 	result, err := txClient.ExecContext(
 		ctx,
-		`INSERT INTO account_groups (account_id, group_id, priority, created_at)
-		 SELECT ag.account_id, $2, ag.priority, NOW()
+		`INSERT INTO account_groups (account_id, group_id, priority, request_speed_tiers, created_at)
+		 SELECT ag.account_id, $2, ag.priority, ag.request_speed_tiers, NOW()
 		 FROM account_groups ag
 		 JOIN accounts a ON a.id = ag.account_id
 		 WHERE ag.group_id = $1
@@ -280,15 +292,88 @@ func (r *groupRepository) GetByIDLite(ctx context.Context, id int64) (*service.G
 	if err != nil {
 		return nil, translatePersistenceError(err, service.ErrGroupNotFound, nil)
 	}
-	return groupEntityToService(m), nil
+	out := groupEntityToService(m)
+	if err := r.hydrateRequestSpeedAvailability(ctx, []*service.Group{out}); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) error {
+	if err := service.ValidateGroupRequestSpeed(groupIn); err != nil {
+		return err
+	}
+	tx, err := r.client.Tx(ctx)
+	if err != nil && !errors.Is(err, dbent.ErrTxStarted) {
+		return err
+	}
+	client := r.client
+	if tx != nil {
+		defer func() { _ = tx.Rollback() }()
+		client = tx.Client()
+	}
+	if _, err := client.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtextextended('sources_request_speed_config', 0))"); err != nil {
+		return err
+	}
+	locked, err := client.Group.Query().Where(group.IDEQ(groupIn.ID)).ForUpdate().Only(ctx)
+	if err != nil {
+		return translatePersistenceError(err, service.ErrGroupNotFound, nil)
+	}
+	if groupIn.RequestSpeedSelectionEnabled {
+		rows, err := client.QueryContext(ctx, `SELECT EXISTS (
+			SELECT 1 FROM account_groups candidate
+			JOIN account_groups other ON other.account_id = candidate.account_id AND other.group_id <> candidate.group_id
+			JOIN groups enabled ON enabled.id = other.group_id
+			WHERE candidate.group_id = $1 AND jsonb_array_length(candidate.request_speed_tiers) = 1
+			AND enabled.deleted_at IS NULL AND enabled.platform = 'openai' AND enabled.request_speed_selection_enabled = TRUE
+			AND jsonb_array_length(other.request_speed_tiers) = 1
+			AND candidate.request_speed_tiers->>0 <> other.request_speed_tiers->>0
+		)`, groupIn.ID)
+		if err != nil {
+			return err
+		}
+		var conflict bool
+		if rows.Next() {
+			err = rows.Scan(&conflict)
+		}
+		rowsErr := rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			return err
+		}
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if conflict {
+			return service.ErrRequestSpeedAccountConflict
+		}
+	}
+	if locked.RequestSpeedSelectionEnabled && !groupIn.RequestSpeedSelectionEnabled {
+		rows, err := client.QueryContext(ctx, "SELECT EXISTS (SELECT 1 FROM api_keys WHERE group_id = $1 AND deleted_at IS NULL AND request_speed_tier = 'fast')", groupIn.ID)
+		if err != nil {
+			return err
+		}
+		var hasFast bool
+		if rows.Next() {
+			err = rows.Scan(&hasFast)
+		}
+		rowsErr := rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			return err
+		}
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if hasFast {
+			return service.ErrRequestSpeedFastKeysExist
+		}
+	}
 	modelPricing, err := json.Marshal(groupIn.ModelPricing)
 	if err != nil {
 		return fmt.Errorf("marshal group model pricing: %w", err)
 	}
-	builder := r.client.Group.UpdateOneID(groupIn.ID).
+	builder := client.Group.UpdateOneID(groupIn.ID).
 		SetName(groupIn.Name).
 		SetDescription(groupIn.Description).
 		SetPlatform(groupIn.Platform).
@@ -315,6 +400,8 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 		SetNillableVideoPrice720p(groupIn.VideoPrice720P).
 		SetNillableVideoPrice1080p(groupIn.VideoPrice1080P).
 		SetVideoModelPrices(service.NormalizeVideoModelPrices(groupIn.VideoModelPrices)).
+		SetUpstreamRejectionBillingEnabled(groupIn.UpstreamRejectionBillingEnabled).
+		SetUpstreamRejectionPrice(groupIn.UpstreamRejectionPrice).
 		SetLongContextPricingEnabled(groupIn.LongContextPricingEnabled).
 		SetModelPricing(modelPricing).
 		SetDefaultValidityDays(groupIn.DefaultValidityDays).
@@ -324,6 +411,9 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 		SetAllowMessagesDispatch(groupIn.AllowMessagesDispatch).
 		SetAllowLive(groupIn.AllowLive).
 		SetForceOpenaiFast(groupIn.ForceOpenAIFast).
+		SetRequestSpeedSelectionEnabled(groupIn.RequestSpeedSelectionEnabled).
+		SetDefaultRequestSpeedTier(groupIn.DefaultRequestSpeedTier).
+		SetOpenaiServiceTierPolicy(groupIn.OpenAIServiceTierPolicy).
 		SetForceOpenaiUltrafast(groupIn.ForceOpenAIUltrafast).
 		SetFreeOpenaiFast(groupIn.FreeOpenAIFast).
 		SetRequireOauthOnly(groupIn.RequireOAuthOnly).
@@ -395,6 +485,7 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 	} else {
 		builder = builder.ClearWebSearchPricePerCall()
 	}
+	builder.SetDeepseekTools(groupIn.DeepSeekTools)
 	if groupIn.SearchPricePer1k != nil {
 		builder = builder.SetSearchPricePer1k(*groupIn.SearchPricePer1k)
 	} else {
@@ -450,8 +541,11 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 		return translatePersistenceError(err, service.ErrGroupNotFound, service.ErrGroupExists)
 	}
 	groupIn.UpdatedAt = updated.UpdatedAt
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventGroupChanged, nil, &groupIn.ID, nil); err != nil {
-		logger.LegacyPrintf("repository.group", "[SchedulerOutbox] enqueue group update failed: group=%d err=%v", groupIn.ID, err)
+	if err := enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventGroupChanged, nil, &groupIn.ID, nil); err != nil {
+		return err
+	}
+	if tx != nil {
+		return tx.Commit()
 	}
 	return nil
 }
@@ -538,6 +632,9 @@ func (r *groupRepository) listWithFiltersQuery(ctx context.Context, q *dbent.Gro
 		}
 	}
 
+	if err := r.hydrateRequestSpeedAvailability(ctx, requestSpeedGroupPointers(outGroups)); err != nil {
+		return nil, nil, err
+	}
 	return outGroups, paginationResultFromTotal(int64(total), params), nil
 }
 
@@ -625,6 +722,9 @@ func (r *groupRepository) listWithAccountCountSort(ctx context.Context, q *dbent
 		}
 	}
 
+	if err := r.hydrateRequestSpeedAvailability(ctx, requestSpeedGroupPointers(outGroups)); err != nil {
+		return nil, nil, err
+	}
 	return outGroups, paginationResultFromTotal(int64(total), params), nil
 }
 
@@ -709,6 +809,9 @@ func (r *groupRepository) ListActive(ctx context.Context) ([]service.Group, erro
 		}
 	}
 
+	if err := r.hydrateRequestSpeedAvailability(ctx, requestSpeedGroupPointers(outGroups)); err != nil {
+		return nil, err
+	}
 	return outGroups, nil
 }
 
@@ -782,6 +885,9 @@ func (r *groupRepository) ListActiveByPlatform(ctx context.Context, platform str
 		}
 	}
 
+	if err := r.hydrateRequestSpeedAvailability(ctx, requestSpeedGroupPointers(outGroups)); err != nil {
+		return nil, err
+	}
 	return outGroups, nil
 }
 

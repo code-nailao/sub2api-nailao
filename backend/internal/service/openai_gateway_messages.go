@@ -32,7 +32,23 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	body []byte,
 	promptCacheKey string,
 	defaultMappedModel string,
-) (*OpenAIForwardResult, error) {
+) (out *OpenAIForwardResult, forwardError error) {
+	defer func() { StampFixedUpstreamRequestTier(ctx, out) }()
+	fixedBody, fixedErr := s.prepareFixedRequestSpeedBody(ctx, account, body, defaultMappedModel, false)
+	if fixedErr != nil {
+		writeAnthropicError(c, http.StatusForbidden, "permission_error", fixedErr.Error())
+		return nil, fixedErr
+	}
+	body = fixedBody
+	if result, handled, err := s.tryForwardDeepSeekTools(ctx, c, account, body, "messages", defaultMappedModel); handled {
+		return result, err
+	}
+	observedHTTPStatus := 0
+	defer func() {
+		if observedHTTPStatus > 0 && forwardError != nil && (out == nil || out.UpstreamRejection == nil) {
+			forwardError = &UpstreamRejectionHTTPError{StatusCode: observedHTTPStatus, Cause: forwardError}
+		}
+	}()
 	// 工具 Schema 清洗必须先于所有分流：下游每条路径（原生 Anthropic 直通、
 	// Chat Completions 转换、Responses 转换）都会把 tools 原样带给上游，而
 	// xAI / Moonshot 等严格校验方会因 input_schema 里的 required:null 或
@@ -433,12 +449,22 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		if err != nil {
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 		}
-		if account.Platform != PlatformGrok || attempt > 0 || resp.StatusCode != http.StatusBadRequest {
+		if account.GetUpstreamRejectionProfile() != "" || account.Platform != PlatformGrok || attempt > 0 || resp.StatusCode != http.StatusBadRequest {
 			break
 		}
 		respBody := s.readUpstreamErrorBody(resp)
 		if resp.Body != nil {
 			_ = resp.Body.Close()
+		}
+		if rejection := DetectUpstreamRejectionHTTP(account, resp.StatusCode, respBody); rejection != nil {
+			result := upstreamRejectionForwardResult(resp, originalModel, billingModel, upstreamModel, clientStream, startTime, rejection)
+			result.UpstreamEndpoint = openAIResponsesUpstreamEndpoint
+			writeAnthropicError(c, rejection.HTTPStatus, "invalid_request_error", "The upstream provider rejected this request under its content policy.")
+			MarkResponseCommitted(c)
+			return result, &UpstreamRejectionError{Evidence: rejection}
+		}
+		if account.GetUpstreamRejectionProfile() != "" {
+			observedHTTPStatus = resp.StatusCode
 		}
 		// Prefer explicit decrypt errors; also strip once on any 400 when the
 		// outbound body still carries reasoning.encrypted_content (account
@@ -469,14 +495,24 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	// 8. Handle error response with failover
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
-		if !agentIdentityTaskRecoveryWasTried(ctx) && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, respBody) {
+		if rejection := DetectUpstreamRejectionHTTP(account, resp.StatusCode, respBody); rejection != nil {
+			result := upstreamRejectionForwardResult(resp, originalModel, billingModel, upstreamModel, clientStream, startTime, rejection)
+			result.UpstreamEndpoint = openAIResponsesUpstreamEndpoint
+			writeAnthropicError(c, rejection.HTTPStatus, "invalid_request_error", "The upstream provider rejected this request under its content policy.")
+			MarkResponseCommitted(c)
+			return result, &UpstreamRejectionError{Evidence: rejection}
+		}
+		if account.GetUpstreamRejectionProfile() != "" {
+			observedHTTPStatus = resp.StatusCode
+		}
+		if account.GetUpstreamRejectionProfile() == "" && !agentIdentityTaskRecoveryWasTried(ctx) && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, respBody) {
 			expectedTaskID := account.GetCredential("task_id")
 			if err := s.recoverAgentIdentityTask(ctx, account, expectedTaskID); err != nil {
 				return nil, fmt.Errorf("agent identity task recovery failed: %w", err)
 			}
 			return s.ForwardAsAnthropic(markAgentIdentityTaskRecoveryTried(ctx), c, account, body, promptCacheKey, defaultMappedModel)
 		}
-		if previousResponseID != "" && (isOpenAICompatPreviousResponseNotFound(resp.StatusCode, upstreamMsg, respBody) || isOpenAICompatPreviousResponseUnsupported(resp.StatusCode, upstreamMsg, respBody)) {
+		if account.GetUpstreamRejectionProfile() == "" && previousResponseID != "" && (isOpenAICompatPreviousResponseNotFound(resp.StatusCode, upstreamMsg, respBody) || isOpenAICompatPreviousResponseUnsupported(resp.StatusCode, upstreamMsg, respBody)) {
 			if isOpenAICompatPreviousResponseUnsupported(resp.StatusCode, upstreamMsg, respBody) {
 				s.disableOpenAICompatSessionContinuation(ctx, c, account, promptCacheKey)
 			} else {
@@ -492,7 +528,7 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		// Grok account-switched history often fails decrypt; strip encrypted
 		// reasoning once at the client-body level so failover accounts can accept
 		// the multi-turn tool continuation instead of cascading 400s.
-		if account.Platform == PlatformGrok &&
+		if account.GetUpstreamRejectionProfile() == "" && account.Platform == PlatformGrok &&
 			isGrokInvalidEncryptedContentResponse(resp.StatusCode, respBody) &&
 			!grokEncryptedContentStripRetried(ctx) {
 			if strippedBody, ok := stripAnthropicThinkingSignatures(body); ok {
@@ -522,16 +558,20 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	// Upstream is always streaming; choose response format based on client preference.
 	var result *OpenAIForwardResult
 	var handleErr error
-	if clientStream {
+	if clientStream && !upstreamRejectionJSONResponse(account, resp) {
 		result, handleErr = s.handleAnthropicStreamingResponse(resp, c, account, originalModel, billingModel, upstreamModel, startTime)
 	} else {
 		// Client wants JSON: buffer the streaming response and assemble a JSON reply.
 		result, handleErr = s.handleAnthropicBufferedStreamingResponse(resp, c, account, originalModel, billingModel, upstreamModel, startTime)
 	}
 
+	if result != nil {
+		result.Stream = clientStream
+	}
+
 	// cyber_policy：标记已设、error 已按 Anthropic 格式发给客户端。丢弃 result、返回哨兵，
 	// 使 handler 落入 tokens=0 免费用量行（对齐 /v1/responses），不计费、不 failover。
-	if GetOpsCyberPolicy(c) != nil {
+	if GetOpsCyberPolicy(c) != nil && (result == nil || result.UpstreamRejection == nil) {
 		if handleErr == nil {
 			handleErr = errOpenAICyberPolicyForwarded
 		}
@@ -609,21 +649,53 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 	billingModel string,
 	upstreamModel string,
 	startTime time.Time,
-) (*OpenAIForwardResult, error) {
+) (result *OpenAIForwardResult, resultErr error) {
+	rejectionObserver := NewUpstreamRejectionObserver(account, resp.StatusCode)
+	defer func() {
+		if evidence := rejectionObserver.Evidence(); evidence != nil {
+			if result == nil {
+				result = upstreamRejectionForwardResult(resp, originalModel, billingModel, upstreamModel, false, startTime, evidence)
+			}
+			result.UpstreamRejection = evidence
+			if resultErr != nil {
+				resultErr = &UpstreamRejectionError{Evidence: evidence}
+			}
+		}
+	}()
+
 	requestID := resp.Header.Get("x-request-id")
 
-	finalResponse, usage, acc, prior, err := s.readOpenAICompatBufferedTerminal(resp, c, account, "openai messages buffered", requestID)
+	var finalResponse *apicompat.ResponsesResponse
+	var usage OpenAIUsage
+	acc := apicompat.NewBufferedResponseAccumulator()
+	prior := newOpenAICompatPriorModelAudit(account)
+	var err error
+	if upstreamRejectionJSONResponse(account, resp) {
+		var body []byte
+		body, err = ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
+		if err == nil {
+			rejectionObserver.ObserveJSON(body)
+			usage, _ = extractOpenAIUsageFromJSONBytes(body)
+			err = json.Unmarshal(body, &finalResponse)
+		}
+	} else {
+		finalResponse, usage, acc, prior, err = s.readOpenAICompatBufferedTerminal(resp, c, account, "openai messages buffered", requestID, rejectionObserver)
+	}
+	if rejectionObserver.Evidence() != nil {
+		result = upstreamRejectionForwardResult(resp, originalModel, billingModel, upstreamModel, false, startTime, rejectionObserver.Evidence())
+		result.Usage = usage
+	}
 	if err != nil {
 		var readErr *openAICompatBufferedReadError
 		if errors.As(err, &readErr) && readErr != nil {
-			return nil, readErr.cause
+			return result, readErr.cause
 		}
-		return nil, err
+		return result, err
 	}
 
 	if finalResponse == nil {
 		writeAnthropicError(c, http.StatusBadGateway, "api_error", "Upstream stream ended without a terminal response event")
-		return nil, fmt.Errorf("upstream stream ended without terminal event")
+		return result, fmt.Errorf("upstream stream ended without terminal event")
 	}
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
@@ -634,6 +706,10 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 	observer.ObserveServiceTier(finalResponse.ServiceTier, true)
 
 	if strings.TrimSpace(finalResponse.Status) == "failed" {
+		if evidence := rejectionObserver.Evidence(); evidence != nil {
+			writeAnthropicError(c, http.StatusBadGateway, "api_error", "The upstream provider rejected this request under its content policy.")
+			return result, &UpstreamRejectionError{Evidence: evidence}
+		}
 		payload, _ := json.Marshal(gin.H{"type": "response.failed", "response": finalResponse})
 		if hit, code, msg := detectOpenAICyberPolicy(payload); hit {
 			MarkOpsCyberPolicy(c, CyberPolicyMark{
@@ -649,11 +725,11 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 				clientMsg = "Request blocked by upstream cyber-security policy"
 			}
 			writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", clientMsg)
-			return nil, fmt.Errorf("openai cyber_policy: %s", msg)
+			return result, fmt.Errorf("openai cyber_policy: %s", msg)
 		}
 		message := openAICompatFailedResponseMessage(finalResponse)
 		if openAIStreamFailedEventShouldFailover(payload, message) {
-			return nil, s.newOpenAIStreamFailoverErrorWithModel(c, account, false, requestID, payload, message, upstreamModel, resp.Header)
+			return result, s.newOpenAIStreamFailoverErrorWithModel(c, account, false, requestID, payload, message, upstreamModel, resp.Header)
 		}
 		message = s.recordOpenAIStreamUpstreamError(c, account, false, requestID, "http_error", payload, message)
 		// 统一走语义状态推断 + body 归一化（与 /v1/responses 路径一致），
@@ -666,10 +742,10 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 			}
 			MarkResponseCommitted(c)
 			writeAnthropicError(c, status, errType, errMsg)
-			return nil, fmt.Errorf("upstream response failed (passthrough): %s", errMsg)
+			return result, fmt.Errorf("upstream response failed (passthrough): %s", errMsg)
 		}
 		writeAnthropicError(c, http.StatusBadGateway, "api_error", message)
-		return nil, fmt.Errorf("upstream response failed: %s", message)
+		return result, fmt.Errorf("upstream response failed: %s", message)
 	}
 	if strings.TrimSpace(finalResponse.Status) == "completed" {
 		logOpenAISuccessMissingUsage(c.Request.Context(), c, account, resp, &usage, "response.completed", false)
@@ -687,7 +763,8 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 	c.Header("Content-Type", "application/json; charset=utf-8")
 	c.JSON(http.StatusOK, anthropicResp)
 
-	result := &OpenAIForwardResult{
+	result = &OpenAIForwardResult{
+		UpstreamTerminalEvent:         upstreamRejectionCompletionEvent(account, "response."+finalResponse.Status),
 		RequestID:                     requestID,
 		UpstreamHeaders:               resp.Header,
 		ResponseID:                    finalResponse.ID,
@@ -832,7 +909,15 @@ func (s *OpenAIGatewayService) readOpenAICompatBufferedTerminal(
 	account *Account,
 	logPrefix string,
 	requestID string,
+	rejectionObservers ...*UpstreamRejectionObserver,
 ) (*apicompat.ResponsesResponse, OpenAIUsage, *apicompat.BufferedResponseAccumulator, openAICompatPriorModelAudit, error) {
+	observeRejection := func(payload []byte) {
+		for _, observer := range rejectionObservers {
+			if observer != nil {
+				observer.ObserveSSEData(payload)
+			}
+		}
+	}
 	acc := apicompat.NewBufferedResponseAccumulator()
 	acc.XAIServerSideSearch = account != nil && account.IsGrok()
 	var usage OpenAIUsage
@@ -922,6 +1007,9 @@ func (s *OpenAIGatewayService) readOpenAICompatBufferedTerminal(
 			if !ok {
 				if frame, ok := parser.Finish(); ok {
 					payload := openAICompatPayloadWithEventType(frame.Data, frame.EventType)
+					if json.Valid([]byte(frame.Data)) {
+						observeRejection([]byte(payload))
+					}
 					payload = string(restoreCodexToolNamesFromContext(c, []byte(payload)))
 					var event apicompat.ResponsesStreamEvent
 					if err := json.Unmarshal([]byte(payload), &event); err == nil {
@@ -963,6 +1051,9 @@ func (s *OpenAIGatewayService) readOpenAICompatBufferedTerminal(
 				continue
 			}
 			payload := openAICompatPayloadWithEventType(frame.Data, frame.EventType)
+			if json.Valid([]byte(frame.Data)) {
+				observeRejection([]byte(payload))
+			}
 			payload = string(restoreCodexToolNamesFromContext(c, []byte(payload)))
 
 			var event apicompat.ResponsesStreamEvent
@@ -1015,7 +1106,20 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 	billingModel string,
 	upstreamModel string,
 	startTime time.Time,
-) (*OpenAIForwardResult, error) {
+) (result *OpenAIForwardResult, resultErr error) {
+	rejectionObserver := NewUpstreamRejectionObserver(account, resp.StatusCode)
+	defer func() {
+		if evidence := rejectionObserver.Evidence(); evidence != nil {
+			if result == nil {
+				result = upstreamRejectionForwardResult(resp, originalModel, billingModel, upstreamModel, true, startTime, evidence)
+			}
+			result.UpstreamRejection = evidence
+			if resultErr != nil {
+				resultErr = &UpstreamRejectionError{Evidence: evidence}
+			}
+		}
+	}()
+
 	requestID := resp.Header.Get("x-request-id")
 	writeStreamHeaders := s.newStreamHeaderWriter(c, resp.Header)
 
@@ -1058,6 +1162,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 	// resultWithUsage builds the final result snapshot.
 	resultWithUsage := func() *OpenAIForwardResult {
 		out := &OpenAIForwardResult{
+			UpstreamTerminalEvent:         upstreamRejectionCompletionEvent(account, terminalEventType),
 			RequestID:                     requestID,
 			UpstreamHeaders:               resp.Header,
 			ResponseID:                    responseID,
@@ -1108,7 +1213,10 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 	}
 
 	// processDataLine handles a single "data: ..." SSE line from upstream.
-	processDataLine := func(payload string) bool {
+	processDataLine := func(payload string, validSourceJSON bool) bool {
+		if validSourceJSON {
+			rejectionObserver.ObserveSSEData([]byte(payload))
+		}
 		payload = string(restoreCodexToolNamesFromContext(c, []byte(payload)))
 		if firstChunk {
 			firstChunk = false
@@ -1179,7 +1287,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 				if isBareErrorEvent {
 					shouldFailover = openAIStreamErrorEventShouldFailover(payloadBytes, message)
 				}
-				if !clientOutputStarted && shouldFailover {
+				if !clientOutputStarted && shouldFailover && rejectionObserver.Evidence() == nil {
 					streamFailoverErr = s.newOpenAIStreamFailoverErrorWithModel(c, account, false, requestID, payloadBytes, message, upstreamModel, resp.Header)
 					return true
 				}
@@ -1283,6 +1391,9 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 			clientDisconnected = true
 		}
 		result := resultWithUsage()
+		if evidence := rejectionObserver.Evidence(); evidence != nil {
+			return result, &UpstreamRejectionError{Evidence: evidence}
+		}
 		if clientDisconnected {
 			return result, fmt.Errorf("stream usage incomplete: missing terminal event")
 		}
@@ -1295,7 +1406,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 	}
 	processFrame := func(frame openAICompatSSEFrame) bool {
 		payload := openAICompatPayloadWithEventType(frame.Data, frame.EventType)
-		return processDataLine(payload)
+		return processDataLine(payload, json.Valid([]byte(frame.Data)))
 	}
 
 	// ── Determine keepalive interval ──

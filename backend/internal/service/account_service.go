@@ -149,6 +149,12 @@ type AccountBillingSettingsRepository interface {
 	) error
 }
 
+// AccountRequestSpeedRepository persists the native account edit, exact group
+// bindings and fixed-upstream tier assignments in a single transaction.
+type AccountRequestSpeedRepository interface {
+	UpdateWithRequestSpeedGroups(ctx context.Context, account *Account, groupIDs *[]int64, mappings *map[string][]string, probeEnabled, rateSyncEnabled *bool, rateMultiplier *float64) error
+}
+
 // AdminAccountRepository makes the account-duplication write capability an explicit
 // construction dependency without forcing read-only gateway test doubles to implement it.
 type AdminAccountRepository interface {
@@ -178,33 +184,35 @@ type AccountBulkUpdate struct {
 
 // CreateAccountRequest 创建账号请求
 type CreateAccountRequest struct {
-	Name               string         `json:"name"`
-	Notes              *string        `json:"notes"`
-	Platform           string         `json:"platform"`
-	Type               string         `json:"type"`
-	Credentials        map[string]any `json:"credentials"`
-	Extra              map[string]any `json:"extra"`
-	ProxyID            *int64         `json:"proxy_id"`
-	Concurrency        int            `json:"concurrency"`
-	Priority           int            `json:"priority"`
-	GroupIDs           []int64        `json:"group_ids"`
-	ExpiresAt          *time.Time     `json:"expires_at"`
-	AutoPauseOnExpired *bool          `json:"auto_pause_on_expired"`
+	Name                     string              `json:"name"`
+	Notes                    *string             `json:"notes"`
+	Platform                 string              `json:"platform"`
+	Type                     string              `json:"type"`
+	Credentials              map[string]any      `json:"credentials"`
+	Extra                    map[string]any      `json:"extra"`
+	ProxyID                  *int64              `json:"proxy_id"`
+	Concurrency              int                 `json:"concurrency"`
+	Priority                 int                 `json:"priority"`
+	GroupIDs                 []int64             `json:"group_ids"`
+	RequestSpeedTiersByGroup map[string][]string `json:"request_speed_tiers_by_group"`
+	ExpiresAt                *time.Time          `json:"expires_at"`
+	AutoPauseOnExpired       *bool               `json:"auto_pause_on_expired"`
 }
 
 // UpdateAccountRequest 更新账号请求
 type UpdateAccountRequest struct {
-	Name               *string         `json:"name"`
-	Notes              *string         `json:"notes"`
-	Credentials        *map[string]any `json:"credentials"`
-	Extra              *map[string]any `json:"extra"`
-	ProxyID            *int64          `json:"proxy_id"`
-	Concurrency        *int            `json:"concurrency"`
-	Priority           *int            `json:"priority"`
-	Status             *string         `json:"status"`
-	GroupIDs           *[]int64        `json:"group_ids"`
-	ExpiresAt          *time.Time      `json:"expires_at"`
-	AutoPauseOnExpired *bool           `json:"auto_pause_on_expired"`
+	Name                     *string              `json:"name"`
+	Notes                    *string              `json:"notes"`
+	Credentials              *map[string]any      `json:"credentials"`
+	Extra                    *map[string]any      `json:"extra"`
+	ProxyID                  *int64               `json:"proxy_id"`
+	Concurrency              *int                 `json:"concurrency"`
+	Priority                 *int                 `json:"priority"`
+	Status                   *string              `json:"status"`
+	GroupIDs                 *[]int64             `json:"group_ids"`
+	RequestSpeedTiersByGroup *map[string][]string `json:"request_speed_tiers_by_group"`
+	ExpiresAt                *time.Time           `json:"expires_at"`
+	AutoPauseOnExpired       *bool                `json:"auto_pause_on_expired"`
 }
 
 // AccountService 账号管理服务
@@ -257,10 +265,6 @@ func (s *AccountService) Create(ctx context.Context, req CreateAccountRequest) (
 		account.AutoPauseOnExpired = true
 	}
 
-	if err := s.accountRepo.Create(ctx, account); err != nil {
-		return nil, fmt.Errorf("create account: %w", err)
-	}
-
 	// require_oauth_only 检查：apikey 类型账号不可加入限制分组
 	if account.Type == AccountTypeAPIKey && len(req.GroupIDs) > 0 {
 		for _, gid := range req.GroupIDs {
@@ -272,6 +276,24 @@ func (s *AccountService) Create(ctx context.Context, req CreateAccountRequest) (
 				return nil, fmt.Errorf("分组 [%s] 仅允许 OAuth 账号，apikey 类型账号无法加入", g.Name)
 			}
 		}
+	}
+
+	if req.RequestSpeedTiersByGroup != nil {
+		mappings, err := NormalizeAccountRequestSpeedMappings(ctx, s.groupRepo, account.Platform, account.Type, req.GroupIDs, req.RequestSpeedTiersByGroup)
+		if err != nil {
+			return nil, err
+		}
+		creator, ok := s.accountRepo.(AccountDuplicateRepository)
+		if !ok {
+			return nil, ErrAccountRequestSpeedUnavailable
+		}
+		if err := creator.CreateWithAccountGroups(ctx, account, accountGroupsWithRequestSpeed(req.GroupIDs, mappings)); err != nil {
+			return nil, err
+		}
+		return account, nil
+	}
+	if err := s.accountRepo.Create(ctx, account); err != nil {
+		return nil, fmt.Errorf("create account: %w", err)
 	}
 
 	// 绑定分组
@@ -381,11 +403,6 @@ func (s *AccountService) Update(ctx context.Context, id int64, req UpdateAccount
 		}
 	}
 
-	// 执行更新
-	if err := s.accountRepo.Update(ctx, account); err != nil {
-		return nil, fmt.Errorf("update account: %w", err)
-	}
-
 	// require_oauth_only 检查
 	if account.Type == AccountTypeAPIKey && req.GroupIDs != nil {
 		for _, gid := range *req.GroupIDs {
@@ -397,6 +414,33 @@ func (s *AccountService) Update(ctx context.Context, id int64, req UpdateAccount
 				return nil, fmt.Errorf("分组 [%s] 仅允许 OAuth 账号，apikey 类型账号无法加入", g.Name)
 			}
 		}
+	}
+
+	requestSpeedUpdater, requestSpeedAtomicSupported := s.accountRepo.(AccountRequestSpeedRepository)
+	if req.RequestSpeedTiersByGroup != nil || (req.GroupIDs != nil && (len(account.RequestSpeedTiersByGroup) > 0 || requestSpeedAtomicSupported)) {
+		groupIDs := account.GroupIDs
+		if req.GroupIDs != nil {
+			groupIDs = *req.GroupIDs
+		}
+		mappings := req.RequestSpeedTiersByGroup
+		if mappings != nil {
+			clean, err := NormalizeAccountRequestSpeedMappings(ctx, s.groupRepo, account.Platform, account.Type, groupIDs, *mappings)
+			if err != nil {
+				return nil, err
+			}
+			mappings = &clean
+		}
+		if !requestSpeedAtomicSupported {
+			return nil, ErrAccountRequestSpeedUnavailable
+		}
+		if err := requestSpeedUpdater.UpdateWithRequestSpeedGroups(ctx, account, req.GroupIDs, mappings, nil, nil, account.RateMultiplier); err != nil {
+			return nil, err
+		}
+		return account, nil
+	}
+	// 执行更新
+	if err := s.accountRepo.Update(ctx, account); err != nil {
+		return nil, fmt.Errorf("update account: %w", err)
 	}
 
 	// 绑定分组

@@ -2,18 +2,24 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"go.uber.org/zap"
 )
 
-const settingKeyImageStorageConfig = "image_storage_config"
+const (
+	settingKeyImageStorageConfig = "image_storage_config"
+	imageStorageRefreshInterval  = 5 * time.Second
+	imageStorageRefreshTimeout   = 3 * time.Second
+)
 
 // ErrImageStorageIncomplete 表示开关已打开但凭证不全，无法启用异步生图。
 var ErrImageStorageIncomplete = errors.New("image storage is enabled but bucket/access_key_id/secret_access_key are incomplete")
@@ -46,8 +52,8 @@ type ImageStorageSettings struct {
 
 // ImageStorageSettingService 读写后台设置，并把结果解析成一个可直接使用的 uploader。
 //
-// 解析结果带缓存：网关每次请求都要判断功能是否开启，不能每次都查库。保存设置时调用
-// Invalidate 清缓存，下一次请求即重建客户端——这是"后台开关立即生效、无需重启"的实现。
+// 解析结果短暂缓存，避免网关每次请求都查库；到期后重新读取有效配置，覆盖其他实例
+// 保存的图片配置和复用的备份 S3 配置。本实例保存后立即刷新，配置变化时才重建客户端。
 type ImageStorageSettingService struct {
 	settingRepo SettingRepository
 	encryptor   SecretEncryptor
@@ -58,10 +64,14 @@ type ImageStorageSettingService struct {
 	// 保证升级前已用配置文件开启该功能的部署不被打断。
 	fallback config.ImageStorageConfig
 
-	mu       sync.Mutex
-	resolved bool
-	uploader *ImageResultUploader
-	enabled  bool
+	mu           sync.Mutex
+	refreshAfter time.Time
+	enabled      bool
+
+	// 保留最后一个可用客户端以复用未变化的配置，但仅在本轮配置检查通过后才返回它。
+	// 不关闭或修改旧对象：已经取得 uploader 的在途上传仍须使用其原始配置完成。
+	uploader   *ImageResultUploader
+	configHash [sha256.Size]byte
 }
 
 func NewImageStorageSettingService(
@@ -93,13 +103,17 @@ func (s *ImageStorageSettingService) resolve() (*ImageResultUploader, bool) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.resolved {
-		return s.uploader, s.enabled
+	if time.Now().Before(s.refreshAfter) {
+		if s.enabled {
+			return s.uploader, true
+		}
+		return nil, false
 	}
 
-	ctx := context.Background()
-	s.resolved = true
-	s.uploader, s.enabled = nil, false
+	ctx, cancel := context.WithTimeout(context.Background(), imageStorageRefreshTimeout)
+	defer cancel()
+	defer func() { s.refreshAfter = time.Now().Add(imageStorageRefreshInterval) }()
+	s.enabled = false
 
 	cfg, err := s.effectiveConfig(ctx)
 	if err != nil {
@@ -115,24 +129,35 @@ func (s *ImageStorageSettingService) resolve() (*ImageResultUploader, bool) {
 		return nil, false
 	}
 
+	encoded, err := json.Marshal(cfg)
+	if err != nil {
+		logger.L().Error("image_storage.config_hash_failed; async image tasks stay disabled", zap.Error(err))
+		return nil, false
+	}
+	configHash := sha256.Sum256(encoded)
+	if s.uploader != nil && s.configHash == configHash {
+		s.enabled = true
+		return s.uploader, true
+	}
+
 	storage, err := s.factory(ctx, cfg)
 	if err != nil {
 		logger.L().Error("image_storage.client_build_failed; async image tasks stay disabled", zap.Error(err))
 		return nil, false
 	}
 	s.uploader = NewImageResultUploader(storage, cfg.Prefix, cfg.MaxDownloadByte, nil)
+	s.configHash = configHash
 	s.enabled = true
 	return s.uploader, true
 }
 
-// Invalidate 丢弃缓存，使下一次请求按最新设置重新解析。
+// Invalidate 使下一次请求重新检查最新配置；配置未变时仍可复用客户端。
 func (s *ImageStorageSettingService) Invalidate() {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
-	s.resolved = false
-	s.uploader = nil
+	s.refreshAfter = time.Time{}
 	s.enabled = false
 	s.mu.Unlock()
 }
@@ -163,7 +188,8 @@ func (s *ImageStorageSettingService) SecretConfigured(ctx context.Context) bool 
 	return settings.SecretAccessKey != ""
 }
 
-// Update 保存设置并立即生效。SecretAccessKey 留空表示沿用已保存的值。
+// Update 保存设置并使本实例立即刷新；其他实例在缓存到期后刷新。
+// SecretAccessKey 留空表示沿用已保存的值。
 func (s *ImageStorageSettingService) Update(ctx context.Context, in ImageStorageSettings) (*ImageStorageSettings, error) {
 	normalizeImageStorageSettings(&in)
 
@@ -294,7 +320,13 @@ func (s *ImageStorageSettingService) load(ctx context.Context) (*ImageStorageSet
 		return nil, nil //nolint:nilnil // no repository means no stored settings
 	}
 	raw, err := s.settingRepo.GetValue(ctx, settingKeyImageStorageConfig)
-	if err != nil || strings.TrimSpace(raw) == "" {
+	if errors.Is(err, ErrSettingNotFound) {
+		return nil, nil //nolint:nilnil // never configured is a valid state
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load image storage settings: %w", err)
+	}
+	if strings.TrimSpace(raw) == "" {
 		return nil, nil //nolint:nilnil // never configured is a valid state
 	}
 	var settings ImageStorageSettings

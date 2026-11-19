@@ -640,9 +640,12 @@ type GeminiCachedContentService struct {
 	cfg    *config.Config
 	now    func() time.Time
 
-	startOnce sync.Once
-	stopOnce  sync.Once
-	stopCh    chan struct{}
+	startOnce   sync.Once
+	stopOnce    sync.Once
+	stopCh      chan struct{}
+	lifecycleMu sync.Mutex
+	stopped     bool
+	recoveryWG  sync.WaitGroup
 }
 
 func NewGeminiCachedContentService(repo GeminiCachedContentRepository, compat *GeminiMessagesCompatService, cfg *config.Config) *GeminiCachedContentService {
@@ -654,7 +657,15 @@ func (s *GeminiCachedContentService) Start() {
 	if s == nil || s.repo == nil {
 		return
 	}
-	s.startOnce.Do(func() { go s.runMutationRecovery() })
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.stopped {
+		return
+	}
+	s.startOnce.Do(func() {
+		s.recoveryWG.Add(1)
+		go func() { defer s.recoveryWG.Done(); s.runMutationRecovery() }()
+	})
 }
 
 // Stop 停止后台回滚恢复。
@@ -662,7 +673,13 @@ func (s *GeminiCachedContentService) Stop() {
 	if s == nil {
 		return
 	}
+	s.lifecycleMu.Lock()
+	s.stopped = true
 	s.stopOnce.Do(func() { close(s.stopCh) })
+	s.lifecycleMu.Unlock()
+	// A taken-over mutation may still be reconciling the upstream expiry and
+	// committing/releasing its lease. Do not close its database underneath it.
+	s.recoveryWG.Wait()
 }
 
 func (s *GeminiCachedContentService) runMutationRecovery() {

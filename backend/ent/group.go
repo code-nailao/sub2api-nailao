@@ -94,6 +94,12 @@ type Group struct {
 	VideoModelPrices map[string]map[string]float64 `json:"video_model_prices,omitempty"`
 	// Codex alpha/search 网页搜索单次价格（USD/次）；nil 表示使用默认价 0.01（官方 $10/1000 次）
 	WebSearchPricePerCall *float64 `json:"web_search_price_per_call,omitempty"`
+	// Enable fixed final billing for verified upstream safety rejections
+	UpstreamRejectionBillingEnabled bool `json:"upstream_rejection_billing_enabled,omitempty"`
+	// Fixed final wallet amount, independent of every multiplier
+	UpstreamRejectionPrice float64 `json:"upstream_rejection_price,omitempty"`
+	// DeepseekTools holds the value of the "deepseek_tools" field.
+	DeepseekTools domain.DeepSeekToolsConfig `json:"deepseek_tools,omitempty"`
 	// 搜索工具价格 per 1000 calls（web_search 等）
 	SearchPricePer1k *float64 `json:"search_price_per_1k,omitempty"`
 	// Voice realtime 每分钟价格（USD）
@@ -126,6 +132,12 @@ type Group struct {
 	AllowMessagesDispatch bool `json:"allow_messages_dispatch,omitempty"`
 	// 是否允许此 OpenAI 分组访问 Live 接口
 	AllowLive bool `json:"allow_live,omitempty"`
+	// OpenAI service tier policy; empty preserves legacy force_fast behavior
+	OpenaiServiceTierPolicy string `json:"openai_service_tier_policy,omitempty"`
+	// RequestSpeedSelectionEnabled holds the value of the "request_speed_selection_enabled" field.
+	RequestSpeedSelectionEnabled bool `json:"request_speed_selection_enabled,omitempty"`
+	// DefaultRequestSpeedTier holds the value of the "default_request_speed_tier" field.
+	DefaultRequestSpeedTier string `json:"default_request_speed_tier,omitempty"`
 	// 是否强制此 OpenAI/Composite 分组请求使用 service_tier=priority
 	ForceOpenaiFast bool `json:"force_openai_fast,omitempty"`
 	// 是否对支持 Ultrafast 的模型强制使用 service_tier=ultrafast（优先于 force_openai_fast）
@@ -264,15 +276,15 @@ func (*Group) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
-		case group.FieldI18n, group.FieldVideoModelPrices, group.FieldModelPricing, group.FieldModelRouting, group.FieldSupportedModelScopes, group.FieldMessagesDispatchModelConfig, group.FieldModelAllowlist, group.FieldCodexModelsManifestConfig, group.FieldReasoningEffortMappings:
+		case group.FieldI18n, group.FieldVideoModelPrices, group.FieldDeepseekTools, group.FieldModelPricing, group.FieldModelRouting, group.FieldSupportedModelScopes, group.FieldMessagesDispatchModelConfig, group.FieldModelAllowlist, group.FieldCodexModelsManifestConfig, group.FieldReasoningEffortMappings:
 			values[i] = new([]byte)
-		case group.FieldPeakRateEnabled, group.FieldIsExclusive, group.FieldAllowImageGeneration, group.FieldAllowBatchImageGeneration, group.FieldImageCountBilling, group.FieldImageRateIndependent, group.FieldVideoRateIndependent, group.FieldLongContextPricingEnabled, group.FieldClaudeCodeOnly, group.FieldModelRoutingEnabled, group.FieldMcpXMLInject, group.FieldAllowMessagesDispatch, group.FieldAllowLive, group.FieldForceOpenaiFast, group.FieldForceOpenaiUltrafast, group.FieldFreeOpenaiFast, group.FieldRequireOauthOnly, group.FieldRequirePrivacySet, group.FieldProfitControlEnabled:
+		case group.FieldPeakRateEnabled, group.FieldIsExclusive, group.FieldAllowImageGeneration, group.FieldAllowBatchImageGeneration, group.FieldImageCountBilling, group.FieldImageRateIndependent, group.FieldVideoRateIndependent, group.FieldUpstreamRejectionBillingEnabled, group.FieldLongContextPricingEnabled, group.FieldClaudeCodeOnly, group.FieldModelRoutingEnabled, group.FieldMcpXMLInject, group.FieldAllowMessagesDispatch, group.FieldAllowLive, group.FieldRequestSpeedSelectionEnabled, group.FieldForceOpenaiFast, group.FieldForceOpenaiUltrafast, group.FieldFreeOpenaiFast, group.FieldRequireOauthOnly, group.FieldRequirePrivacySet, group.FieldProfitControlEnabled:
 			values[i] = new(sql.NullBool)
-		case group.FieldRateMultiplier, group.FieldPeakRateMultiplier, group.FieldDailyLimitUsd, group.FieldWeeklyLimitUsd, group.FieldMonthlyLimitUsd, group.FieldImageRateMultiplier, group.FieldImagePrice1k, group.FieldImagePrice2k, group.FieldImagePrice4k, group.FieldBatchImageDiscountMultiplier, group.FieldBatchImageHoldMultiplier, group.FieldVideoRateMultiplier, group.FieldVideoPrice480p, group.FieldVideoPrice720p, group.FieldVideoPrice1080p, group.FieldWebSearchPricePerCall, group.FieldSearchPricePer1k, group.FieldAudioRealtimePricePerMin, group.FieldAudioTtsPricePerMillionChars, group.FieldAudioSttPricePerHour, group.FieldProfitMinMargin, group.FieldProfitSafetyBuffer:
+		case group.FieldRateMultiplier, group.FieldPeakRateMultiplier, group.FieldDailyLimitUsd, group.FieldWeeklyLimitUsd, group.FieldMonthlyLimitUsd, group.FieldImageRateMultiplier, group.FieldImagePrice1k, group.FieldImagePrice2k, group.FieldImagePrice4k, group.FieldBatchImageDiscountMultiplier, group.FieldBatchImageHoldMultiplier, group.FieldVideoRateMultiplier, group.FieldVideoPrice480p, group.FieldVideoPrice720p, group.FieldVideoPrice1080p, group.FieldWebSearchPricePerCall, group.FieldUpstreamRejectionPrice, group.FieldSearchPricePer1k, group.FieldAudioRealtimePricePerMin, group.FieldAudioTtsPricePerMillionChars, group.FieldAudioSttPricePerHour, group.FieldProfitMinMargin, group.FieldProfitSafetyBuffer:
 			values[i] = new(sql.NullFloat64)
 		case group.FieldID, group.FieldDefaultValidityDays, group.FieldFallbackGroupID, group.FieldFallbackGroupIDOnInvalidRequest, group.FieldSortOrder, group.FieldRpmLimit:
 			values[i] = new(sql.NullInt64)
-		case group.FieldName, group.FieldDescription, group.FieldPeakStart, group.FieldPeakEnd, group.FieldStatus, group.FieldDuplicateOperationID, group.FieldPlatform, group.FieldSubscriptionType, group.FieldDefaultMappedModel, group.FieldMaxReasoningEffort, group.FieldMaxReasoningEffortOverLimit:
+		case group.FieldName, group.FieldDescription, group.FieldPeakStart, group.FieldPeakEnd, group.FieldStatus, group.FieldDuplicateOperationID, group.FieldPlatform, group.FieldSubscriptionType, group.FieldOpenaiServiceTierPolicy, group.FieldDefaultRequestSpeedTier, group.FieldDefaultMappedModel, group.FieldMaxReasoningEffort, group.FieldMaxReasoningEffortOverLimit:
 			values[i] = new(sql.NullString)
 		case group.FieldCreatedAt, group.FieldUpdatedAt, group.FieldDeletedAt:
 			values[i] = new(sql.NullTime)
@@ -536,6 +548,26 @@ func (_m *Group) assignValues(columns []string, values []any) error {
 				_m.WebSearchPricePerCall = new(float64)
 				*_m.WebSearchPricePerCall = value.Float64
 			}
+		case group.FieldUpstreamRejectionBillingEnabled:
+			if value, ok := values[i].(*sql.NullBool); !ok {
+				return fmt.Errorf("unexpected type %T for field upstream_rejection_billing_enabled", values[i])
+			} else if value.Valid {
+				_m.UpstreamRejectionBillingEnabled = value.Bool
+			}
+		case group.FieldUpstreamRejectionPrice:
+			if value, ok := values[i].(*sql.NullFloat64); !ok {
+				return fmt.Errorf("unexpected type %T for field upstream_rejection_price", values[i])
+			} else if value.Valid {
+				_m.UpstreamRejectionPrice = value.Float64
+			}
+		case group.FieldDeepseekTools:
+			if value, ok := values[i].(*[]byte); !ok {
+				return fmt.Errorf("unexpected type %T for field deepseek_tools", values[i])
+			} else if value != nil && len(*value) > 0 {
+				if err := json.Unmarshal(*value, &_m.DeepseekTools); err != nil {
+					return fmt.Errorf("unmarshal field deepseek_tools: %w", err)
+				}
+			}
 		case group.FieldSearchPricePer1k:
 			if value, ok := values[i].(*sql.NullFloat64); !ok {
 				return fmt.Errorf("unexpected type %T for field search_price_per_1k", values[i])
@@ -643,6 +675,24 @@ func (_m *Group) assignValues(columns []string, values []any) error {
 				return fmt.Errorf("unexpected type %T for field allow_live", values[i])
 			} else if value.Valid {
 				_m.AllowLive = value.Bool
+			}
+		case group.FieldOpenaiServiceTierPolicy:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field openai_service_tier_policy", values[i])
+			} else if value.Valid {
+				_m.OpenaiServiceTierPolicy = value.String
+			}
+		case group.FieldRequestSpeedSelectionEnabled:
+			if value, ok := values[i].(*sql.NullBool); !ok {
+				return fmt.Errorf("unexpected type %T for field request_speed_selection_enabled", values[i])
+			} else if value.Valid {
+				_m.RequestSpeedSelectionEnabled = value.Bool
+			}
+		case group.FieldDefaultRequestSpeedTier:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field default_request_speed_tier", values[i])
+			} else if value.Valid {
+				_m.DefaultRequestSpeedTier = value.String
 			}
 		case group.FieldForceOpenaiFast:
 			if value, ok := values[i].(*sql.NullBool); !ok {
@@ -961,6 +1011,15 @@ func (_m *Group) String() string {
 		builder.WriteString(fmt.Sprintf("%v", *v))
 	}
 	builder.WriteString(", ")
+	builder.WriteString("upstream_rejection_billing_enabled=")
+	builder.WriteString(fmt.Sprintf("%v", _m.UpstreamRejectionBillingEnabled))
+	builder.WriteString(", ")
+	builder.WriteString("upstream_rejection_price=")
+	builder.WriteString(fmt.Sprintf("%v", _m.UpstreamRejectionPrice))
+	builder.WriteString(", ")
+	builder.WriteString("deepseek_tools=")
+	builder.WriteString(fmt.Sprintf("%v", _m.DeepseekTools))
+	builder.WriteString(", ")
 	if v := _m.SearchPricePer1k; v != nil {
 		builder.WriteString("search_price_per_1k=")
 		builder.WriteString(fmt.Sprintf("%v", *v))
@@ -1020,6 +1079,15 @@ func (_m *Group) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("allow_live=")
 	builder.WriteString(fmt.Sprintf("%v", _m.AllowLive))
+	builder.WriteString(", ")
+	builder.WriteString("openai_service_tier_policy=")
+	builder.WriteString(_m.OpenaiServiceTierPolicy)
+	builder.WriteString(", ")
+	builder.WriteString("request_speed_selection_enabled=")
+	builder.WriteString(fmt.Sprintf("%v", _m.RequestSpeedSelectionEnabled))
+	builder.WriteString(", ")
+	builder.WriteString("default_request_speed_tier=")
+	builder.WriteString(_m.DefaultRequestSpeedTier)
 	builder.WriteString(", ")
 	builder.WriteString("force_openai_fast=")
 	builder.WriteString(fmt.Sprintf("%v", _m.ForceOpenaiFast))

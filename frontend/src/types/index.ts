@@ -576,7 +576,14 @@ export interface GroupLocaleText {
 export type GroupI18n = Record<string, GroupLocaleText>
 
 // 用户侧接口返回的 name / description 已由后端按请求语言（Accept-Language）选好
+export interface DeepSeekToolsConfig { enabled: boolean; auto_inject: boolean; account_id?: number | null; fetch_price_per_1k: number | null }
+
+export type RequestSpeedTier = 'fast' | 'ultrafast'
+
 export interface Group {
+  request_speed_selection_enabled?: boolean
+  default_request_speed_tier?: RequestSpeedTier
+  available_request_speed_tiers?: RequestSpeedTier[]
   id: number
   name: string
   description: string | null
@@ -592,6 +599,8 @@ export interface Group {
   daily_limit_usd: number | null
   weekly_limit_usd: number | null
   monthly_limit_usd: number | null
+  upstream_rejection_billing_enabled?: boolean
+  upstream_rejection_price?: number
   long_context_pricing_enabled: boolean
   // 图片生成计费配置
   allow_image_generation: boolean
@@ -614,6 +623,7 @@ export interface Group {
   // Codex 网页搜索单次价格（USD/次）；null 表示使用默认价 0.01
   web_search_price_per_call: number | null
   // Grok Voice 显式定价（分组级）
+  deepseek_tools?: DeepSeekToolsConfig
   search_price_per_1k: number | null
   audio_realtime_price_per_min: number | null
   audio_tts_price_per_million_chars: number | null
@@ -643,6 +653,7 @@ export interface AdminGroup extends Group {
   // 管理端的 name / description 始终是原字段，各语言译文另放在 i18n 里
   i18n?: GroupI18n
   force_openai_fast: boolean
+  openai_service_tier_policy?: string | null
   force_openai_ultrafast: boolean
   free_openai_fast: boolean
   model_pricing: import('@/api/admin/channels').ChannelModelPricing[]
@@ -747,6 +758,8 @@ export interface CompositeRouteDecision {
 }
 
 export interface ApiKey {
+  request_speed_tier?: RequestSpeedTier | null
+  deepseek_tool_mode?: 'inherit' | 'enabled' | 'disabled'
   id: number
   user_id: number
   key: string
@@ -779,6 +792,8 @@ export interface ApiKey {
 }
 
 export interface CreateApiKeyRequest {
+  request_speed_tier?: RequestSpeedTier | null
+  deepseek_tool_mode?: 'inherit' | 'enabled' | 'disabled'
   name: string
   group_id?: number | null
   custom_key?: string // Optional custom API Key
@@ -792,6 +807,8 @@ export interface CreateApiKeyRequest {
 }
 
 export interface UpdateApiKeyRequest {
+  request_speed_tier?: RequestSpeedTier | null
+  deepseek_tool_mode?: 'inherit' | 'enabled' | 'disabled'
   name?: string
   group_id?: number | null
   status?: 'active' | 'inactive'
@@ -807,6 +824,8 @@ export interface UpdateApiKeyRequest {
 }
 
 export interface CreateGroupRequest {
+  request_speed_selection_enabled?: boolean
+  default_request_speed_tier?: RequestSpeedTier
   name: string
   description?: string | null
   i18n?: GroupI18n
@@ -817,8 +836,11 @@ export interface CreateGroupRequest {
   daily_limit_usd?: number | null
   weekly_limit_usd?: number | null
   monthly_limit_usd?: number | null
+  upstream_rejection_billing_enabled?: boolean
+  upstream_rejection_price?: number
   long_context_pricing_enabled?: boolean
   force_openai_fast?: boolean
+  openai_service_tier_policy?: string | null
   force_openai_ultrafast?: boolean
   free_openai_fast?: boolean
   model_pricing?: import('@/api/admin/channels').ChannelModelPricing[]
@@ -839,6 +861,7 @@ export interface CreateGroupRequest {
   video_price_1080p?: number | null
   video_model_prices?: VideoModelPrices
   web_search_price_per_call?: number | null
+  deepseek_tools?: DeepSeekToolsConfig
   search_price_per_1k?: number | null
   audio_realtime_price_per_min?: number | null
   audio_tts_price_per_million_chars?: number | null
@@ -875,6 +898,8 @@ export interface CreateGroupRequest {
 }
 
 export interface UpdateGroupRequest {
+  request_speed_selection_enabled?: boolean
+  default_request_speed_tier?: RequestSpeedTier
   name?: string
   description?: string | null
   i18n?: GroupI18n
@@ -886,8 +911,11 @@ export interface UpdateGroupRequest {
   daily_limit_usd?: number | null
   weekly_limit_usd?: number | null
   monthly_limit_usd?: number | null
+  upstream_rejection_billing_enabled?: boolean
+  upstream_rejection_price?: number
   long_context_pricing_enabled?: boolean
   force_openai_fast?: boolean
+  openai_service_tier_policy?: string | null
   force_openai_ultrafast?: boolean
   free_openai_fast?: boolean
   model_pricing?: import('@/api/admin/channels').ChannelModelPricing[]
@@ -908,6 +936,7 @@ export interface UpdateGroupRequest {
   video_price_1080p?: number | null
   video_model_prices?: VideoModelPrices
   web_search_price_per_call?: number | null
+  deepseek_tools?: DeepSeekToolsConfig
   search_price_per_1k?: number | null
   audio_realtime_price_per_min?: number | null
   audio_tts_price_per_million_chars?: number | null
@@ -1266,6 +1295,7 @@ export interface GrokModelDiagnostics {
 }
 
 export interface Account {
+  request_speed_tiers_by_group?: Record<string, RequestSpeedTier[]>
   id: number
   name: string
   notes?: string | null
@@ -1605,6 +1635,7 @@ export interface OpenAIResponsesState {
 }
 
 export interface CreateAccountRequest {
+  request_speed_tiers_by_group?: Record<string, RequestSpeedTier[]>
   name: string
   notes?: string | null
   platform: AccountPlatform
@@ -1624,6 +1655,7 @@ export interface CreateAccountRequest {
 }
 
 export interface UpdateAccountRequest {
+  request_speed_tiers_by_group?: Record<string, RequestSpeedTier[]>
   name?: string
   notes?: string | null
   type?: AccountType
@@ -1822,6 +1854,25 @@ export type UsageRequestType = 'unknown' | 'sync' | 'stream' | 'ws_v2' | 'cyber'
 export type ImageSizeSource = 'output' | 'input' | 'default' | 'legacy'
 export type ImageSizeBreakdown = Record<string, number>
 
+// Content-fee customer snapshots contain only charge_kind and fixed_charge.
+// Normal usage retains its historical tier-pricing fields.
+export interface UsageBillingSnapshot {
+  deepseek_tools?: { search_count: number; fetch_count: number; search_price_per_call: number; fetch_price_per_call: number; standalone?: boolean }
+  version?: number
+  charge_kind?: string
+  fixed_charge?: number
+  requested_tier?: string | null
+  forwarded_tier?: string
+  observed_tier?: string
+  billed_tier?: string
+  tier_multiplier?: number
+  charged_tier_multiplier?: number
+  group_multiplier?: number
+  effective_rate_multiplier?: number
+  free_fast_applied?: boolean
+  effective_unit_prices?: Record<string, number>
+}
+
 export interface UsageLog {
   id: number
   user_id: number
@@ -1830,6 +1881,7 @@ export interface UsageLog {
   request_id: string
   model: string
   service_tier?: string | null
+  billing_snapshot?: UsageBillingSnapshot | null
   reasoning_effort?: string | null
   inbound_endpoint?: string | null
   upstream_endpoint?: string | null

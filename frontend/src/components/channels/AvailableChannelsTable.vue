@@ -111,6 +111,7 @@
                     <Icon name="clock" size="xs" class="h-3 w-3" />
                     {{ peakRateLabel(g) }}
                   </span>
+                  <UpstreamRejectionNotice :group="g" />
                 </div>
               </div>
               <div
@@ -145,6 +146,7 @@
                     <Icon name="clock" size="xs" class="h-3 w-3" />
                     {{ peakRateLabel(g) }}
                   </span>
+                  <UpstreamRejectionNotice :group="g" />
                 </div>
               </div>
               <span v-if="section.groups.length === 0" class="text-xs text-gray-400">-</span>
@@ -250,6 +252,7 @@
                         <Icon name="clock" size="xs" class="h-3 w-3" />
                         {{ peakRateLabel(g) }}
                       </span>
+                      <UpstreamRejectionNotice :group="g" />
                     </div>
                   </div>
                   <div
@@ -285,6 +288,7 @@
                         <Icon name="clock" size="xs" class="h-3 w-3" />
                         {{ peakRateLabel(g) }}
                       </span>
+                      <UpstreamRejectionNotice :group="g" />
                     </div>
                   </div>
                   <span v-if="section.groups.length === 0" class="text-xs text-gray-400">-</span>
@@ -324,6 +328,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/icons/Icon.vue'
 import PlatformIcon from '@/components/common/PlatformIcon.vue'
 import GroupBadge from '@/components/common/GroupBadge.vue'
+import UpstreamRejectionNotice from '@/components/common/UpstreamRejectionNotice.vue'
 import SupportedModelChip from './SupportedModelChip.vue'
 import type { UserAvailableChannel, UserAvailableGroup, UserChannelPlatformSection } from '@/api/channels'
 import type { GroupPlatform, SubscriptionType } from '@/types'

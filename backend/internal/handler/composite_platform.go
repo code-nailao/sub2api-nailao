@@ -109,6 +109,7 @@ func bindRequestedReasoningEffort(c *gin.Context, body []byte, model string) {
 	if c == nil || c.Request == nil {
 		return
 	}
+	c.Request = c.Request.WithContext(service.WithRequestedOpenAIServiceTier(c.Request.Context(), gjson.GetBytes(body, "service_tier").String()))
 	effort := service.CanonicalRequestedReasoningEffort(body, model)
 	if effort == nil {
 		return
@@ -117,13 +118,18 @@ func bindRequestedReasoningEffort(c *gin.Context, body []byte, model string) {
 }
 
 func stampOpenAIRequestedReasoningEffort(result *service.OpenAIForwardResult, c *gin.Context) {
-	if result == nil || result.RequestedReasoningEffort != nil {
+	if result == nil {
 		return
 	}
 	if c == nil || c.Request == nil {
 		return
 	}
-	result.RequestedReasoningEffort = service.RequestedReasoningEffortFromContext(c.Request.Context())
+	if result.RequestedServiceTier == nil {
+		result.RequestedServiceTier = service.RequestedOpenAIServiceTierFromContext(c.Request.Context())
+	}
+	if result.RequestedReasoningEffort == nil {
+		result.RequestedReasoningEffort = service.RequestedReasoningEffortFromContext(c.Request.Context())
+	}
 }
 
 func stampForwardRequestedReasoningEffort(result *service.ForwardResult, requested *string) {

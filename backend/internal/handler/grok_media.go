@@ -163,25 +163,33 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 		defer userReleaseFunc()
 	}
 
-	if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(c.Request.Context(), apiKey)); err != nil {
-		reqLog.Info("grok_media.billing_eligibility_check_failed", zap.Error(err))
-		status, code, message, retryAfter := billingErrorDetails(err)
-		if retryAfter > 0 {
-			c.Header("Retry-After", strconv.Itoa(retryAfter))
+	// Retrieval observes an already admitted task; it does not buy a new
+	// generation. Strict task-owner checks below still apply to every lookup.
+	if endpoint.IsGenerationRequest() {
+		if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(c.Request.Context(), apiKey)); err != nil {
+			reqLog.Info("grok_media.billing_eligibility_check_failed", zap.Error(err))
+			status, code, message, retryAfter := billingErrorDetails(err)
+			if retryAfter > 0 {
+				c.Header("Retry-After", strconv.Itoa(retryAfter))
+			}
+			h.errorResponse(c, status, code, message)
+			return
 		}
-		h.errorResponse(c, status, code, message)
-		return
 	}
 
-	// 余额模式在途预留（与计费同口径估算；计费任务扣减余额缓存后才释放）。
-	inflightDone, inflightErr := reserveInflightBalance(c, h.billingCacheService, h.gatewayService, apiKey, subscription, grokMediaInflightEstimate(endpoint, routingModel, requestInfo, body))
-	if inflightErr != nil {
-		status, code, message, retryAfter := billingErrorDetails(inflightErr)
-		if retryAfter > 0 {
-			c.Header("Retry-After", strconv.Itoa(retryAfter))
+	// Read-only task lookups never reserve additional generation funds.
+	inflightDone := inflightNoop
+	if endpoint.IsGenerationRequest() {
+		var inflightErr error
+		inflightDone, inflightErr = reserveInflightBalance(c, h.billingCacheService, h.gatewayService, apiKey, subscription, grokMediaInflightEstimate(endpoint, routingModel, requestInfo, body))
+		if inflightErr != nil {
+			status, code, message, retryAfter := billingErrorDetails(inflightErr)
+			if retryAfter > 0 {
+				c.Header("Retry-After", strconv.Itoa(retryAfter))
+			}
+			h.errorResponse(c, status, code, message)
+			return
 		}
-		h.errorResponse(c, status, code, message)
-		return
 	}
 	defer inflightDone()
 
@@ -191,8 +199,21 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 	}
 	sessionHash := h.gatewayService.GenerateExplicitSessionHash(c, sessionSeed)
 	boundLookupAccountID := int64(0)
+	var lookupRejectionReservation *service.UpstreamRejectionReservation
 	if endpoint.IsVideoLookupRequest() {
 		sessionHash = service.GrokMediaVideoRequestSessionHash(requestID, subject.UserID, apiKey.ID)
+		lookupRejectionReservation, err = h.gatewayService.LoadGrokVideoRejectionReservation(c.Request.Context(), requestID, subject.UserID, apiKey.ID)
+		if err != nil {
+			h.errorResponse(c, http.StatusServiceUnavailable, "billing_unavailable", "Video billing state is unavailable")
+			return
+		}
+		if lookupRejectionReservation != nil {
+			apiKey, err = service.RestoreGrokVideoRejectionBillingKey(apiKey, lookupRejectionReservation)
+			if err != nil {
+				h.errorResponse(c, http.StatusNotFound, "not_found_error", "Video request not found")
+				return
+			}
+		}
 		boundLookupAccountID, err = h.gatewayService.ResolveGrokMediaVideoRequestAccount(
 			c.Request.Context(), apiKey.GroupID, requestID, subject.UserID, apiKey.ID,
 		)
@@ -239,7 +260,9 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 		}
 		var selection *service.AccountSelectionResult
 		var scheduleDecision service.OpenAIAccountScheduleDecision
-		if boundLookupAccountID > 0 {
+		if lookupRejectionReservation != nil {
+			selection, scheduleDecision, err = h.gatewayService.SelectGrokVideoRejectionTaskAccount(requestCtx, lookupRejectionReservation)
+		} else if boundLookupAccountID > 0 {
 			selection, scheduleDecision, err = h.gatewayService.SelectMediaVideoRequestAccount(
 				requestCtx, apiKey.GroupID, sessionHash, boundLookupAccountID, routingModel, platform,
 			)
@@ -381,6 +404,18 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 		}
 
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
+		var rejectionAttempt *service.UpstreamRejectionBillingAttempt
+		if endpoint.IsGenerationRequest() && !endpoint.IsSeedance() {
+			rejectionAttempt, err = h.gatewayService.BeginUpstreamRejectionBilling(requestCtx, apiKey, account, requestModel, body)
+			if err != nil {
+				releaseAccount()
+				status, code, message := upstreamRejectionAdmissionError(err)
+				h.errorResponse(c, status, code, message)
+				return
+			}
+			requestCtx = service.WithUpstreamRejectionBillingAttempt(requestCtx, rejectionAttempt)
+			c.Request = c.Request.WithContext(service.WithUpstreamRejectionBillingAttempt(c.Request.Context(), rejectionAttempt))
+		}
 		forwardStart := time.Now()
 		writerSizeBeforeForward := c.Writer.Size()
 		result, err := func() (*service.OpenAIForwardResult, error) {
@@ -388,8 +423,15 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 			if endpoint.IsSeedance() {
 				return h.gatewayService.ForwardSeedance(requestCtx, c, account, endpoint, requestID, body)
 			}
-			return h.gatewayService.ForwardGrokMedia(requestCtx, c, account, endpoint, requestID, body, contentType)
+			forwardAccount := grokMediaAccountForReservation(account, lookupRejectionReservation)
+			return h.gatewayService.ForwardGrokMedia(requestCtx, c, forwardAccount, endpoint, requestID, body, contentType)
 		}()
+		if finishErr := h.gatewayService.FinishUpstreamRejectionBillingAttempt(requestCtx, rejectionAttempt, result, err); finishErr != nil {
+			err = finishErr
+		}
+		if result != nil && lookupRejectionReservation != nil {
+			result.UpstreamRejectionReservationID = lookupRejectionReservation.RequestID
+		}
 
 		forwardDurationMs := time.Since(forwardStart).Milliseconds()
 		upstreamLatencyMs, _ := getContextInt64(c, service.OpsUpstreamLatencyMsKey)
@@ -398,6 +440,17 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 			responseLatencyMs = forwardDurationMs - upstreamLatencyMs
 		}
 		service.SetOpsLatencyMs(c, service.OpsResponseLatencyMsKey, responseLatencyMs)
+		if result != nil && result.UpstreamRejection != nil {
+			// Charged refusals are terminal outcomes, never account failures or pool
+			// retries. Lookups may only settle their create-time durable operation.
+			if endpoint.IsVideoLookupRequest() {
+				result = prepareGrokVideoRejectionBilling(result, lookupRejectionReservation, requestID)
+			}
+			if result != nil {
+				recordGrokMediaUsage(c, h, reqLog, apiKey, subject, subscription, account, result, result.Model, body, requestID)
+			}
+			return
+		}
 
 		if err != nil {
 			var failoverErr *service.UpstreamFailoverError
@@ -490,6 +543,8 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 			// model/duration/resolution so status can still price if upstream omits them.
 			// Retry once: missing pending causes silent underpricing (status omits resolution).
 			pending := service.GrokVideoPendingBilling{
+				UpstreamRejectionReservationID: result.UpstreamRejectionReservationID,
+				VideoBasePricePerSecond:        result.VideoBasePricePerSecond, VideoFinalPricePerSecond: result.VideoFinalPricePerSecond,
 				Model:                requestModel,
 				BillingModel:         firstNonEmptyString(result.BillingModel, requestModel),
 				UpstreamModel:        result.UpstreamModel,
@@ -592,6 +647,9 @@ func shouldRecordGrokMediaUsage(endpoint service.GrokMediaEndpoint, requestModel
 	if result == nil {
 		return false
 	}
+	if result.UpstreamRejection != nil {
+		return endpoint.IsGenerationRequest() && strings.TrimSpace(requestModel) != ""
+	}
 	if isGrokVideoCreateEndpoint(endpoint) || endpoint.IsVideoLookupRequest() {
 		return false
 	}
@@ -658,6 +716,9 @@ func prepareGrokVideoCompletionBilling(
 	// Re-merge with pending: resolution is request-only; model/duration fill gaps.
 	merged := *statusResult
 	if pending != nil {
+		merged.UpstreamRejectionReservationID = pending.UpstreamRejectionReservationID
+		merged.VideoBasePricePerSecond = pending.VideoBasePricePerSecond
+		merged.VideoFinalPricePerSecond = pending.VideoFinalPricePerSecond
 		if strings.TrimSpace(merged.Model) == "" {
 			merged.Model = firstNonEmptyString(pending.BillingModel, pending.Model, pending.OriginalModel)
 		}
@@ -686,7 +747,8 @@ func prepareGrokVideoCompletionBilling(
 	}
 	// Always force durable task id so usage_billing_dedup survives multi-poll +
 	// context-local request ids (do not prefer empty-only fill).
-	merged.RequestID = service.StableGrokVideoBillingRequestID(firstNonEmptyString(merged.ResponseID, taskRequestID))
+	merged.RequestID = firstNonEmptyString(merged.UpstreamRejectionReservationID,
+		service.StableGrokVideoBillingRequestID(firstNonEmptyString(merged.ResponseID, taskRequestID)))
 	merged.ResponseID = firstNonEmptyString(merged.ResponseID, taskRequestID)
 	merged.VideoCount = 1
 	// Pure video: do not keep legacy ImageCount (avoids image-path heuristics).
@@ -749,7 +811,9 @@ func recordGrokMediaUsage(
 	videoTaskID := ""
 	if result != nil && (result.VideoCount > 0 || strings.HasPrefix(result.ResponseID, "seedance:")) {
 		videoTaskID = strings.TrimSpace(firstNonEmptyString(requestID, result.ResponseID))
-		if stable := service.StableGrokVideoBillingRequestID(firstNonEmptyString(result.ResponseID, requestID)); stable != "" {
+		if result.UpstreamRejectionReservationID != "" {
+			result.RequestID = result.UpstreamRejectionReservationID
+		} else if stable := service.StableGrokVideoBillingRequestID(firstNonEmptyString(result.ResponseID, requestID)); stable != "" {
 			result.RequestID = stable
 		}
 		// Prefer task id hash for payload fingerprint stability across status/content.

@@ -58,6 +58,7 @@ type DashboardAggregationService struct {
 	timingWheel          *TimingWheelService
 	cfg                  config.DashboardAggregationConfig
 	settingRepo          SettingRepository
+	externalCleanup      externalCleanupOwnership
 	running              int32
 	lastRetentionCleanup atomic.Value // time.Time
 
@@ -387,13 +388,17 @@ func (s *DashboardAggregationService) maybeCleanupRetention(ctx context.Context,
 	}
 
 	var aggErr, usageErr, dedupErr error
-	if s.cfg.Enabled {
+	external, ownershipErr := s.externalCleanup.read(ctx, s.settingRepo)
+	if ownershipErr != nil {
+		logger.LegacyPrintf("service.dashboard_aggregation", "[DashboardAggregation] controlled log retention skipped: %v", ownershipErr)
+	}
+	if s.cfg.Enabled && !external {
 		aggErr = s.repo.CleanupAggregates(ctx, hourlyCutoff, dailyCutoff)
 	}
 	if aggErr != nil {
 		logger.LegacyPrintf("service.dashboard_aggregation", "[DashboardAggregation] 聚合保留清理失败: %v", aggErr)
 	}
-	if usageDays > 0 {
+	if usageDays > 0 && !external {
 		usageErr = s.repo.CleanupUsageLogs(ctx, usageCutoff)
 	}
 	if usageErr != nil {
@@ -405,7 +410,7 @@ func (s *DashboardAggregationService) maybeCleanupRetention(ctx context.Context,
 	if dedupErr != nil {
 		logger.LegacyPrintf("service.dashboard_aggregation", "[DashboardAggregation] usage_billing_dedup 保留清理失败: %v", dedupErr)
 	}
-	if aggErr == nil && usageErr == nil && dedupErr == nil {
+	if aggErr == nil && usageErr == nil && dedupErr == nil && ownershipErr == nil {
 		s.lastRetentionCleanup.Store(now)
 	}
 }

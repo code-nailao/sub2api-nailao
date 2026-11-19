@@ -149,7 +149,7 @@ func createAccountRecord(ctx context.Context, client *dbent.Client, account *ser
 		SetPlatform(account.Platform).
 		SetType(account.Type).
 		SetCredentials(normalizeJSONMap(account.Credentials)).
-		SetExtra(normalizeJSONMap(account.Extra)).
+		SetExtra(normalizeJSONMap(stripWalletConfig(account.Extra))).
 		SetConcurrency(account.Concurrency).
 		SetPriority(account.Priority).
 		SetStatus(account.Status).
@@ -211,6 +211,13 @@ func createAccountRecord(ctx context.Context, client *dbent.Client, account *ser
 // CreateWithAccountGroups atomically persists an account, its exact per-group priorities,
 // and the scheduler outbox event used to publish the new routing snapshot.
 func (r *accountRepository) CreateWithAccountGroups(ctx context.Context, account *service.Account, groups []service.AccountGroup) error {
+	if scoped := r.accountTransactionScope(ctx); scoped != r {
+		err := scoped.CreateWithAccountGroups(ctx, account, groups)
+		if err == nil {
+			service.AfterAccountCommit(ctx, func(committed context.Context) { r.syncSchedulerAccountSnapshot(committed, account.ID) })
+		}
+		return err
+	}
 	if account == nil {
 		return service.ErrAccountNilInput
 	}
@@ -227,6 +234,9 @@ func (r *accountRepository) CreateWithAccountGroups(ctx context.Context, account
 		// Reuse a caller-owned transaction when this repository is already transactional.
 		txClient = r.client
 	}
+	if _, err := txClient.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('sources_request_speed_config', 0))`); err != nil {
+		return err
+	}
 	groupIDs := make([]int64, 0, len(groups))
 	for i := range groups {
 		groupIDs = append(groupIDs, groups[i].GroupID)
@@ -235,6 +245,9 @@ func (r *accountRepository) CreateWithAccountGroups(ctx context.Context, account
 		return err
 	}
 
+	if err := validateLockedAccountRequestSpeeds(ctx, txClient, account, groups, true); err != nil {
+		return err
+	}
 	if err := createAccountRecord(ctx, txClient, account); err != nil {
 		return err
 	}
@@ -245,7 +258,8 @@ func (r *accountRepository) CreateWithAccountGroups(ctx context.Context, account
 			builders = append(builders, txClient.AccountGroup.Create().
 				SetAccountID(account.ID).
 				SetGroupID(groups[i].GroupID).
-				SetPriority(groups[i].Priority),
+				SetPriority(groups[i].Priority).
+				SetRequestSpeedTiers(append([]string{}, groups[i].RequestSpeedTiers...)),
 			)
 		}
 		if _, err := txClient.AccountGroup.CreateBulk(builders...).Save(ctx); err != nil {
@@ -254,6 +268,7 @@ func (r *accountRepository) CreateWithAccountGroups(ctx context.Context, account
 	}
 	account.GroupIDs = groupIDs
 	account.AccountGroups = append([]service.AccountGroup(nil), groups...)
+	account.RefreshRequestSpeedMappings()
 	if err := enqueueSchedulerOutbox(ctx, txClient, service.SchedulerOutboxEventAccountChanged, &account.ID, nil, buildSchedulerGroupPayload(groupIDs)); err != nil {
 		return err
 	}
@@ -262,6 +277,7 @@ func (r *accountRepository) CreateWithAccountGroups(ctx context.Context, account
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		r.syncSchedulerAccountSnapshot(ctx, account.ID)
 	}
 	return nil
 }
@@ -351,6 +367,7 @@ func (r *accountRepository) GetByIDs(ctx context.Context, ids []int64) ([]*servi
 		}
 		if ags, ok := accountGroupsByAccount[entAcc.ID]; ok {
 			out.AccountGroups = ags
+			out.RefreshRequestSpeedMappings()
 		}
 		outByID[entAcc.ID] = out
 	}
@@ -537,6 +554,10 @@ func (r *accountRepository) updateLockedAccount(
 		return nil, err
 	}
 	account.Extra = extra
+	previousWalletAccount, err := lockedWalletEditAccount(ctx, client, account)
+	if err != nil {
+		return nil, err
+	}
 
 	schedulable := account.Schedulable
 	if account.Status == service.StatusError {
@@ -618,7 +639,14 @@ func (r *accountRepository) updateLockedAccount(
 	builder.SetQuotaDimension(dbaccount.QuotaDimension(account.QuotaDimensionOrDefault()))
 	builder.SetNillableParentAccountID(account.ParentAccountID)
 
-	return builder.Save(ctx)
+	updated, err := builder.Save(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := preserveWalletAfterMetadataEdit(ctx, client, previousWalletAccount, accountEntityToService(updated)); err != nil {
+		return nil, err
+	}
+	return updated, nil
 }
 
 func lockAndMergeAccountProbeExtra(
@@ -682,7 +710,8 @@ func lockAndMergeAccountProbeExtra(
 			extra -> 'opencode_go_usage_auto_refresh',
 			extra -> 'opencode_go_usage_snapshot',
 			extra -> 'grok_observed_models',
-			extra -> 'upstream_model_metadata'
+			extra -> 'upstream_model_metadata',
+			extra -> 'sources_wallet_query'
 		FROM accounts
 		WHERE id = $1 AND deleted_at IS NULL
 		FOR NO KEY UPDATE
@@ -713,6 +742,7 @@ func lockAndMergeAccountProbeExtra(
 		currentOpenCodeSnapshot        []byte
 		currentGrokObservedModels      []byte
 		currentUpstreamModelMetadata   []byte
+		currentWalletConfig            []byte
 	)
 	if err := rows.Scan(
 		&identityUnchanged,
@@ -729,6 +759,7 @@ func lockAndMergeAccountProbeExtra(
 		&currentOpenCodeSnapshot,
 		&currentGrokObservedModels,
 		&currentUpstreamModelMetadata,
+		&currentWalletConfig,
 	); err != nil {
 		return nil, err
 	}
@@ -736,7 +767,12 @@ func lockAndMergeAccountProbeExtra(
 		return nil, err
 	}
 
-	extra := copyJSONMap(normalizeJSONMap(account.Extra))
+	extra := copyJSONMap(normalizeJSONMap(stripWalletConfig(account.Extra)))
+	if value, ok, err := decodeAccountExtraJSON(currentWalletConfig); err != nil {
+		return nil, err
+	} else if ok {
+		extra[service.AccountWalletConfigExtraKey] = value
+	}
 	for _, key := range []string{
 		service.UpstreamBillingProbeEnabledExtraKey,
 		service.UpstreamBillingRateSyncEnabledExtraKey,
@@ -2018,10 +2054,21 @@ func (r *accountRepository) BindGroups(ctx context.Context, accountID int64, gro
 		// 已处于外部事务中（ErrTxStarted），复用当前 client
 		txClient = r.client
 	}
+	if _, err := txClient.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('scoped_admin_account:' || $1::text, 0))`, accountID); err != nil {
+		return err
+	}
 	if err := lockLiveGroups(ctx, txClient, groupIDs); err != nil {
 		return err
 	}
 
+	existingEdges, err := txClient.AccountGroup.Query().Where(dbaccountgroup.AccountIDEQ(accountID)).All(ctx)
+	if err != nil {
+		return err
+	}
+	existingTiers := make(map[int64][]string, len(existingEdges))
+	for _, edge := range existingEdges {
+		existingTiers[edge.GroupID] = append([]string(nil), edge.RequestSpeedTiers...)
+	}
 	if _, err := txClient.AccountGroup.Delete().Where(dbaccountgroup.AccountIDEQ(accountID)).Exec(ctx); err != nil {
 		return err
 	}
@@ -2038,7 +2085,7 @@ func (r *accountRepository) BindGroups(ctx context.Context, accountID int64, gro
 		builders = append(builders, txClient.AccountGroup.Create().
 			SetAccountID(accountID).
 			SetGroupID(groupID).
-			SetPriority(i+1),
+			SetPriority(i+1).SetRequestSpeedTiers(append([]string{}, existingTiers[groupID]...)),
 		)
 	}
 
@@ -2866,7 +2913,7 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 	if scoped := r.accountTransactionScope(ctx); scoped != r {
 		return scoped.UpdateExtra(ctx, id, updates)
 	}
-	updates = stripCodexFingerprintSeedFromExtraUpdate(updates)
+	updates = stripCodexFingerprintSeedFromExtraUpdate(stripWalletConfig(updates))
 	if len(updates) == 0 {
 		return nil
 	}
@@ -3143,7 +3190,7 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	updates.Extra = stripCodexFingerprintSeedFromExtraUpdate(updates.Extra)
+	updates.Extra = stripCodexFingerprintSeedFromExtraUpdate(stripWalletConfig(updates.Extra))
 
 	setClauses := make([]string, 0, 8)
 	args := make([]any, 0, 8)
@@ -3554,6 +3601,7 @@ func (r *accountRepository) accountsToService(ctx context.Context, accounts []*d
 		}
 		if ags, ok := accountGroupsByAccount[acc.ID]; ok {
 			out.AccountGroups = ags
+			out.RefreshRequestSpeedMappings()
 		}
 		outAccounts = append(outAccounts, *out)
 	}
@@ -3636,11 +3684,12 @@ func (r *accountRepository) loadAccountGroups(ctx context.Context, accountIDs []
 		for _, ag := range entries {
 			groupSvc := groupMap[ag.GroupID]
 			agSvc := service.AccountGroup{
-				AccountID: ag.AccountID,
-				GroupID:   ag.GroupID,
-				Priority:  ag.Priority,
-				CreatedAt: ag.CreatedAt,
-				Group:     groupSvc,
+				AccountID:         ag.AccountID,
+				GroupID:           ag.GroupID,
+				Priority:          ag.Priority,
+				CreatedAt:         ag.CreatedAt,
+				RequestSpeedTiers: append([]string(nil), ag.RequestSpeedTiers...),
+				Group:             groupSvc,
 			}
 			accountGroupsByAccount[ag.AccountID] = append(accountGroupsByAccount[ag.AccountID], agSvc)
 			groupIDsByAccount[ag.AccountID] = append(groupIDsByAccount[ag.AccountID], ag.GroupID)

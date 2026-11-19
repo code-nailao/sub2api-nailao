@@ -156,6 +156,7 @@ function mountUsageView() {
       stubs: {
         AppLayout: simpleStub,
         Pagination: true,
+        PendingChargesNotice: true,
         Select: true,
         DateRangePicker: true,
         Icon: true,

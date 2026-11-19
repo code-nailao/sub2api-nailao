@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>图片创作 · Sources</title>
+  <link rel="stylesheet" href="/ops-assets/studio.css">
+</head>
+<body data-surface="studio" data-state="loading" aria-busy="true">
+  <header id="connection-bar" hidden>
+    <strong>图片工作台</strong>
+    <details id="connection-menu">
+      <summary>连接与授权</summary>
+      <div class="connection-controls">
+        <label>生图分组 <select id="groups" aria-label="生图分组"></select></label>
+        <button id="reconnect" hidden>恢复连接</button>
+        <a id="keys" href="/keys" target="_top">管理授权</a>
+        <button id="lock">锁定工作台</button>
+      </div>
+    </details>
+  </header>
+  <section id="loading-panel" aria-labelledby="status-title">
+    <div class="loading-mark" aria-hidden="true"></div>
+    <h1 id="status-title">正在打开图片工作台</h1>
+    <p id="message" role="status" aria-live="polite">正在连接工作台，请稍候…</p>
+    <div id="recovery-actions" hidden>
+      <button id="retry" type="button">重试连接</button>
+      <a id="login" href="/login" target="_top" hidden>重新登录</a>
+      <a id="open-main" href="/" target="_top">返回主站</a>
+    </div>
+  </section>
+  <iframe id="studio" title="图片创作区" hidden referrerpolicy="no-referrer"></iframe>
+  <script src="/ops-assets/studio.js" type="module"></script>
+</body>
+</html>

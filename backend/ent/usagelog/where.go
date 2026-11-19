@@ -930,6 +930,16 @@ func BillingTierContainsFold(v string) predicate.UsageLog {
 	return predicate.UsageLog(sql.FieldContainsFold(FieldBillingTier, v))
 }
 
+// BillingSnapshotIsNil applies the IsNil predicate on the "billing_snapshot" field.
+func BillingSnapshotIsNil() predicate.UsageLog {
+	return predicate.UsageLog(sql.FieldIsNull(FieldBillingSnapshot))
+}
+
+// BillingSnapshotNotNil applies the NotNil predicate on the "billing_snapshot" field.
+func BillingSnapshotNotNil() predicate.UsageLog {
+	return predicate.UsageLog(sql.FieldNotNull(FieldBillingSnapshot))
+}
+
 // BillingModeEQ applies the EQ predicate on the "billing_mode" field.
 func BillingModeEQ(v string) predicate.UsageLog {
 	return predicate.UsageLog(sql.FieldEQ(FieldBillingMode, v))

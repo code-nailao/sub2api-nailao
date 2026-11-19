@@ -341,3 +341,19 @@ describe('PaymentStatusPanel', () => {
     if (originalHidden) Object.defineProperty(document, 'hidden', originalHidden)
   })
 })
+
+describe('manual payment review', () => {
+  it('does not mark a reviewed payment as paid or expired and does not invite a second payment', async () => {
+    vi.useFakeTimers()
+    pollOrderStatus.mockResolvedValue(orderFactory('PAYMENT_REVIEW'))
+    const wrapper = mount(PaymentStatusPanel, { props: { orderId: 42, qrCode: '', expiresAt: '2099-01-01T12:30:00Z', paymentType: 'usdt_bsc', orderType: 'balance' }, global: { stubs: { Icon: true } } })
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(3000)
+    await flushPromises()
+    expect(wrapper.text()).toContain('payment.result.reviewDescription')
+    expect(wrapper.text()).not.toContain('payment.qr.expiredDesc')
+    expect(wrapper.emitted('success')).toBeUndefined()
+    wrapper.unmount()
+    vi.useRealTimers()
+  })
+})

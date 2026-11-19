@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 	"github.com/google/uuid"
 )
 
@@ -288,6 +289,6 @@ func (w *AuthCacheInvalidationWorker) Health(ctx context.Context) AuthCacheInval
 
 func ProvideAuthCacheInvalidationWorker(repo AuthCacheInvalidationOutboxRepository, cache APIKeyCache, apiKeyService *APIKeyService) *AuthCacheInvalidationWorker {
 	worker := NewAuthCacheInvalidationWorker(repo, cache, apiKeyService)
-	worker.Start()
+	processrole.StartBackground("AuthCacheInvalidationOutbox", worker.Start)
 	return worker
 }

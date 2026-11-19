@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"time"
 
@@ -74,6 +76,9 @@ type usageLogBestEffortWriter interface {
 
 // postUsageBillingParams 统一扣费所需的参数
 type postUsageBillingParams struct {
+	DeepSeekTools                  *DeepSeekToolUsage
+	UpstreamRejectionReservationID string
+
 	Cost                  *CostBreakdown
 	User                  *User
 	APIKey                *APIKey
@@ -88,6 +93,9 @@ type postUsageBillingParams struct {
 	// path that records only API-key 5h/1d/7d window usage. It must not trigger
 	// balance, subscription, account, platform, or lifetime-key-quota effects.
 	SimpleModeKeyRateLimitOnly bool
+
+	// A durable native hold already removed available balance (media engine capture).
+	BalanceAlreadyReserved bool
 }
 
 var ErrSimpleModeKeyRateLimitBillingUnavailable = errors.New("simple mode api key rate-limit billing unavailable")
@@ -239,7 +247,7 @@ func resolveUsageBillingRequestID(ctx context.Context, upstreamRequestID string)
 
 func isForcedUsageBillingRequestID(requestID string) bool {
 	id := strings.TrimSpace(requestID)
-	return strings.HasPrefix(id, "web_search:") ||
+	return IsUpstreamRejectionRequestID(id) || strings.HasPrefix(id, "deepseek-tools:") || strings.HasPrefix(id, "web_search:") ||
 		strings.HasPrefix(id, "grok-video:") ||
 		strings.HasPrefix(id, "grok_audio:") ||
 		strings.HasPrefix(id, "grok_realtime:") ||
@@ -293,12 +301,13 @@ func buildUsageBillingCommand(requestID string, usageLog *UsageLog, p *postUsage
 	}
 
 	cmd := &UsageBillingCommand{
-		RequestID:          requestID,
-		APIKeyID:           p.APIKey.ID,
-		UserID:             p.User.ID,
-		AccountID:          p.Account.ID,
-		AccountType:        p.Account.Type,
-		RequestPayloadHash: strings.TrimSpace(p.RequestPayloadHash),
+		RequestID:                      requestID,
+		APIKeyID:                       p.APIKey.ID,
+		UserID:                         p.User.ID,
+		AccountID:                      p.Account.ID,
+		AccountType:                    p.Account.Type,
+		RequestPayloadHash:             strings.TrimSpace(p.RequestPayloadHash),
+		UpstreamRejectionReservationID: p.UpstreamRejectionReservationID,
 	}
 	if usageLog != nil {
 		cmd.Model = usageLog.Model
@@ -308,6 +317,9 @@ func buildUsageBillingCommand(requestID string, usageLog *UsageLog, p *postUsage
 		cmd.CacheCreationTokens = usageLog.CacheCreationTokens
 		cmd.CacheReadTokens = usageLog.CacheReadTokens
 		cmd.ImageCount = usageLog.ImageCount
+		if usageLog.UpstreamRequestID != nil && p.UpstreamRejectionReservationID != "" {
+			cmd.UpstreamRequestID = *usageLog.UpstreamRequestID
+		}
 		if usageLog.ServiceTier != nil {
 			cmd.ServiceTier = *usageLog.ServiceTier
 		}
@@ -323,7 +335,9 @@ func buildUsageBillingCommand(requestID string, usageLog *UsageLog, p *postUsage
 		if p.Cost.ActualCost > 0 && p.APIKey.HasRateLimits() {
 			cmd.APIKeyRateLimitCost = p.Cost.ActualCost
 		}
-		cmd.Normalize()
+		if !HasPrivateUsageBillingEffects(cmd) {
+			cmd.Normalize()
+		}
 		return cmd
 	}
 
@@ -346,11 +360,31 @@ func buildUsageBillingCommand(requestID string, usageLog *UsageLog, p *postUsage
 	}
 	if p.shouldUpdateAccountQuota() {
 		cmd.AccountQuotaCost = p.Cost.TotalCost * p.AccountRateMultiplier
+		if p.DeepSeekTools != nil {
+			cmd.AccountQuotaCost = math.Max(0, p.Cost.TotalCost-p.DeepSeekTools.Cost()) * p.AccountRateMultiplier
+		}
 		cmd.AccountQuotaHasDailyLimit = p.Account.GetQuotaDailyLimit() > 0
 		cmd.AccountQuotaHasWeeklyLimit = p.Account.GetQuotaWeeklyLimit() > 0
 	}
 
-	cmd.Normalize()
+	if u := p.DeepSeekTools; u != nil {
+		cmd.DeepSeekToolFingerprint = fmt.Sprintf("%d:%d:%0.8f:%0.8f:%d:%0.8f:%0.8f", u.SearchCount, u.FetchCount, u.SearchPrice, u.FetchPrice, u.SupplierAccountID, u.SupplierSearchPrice, u.SupplierFetchPrice)
+		if u.SupplierHasQuota {
+			if u.SupplierAccountID == cmd.AccountID {
+				cmd.AccountQuotaCost += u.SupplierCost()
+			} else {
+				cmd.ToolAccountID = u.SupplierAccountID
+				cmd.ToolAccountQuotaCost = u.SupplierCost()
+				cmd.ToolAccountDailyQuota = u.SupplierDailyQuota
+				cmd.ToolAccountWeeklyQuota = u.SupplierWeeklyQuota
+			}
+		}
+	}
+	// Private transactional paths validate original amounts before rounding.
+	// The repository (or durable journal) owns their normalization.
+	if !HasPrivateUsageBillingEffects(cmd) {
+		cmd.Normalize()
+	}
 	return cmd
 }
 
@@ -361,6 +395,12 @@ func applyUsageBilling(ctx context.Context, requestID string, usageLog *UsageLog
 
 	cmd := buildUsageBillingCommand(requestID, usageLog, p)
 	if cmd == nil || cmd.RequestID == "" || repo == nil {
+		if p.DeepSeekTools != nil {
+			return false, errors.New("DeepSeek tools require transactional billing")
+		}
+		if p.UpstreamRejectionReservationID != "" {
+			return false, ErrUpstreamRejectionBillingUnavailable
+		}
 		if p.SimpleModeKeyRateLimitOnly {
 			return false, ErrSimpleModeKeyRateLimitBillingUnavailable
 		}
@@ -419,7 +459,7 @@ func finalizePostUsageBilling(ctx context.Context, p *postUsageBillingParams, de
 		if p.Cost.ActualCost > 0 && p.User != nil && p.APIKey != nil && p.APIKey.GroupID != nil {
 			deps.billingCacheService.QueueUpdateSubscriptionUsage(p.User.ID, *p.APIKey.GroupID, p.Cost.ActualCost)
 		}
-	} else if p.Cost.ActualCost > 0 && p.User != nil {
+	} else if p.Cost.ActualCost > 0 && p.User != nil && !p.BalanceAlreadyReserved {
 		syncBalanceCacheAfterDeduction(ctx, p, deps, result)
 	}
 
@@ -780,6 +820,9 @@ func (s *GatewayService) recordUsageCore(ctx context.Context, input *recordUsage
 	account := input.Account
 	subscription := input.Subscription
 	ApplyForwardImageBillingResolution(result)
+	if result.FixedUpstreamRequestTier == "" && account != nil && account.Platform == PlatformOpenAI && account.Type == AccountTypeAPIKey {
+		result.FixedUpstreamRequestTier = RequestSpeedServiceTierFromContext(ctx)
+	}
 	logServiceTierBillingDowngrade("service.gateway", account, result.RequestID, ApplyForwardServiceTierBillingResolution(result))
 
 	// 强制缓存计费：将 input_tokens 转为 cache_read_input_tokens

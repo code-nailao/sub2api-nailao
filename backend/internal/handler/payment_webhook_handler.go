@@ -37,6 +37,8 @@ func NewPaymentWebhookHandler(paymentService *service.PaymentService, registry *
 	}
 }
 
+func (h *PaymentWebhookHandler) BEPusdtNotify(c *gin.Context) { h.handleNotify(c, payment.TypeBEPusdt) }
+
 // EasyPayNotify handles EasyPay payment notifications.
 // POST /api/v1/payment/webhook/easypay
 func (h *PaymentWebhookHandler) EasyPayNotify(c *gin.Context) {
@@ -90,11 +92,10 @@ func (h *PaymentWebhookHandler) handleNotify(c *gin.Context, providerKey string)
 	providers, err := h.paymentService.GetWebhookProviders(c.Request.Context(), providerKey, outTradeNo)
 	if err != nil {
 		slog.Warn("[Payment Webhook] provider not found", "provider", providerKey, "outTradeNo", outTradeNo, "error", err)
-		if providerKey == payment.TypeWxpay {
-			c.String(http.StatusBadRequest, "verify failed")
-			return
-		}
-		writeSuccessResponse(c, providerKey)
+		// A failed merchant/configuration lookup has not authenticated the event.
+		// Keep provider retries available; only a verified unknown order below
+		// can be safely acknowledged without changing a balance.
+		c.String(http.StatusServiceUnavailable, "payment verification unavailable")
 		return
 	}
 
@@ -156,6 +157,13 @@ func (h *PaymentWebhookHandler) handleNotify(c *gin.Context, providerKey string)
 // This allows looking up the correct provider instance before verification.
 func extractOutTradeNo(rawBody, providerKey string) string {
 	switch providerKey {
+	case payment.TypeBEPusdt:
+		var body struct {
+			OrderID string `json:"order_id"`
+		}
+		if json.Unmarshal([]byte(rawBody), &body) == nil {
+			return body.OrderID
+		}
 	case payment.TypeEasyPay, payment.TypeAlipay:
 		values, err := url.ParseQuery(rawBody)
 		if err == nil {

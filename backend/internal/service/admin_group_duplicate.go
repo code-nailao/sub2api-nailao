@@ -94,12 +94,21 @@ func cloneGroupMessagesDispatchModelConfig(value OpenAIMessagesDispatchModelConf
 }
 
 func cloneGroupForDuplicate(source *Group, operationID string) *Group {
+	var modelPricing []ChannelModelPricing
+	if source.ModelPricing != nil {
+		modelPricing = make([]ChannelModelPricing, len(source.ModelPricing))
+		for i := range source.ModelPricing {
+			modelPricing[i] = source.ModelPricing[i].Clone()
+		}
+	}
 	return &Group{
 		Name:                            duplicateGroupName(source.Name, 1),
 		Description:                     source.Description,
 		I18n:                            cloneGroupI18nForDuplicate(source.I18n),
 		Platform:                        source.Platform,
 		RateMultiplier:                  source.RateMultiplier,
+		LongContextPricingEnabled:       source.LongContextPricingEnabled,
+		ModelPricing:                    modelPricing,
 		PeakRateEnabled:                 source.PeakRateEnabled,
 		PeakStart:                       source.PeakStart,
 		PeakEnd:                         source.PeakEnd,
@@ -132,6 +141,9 @@ func cloneGroupForDuplicate(source *Group, operationID string) *Group {
 		VideoPrice1080P:                 cloneGroupValuePointer(source.VideoPrice1080P),
 		VideoModelPrices:                cloneGroupVideoModelPrices(source.VideoModelPrices),
 		WebSearchPricePerCall:           cloneGroupValuePointer(source.WebSearchPricePerCall),
+		UpstreamRejectionBillingEnabled: source.UpstreamRejectionBillingEnabled,
+		UpstreamRejectionPrice:          source.UpstreamRejectionPrice,
+		DeepSeekTools:                   cloneDeepSeekToolsConfig(source.DeepSeekTools),
 		SearchPricePer1k:                cloneGroupValuePointer(source.SearchPricePer1k),
 		AudioRealtimePricePerMin:        cloneGroupValuePointer(source.AudioRealtimePricePerMin),
 		AudioTTSPricePerMillionChars:    cloneGroupValuePointer(source.AudioTTSPricePerMillionChars),
@@ -147,6 +159,9 @@ func cloneGroupForDuplicate(source *Group, operationID string) *Group {
 		AllowMessagesDispatch:           source.AllowMessagesDispatch,
 		AllowLive:                       source.AllowLive,
 		ForceOpenAIFast:                 source.ForceOpenAIFast,
+		OpenAIServiceTierPolicy:         source.OpenAIServiceTierPolicy,
+		RequestSpeedSelectionEnabled:    source.RequestSpeedSelectionEnabled,
+		DefaultRequestSpeedTier:         source.DefaultRequestSpeedTier,
 		ForceOpenAIUltrafast:            source.ForceOpenAIUltrafast,
 		FreeOpenAIFast:                  source.FreeOpenAIFast,
 		RequireOAuthOnly:                source.RequireOAuthOnly,

@@ -1,5 +1,7 @@
 # Sub2API Deployment Files
 
+> This fork adds a fixed blue/green release tool for Docker hosts; see [`sources/README.md`](sources/README.md).
+
 This directory contains files for deploying Sub2API on Linux servers and Apple-silicon Macs.
 
 ## Deployment Methods

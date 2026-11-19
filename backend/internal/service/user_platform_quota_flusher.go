@@ -8,6 +8,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 )
 
 // quotaDirtyCache 是 flusher 依赖的窄接口（来自 BillingCache）。
@@ -262,5 +263,9 @@ func (s *UserPlatformQuotaUsageFlusher) Stop() {
 	}
 	s.stopped.Store(true)
 	s.timingWheel.Cancel("deferred:platform_quota")
-	s.flush()
+	// Dirty keys live in shared Redis, not in this instance. A serving process
+	// never started the global flusher and must not drain the owner's queue.
+	if processrole.BackgroundEnabled() {
+		s.flush()
+	}
 }

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -41,6 +42,13 @@ var selectionModelRateLimitedPattern = regexp.MustCompile(`(?:model_rate_limited
 func classifySelectionFailureError(err error, fallback noAccountErrorClassification) noAccountErrorClassification {
 	if err == nil {
 		return fallback
+	}
+	var blocked *service.OpenAIFastBlockedError
+	if errors.As(err, &blocked) {
+		return noAccountErrorClassification{Status: http.StatusForbidden, ErrType: "permission_error", Message: blocked.Message}
+	}
+	if errors.Is(err, service.ErrRequestSpeedContinuationMismatch) {
+		return noAccountErrorClassification{Status: http.StatusConflict, ErrType: "invalid_request_error", Message: err.Error()}
 	}
 	// A 404 model_not_found fallback is authoritative and must not be downgraded
 	// to a rate-limit verdict. classifyNoAccountError only reaches it through

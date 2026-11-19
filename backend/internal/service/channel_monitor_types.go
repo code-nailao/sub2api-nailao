@@ -42,6 +42,7 @@ type ChannelMonitor struct {
 	ExtraModels     []string
 	GroupName       string
 	Enabled         bool
+	SortOrder       int
 	IntervalSeconds int
 	JitterSeconds   int // 每次调度 ± [0, jitter] 的随机偏移（秒），0 = 固定间隔
 	LastCheckedAt   *time.Time

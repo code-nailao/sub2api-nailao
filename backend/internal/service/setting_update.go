@@ -410,6 +410,19 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 		updates[SettingKeyOpsMetricsIntervalSeconds] = strconv.Itoa(settings.OpsMetricsIntervalSeconds)
 	}
 
+	// 两个参数作为同一快照验证和写入；省略字段由原版omitted机制保留。
+	degradedSeconds, timeoutSeconds := settings.ChannelMonitorDegradedThresholdSeconds, settings.ChannelMonitorRequestTimeoutSeconds
+	if degradedSeconds == 0 {
+		degradedSeconds = int(monitorDegradedThreshold / time.Second)
+	}
+	if timeoutSeconds == 0 {
+		timeoutSeconds = int(monitorRequestTimeout / time.Second)
+	}
+	if err := ValidateChannelMonitorProbeTiming(degradedSeconds, timeoutSeconds); err != nil {
+		return nil, err
+	}
+	updates[SettingKeyChannelMonitorDegradedThresholdSeconds] = strconv.Itoa(degradedSeconds)
+	updates[SettingKeyChannelMonitorRequestTimeoutSeconds] = strconv.Itoa(timeoutSeconds)
 	// Channel monitor feature switch
 	updates[SettingKeyChannelMonitorEnabled] = strconv.FormatBool(settings.ChannelMonitorEnabled)
 	updates[SettingKeyChannelMonitorMode] = normalizeChannelMonitorMode(settings.ChannelMonitorMode)

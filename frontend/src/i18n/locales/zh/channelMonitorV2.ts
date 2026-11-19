@@ -1,7 +1,67 @@
 /** Channel Monitor V2 (user + admin passive monitor UI) */
 export default {
   channelMonitorV2: {
-    title: '渠道监控',
+    cards: {
+      loadFailedRetained: '仍显示上次成功加载的数据，尚未应用当前时间范围或筛选，请重试。',
+      loadFailedRetry: '本次未能读取渠道统计，请重试。',
+
+      imageGrouping: '生图展示',
+      imageSeparate: '集中到生图分类',
+      imageProvider: '放回原平台末尾',
+      imageGroupingHint: '手动指定的分类优先；选择“跟随默认”后，渠道会重新随这里的模式切换。',
+      followDefault: '跟随默认',
+
+      passiveDescription: 'V2 被动用量 · 缓存率与可用率',
+      adminDiagnostics: '管理诊断 / 高级筛选',
+      shortMetricHint: '灰色表示无流量或样本不足；— 表示暂无统计。',
+
+      "title": "渠道卡片",
+      "all": "全部",
+      "categoryFilter": "渠道分类",
+      "search": "搜索渠道名称…",
+      "userRate": "用户倍率",
+      "rateHint": "当前用户适用的分组倍率；实际费用以模型价格、用量及计费规则为准。",
+      "availability": "可用率",
+      "domestic": "国模",
+      "periods": "近 {count} 个时段",
+      "timelineAria": "{name} 的历史状态",
+      "states": {
+            "healthy": "健康",
+            "warning": "需关注",
+            "critical": "异常",
+            "unknown": "无流量 / 样本不足"
+      },
+      "categories": {
+            "openai": "OpenAI",
+            "anthropic": "Anthropic",
+            "grok": "Grok",
+            "gemini": "Gemini",
+            "domestic": "国模",
+            "image": "生图",
+            "other": "其他"
+      },
+      "attentionOnly": "只看需关注",
+      "ratesUnavailable": "暂时无法读取你的适用倍率，已保留为空，请稍后刷新。",
+      "sortTitle": "自定义排序",
+      "sortHint": "调整大分类与组内渠道顺序，保存后对所有用户生效。也可以调整渠道所属分类。",
+      "sortScope": "选择排序范围",
+      "categoryOrder": "大分类顺序",
+      "dragHint": "拖动手柄排序，或使用上下按钮。",
+      "moveUp": "上移 {name}",
+      "moveDown": "下移 {name}",
+      "groupCategory": "{name} 所属分类",
+      "emptyCategory": "这个分类暂时没有渠道。",
+      "resetOrder": "恢复默认排列",
+      "sortGroup": "调整 {name} 内部顺序",
+      "adjustOrder": "调整顺序",
+      "orderLoadFailed": "读取排序配置失败，请关闭后重试。",
+      "orderSaveFailed": "保存失败。若配置已被其他管理员更新，请关闭后重新打开。",
+      "orderSaved": "渠道展示顺序已保存",
+      "metricHint": "每条对应一个统计时段；点击查看详情。颜色沿用 V2 健康度规则，灰色表示无流量或样本不足。缺失的缓存率和首 Token 显示为 —。",
+      "empty": "没有匹配的渠道",
+      "advancedDetails": "模型、错误原因与用量明细"
+},
+    title: '渠道状态',
     updating: '正在更新数据',
     updatedTo: '更新至 {time}',
     partialCoverage: '部分历史覆盖',
@@ -30,7 +90,7 @@ export default {
     groupBy: {
       label: '展示维度', platform: '平台', platformGroup: '平台 / 分组', platformModel: '平台 / 模型', platformGroupModel: '平台 / 分组 / 模型'
     },
-    trendView: { label: '趋势视图', pulse: '色块矩阵', line: '折线图' },
+    trendView: { cards: '渠道卡片', label: '趋势视图', pulse: '色块矩阵', line: '折线图' },
     healthMode: { label: '健康显示', overall: '综合', success: '错误率', ttft: '首 Token', cache: '缓存率' },
     tabs: { aria: '明细维度', models: '模型', errors: '错误原因', users: '用户排行' },
     metrics: {

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 )
 
 const (
@@ -53,9 +55,12 @@ func (s *AuditLogService) Start() {
 	if s == nil || s.repo == nil {
 		return
 	}
-	s.wg.Add(2)
+	s.wg.Add(1)
 	go s.runWriter()
-	go s.runRetentionLoop()
+	processrole.StartBackground("AuditLogRetention", func() {
+		s.wg.Add(1)
+		go s.runRetentionLoop()
+	})
 }
 
 // Stop 停止服务并尽量落盘队列中剩余记录。

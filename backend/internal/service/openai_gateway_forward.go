@@ -19,7 +19,17 @@ import (
 )
 
 // Forward forwards request to OpenAI API
-func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
+func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (out *OpenAIForwardResult, forwardErr error) {
+	defer func() { StampFixedUpstreamRequestTier(ctx, out) }()
+	fixedBody, fixedErr := s.prepareFixedRequestSpeedBody(ctx, account, body, "", isOpenAIResponsesCompactPath(c))
+	if fixedErr != nil {
+		writeOpenAIFastPolicyBlockedResponse(c, &OpenAIFastBlockedError{Message: fixedErr.Error()})
+		return nil, fixedErr
+	}
+	body = fixedBody
+	if result, handled, err := s.tryForwardDeepSeekTools(ctx, c, account, body, "responses", ""); handled {
+		return result, err
+	}
 	beginUpstreamResponseModelObservation(c)
 	ClearActualOpenAIUpstreamEndpoint(c)
 	if shouldForwardOpenAIResponsesViaRawChatCompletions(account) {
@@ -678,38 +688,15 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 
 	rawTier := requestView.ServiceTier
-	if forcedTier := openAIGroupForcedServiceTier(ctx, account, upstreamModel); forcedTier != "" {
-		rawTier = forcedTier
-		if requestView.ServiceTier != forcedTier {
-			markPatchSet("service_tier", forcedTier)
-		}
+	tier, removeTier, tierErr := s.resolveOpenAIRequestServiceTier(ctx, account, upstreamModel, rawTier)
+	if tierErr != nil {
+		writeOpenAIFastPolicyBlockedResponse(c, tierErr)
+		return nil, tierErr
 	}
-	if rawTier != "" {
-		if normTier := normalizedOpenAIServiceTierValue(rawTier); normTier != "" {
-			action, errMsg := s.evaluateOpenAIFastPolicy(ctx, account, upstreamModel, normTier)
-			switch action {
-			case BetaPolicyActionBlock:
-				msg := errMsg
-				if msg == "" {
-					msg = fmt.Sprintf("openai service_tier=%s is not allowed for model %s", normTier, upstreamModel)
-				}
-				blocked := &OpenAIFastBlockedError{Message: msg}
-				writeOpenAIFastPolicyBlockedResponse(c, blocked)
-				return nil, blocked
-			case BetaPolicyActionFilter:
-				markPatchDelete("service_tier")
-			case OpenAIFastPolicyActionForcePriority:
-				if rawTier != OpenAIFastTierPriority {
-					markPatchSet("service_tier", OpenAIFastTierPriority)
-				}
-			default:
-				if normTier != rawTier {
-					markPatchSet("service_tier", normTier)
-				}
-			}
-		}
-	} else if s.shouldForceOpenAIFastPriorityForMissingTier(ctx, account, upstreamModel) {
-		markPatchSet("service_tier", OpenAIFastTierPriority)
+	if removeTier {
+		markPatchDelete("service_tier")
+	} else if tier != rawTier {
+		markPatchSet("service_tier", tier)
 	}
 
 	if account.UsesOpenAICodexProtocol() {

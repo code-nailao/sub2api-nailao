@@ -209,7 +209,7 @@
         <template #cell-cost="{ row }">
           <div class="text-sm">
             <div class="flex items-center gap-1.5">
-              <span class="font-medium text-green-600 dark:text-green-400">${{ row.actual_cost?.toFixed(6) || '0.000000' }}</span>
+              <span class="font-medium text-green-600 dark:text-green-400">{{ isRejectionCharge(row) ? '¥' : '$' }}{{ row.actual_cost?.toFixed(6) || '0.000000' }}</span>
               <span
                 v-if="row.long_context_billing_applied"
                 data-testid="long-context-billing-marker"
@@ -219,18 +219,29 @@
               <!-- Cost Detail Tooltip -->
               <div
                 class="group relative"
+                role="button"
+                tabindex="0"
+                :aria-label="t('usage.costDetails')"
                 @mouseenter="showTooltip($event, row)"
                 @mouseleave="hideTooltip"
+                @focus="showTooltip($event, row)"
+                @blur="hideTooltip"
+                @click="showTooltip($event, row)"
+                @keydown.esc="hideTooltip"
               >
                 <div class="flex h-4 w-4 cursor-help items-center justify-center rounded-full bg-gray-100 transition-colors group-hover:bg-blue-100 dark:bg-gray-700 dark:group-hover:bg-blue-900/50">
                   <Icon name="infoCircle" size="xs" class="text-gray-400 group-hover:text-blue-500 dark:text-gray-500 dark:group-hover:text-blue-400" />
                 </div>
               </div>
             </div>
-            <div v-if="showAccountBilling && row.account_rate_multiplier != null" class="mt-0.5 text-[11px] text-orange-500 dark:text-orange-400">
+            <div v-if="showAccountBilling && row.account_rate_multiplier != null && (!isRejectionCharge(row) || typeof row.account_stats_cost === 'number')" class="mt-0.5 text-[11px] text-orange-500 dark:text-orange-400">
               A ${{ accountBilled(row).toFixed(6) }}
             </div>
           </div>
+        </template>
+
+        <template #cell-cache_hit_rate="{ row }">
+          <CacheHitRateCell :usage="row" />
         </template>
 
         <!-- 合并首字/总耗时的健康度列：左侧色条上端随首字档、下端随总耗时档，中段(40%-60%)短渐变过渡，便于纵向扫视整体健康状况 -->
@@ -410,16 +421,17 @@
   <Teleport to="body">
     <div
       v-if="tooltipVisible"
+      ref="costTooltipRef"
       class="fixed z-[9999] pointer-events-none -translate-y-1/2"
       :style="{
         left: tooltipPosition.x + 'px',
         top: tooltipPosition.y + 'px'
       }"
     >
-      <div class="whitespace-nowrap rounded-lg border border-gray-700 bg-gray-900 px-3 py-2.5 text-xs text-white shadow-xl dark:border-gray-600 dark:bg-gray-800">
+      <div :class="isRejectionTooltip ? 'whitespace-normal w-80 max-w-[calc(100vw-24px)]' : 'whitespace-nowrap'" class="rounded-lg border border-gray-700 bg-gray-900 px-3 py-2.5 text-xs text-white shadow-xl dark:border-gray-600 dark:bg-gray-800">
         <div class="space-y-1.5">
           <!-- Cost Breakdown -->
-          <div class="mb-2 border-b border-gray-700 pb-1.5">
+          <div v-if="!isRejectionTooltip" class="mb-2 border-b border-gray-700 pb-1.5">
             <div class="text-xs font-semibold text-gray-300 mb-1">{{ t('usage.costDetails') }}</div>
             <div v-if="tooltipData && tooltipData.input_cost > 0" class="flex items-center justify-between gap-4">
               <span class="text-gray-400">{{ t('admin.usage.inputCost') }}</span>
@@ -503,26 +515,27 @@
               <span class="font-medium text-white">${{ tooltipData.cache_read_cost.toFixed(8) }}</span>
             </div>
           </div>
+          <UsageBillingSnapshotDetails :snapshot="tooltipData?.billing_snapshot" />
           <!-- Rate and Summary -->
-          <div class="flex items-center justify-between gap-6">
+          <div v-if="!isRejectionTooltip" class="flex items-center justify-between gap-6">
             <span class="text-gray-400">{{ t('usage.serviceTier') }}</span>
             <span class="font-semibold text-cyan-300">{{ getUsageServiceTierLabel(tooltipData?.service_tier, t) }}</span>
           </div>
-          <div class="flex items-center justify-between gap-6">
+          <div v-if="!isRejectionTooltip" class="flex items-center justify-between gap-6">
             <span class="text-gray-400">{{ t('usage.rate') }}</span>
             <span class="font-semibold text-blue-400">{{ formatMultiplier(tooltipData?.rate_multiplier ?? 1) }}x</span>
           </div>
-          <div class="flex items-center justify-between gap-6">
+          <div v-if="!isRejectionTooltip" class="flex items-center justify-between gap-6">
             <span class="text-gray-400">{{ t('usage.original') }}</span>
             <span class="font-medium text-white">${{ tooltipData?.total_cost?.toFixed(8) || '0.00000000' }}</span>
           </div>
           <div class="flex items-center justify-between gap-6">
             <span class="text-gray-400">{{ t('usage.userBilled') }}</span>
-            <span class="font-semibold text-green-400">${{ tooltipData?.actual_cost?.toFixed(8) || '0.00000000' }}</span>
+            <span class="font-semibold text-green-400">{{ isRejectionTooltip ? '¥' : '$' }}{{ tooltipData?.actual_cost?.toFixed(8) || '0.00000000' }}</span>
           </div>
           <!-- Account billing (separated from user billing) -->
-          <template v-if="showAccountBilling">
-            <div class="flex items-center justify-between gap-6 border-t border-gray-700 pt-1.5">
+          <template v-if="showAccountBilling && (!isRejectionTooltip || typeof tooltipData?.account_stats_cost === 'number')">
+            <div v-if="!isRejectionTooltip" class="flex items-center justify-between gap-6 border-t border-gray-700 pt-1.5">
               <span class="text-gray-400">{{ t('usage.accountMultiplier') }}</span>
               <span class="font-semibold text-blue-400">{{ formatMultiplier(tooltipData?.account_rate_multiplier ?? 1) }}x</span>
             </div>
@@ -545,7 +558,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import UsageBillingSnapshotDetails from '@/components/common/UsageBillingSnapshotDetails.vue'
+import { computed, nextTick, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { formatDateTime, formatReasoningEffort, reasoningEffortValuesEqual } from '@/utils/format'
@@ -564,6 +578,7 @@ import {
 } from '@/utils/latencyHealth'
 import {
   BILLING_MODE_TOKEN,
+  isContentRejectionKind,
   getBillingModeLabel,
   getBillingModeBadgeClass,
   isImageUsage,
@@ -594,6 +609,7 @@ function accountBilled(row: { total_cost?: number | null; account_stats_cost?: n
 
 import DataTable from '@/components/common/DataTable.vue'
 import EmptyState from '@/components/common/EmptyState.vue'
+import CacheHitRateCell from '@/features/sources/usage/CacheHitRateCell.vue'
 import IpGeoCell from '@/components/common/IpGeoCell.vue'
 import Icon from '@/components/icons/Icon.vue'
 import { fetchBatch, getEntry } from '@/utils/ipGeoLookup'
@@ -706,6 +722,9 @@ const copyUpstreamRequestId = (upstreamRequestId: string) =>
 const tooltipVisible = ref(false)
 const tooltipPosition = ref({ x: 0, y: 0 })
 const tooltipData = ref<AdminUsageLog | null>(null)
+const costTooltipRef = ref<HTMLElement | null>(null)
+const isRejectionCharge = (row: AdminUsageLog | null | undefined) => isContentRejectionKind(row?.billing_snapshot?.charge_kind)
+const isRejectionTooltip = computed(() => isRejectionCharge(tooltipData.value))
 
 // Tooltip state - token
 const tokenTooltipVisible = ref(false)
@@ -749,13 +768,20 @@ const formatDuration = (ms: number | null | undefined): string => {
 }
 
 // Cost tooltip functions
-const showTooltip = (event: MouseEvent, row: AdminUsageLog) => {
+const showTooltip = async (event: Event, row: AdminUsageLog) => {
   const target = event.currentTarget as HTMLElement
   const rect = target.getBoundingClientRect()
   tooltipData.value = row
   tooltipPosition.value.x = rect.right + 8
   tooltipPosition.value.y = rect.top + rect.height / 2
   tooltipVisible.value = true
+  if (isRejectionCharge(row)) {
+    await nextTick()
+    if (!tooltipVisible.value || tooltipData.value?.request_id !== row.request_id || !costTooltipRef.value) return
+    const size = costTooltipRef.value.getBoundingClientRect()
+    tooltipPosition.value.x = Math.max(12, Math.min(rect.right + 8, window.innerWidth - size.width - 12))
+    tooltipPosition.value.y = Math.max(size.height / 2 + 12, Math.min(rect.top + rect.height / 2, window.innerHeight - size.height / 2 - 12))
+  }
 }
 
 const hideTooltip = () => {

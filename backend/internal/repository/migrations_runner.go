@@ -66,6 +66,8 @@ const usageLogsUpstreamRequestIDIndexMigration = "233_add_usage_log_upstream_req
 const usageLogsUpstreamRequestIDIndex = "idx_usage_logs_upstream_request_id"
 const usageLogsAPIKeyCostIndexMigration = "249_add_usage_logs_api_key_cost_index_notx.sql"
 const usageLogsAPIKeyCostIndex = "idx_usage_logs_api_key_created_cost"
+const upstreamRejectionReleaseDueIndexMigration = "273_upstream_rejection_release_due_index_notx.sql"
+const upstreamRejectionReleaseDueIndex = "idx_upstream_rejection_release_due"
 
 type migrationChecksumCompatibilityRule struct {
 	fileChecksum       string
@@ -313,6 +315,10 @@ func prepareNonTransactionalMigration(ctx context.Context, db migrationConnectio
 		return dropInvalidIndexIfPresent(ctx, db, usageLogsUpstreamRequestIDIndex)
 	case usageLogsAPIKeyCostIndexMigration:
 		return dropInvalidIndexIfPresent(ctx, db, usageLogsAPIKeyCostIndex)
+	case upstreamRejectionReleaseDueIndexMigration:
+		// A build interrupted mid-way leaves an INVALID index that IF NOT EXISTS
+		// would otherwise keep forever.
+		return dropInvalidIndexIfPresent(ctx, db, upstreamRejectionReleaseDueIndex)
 	default:
 		return nil
 	}

@@ -39,7 +39,13 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	originalModel string,
 	reqStream bool,
 	startTime time.Time,
-) (*OpenAIForwardResult, error) {
+) (out *OpenAIForwardResult, forwardError error) {
+	observedHTTPStatus := 0
+	defer func() {
+		if observedHTTPStatus > 0 && forwardError != nil && (out == nil || out.UpstreamRejection == nil) {
+			forwardError = &UpstreamRejectionHTTPError{StatusCode: observedHTTPStatus, Cause: forwardError}
+		}
+	}()
 	if account.Type != AccountTypeOAuth && account.Type != AccountTypeAPIKey {
 		return nil, fmt.Errorf("grok account type %s is not supported by Responses forwarding", account.Type)
 	}
@@ -124,12 +130,20 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		// xAI can reject encrypted reasoning or a compaction blob copied from a
 		// different decoder/cache context. Retry once on the same account after
 		// preserving visible summaries and removing only opaque replay state.
-		if attempt > 0 || (resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusUnprocessableEntity) {
+		if account.GetUpstreamRejectionProfile() != "" || attempt > 0 || (resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusUnprocessableEntity) {
 			break
 		}
 		respBody := s.readUpstreamErrorBody(resp)
 		if resp.Body != nil {
 			_ = resp.Body.Close()
+		}
+		if rejection := DetectUpstreamRejectionHTTP(account, resp.StatusCode, respBody); rejection != nil {
+			result := upstreamRejectionForwardResult(resp, originalModel, upstreamModel, upstreamModel, reqStream, startTime, rejection)
+			result.UpstreamEndpoint = openAIResponsesUpstreamEndpoint
+			return result, writeUpstreamRejectionHTTP(c, rejection)
+		}
+		if account.GetUpstreamRejectionProfile() != "" {
+			observedHTTPStatus = resp.StatusCode
 		}
 		invalidEncryptedContent := isGrokInvalidEncryptedContentResponse(resp.StatusCode, respBody)
 		if !invalidEncryptedContent && !isGrokCompactionReplayDecodeError(resp.StatusCode, respBody) {
@@ -161,6 +175,14 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	if resp.StatusCode >= 400 {
 		respBody := s.readUpstreamErrorBody(resp)
 		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+		if rejection := DetectUpstreamRejectionHTTP(account, resp.StatusCode, respBody); rejection != nil {
+			result := upstreamRejectionForwardResult(resp, originalModel, upstreamModel, upstreamModel, reqStream, startTime, rejection)
+			result.UpstreamEndpoint = openAIResponsesUpstreamEndpoint
+			return result, writeUpstreamRejectionHTTP(c, rejection)
+		}
+		if account.GetUpstreamRejectionProfile() != "" {
+			observedHTTPStatus = resp.StatusCode
+		}
 		upstreamMsg := sanitizeUpstreamErrorMessage(extractUpstreamErrorMessage(respBody))
 		if upstreamMsg == "" {
 			upstreamMsg = fmt.Sprintf("xAI upstream returned status %d", resp.StatusCode)
@@ -213,7 +235,10 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	searchCount := 0
 	imageCount := 0
 	var imageOutputSizes []string
-	if reqStream {
+	var upstreamRejection *UpstreamRejectionEvidence
+	var forwardErr error
+	upstreamTerminalEvent := ""
+	if reqStream && !upstreamRejectionJSONResponse(account, resp) {
 		maxLineSize := defaultMaxLineSize
 		if s.cfg != nil && s.cfg.Gateway.MaxLineSize > 0 {
 			maxLineSize = s.cfg.Gateway.MaxLineSize
@@ -223,9 +248,12 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 			resp.Body = newGrokResponsesClientToolStreamBody(resp.Body, clientToolMapping, maxLineSize, s.cfg)
 		}
 		streamResult, err := s.handleStreamingResponse(ctx, resp, c, account, startTime, originalModel, upstreamModel)
-		if err != nil {
+		if err != nil && (streamResult == nil || (streamResult.upstreamRejection == nil && account.GetUpstreamRejectionProfile() == "")) {
 			return nil, err
 		}
+		forwardErr = err
+		upstreamTerminalEvent = streamResult.upstreamTerminalEvent
+		upstreamRejection = streamResult.upstreamRejection
 		usage = streamResult.usage
 		firstTokenMs = streamResult.firstTokenMs
 		responseID = strings.TrimSpace(streamResult.responseID)
@@ -234,9 +262,12 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		imageOutputSizes = streamResult.imageOutputSizes
 	} else {
 		nonStreamResult, err := s.handleNonStreamingResponse(ctx, resp, c, account, originalModel, upstreamModel)
-		if err != nil {
+		if err != nil && (nonStreamResult == nil || (nonStreamResult.upstreamRejection == nil && account.GetUpstreamRejectionProfile() == "")) {
 			return nil, err
 		}
+		forwardErr = err
+		upstreamTerminalEvent = nonStreamResult.upstreamTerminalEvent
+		upstreamRejection = nonStreamResult.upstreamRejection
 		usage = nonStreamResult.usage
 		responseID = strings.TrimSpace(nonStreamResult.responseID)
 		searchCount = nonStreamResult.searchCount
@@ -249,6 +280,8 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	}
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(patchedBody, originalModel)
 	result := &OpenAIForwardResult{
+		UpstreamRejection:             upstreamRejection,
+		UpstreamTerminalEvent:         upstreamTerminalEvent,
 		RequestID:                     firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
 		UpstreamHeaders:               resp.Header,
 		ResponseID:                    responseID,
@@ -273,7 +306,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		result.ImageCount = imageCount
 		result.ImageOutputSizes = imageOutputSizes
 	}
-	return result, nil
+	return result, forwardErr
 }
 
 func isGrokInvalidEncryptedContentResponse(statusCode int, body []byte) bool {

@@ -185,18 +185,20 @@ func sanitizeUpdateGroupRequestForSimpleMode(req *UpdateGroupRequest) {
 
 // CreateGroupRequest represents create group request
 type CreateGroupRequest struct {
-	Name                      string                        `json:"name" binding:"required"`
-	Description               string                        `json:"description"`
-	I18n                      service.GroupI18n             `json:"i18n"` // 名称与描述的界面语言译文
-	Platform                  string                        `json:"platform" binding:"omitempty,group_platform"`
-	RateMultiplier            float64                       `json:"rate_multiplier"`
-	IsExclusive               bool                          `json:"is_exclusive"`
-	SubscriptionType          string                        `json:"subscription_type" binding:"omitempty,oneof=standard subscription"`
-	DailyLimitUSD             optionalLimitField            `json:"daily_limit_usd"`
-	WeeklyLimitUSD            optionalLimitField            `json:"weekly_limit_usd"`
-	MonthlyLimitUSD           optionalLimitField            `json:"monthly_limit_usd"`
-	LongContextPricingEnabled bool                          `json:"long_context_pricing_enabled"`
-	ModelPricing              []service.ChannelModelPricing `json:"model_pricing"`
+	RequestSpeedSelectionEnabled bool                          `json:"request_speed_selection_enabled"`
+	DefaultRequestSpeedTier      string                        `json:"default_request_speed_tier"`
+	Name                         string                        `json:"name" binding:"required"`
+	Description                  string                        `json:"description"`
+	I18n                         service.GroupI18n             `json:"i18n"` // 名称与描述的界面语言译文
+	Platform                     string                        `json:"platform" binding:"omitempty,group_platform"`
+	RateMultiplier               float64                       `json:"rate_multiplier"`
+	IsExclusive                  bool                          `json:"is_exclusive"`
+	SubscriptionType             string                        `json:"subscription_type" binding:"omitempty,oneof=standard subscription"`
+	DailyLimitUSD                optionalLimitField            `json:"daily_limit_usd"`
+	WeeklyLimitUSD               optionalLimitField            `json:"weekly_limit_usd"`
+	MonthlyLimitUSD              optionalLimitField            `json:"monthly_limit_usd"`
+	LongContextPricingEnabled    bool                          `json:"long_context_pricing_enabled"`
+	ModelPricing                 []service.ChannelModelPricing `json:"model_pricing"`
 	// 图片生成计费配置（antigravity 和 gemini 平台使用，负数表示清除配置）
 	AllowImageGeneration            bool                          `json:"allow_image_generation"`
 	AllowBatchImageGeneration       bool                          `json:"allow_batch_image_generation"`
@@ -222,6 +224,9 @@ type CreateGroupRequest struct {
 	VideoPrice1080P                 *float64                      `json:"video_price_1080p"`
 	VideoModelPrices                map[string]map[string]float64 `json:"video_model_prices,omitempty"`
 	WebSearchPricePerCall           *float64                      `json:"web_search_price_per_call"`
+	UpstreamRejectionBillingEnabled bool                          `json:"upstream_rejection_billing_enabled"`
+	UpstreamRejectionPrice          *float64                      `json:"upstream_rejection_price"`
+	DeepSeekTools                   *service.DeepSeekToolsConfig  `json:"deepseek_tools"`
 	SearchPricePer1k                *float64                      `json:"search_price_per_1k"`
 	AudioRealtimePricePerMin        *float64                      `json:"audio_realtime_price_per_min"`
 	AudioTtsPricePerMillionChars    *float64                      `json:"audio_tts_price_per_million_chars"`
@@ -239,6 +244,7 @@ type CreateGroupRequest struct {
 	AllowMessagesDispatch       bool                                      `json:"allow_messages_dispatch"`
 	AllowLive                   bool                                      `json:"allow_live"`
 	ForceOpenAIFast             bool                                      `json:"force_openai_fast"`
+	OpenAIServiceTierPolicy     string                                    `json:"openai_service_tier_policy,omitempty"`
 	ForceOpenAIUltrafast        bool                                      `json:"force_openai_ultrafast"`
 	FreeOpenAIFast              bool                                      `json:"free_openai_fast"`
 	RequireOAuthOnly            bool                                      `json:"require_oauth_only"`
@@ -262,19 +268,21 @@ type CreateGroupRequest struct {
 
 // UpdateGroupRequest represents update group request
 type UpdateGroupRequest struct {
-	Name                      string                         `json:"name"`
-	Description               *string                        `json:"description"`
-	I18n                      *service.GroupI18n             `json:"i18n"` // 缺省不修改，传入则整体替换
-	Platform                  string                         `json:"platform" binding:"omitempty,group_platform"`
-	RateMultiplier            *float64                       `json:"rate_multiplier"`
-	IsExclusive               *bool                          `json:"is_exclusive"`
-	Status                    string                         `json:"status" binding:"omitempty,oneof=active inactive"`
-	SubscriptionType          string                         `json:"subscription_type" binding:"omitempty,oneof=standard subscription"`
-	DailyLimitUSD             optionalLimitField             `json:"daily_limit_usd"`
-	WeeklyLimitUSD            optionalLimitField             `json:"weekly_limit_usd"`
-	MonthlyLimitUSD           optionalLimitField             `json:"monthly_limit_usd"`
-	LongContextPricingEnabled *bool                          `json:"long_context_pricing_enabled"`
-	ModelPricing              *[]service.ChannelModelPricing `json:"model_pricing"`
+	RequestSpeedSelectionEnabled *bool                          `json:"request_speed_selection_enabled"`
+	DefaultRequestSpeedTier      *string                        `json:"default_request_speed_tier"`
+	Name                         string                         `json:"name"`
+	Description                  *string                        `json:"description"`
+	I18n                         *service.GroupI18n             `json:"i18n"` // 缺省不修改，传入则整体替换
+	Platform                     string                         `json:"platform" binding:"omitempty,group_platform"`
+	RateMultiplier               *float64                       `json:"rate_multiplier"`
+	IsExclusive                  *bool                          `json:"is_exclusive"`
+	Status                       string                         `json:"status" binding:"omitempty,oneof=active inactive"`
+	SubscriptionType             string                         `json:"subscription_type" binding:"omitempty,oneof=standard subscription"`
+	DailyLimitUSD                optionalLimitField             `json:"daily_limit_usd"`
+	WeeklyLimitUSD               optionalLimitField             `json:"weekly_limit_usd"`
+	MonthlyLimitUSD              optionalLimitField             `json:"monthly_limit_usd"`
+	LongContextPricingEnabled    *bool                          `json:"long_context_pricing_enabled"`
+	ModelPricing                 *[]service.ChannelModelPricing `json:"model_pricing"`
 	// 图片生成计费配置（antigravity 和 gemini 平台使用，负数表示清除配置）
 	AllowImageGeneration            *bool                         `json:"allow_image_generation"`
 	AllowBatchImageGeneration       *bool                         `json:"allow_batch_image_generation"`
@@ -300,6 +308,9 @@ type UpdateGroupRequest struct {
 	VideoPrice1080P                 *float64                      `json:"video_price_1080p"`
 	VideoModelPrices                map[string]map[string]float64 `json:"video_model_prices,omitempty"`
 	WebSearchPricePerCall           *float64                      `json:"web_search_price_per_call"`
+	UpstreamRejectionBillingEnabled *bool                         `json:"upstream_rejection_billing_enabled"`
+	UpstreamRejectionPrice          *float64                      `json:"upstream_rejection_price"`
+	DeepSeekTools                   *service.DeepSeekToolsConfig  `json:"deepseek_tools"`
 	SearchPricePer1k                *float64                      `json:"search_price_per_1k"`
 	AudioRealtimePricePerMin        *float64                      `json:"audio_realtime_price_per_min"`
 	AudioTtsPricePerMillionChars    *float64                      `json:"audio_tts_price_per_million_chars"`
@@ -317,6 +328,7 @@ type UpdateGroupRequest struct {
 	AllowMessagesDispatch       *bool                                      `json:"allow_messages_dispatch"`
 	AllowLive                   *bool                                      `json:"allow_live"`
 	ForceOpenAIFast             *bool                                      `json:"force_openai_fast"`
+	OpenAIServiceTierPolicy     *string                                    `json:"openai_service_tier_policy,omitempty"`
 	ForceOpenAIUltrafast        *bool                                      `json:"force_openai_ultrafast"`
 	FreeOpenAIFast              *bool                                      `json:"free_openai_fast"`
 	RequireOAuthOnly            *bool                                      `json:"require_oauth_only"`
@@ -707,6 +719,9 @@ func (h *GroupHandler) Create(c *gin.Context) {
 		VideoPrice1080P:                 req.VideoPrice1080P,
 		VideoModelPrices:                req.VideoModelPrices,
 		WebSearchPricePerCall:           req.WebSearchPricePerCall,
+		UpstreamRejectionBillingEnabled: req.UpstreamRejectionBillingEnabled,
+		UpstreamRejectionPrice:          req.UpstreamRejectionPrice,
+		DeepSeekTools:                   req.DeepSeekTools,
 		SearchPricePer1k:                req.SearchPricePer1k,
 		AudioRealtimePricePerMin:        req.AudioRealtimePricePerMin,
 		AudioTTSPricePerMillionChars:    req.AudioTtsPricePerMillionChars,
@@ -721,6 +736,9 @@ func (h *GroupHandler) Create(c *gin.Context) {
 		AllowMessagesDispatch:           req.AllowMessagesDispatch,
 		AllowLive:                       req.AllowLive,
 		ForceOpenAIFast:                 req.ForceOpenAIFast,
+		OpenAIServiceTierPolicy:         req.OpenAIServiceTierPolicy,
+		RequestSpeedSelectionEnabled:    req.RequestSpeedSelectionEnabled,
+		DefaultRequestSpeedTier:         req.DefaultRequestSpeedTier,
 		ForceOpenAIUltrafast:            req.ForceOpenAIUltrafast,
 		FreeOpenAIFast:                  req.FreeOpenAIFast,
 		RequireOAuthOnly:                req.RequireOAuthOnly,
@@ -856,6 +874,9 @@ func (h *GroupHandler) Update(c *gin.Context) {
 		VideoPrice1080P:                 req.VideoPrice1080P,
 		VideoModelPrices:                req.VideoModelPrices,
 		WebSearchPricePerCall:           req.WebSearchPricePerCall,
+		UpstreamRejectionBillingEnabled: req.UpstreamRejectionBillingEnabled,
+		UpstreamRejectionPrice:          req.UpstreamRejectionPrice,
+		DeepSeekTools:                   req.DeepSeekTools,
 		SearchPricePer1k:                req.SearchPricePer1k,
 		AudioRealtimePricePerMin:        req.AudioRealtimePricePerMin,
 		AudioTTSPricePerMillionChars:    req.AudioTtsPricePerMillionChars,
@@ -870,6 +891,9 @@ func (h *GroupHandler) Update(c *gin.Context) {
 		AllowMessagesDispatch:           req.AllowMessagesDispatch,
 		AllowLive:                       req.AllowLive,
 		ForceOpenAIFast:                 req.ForceOpenAIFast,
+		OpenAIServiceTierPolicy:         req.OpenAIServiceTierPolicy,
+		RequestSpeedSelectionEnabled:    req.RequestSpeedSelectionEnabled,
+		DefaultRequestSpeedTier:         req.DefaultRequestSpeedTier,
 		ForceOpenAIUltrafast:            req.ForceOpenAIUltrafast,
 		FreeOpenAIFast:                  req.FreeOpenAIFast,
 		RequireOAuthOnly:                req.RequireOAuthOnly,

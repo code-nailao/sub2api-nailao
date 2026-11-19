@@ -82,10 +82,12 @@ func APIKeyFromService(k *service.APIKey) *APIKey {
 		return nil
 	}
 	out := &APIKey{
+		RequestSpeedTier:   k.RequestSpeedTier,
 		ID:                 k.ID,
 		UserID:             k.UserID,
 		Key:                k.Key,
 		Name:               k.Name,
+		DeepSeekToolMode:   k.DeepSeekToolMode,
 		GroupID:            k.GroupID,
 		Status:             k.Status,
 		IPWhitelist:        k.IPWhitelist,
@@ -149,6 +151,7 @@ func GroupFromServiceAdmin(g *service.Group) *AdminGroup {
 	out := &AdminGroup{
 		Group:                       groupFromServiceBase(g),
 		ForceOpenAIFast:             g.ForceOpenAIFast,
+		OpenAIServiceTierPolicy:     g.OpenAIServiceTierPolicy,
 		ForceOpenAIUltrafast:        g.ForceOpenAIUltrafast,
 		FreeOpenAIFast:              g.FreeOpenAIFast,
 		ProfitControlEnabled:        g.ProfitControlEnabled,
@@ -175,11 +178,15 @@ func GroupFromServiceAdmin(g *service.Group) *AdminGroup {
 			out.AccountGroups = append(out.AccountGroups, *AccountGroupFromService(&ag))
 		}
 	}
+	out.DeepSeekTools = g.DeepSeekTools
 	return out
 }
 
 func groupFromServiceBase(g *service.Group) Group {
 	return Group{
+		RequestSpeedSelectionEnabled:    g.RequestSpeedSelectionEnabled,
+		DefaultRequestSpeedTier:         g.DefaultRequestSpeedTier,
+		AvailableRequestSpeedTiers:      append([]string{}, g.AvailableRequestSpeedTiers...),
 		ID:                              g.ID,
 		Name:                            g.Name,
 		Description:                     g.Description,
@@ -214,6 +221,9 @@ func groupFromServiceBase(g *service.Group) Group {
 		VideoPrice1080P:                 g.VideoPrice1080P,
 		VideoModelPrices:                g.VideoModelPrices,
 		WebSearchPricePerCall:           g.WebSearchPricePerCall,
+		UpstreamRejectionBillingEnabled: g.UpstreamRejectionBillingEnabled,
+		UpstreamRejectionPrice:          g.UpstreamRejectionPrice,
+		DeepSeekTools:                   g.DeepSeekToolsPublic(),
 		SearchPricePer1k:                g.SearchPricePer1k,
 		AudioRealtimePricePerMin:        g.AudioRealtimePricePerMin,
 		AudioTtsPricePerMillionChars:    g.AudioTTSPricePerMillionChars,
@@ -249,42 +259,43 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		openCodeGoUsage = state
 	}
 	out := &Account{
-		ID:                      a.ID,
-		Name:                    a.Name,
-		Notes:                   a.Notes,
-		Platform:                a.Platform,
-		Type:                    a.Type,
-		Credentials:             redactedCreds,
-		CredentialsStatus:       credsStatus,
-		Extra:                   extra,
-		OllamaCloudUsage:        ollamaCloudUsage,
-		OpenCodeGoUsage:         openCodeGoUsage,
-		ProxyID:                 a.ProxyID,
-		ProxyFallbackOriginID:   a.ProxyFallbackOriginID,
-		ProxyFallbackOriginName: a.ProxyFallbackOriginName,
-		Concurrency:             a.Concurrency,
-		LoadFactor:              a.LoadFactor,
-		Priority:                a.Priority,
-		RateMultiplier:          a.BillingRateMultiplier(),
-		Status:                  a.Status,
-		ErrorMessage:            a.ErrorMessage,
-		LastUsedAt:              a.LastUsedAt,
-		ExpiresAt:               timeToUnixSeconds(a.ExpiresAt),
-		AutoPauseOnExpired:      a.AutoPauseOnExpired,
-		CreatedAt:               a.CreatedAt,
-		UpdatedAt:               a.UpdatedAt,
-		Schedulable:             a.Schedulable,
-		RateLimitedAt:           a.RateLimitedAt,
-		RateLimitResetAt:        a.RateLimitResetAt,
-		OverloadUntil:           a.OverloadUntil,
-		TempUnschedulableUntil:  a.TempUnschedulableUntil,
-		TempUnschedulableReason: a.TempUnschedulableReason,
-		SessionWindowStart:      a.SessionWindowStart,
-		SessionWindowEnd:        a.SessionWindowEnd,
-		SessionWindowStatus:     a.SessionWindowStatus,
-		GroupIDs:                a.GroupIDs,
-		ParentAccountID:         a.ParentAccountID,
-		QuotaDimension:          a.QuotaDimension,
+		RequestSpeedTiersByGroup: a.RequestSpeedTiersByGroup,
+		ID:                       a.ID,
+		Name:                     a.Name,
+		Notes:                    a.Notes,
+		Platform:                 a.Platform,
+		Type:                     a.Type,
+		Credentials:              redactedCreds,
+		CredentialsStatus:        credsStatus,
+		Extra:                    extra,
+		OllamaCloudUsage:         ollamaCloudUsage,
+		OpenCodeGoUsage:          openCodeGoUsage,
+		ProxyID:                  a.ProxyID,
+		ProxyFallbackOriginID:    a.ProxyFallbackOriginID,
+		ProxyFallbackOriginName:  a.ProxyFallbackOriginName,
+		Concurrency:              a.Concurrency,
+		LoadFactor:               a.LoadFactor,
+		Priority:                 a.Priority,
+		RateMultiplier:           a.BillingRateMultiplier(),
+		Status:                   a.Status,
+		ErrorMessage:             a.ErrorMessage,
+		LastUsedAt:               a.LastUsedAt,
+		ExpiresAt:                timeToUnixSeconds(a.ExpiresAt),
+		AutoPauseOnExpired:       a.AutoPauseOnExpired,
+		CreatedAt:                a.CreatedAt,
+		UpdatedAt:                a.UpdatedAt,
+		Schedulable:              a.Schedulable,
+		RateLimitedAt:            a.RateLimitedAt,
+		RateLimitResetAt:         a.RateLimitResetAt,
+		OverloadUntil:            a.OverloadUntil,
+		TempUnschedulableUntil:   a.TempUnschedulableUntil,
+		TempUnschedulableReason:  a.TempUnschedulableReason,
+		SessionWindowStart:       a.SessionWindowStart,
+		SessionWindowEnd:         a.SessionWindowEnd,
+		SessionWindowStatus:      a.SessionWindowStatus,
+		GroupIDs:                 a.GroupIDs,
+		ParentAccountID:          a.ParentAccountID,
+		QuotaDimension:           a.QuotaDimension,
 	}
 
 	// 提取 5h 窗口费用控制和会话数量控制配置（仅 Anthropic OAuth/SetupToken 账号有效）
@@ -423,6 +434,12 @@ func redactAccountManagedExtra(extra map[string]any) map[string]any {
 	redacted := make(map[string]any, len(extra))
 	for key, value := range extra {
 		switch key {
+		case "upstream_rejection_profile":
+			if profile, ok := value.(string); ok && service.IsUpstreamRejectionLegacyProfile(profile) {
+				redacted[key] = service.UpstreamRejectionProfileGrokContentV1
+			} else {
+				redacted[key] = value
+			}
 		case service.OllamaCloudUsageSessionExtraKey,
 			service.OllamaCloudUsageAutoRefreshExtraKey,
 			service.OllamaCloudUsageSnapshotExtraKey,
@@ -512,12 +529,13 @@ func AccountGroupFromService(ag *service.AccountGroup) *AccountGroup {
 		return nil
 	}
 	return &AccountGroup{
-		AccountID: ag.AccountID,
-		GroupID:   ag.GroupID,
-		Priority:  ag.Priority,
-		CreatedAt: ag.CreatedAt,
-		Account:   AccountFromServiceShallow(ag.Account),
-		Group:     GroupFromServiceShallow(ag.Group),
+		RequestSpeedTiers: append([]string{}, ag.RequestSpeedTiers...),
+		AccountID:         ag.AccountID,
+		GroupID:           ag.GroupID,
+		Priority:          ag.Priority,
+		CreatedAt:         ag.CreatedAt,
+		Account:           AccountFromServiceShallow(ag.Account),
+		Group:             GroupFromServiceShallow(ag.Group),
 	}
 }
 
@@ -700,6 +718,7 @@ func usageLogFromServiceUser(l *service.UsageLog) UsageLog {
 		RequestID:                 l.RequestID,
 		Model:                     requestedModel,
 		ServiceTier:               l.ServiceTier,
+		BillingSnapshot:           usageBillingSnapshotForUser(l.BillingSnapshot),
 		ReasoningEffort:           userFacingReasoningEffort(l),
 		InboundEndpoint:           l.InboundEndpoint,
 		GroupID:                   l.GroupID,
@@ -768,6 +787,9 @@ func UsageLogFromServiceAdmin(l *service.UsageLog) *AdminUsageLog {
 		return nil
 	}
 	usageLog := usageLogFromServiceUser(l)
+	if l.BillingSnapshot != nil {
+		usageLog.BillingSnapshot = l.BillingSnapshot
+	}
 	usageLog.UpstreamEndpoint = l.UpstreamEndpoint
 	return &AdminUsageLog{
 		UsageLog:                usageLog,

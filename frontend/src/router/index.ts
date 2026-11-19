@@ -409,6 +409,11 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
+    path: '/custom/sources-upstream-balance',
+    redirect: '/admin/accounts',
+    meta: { requiresAuth: true, requiresAdmin: true }
+  },
+  {
     path: '/custom/:id',
     name: 'CustomPage',
     component: () => import('@/views/user/CustomPageView.vue'),
@@ -547,6 +552,12 @@ const routes: RouteRecordRaw[] = [
       titleKey: 'admin.accounts.title',
       descriptionKey: 'admin.accounts.description'
     }
+  },
+  {
+    path: '/admin/image-tasks',
+    name: 'SourcesImageTaskReview',
+    component: () => import('@/features/sources/ImageTaskReview.vue'),
+    meta: { requiresAuth: true, requiresAdmin: true, title: 'Image exceptions', titleKey: 'nav.imageTaskReview' }
   },
   {
     path: '/admin/plugins',

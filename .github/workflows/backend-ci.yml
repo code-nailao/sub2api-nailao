@@ -1,56 +1,206 @@
 name: CI
 
 on:
+  # Pushes to a working branch are already covered by the pull request that
+  # opens it; running both doubled every change. The merge into main is still
+  # verified on push, and that run is the one a release requires.
   push:
+    branches: [main]
   pull_request:
+
+# A newer push to a pull request makes the run for the older commit pointless.
+# Runs on main are never cancelled: each one is the receipt for its commit.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
-jobs:
-  shell:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v6
-      - name: Check deployment scripts
-        run: |
-          /bin/bash -n deploy/apple-container.sh
-          /bin/bash deploy/tests/apple-container-test.sh
-          /bin/sh deploy/tests/docker-compose-security-test.sh
-          /bin/sh deploy/tests/docker-compose-gateway-env-test.sh
-          /bin/sh deploy/tests/docker-runtime-resources-test.sh
-          /bin/sh deploy/test-caddyfile-cache.sh
+env:
+  # Standard runners for public repositories have four cores.
+  GO_TEST_P: '4'
 
-  test:
+jobs:
+  changes:
+    # Decides which jobs a pull request needs, so a documentation change does
+    # not wait for the backend suite. A push to main always runs everything.
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      backend: ${{ steps.pick.outputs.backend }}
+      frontend: ${{ steps.pick.outputs.frontend }}
+      deploy: ${{ steps.pick.outputs.deploy }}
+      tooling: ${{ steps.pick.outputs.tooling }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          everything() {
+            for key in backend frontend deploy tooling; do echo "$key=true" >> "$GITHUB_OUTPUT"; done
+          }
+          if [ "$EVENT" != pull_request ]; then everything; exit 0; fi
+          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | .filename, (.previous_filename // empty)')
+          count=$(grep -c . <<<"$files" || true)
+          # The API stops at 3000 files, and a workflow change can affect any job:
+          # in both cases run everything rather than guess.
+          if [ "$count" -eq 0 ] || [ "$count" -ge 2900 ] || grep -qE '^\.github/' <<<"$files"; then
+            everything; exit 0
+          fi
+          has() { if grep -qE "$1" <<<"$files"; then echo true; else echo false; fi; }
+          {
+            echo "backend=$(has '^(backend/|scripts/sources_validation/|Makefile$)')"
+            echo "frontend=$(has '^(frontend/|docs/legal/|Makefile$)')"
+            echo "deploy=$(has '^deploy/')"
+            echo "tooling=$(has '^(backend/|frontend/|extensions/|scripts/|deploy/|docs/legal/|docs/sources/CORE-PATCHES\.json$|Dockerfile|Makefile$|\.goreleaser|\.sources-identity\.json$|\.upstream-sub2api$)')"
+          } >> "$GITHUB_OUTPUT"
+
+  tree:
+    # Cheap checks that apply to every change, documentation included.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Check Docker Compose simple mode environment
-        run: /bin/sh deploy/tests/docker-compose-simple-mode-env-test.sh
+      - name: Links resolve and no host details are committed
+        run: python3 scripts/sources_extensions/check_public_tree.py
+
+  unit:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # internal/service is split four ways (see unit.sh). The four slices
+        # compile the same test binary, so they share one cache and only one
+        # of them saves it.
+        include:
+          - { shard: other, cache: unit-other, save: true }
+          - { shard: service-1, cache: unit-service, save: true }
+          - { shard: service-2, cache: unit-service, save: false }
+          - { shard: service-3, cache: unit-service, save: false }
+          - { shard: service-4, cache: unit-service, save: false }
+    steps:
+      - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version-file: backend/go.mod
           check-latest: false
-          cache: true
-          cache-dependency-path: backend/go.sum
+          # setup-go keys its cache on go.sum alone, so every job would share
+          # one entry holding whichever job's build finished first. Each kind
+          # of job keeps its own cache below instead.
+          cache: false
       - name: Verify Go version
         run: |
           go version | grep -q 'go1.27.4'
+      - name: Restore Go caches
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ matrix.cache }}-${{ hashFiles('backend/go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ matrix.cache }}-${{ hashFiles('backend/go.sum') }}-
       - name: Unit tests
-        working-directory: backend
-        run: make test-unit
+        run: scripts/sources_validation/unit.sh ${{ matrix.shard }}
+      - name: Save Go caches
+        # Pull requests read the cache that main last wrote; only main writes.
+        if: github.ref == 'refs/heads/main' && matrix.save
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ matrix.cache }}-${{ hashFiles('backend/go.sum') }}-${{ github.sha }}
+
+  integration:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache: false
+      - name: Restore Go caches
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-integration-${{ hashFiles('backend/go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-${{ runner.os }}-integration-${{ hashFiles('backend/go.sum') }}-
       - name: Integration tests
         working-directory: backend
-        run: make test-integration
+        run: |
+          make test-integration
+          go test -tags=unit,integration -run '^TestVerifiedNativePostgres' ./internal/service
+      - name: Save Go caches
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-integration-${{ hashFiles('backend/go.sum') }}-${{ github.sha }}
+
+  golangci-lint:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache: false
+      - name: Verify Go version
+        run: |
+          go version | grep -q 'go1.27.4'
+      - name: Restore Go caches
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-lint-${{ hashFiles('backend/go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-${{ runner.os }}-lint-${{ hashFiles('backend/go.sum') }}-
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+          args: --timeout=30m
+          working-directory: backend
+      - name: Save Go caches
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-lint-${{ hashFiles('backend/go.sum') }}-${{ github.sha }}
 
   frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
-          version: 9
+          version: 9.15.9
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
@@ -63,27 +213,26 @@ jobs:
       - name: Frontend typecheck and critical vitest
         run: make test-frontend
 
-  golangci-lint:
-    runs-on: ubuntu-latest
+  shell:
+    needs: changes
+    if: needs.changes.outputs.deploy == 'true'
+    # apple-container.sh reads the Apple `container` CLI's output with plutil,
+    # which exists only on macOS, so this job has to stay on a Mac runner.
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: backend/go.mod
-          check-latest: false
-          cache: true
-          cache-dependency-path: backend/go.sum
-      - name: Verify Go version
+      - name: Check deployment scripts
         run: |
-          go version | grep -q 'go1.27.4'
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
-        with:
-          version: v2.14.0
-          args: --timeout=30m
-          working-directory: backend
+          /bin/bash -n deploy/apple-container.sh
+          /bin/bash deploy/tests/apple-container-test.sh
+          /bin/sh deploy/tests/docker-compose-security-test.sh
+          /bin/sh deploy/tests/docker-compose-gateway-env-test.sh
+          /bin/sh deploy/tests/docker-runtime-resources-test.sh
+          /bin/sh deploy/test-caddyfile-cache.sh
 
   release-helpers:
+    needs: changes
+    if: needs.changes.outputs.tooling == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -93,3 +242,72 @@ jobs:
       - run: python -m pip install -r .github/release-tools/requirements-release.txt
       - run: python -m unittest discover -s .github/release-tools -p 'test_release_matrix.py'
       - run: bash -n .github/release-tools/release-images.sh
+
+  sources-extensions:
+    needs: changes
+    if: needs.changes.outputs.tooling == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Fetch and verify the fixed upstream baseline
+        run: python3 scripts/sources_extensions/fetch_baseline.py
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+      - name: Restore Go caches
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-extensions-${{ hashFiles('extensions/*/go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-${{ runner.os }}-extensions-${{ hashFiles('extensions/*/go.sum') }}-
+      - run: go test -race ./... && go vet ./...
+        working-directory: extensions/sources-portal
+      - run: go test -race ./... && go vet ./...
+        working-directory: extensions/sources-media-engine
+      - run: python3 scripts/sources_extensions/core_parity.py
+      - run: python3 scripts/sources_extensions/check_boundaries.py
+      - run: python3 -m unittest discover -s scripts/sources_release -p 'test_*.py'
+      - run: python3 -m unittest discover -s deploy/sources -p 'test_*.py'
+      - name: Migrations only expand the schema
+        run: python3 deploy/sources/migration_lint.py --base "origin/${{ github.base_ref || 'main' }}"
+      - name: Check Docker Compose simple mode environment
+        run: /bin/sh deploy/tests/docker-compose-simple-mode-env-test.sh
+      - name: Shell syntax of the release scripts
+        # `bash -n a b` checks only a, so check them one at a time.
+        run: |
+          for script in scripts/sources_release/build.sh scripts/sources_release/publish.sh scripts/sources_validation/unit.sh; do
+            bash -n "$script"
+          done
+      - name: Save Go caches
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-extensions-${{ hashFiles('extensions/*/go.sum') }}-${{ github.sha }}
+
+  ci:
+    # The one check to require on main. A job that `changes` skipped counts as
+    # passed; a failed or cancelled job does not.
+    if: always()
+    needs: [changes, tree, unit, integration, golangci-lint, frontend, shell, release-helpers, sources-extensions]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job passed or was skipped on purpose
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          results = {name: job["result"] for name, job in json.loads(os.environ["RESULTS"]).items()}
+          bad = {name: result for name, result in results.items() if result not in ("success", "skipped")}
+          print(json.dumps(results, indent=2))
+          sys.exit(f"not passed: {bad}" if bad else 0)
+          PY

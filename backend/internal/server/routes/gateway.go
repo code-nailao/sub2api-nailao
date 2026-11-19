@@ -188,6 +188,8 @@ func RegisterGatewayRoutes(
 	gateway.Use(compositeTarget)
 	gateway.Use(requireGroupAnthropic)
 	{
+		gateway.POST("/tools/search", h.OpenAIGateway.DeepSeekTool)
+		gateway.POST("/tools/fetch", h.OpenAIGateway.DeepSeekTool)
 		// /v1/messages: auto-route based on group platform
 		gateway.POST("/messages", func(c *gin.Context) {
 			if isOpenAIResponsesCompatibleGatewayPlatform(c) {

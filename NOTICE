@@ -1,0 +1,22 @@
+Sources (sub2api-nailao)
+
+This project is a modified version of Sub2API by Wei-Shaw and contributors
+(https://github.com/Wei-Shaw/sub2api). It is distributed under the same
+licence as Sub2API, the GNU Lesser General Public License version 3; the full
+text is in the LICENSE file, which is unchanged from upstream.
+
+Upstream baseline
+    The upstream tag and commit this tree is based on are recorded in
+    .upstream-sub2api.
+
+Modifications
+    Every upstream file that this project changes is listed in
+    docs/sources/CORE-PATCHES.json with its SHA-256 and the reason for the
+    change, and CI verifies that list against the baseline. SOURCES.md
+    describes the changes feature by feature. Code that exists only in this
+    project lives mainly under extensions/, scripts/ and deploy/sources/.
+
+Corresponding source
+    Published container images are labelled with the revision they were built
+    from. The corresponding source for an image is that revision of this
+    repository.

@@ -3,6 +3,7 @@
 package ent
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -21,6 +22,8 @@ type AccountGroup struct {
 	AccountID int64 `json:"account_id,omitempty"`
 	// GroupID holds the value of the "group_id" field.
 	GroupID int64 `json:"group_id,omitempty"`
+	// RequestSpeedTiers holds the value of the "request_speed_tiers" field.
+	RequestSpeedTiers []string `json:"request_speed_tiers,omitempty"`
 	// Priority holds the value of the "priority" field.
 	Priority int `json:"priority,omitempty"`
 	// CreatedAt holds the value of the "created_at" field.
@@ -69,6 +72,8 @@ func (*AccountGroup) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
+		case accountgroup.FieldRequestSpeedTiers:
+			values[i] = new([]byte)
 		case accountgroup.FieldAccountID, accountgroup.FieldGroupID, accountgroup.FieldPriority:
 			values[i] = new(sql.NullInt64)
 		case accountgroup.FieldCreatedAt:
@@ -99,6 +104,14 @@ func (_m *AccountGroup) assignValues(columns []string, values []any) error {
 				return fmt.Errorf("unexpected type %T for field group_id", values[i])
 			} else if value.Valid {
 				_m.GroupID = value.Int64
+			}
+		case accountgroup.FieldRequestSpeedTiers:
+			if value, ok := values[i].(*[]byte); !ok {
+				return fmt.Errorf("unexpected type %T for field request_speed_tiers", values[i])
+			} else if value != nil && len(*value) > 0 {
+				if err := json.Unmarshal(*value, &_m.RequestSpeedTiers); err != nil {
+					return fmt.Errorf("unmarshal field request_speed_tiers: %w", err)
+				}
 			}
 		case accountgroup.FieldPriority:
 			if value, ok := values[i].(*sql.NullInt64); !ok {
@@ -162,6 +175,9 @@ func (_m *AccountGroup) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("group_id=")
 	builder.WriteString(fmt.Sprintf("%v", _m.GroupID))
+	builder.WriteString(", ")
+	builder.WriteString("request_speed_tiers=")
+	builder.WriteString(fmt.Sprintf("%v", _m.RequestSpeedTiers))
 	builder.WriteString(", ")
 	builder.WriteString("priority=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Priority))

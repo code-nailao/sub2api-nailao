@@ -1471,3 +1471,53 @@ describe('EditAccountModal Grok OAuth upstream config', () => {
     }
   )
 })
+
+
+describe('EditAccountModal content restriction profile', () => {
+  beforeEach(() => {
+    authIsSimpleMode.value = false
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+  })
+  const account = () => ({ ...buildGrokOAuthAccount({ base_url: 'https://example.invalid', model_mapping: { 'grok-4.7': 'grok-4.7' } }, { unrelated: 'preserve' }), type: 'apikey', credentials_status: { has_api_key: true } })
+  it('defaults off and persists profile/cost independently of customer price', async () => {
+    const a = account(); updateAccountMock.mockResolvedValue(a)
+    const wrapper = mountModal(a)
+    expect((wrapper.get('[data-testid="account-rejection-enabled"]').element as HTMLInputElement).checked).toBe(false)
+    await wrapper.get('[data-testid="account-rejection-enabled"]').setValue(true)
+    await wrapper.get('[data-testid="account-rejection-cost"]').setValue('0.12')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    await vi.waitFor(() => expect(updateAccountMock).toHaveBeenCalledOnce())
+    const payload = updateAccountMock.mock.calls[0][1]
+    expect(payload.extra).toMatchObject({ unrelated: 'preserve', upstream_rejection_profile: 'grok_content_rejection_v1', upstream_rejection_cost: 0.12, upstream_rejection_currency: 'USD' })
+    expect(payload.extra.upstream_rejection_price).toBeUndefined()
+    expect(payload.credentials.model_mapping).toEqual({ 'grok-4.7': 'grok-4.7' })
+    wrapper.unmount()
+  })
+  it('disables profile while preserving unrelated settings', async () => {
+    const a = account(); a.extra = { ...a.extra, upstream_rejection_profile: 'grok_content_rejection_v1', upstream_rejection_cost: 0.1, upstream_rejection_currency: 'USD' }
+    updateAccountMock.mockResolvedValue(a)
+    const wrapper = mountModal(a)
+    await wrapper.get('[data-testid="account-rejection-enabled"]').setValue(false)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    await vi.waitFor(() => expect(updateAccountMock).toHaveBeenCalledOnce())
+    const payload = updateAccountMock.mock.calls[0][1]
+    expect(payload.extra.unrelated).toBe('preserve')
+    expect(payload.extra.upstream_rejection_profile).toBeUndefined()
+    expect(payload.extra.upstream_rejection_cost).toBeUndefined()
+    wrapper.unmount()
+  })
+  it('blocks invalid cost and prefixed mappings before API mutation', async () => {
+    const a = account(); a.credentials.model_mapping = { 'xai/grok-4.7': 'grok-4.7' }
+    const wrapper = mountModal(a)
+    await wrapper.get('[data-testid="account-rejection-enabled"]').setValue(true)
+    await wrapper.get('[data-testid="account-rejection-cost"]').setValue('0.000000001')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(wrapper.find('[role="alert"]').exists()).toBe(true)
+    expect(updateAccountMock).not.toHaveBeenCalled()
+    await wrapper.get('[data-testid="account-rejection-cost"]').setValue('0.1')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    expect(updateAccountMock).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+})

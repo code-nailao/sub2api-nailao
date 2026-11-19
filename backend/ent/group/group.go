@@ -90,6 +90,12 @@ const (
 	FieldVideoModelPrices = "video_model_prices"
 	// FieldWebSearchPricePerCall holds the string denoting the web_search_price_per_call field in the database.
 	FieldWebSearchPricePerCall = "web_search_price_per_call"
+	// FieldUpstreamRejectionBillingEnabled holds the string denoting the upstream_rejection_billing_enabled field in the database.
+	FieldUpstreamRejectionBillingEnabled = "upstream_rejection_billing_enabled"
+	// FieldUpstreamRejectionPrice holds the string denoting the upstream_rejection_price field in the database.
+	FieldUpstreamRejectionPrice = "upstream_rejection_price"
+	// FieldDeepseekTools holds the string denoting the deepseek_tools field in the database.
+	FieldDeepseekTools = "deepseek_tools"
 	// FieldSearchPricePer1k holds the string denoting the search_price_per_1k field in the database.
 	FieldSearchPricePer1k = "search_price_per_1k"
 	// FieldAudioRealtimePricePerMin holds the string denoting the audio_realtime_price_per_min field in the database.
@@ -122,6 +128,12 @@ const (
 	FieldAllowMessagesDispatch = "allow_messages_dispatch"
 	// FieldAllowLive holds the string denoting the allow_live field in the database.
 	FieldAllowLive = "allow_live"
+	// FieldOpenaiServiceTierPolicy holds the string denoting the openai_service_tier_policy field in the database.
+	FieldOpenaiServiceTierPolicy = "openai_service_tier_policy"
+	// FieldRequestSpeedSelectionEnabled holds the string denoting the request_speed_selection_enabled field in the database.
+	FieldRequestSpeedSelectionEnabled = "request_speed_selection_enabled"
+	// FieldDefaultRequestSpeedTier holds the string denoting the default_request_speed_tier field in the database.
+	FieldDefaultRequestSpeedTier = "default_request_speed_tier"
 	// FieldForceOpenaiFast holds the string denoting the force_openai_fast field in the database.
 	FieldForceOpenaiFast = "force_openai_fast"
 	// FieldForceOpenaiUltrafast holds the string denoting the force_openai_ultrafast field in the database.
@@ -266,6 +278,9 @@ var Columns = []string{
 	FieldVideoPrice1080p,
 	FieldVideoModelPrices,
 	FieldWebSearchPricePerCall,
+	FieldUpstreamRejectionBillingEnabled,
+	FieldUpstreamRejectionPrice,
+	FieldDeepseekTools,
 	FieldSearchPricePer1k,
 	FieldAudioRealtimePricePerMin,
 	FieldAudioTtsPricePerMillionChars,
@@ -282,6 +297,9 @@ var Columns = []string{
 	FieldSortOrder,
 	FieldAllowMessagesDispatch,
 	FieldAllowLive,
+	FieldOpenaiServiceTierPolicy,
+	FieldRequestSpeedSelectionEnabled,
+	FieldDefaultRequestSpeedTier,
 	FieldForceOpenaiFast,
 	FieldForceOpenaiUltrafast,
 	FieldFreeOpenaiFast,
@@ -387,6 +405,12 @@ var (
 	DefaultVideoRateIndependent bool
 	// DefaultVideoRateMultiplier holds the default value on creation for the "video_rate_multiplier" field.
 	DefaultVideoRateMultiplier float64
+	// DefaultUpstreamRejectionBillingEnabled holds the default value on creation for the "upstream_rejection_billing_enabled" field.
+	DefaultUpstreamRejectionBillingEnabled bool
+	// DefaultUpstreamRejectionPrice holds the default value on creation for the "upstream_rejection_price" field.
+	DefaultUpstreamRejectionPrice float64
+	// UpstreamRejectionPriceValidator is a validator for the "upstream_rejection_price" field. It is called by the builders before save.
+	UpstreamRejectionPriceValidator func(float64) error
 	// SearchPricePer1kValidator is a validator for the "search_price_per_1k" field. It is called by the builders before save.
 	SearchPricePer1kValidator func(float64) error
 	// AudioRealtimePricePerMinValidator is a validator for the "audio_realtime_price_per_min" field. It is called by the builders before save.
@@ -411,6 +435,12 @@ var (
 	DefaultAllowMessagesDispatch bool
 	// DefaultAllowLive holds the default value on creation for the "allow_live" field.
 	DefaultAllowLive bool
+	// OpenaiServiceTierPolicyValidator is a validator for the "openai_service_tier_policy" field. It is called by the builders before save.
+	OpenaiServiceTierPolicyValidator func(string) error
+	// DefaultRequestSpeedSelectionEnabled holds the default value on creation for the "request_speed_selection_enabled" field.
+	DefaultRequestSpeedSelectionEnabled bool
+	// DefaultDefaultRequestSpeedTier holds the default value on creation for the "default_request_speed_tier" field.
+	DefaultDefaultRequestSpeedTier string
 	// DefaultForceOpenaiFast holds the default value on creation for the "force_openai_fast" field.
 	DefaultForceOpenaiFast bool
 	// DefaultForceOpenaiUltrafast holds the default value on creation for the "force_openai_ultrafast" field.
@@ -634,6 +664,16 @@ func ByWebSearchPricePerCall(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldWebSearchPricePerCall, opts...).ToFunc()
 }
 
+// ByUpstreamRejectionBillingEnabled orders the results by the upstream_rejection_billing_enabled field.
+func ByUpstreamRejectionBillingEnabled(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldUpstreamRejectionBillingEnabled, opts...).ToFunc()
+}
+
+// ByUpstreamRejectionPrice orders the results by the upstream_rejection_price field.
+func ByUpstreamRejectionPrice(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldUpstreamRejectionPrice, opts...).ToFunc()
+}
+
 // BySearchPricePer1k orders the results by the search_price_per_1k field.
 func BySearchPricePer1k(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldSearchPricePer1k, opts...).ToFunc()
@@ -697,6 +737,21 @@ func ByAllowMessagesDispatch(opts ...sql.OrderTermOption) OrderOption {
 // ByAllowLive orders the results by the allow_live field.
 func ByAllowLive(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldAllowLive, opts...).ToFunc()
+}
+
+// ByOpenaiServiceTierPolicy orders the results by the openai_service_tier_policy field.
+func ByOpenaiServiceTierPolicy(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldOpenaiServiceTierPolicy, opts...).ToFunc()
+}
+
+// ByRequestSpeedSelectionEnabled orders the results by the request_speed_selection_enabled field.
+func ByRequestSpeedSelectionEnabled(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldRequestSpeedSelectionEnabled, opts...).ToFunc()
+}
+
+// ByDefaultRequestSpeedTier orders the results by the default_request_speed_tier field.
+func ByDefaultRequestSpeedTier(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldDefaultRequestSpeedTier, opts...).ToFunc()
 }
 
 // ByForceOpenaiFast orders the results by the force_openai_fast field.

@@ -153,7 +153,7 @@ func TestBackupRecovery_FailedStateWriteNeverDeletesObjects(t *testing.T) {
 	seedS3Config(t, repo)
 	store := newMockObjectStore()
 	svc := newTestBackupService(repo, &mockDumper{}, store)
-	record := archiveRecord("interrupted", time.Now().Add(-time.Hour).Format(time.RFC3339))
+	record := archiveRecord("interrupted", time.Now().Add(-3*time.Hour).Format(time.RFC3339))
 	record.Status, record.S3Key = "running", "interrupted.sql.gz"
 	store.objects[record.S3Key] = []byte("payload")
 	require.NoError(t, svc.saveRecord(ctx, record))

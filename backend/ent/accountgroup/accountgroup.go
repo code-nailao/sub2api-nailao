@@ -16,6 +16,8 @@ const (
 	FieldAccountID = "account_id"
 	// FieldGroupID holds the string denoting the group_id field in the database.
 	FieldGroupID = "group_id"
+	// FieldRequestSpeedTiers holds the string denoting the request_speed_tiers field in the database.
+	FieldRequestSpeedTiers = "request_speed_tiers"
 	// FieldPriority holds the string denoting the priority field in the database.
 	FieldPriority = "priority"
 	// FieldCreatedAt holds the string denoting the created_at field in the database.
@@ -50,6 +52,7 @@ const (
 var Columns = []string{
 	FieldAccountID,
 	FieldGroupID,
+	FieldRequestSpeedTiers,
 	FieldPriority,
 	FieldCreatedAt,
 }
@@ -65,6 +68,8 @@ func ValidColumn(column string) bool {
 }
 
 var (
+	// DefaultRequestSpeedTiers holds the default value on creation for the "request_speed_tiers" field.
+	DefaultRequestSpeedTiers []string
 	// DefaultPriority holds the default value on creation for the "priority" field.
 	DefaultPriority int
 	// DefaultCreatedAt holds the default value on creation for the "created_at" field.

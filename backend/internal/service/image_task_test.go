@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 	"github.com/stretchr/testify/require"
 )
 
@@ -52,6 +53,12 @@ func TestImageTaskServiceLifecycleAndOwnership(t *testing.T) {
 	require.Equal(t, time.Hour, store.ttl)
 	require.Equal(t, owner.UserID, store.task.UserID)
 	require.Equal(t, owner.APIKeyID, store.task.APIKeyID)
+	instance := processrole.Default().Status().InstanceID
+	require.NotEmpty(t, instance)
+	require.Equal(t, instance, store.task.InstanceID)
+	public, err := json.Marshal(created)
+	require.NoError(t, err)
+	require.NotContains(t, string(public), "instance_id")
 
 	_, err = svc.Get(context.Background(), ImageTaskOwner{UserID: 7, APIKeyID: 10}, created.ID)
 	require.ErrorIs(t, err, ErrImageTaskNotFound)
@@ -66,6 +73,7 @@ func TestImageTaskServiceLifecycleAndOwnership(t *testing.T) {
 	require.Equal(t, "https://example.test/image.png", completed.ImageURL)
 	require.JSONEq(t, string(result), string(completed.Result))
 	require.NotNil(t, completed.CompletedAt)
+	require.Equal(t, instance, store.task.InstanceID, "completion must preserve execution ownership")
 }
 
 func TestImageTaskServiceInvalidResultBecomesFailed(t *testing.T) {

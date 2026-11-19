@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "repository": "https://github.com/Wei-Shaw/sub2api",
+  "version": "v0.2.23",
+  "commit": "5af9afb588c4b014b3df9db7d4073af1f8ae01b6",
+  "image": "ghcr.io/wei-shaw/sub2api@sha256:0cc625218210f98e94b72da1a69f8678792b6f6a0ab4ecd6a4e5818a21867167",
+  "platform": "linux/amd64",
+  "migration_count": 305
+}

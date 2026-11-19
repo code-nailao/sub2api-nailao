@@ -327,6 +327,11 @@ func (s *OpenAIGatewayService) ResolveGrokMediaVideoRequestAccount(
 	requestID string,
 	userID, apiKeyID int64,
 ) (int64, error) {
+	if reservation, err := s.LoadGrokVideoRejectionReservation(ctx, requestID, userID, apiKeyID); err != nil {
+		return 0, err
+	} else if reservation != nil {
+		return reservation.AccountID, nil
+	}
 	if s == nil || s.cache == nil {
 		return 0, fmt.Errorf("grok video request binding cache is unavailable")
 	}
@@ -377,12 +382,17 @@ func (s *OpenAIGatewayService) SelectMediaVideoRequestAccount(
 // first observes a completed video URL. Status may omit model/duration; we fall
 // back to this snapshot, then defaults.
 type GrokVideoPendingBilling struct {
-	Model                string `json:"model"`
-	BillingModel         string `json:"billing_model,omitempty"`
-	UpstreamModel        string `json:"upstream_model,omitempty"`
-	VideoResolution      string `json:"video_resolution,omitempty"`
-	VideoDurationSeconds int    `json:"video_duration_seconds,omitempty"`
-	OriginalModel        string `json:"original_model,omitempty"`
+	VideoBasePricePerSecond  *float64 `json:"video_base_price_per_second,omitempty"`
+	VideoFinalPricePerSecond *float64 `json:"video_final_price_per_second,omitempty"`
+	// For opted-in suppliers PostgreSQL owns the task/price identity. Redis is a
+	// compatibility cache, never the authority for the charged refusal.
+	UpstreamRejectionReservationID string `json:"upstream_rejection_reservation_id,omitempty"`
+	Model                          string `json:"model"`
+	BillingModel                   string `json:"billing_model,omitempty"`
+	UpstreamModel                  string `json:"upstream_model,omitempty"`
+	VideoResolution                string `json:"video_resolution,omitempty"`
+	VideoDurationSeconds           int    `json:"video_duration_seconds,omitempty"`
+	OriginalModel                  string `json:"original_model,omitempty"`
 	// CreatedAt is when the gateway accepted the async create (RFC3339Nano UTC).
 	// duration_ms for deferred billing is measured from this instant until the
 	// first official done+video.url observation (status poll or content download),
@@ -448,7 +458,7 @@ func (s *OpenAIGatewayService) StoreGrokVideoPendingBilling(
 	userID, apiKeyID int64,
 	pending GrokVideoPendingBilling,
 ) error {
-	if s == nil || s.cache == nil {
+	if s == nil || (s.cache == nil && pending.UpstreamRejectionReservationID == "") {
 		return fmt.Errorf("grok video pending billing cache is unavailable")
 	}
 	key := grokVideoPendingBillingKey(requestID, userID, apiKeyID)
@@ -475,6 +485,30 @@ func (s *OpenAIGatewayService) StoreGrokVideoPendingBilling(
 	if err != nil {
 		return err
 	}
+	if pending.UpstreamRejectionReservationID != "" {
+		// Client disconnect cannot erase an accepted upstream task binding.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		repo, ok := s.usageBillingRepo.(UpstreamRejectionBillingRepository)
+		if !ok {
+			return fmt.Errorf("durable video rejection billing is unavailable")
+		}
+		if err := repo.BindUpstreamRejectionTask(ctx, &UpstreamRejectionTaskBinding{
+			RequestID: pending.UpstreamRejectionReservationID, APIKeyID: apiKeyID,
+			TaskID: requestID, DurationSeconds: pending.VideoDurationSeconds,
+			Resolution: pending.VideoResolution, OriginalModel: pending.OriginalModel,
+			UpstreamModel:           pending.UpstreamModel,
+			VideoBasePricePerSecond: pending.VideoBasePricePerSecond, VideoFinalPricePerSecond: pending.VideoFinalPricePerSecond,
+		}); err != nil {
+			return err
+		}
+		// PostgreSQL is sufficient for recovery even if the optional cache failed.
+		if s.cache != nil {
+			_ = s.cache.SetGrokVideoPendingBilling(ctx, key, payload, grokVideoPendingBillingTTL(s.cfg))
+		}
+		return nil
+	}
 	return s.cache.SetGrokVideoPendingBilling(ctx, key, payload, grokVideoPendingBillingTTL(s.cfg))
 }
 
@@ -484,6 +518,11 @@ func (s *OpenAIGatewayService) LoadGrokVideoPendingBilling(
 	requestID string,
 	userID, apiKeyID int64,
 ) (*GrokVideoPendingBilling, error) {
+	if reservation, err := s.LoadGrokVideoRejectionReservation(ctx, requestID, userID, apiKeyID); err != nil {
+		return nil, err
+	} else if reservation != nil {
+		return grokVideoPendingFromReservation(reservation), nil
+	}
 	if s == nil || s.cache == nil {
 		return nil, fmt.Errorf("grok video pending billing cache is unavailable")
 	}
@@ -509,6 +548,13 @@ func (s *OpenAIGatewayService) ClaimGrokVideoBilling(
 	requestID string,
 	userID, apiKeyID int64,
 ) (bool, error) {
+	if reservation, err := s.LoadGrokVideoRejectionReservation(ctx, requestID, userID, apiKeyID); err != nil {
+		return false, err
+	} else if reservation != nil {
+		// This is only a scheduling hint. The PostgreSQL settlement transaction
+		// arbitrates simultaneous poll/worker observations with the same hold ID.
+		return reservation.State == UpstreamRejectionSent || reservation.State == UpstreamRejectionUnknown, nil
+	}
 	if s == nil || s.cache == nil {
 		return false, fmt.Errorf("grok video billing claim cache is unavailable")
 	}
@@ -526,6 +572,11 @@ func (s *OpenAIGatewayService) ReleaseGrokVideoBilling(
 	requestID string,
 	userID, apiKeyID int64,
 ) error {
+	if reservation, err := s.LoadGrokVideoRejectionReservation(ctx, requestID, userID, apiKeyID); err != nil {
+		return err
+	} else if reservation != nil {
+		return nil // No disposable Redis claim exists for a durable reservation.
+	}
 	if s == nil || s.cache == nil {
 		return fmt.Errorf("grok video billing claim cache is unavailable")
 	}
@@ -634,14 +685,21 @@ func ExtractGrokVideoBillingFromStatusBody(statusBody []byte, pending *GrokVideo
 	if responseID == "" {
 		responseID = strings.TrimSpace(requestID)
 	}
+	reservationID := ""
+	if pending != nil {
+		reservationID = pending.UpstreamRejectionReservationID
+	}
 	return &OpenAIForwardResult{
-		ResponseID:           responseID,
-		Model:                model,
-		BillingModel:         billingModel,
-		UpstreamModel:        upstreamModel,
-		VideoCount:           1,
-		VideoResolution:      resolution,
-		VideoDurationSeconds: durationSeconds,
+		UpstreamRejectionReservationID: reservationID,
+		VideoBasePricePerSecond:        pendingVideoBasePrice(pending),
+		VideoFinalPricePerSecond:       pendingVideoFinalPrice(pending),
+		ResponseID:                     responseID,
+		Model:                          model,
+		BillingModel:                   billingModel,
+		UpstreamModel:                  upstreamModel,
+		VideoCount:                     1,
+		VideoResolution:                resolution,
+		VideoDurationSeconds:           durationSeconds,
 	}
 }
 
@@ -729,6 +787,9 @@ func (s *OpenAIGatewayService) ForwardGrokMedia(
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
 	}
+	if err := s.MarkUpstreamRejectionBillingSent(ctx); err != nil {
+		return nil, err
+	}
 	upstreamStart := time.Now()
 	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
 	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
@@ -747,6 +808,25 @@ func (s *OpenAIGatewayService) ForwardGrokMedia(
 	respBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
 	if err != nil {
 		return nil, err
+	}
+	// A supplier-billed refusal is terminal even when returned with HTTP 200 and
+	// no image/usage. Observe before the empty-output failover below.
+	if endpoint.IsVideoLookupRequest() {
+		if err := validateGrokRejectionTaskResponse(account, requestID, respBody); err != nil {
+			return nil, err
+		}
+	}
+	if rejected := grokMediaRejectionResult(account, resp.StatusCode, respBody, requestModel, requestIDHeader); rejected != nil {
+		usage := grokMediaUsageFromResponse(endpoint, requestInfo, respBody)
+		rejected.ImageCount, rejected.ImageSize = usage.ImageCount, usage.ImageSize
+		rejected.ImageInputSize, rejected.ImageOutputSizes = usage.ImageInputSize, usage.ImageOutputSizes
+		rejected.VideoCount, rejected.VideoResolution = usage.VideoCount, usage.VideoResolution
+		rejected.VideoDurationSeconds = usage.VideoDurationSeconds
+		rejected.ResponseID = firstNonEmpty(extractGrokMediaVideoRequestID(respBody), requestID)
+		rejected.Duration = time.Since(startTime)
+		rejected.UpstreamHeaders = resp.Header.Clone()
+		writeGrokMediaResponse(c, resp, respBody, s.responseHeaderFilter)
+		return rejected, &UpstreamRejectionError{Evidence: rejected.UpstreamRejection}
 	}
 	if endpoint == GrokMediaEndpointImagesGenerations || endpoint == GrokMediaEndpointImagesEdits {
 		if countOpenAIResponseImageOutputsFromJSONBytes(respBody) <= 0 {
@@ -854,6 +934,15 @@ func (s *OpenAIGatewayService) forwardGrokMediaVideoContent(
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 		return nil, err
 	}
+	if err := validateGrokRejectionTaskResponse(account, requestID, statusBody); err != nil {
+		return nil, err
+	}
+	if rejected := grokMediaRejectionResult(account, statusResp.StatusCode, statusBody, "", statusRequestID); rejected != nil {
+		rejected.ResponseID = requestID
+		rejected.Duration = time.Since(startTime)
+		writeGrokMediaResponse(c, statusResp, statusBody, s.responseHeaderFilter)
+		return rejected, &UpstreamRejectionError{Evidence: rejected.UpstreamRejection}
+	}
 
 	contentURL, err := grokMediaSignedVideoContentURL(statusBody, requestID)
 	if err != nil {
@@ -904,7 +993,13 @@ func (s *OpenAIGatewayService) forwardGrokMediaVideoContent(
 		return nil, fmt.Errorf("grok media signed content redirect is not allowed")
 	}
 	if contentResp.StatusCode >= 400 && contentResp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
-		return s.handleGrokMediaErrorResponse(ctx, contentResp, c, account, contentRequestID, "")
+		// Download/CDN failures do not create new billable generation events.
+		// Only the task's status response above can establish a refusal. In
+		// particular a signed media host's 403 must not replace a completed video
+		// charge with a supplier moderation fee or cool the API account.
+		MarkResponseCommitted(c)
+		writeGrokMediaErrorResponse(c, contentResp.StatusCode, grokMediaErrorType(contentResp.StatusCode), "Video content is unavailable", "")
+		return nil, fmt.Errorf("grok video content unavailable: HTTP %d", contentResp.StatusCode)
 	}
 
 	s.updateGrokUsageFromResponse(withGrokTeamRateLimitModel(ctx, ""), account, contentResp.Header, contentResp.StatusCode)
@@ -1261,8 +1356,24 @@ func (s *OpenAIGatewayService) handleGrokMediaErrorResponse(
 	account *Account,
 	requestIDHeader string,
 	requestedModel string,
-) (*OpenAIForwardResult, error) {
+) (out *OpenAIForwardResult, forwardError error) {
+	// Preserve the original observed status for financial release, regardless
+	// of downstream passthrough/status rewrites. Unwrap retains existing pool
+	// retry semantics; charged rejection evidence is never classified this way.
+	defer func() {
+		if account.GetUpstreamRejectionProfile() != "" && forwardError != nil && (out == nil || out.UpstreamRejection == nil) {
+			forwardError = &UpstreamRejectionHTTPError{StatusCode: resp.StatusCode, Cause: forwardError}
+		}
+	}()
 	body := s.readUpstreamErrorBody(resp)
+	// This must precede readiness changes, configurable passthrough and pool
+	// retries: a request-scoped charged rejection does not invalidate the account.
+	if rejected := grokMediaRejectionResult(account, resp.StatusCode, body, requestedModel, requestIDHeader); rejected != nil {
+		rejected.UpstreamHeaders = resp.Header.Clone()
+		MarkResponseCommitted(c)
+		writeGrokMediaErrorResponse(c, resp.StatusCode, "invalid_request_error", grokContentPolicyClientMessage(body), grokUpstreamErrorCode(body))
+		return rejected, &UpstreamRejectionError{Evidence: rejected.UpstreamRejection}
+	}
 	// Reconcile readiness before configurable passthrough branches can return;
 	// otherwise a Grok 429 can remain schedulable.
 	s.handleGrokAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, body)

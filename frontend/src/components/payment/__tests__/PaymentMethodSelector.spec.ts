@@ -9,7 +9,7 @@ vi.mock('vue-i18n', () => ({
 }))
 
 describe('PaymentMethodSelector', () => {
-  it('wraps large custom method collections without letting labels widen the selector', () => {
+  it('keeps every custom payment method labelled and selectable', async () => {
     const methods = Array.from({ length: 12 }, (_, index) => ({
       type: `custom_${index}`,
       display_name: `CUSTOM_PAYMENT_METHOD_${index}`,
@@ -32,7 +32,10 @@ describe('PaymentMethodSelector', () => {
     expect(buttons).toHaveLength(methods.length)
     expect(buttons.every(button => button.classes().includes('min-w-0'))).toBe(true)
     expect(buttons.every((button, index) => button.attributes('title') === methods[index].display_name)).toBe(true)
-    expect(wrapper.findAll('[data-testid="payment-method-label"]').every(label => label.classes().includes('truncate'))).toBe(true)
+    expect(wrapper.findAll('[data-testid="payment-method-label"]').map(label => label.text()))
+      .toEqual(methods.map(method => method.display_name))
+    await buttons[11]!.trigger('click')
+    expect(wrapper.emitted('select')).toEqual([['custom_11']])
   })
 
   it('shows the configured display name for custom EasyPay methods', () => {
