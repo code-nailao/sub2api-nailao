@@ -169,6 +169,13 @@ type UpstreamRejectionBillingEvidence struct {
 	// ReleasedFrom is the state a deadline release left (sent or unknown). The
 	// repository writes it from the locked row; a command can never carry it.
 	ReleasedFrom string `json:"released_from,omitempty"`
+	// Identifiers the direct upstream returned with its response, kept so a
+	// hold can be matched to one supplier bill line. They are evidence for
+	// reconciliation only and never decide a charge. Empty when the response
+	// did not carry them; omitted then, so earlier fingerprints are unchanged.
+	XClientRequestID string `json:"x_client_request_id,omitempty"`
+	XRequestID       string `json:"x_request_id,omitempty"`
+	CFRay            string `json:"cf_ray,omitempty"`
 }
 
 type UpstreamRejectionFinalizeCommand struct {
@@ -217,6 +224,9 @@ func (c *UpstreamRejectionFinalizeCommand) Validate() error {
 		e.InputTokens < 0 || e.OutputTokens < 0 || e.CacheReadTokens < 0 || e.CacheWriteTokens < 0 ||
 		len(e.OriginalModel) > 256 || len(e.UpstreamModel) > 256 || len(e.UpstreamResponseModel) > 256 ||
 		len(e.InboundEndpoint) > 256 || len(e.UpstreamEndpoint) > 256 || strings.ContainsAny(e.InboundEndpoint+e.UpstreamEndpoint, "?#\r\n") || e.DurationMs < 0 || e.DurationMs > 2147483647 {
+		return ErrUpstreamRejectionInvalid
+	}
+	if !validUpstreamRejectionTraceValue(e.XClientRequestID) || !validUpstreamRejectionTraceValue(e.XRequestID) || !validUpstreamRejectionTraceValue(e.CFRay) {
 		return ErrUpstreamRejectionInvalid
 	}
 	// The reason is server-owned: only the waiver may carry it, and the waiver
