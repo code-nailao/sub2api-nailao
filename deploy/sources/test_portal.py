@@ -21,10 +21,11 @@ NGINX_DUMP = ("upstream sources_portal {\n    server 127.0.0.1:9300;\n}\n"
               "server { location / { proxy_pass http://sources_portal; } }\n")
 
 
-class PortalFakeOps(FakeOps, portal.PortalOps):
+class PortalSim(FakeOps):
     """FakeOps plus what the Portal adds: a state lock shared by all Portal
     containers (a second one exits at once with code 1), SIGTERM that takes
-    a moment to finish, the -check-config one-off and file modes."""
+    a moment to finish, the -check-config one-off, hung commands and file
+    modes. Docker never restarts a signalled container."""
 
     def __init__(self, tmp: Path, dry_run: bool = False):
         super().__init__(tmp, dry_run=dry_run)
@@ -40,6 +41,8 @@ class PortalFakeOps(FakeOps, portal.PortalOps):
         self.on_reload: list = []
         self.at_clock: list = []
         self.writes: list[str] = []
+        self.hang: set[tuple[str, ...]] = set()
+        self.on_create: list = []
 
     # time ----------------------------------------------------------------------
     def settle(self):
@@ -61,6 +64,9 @@ class PortalFakeOps(FakeOps, portal.PortalOps):
 
     def run(self, args, *, mutate, timeout=600, check=True):
         self.settle()
+        if tuple(args) in self.hang and not (self.dry_run and mutate):
+            self.commands.append(list(args))
+            raise subprocess.TimeoutExpired(args, timeout)
         if self.dry_run and mutate:
             return super().run(args, mutate=mutate, timeout=timeout, check=check)
         if args[:2] == ["docker", "create"] and "-check-" in args[args.index("--name") + 1]:
@@ -97,6 +103,10 @@ class PortalFakeOps(FakeOps, portal.PortalOps):
                 self.containers[name]["lock_refused"] = holder
                 return subprocess.CompletedProcess(args, 0, "", "")
         result = super().run(args, mutate=mutate, timeout=timeout, check=check)
+        if args[:2] == ["docker", "create"]:
+            hooks, self.on_create = self.on_create, []
+            for hook in hooks:
+                hook()
         if args[1:] == ["-s", "reload"]:
             hooks, self.on_reload = self.on_reload, []
             for hook in hooks:
@@ -109,8 +119,8 @@ class PortalFakeOps(FakeOps, portal.PortalOps):
             return super().http_json(url, token, method, body, timeout)
         port = int(url.split(":")[2].split("/")[0])
         c = next((c for c in self.containers.values() if c["port"] == port and c["State"]["Running"]), None)
-        if not c:
-            return 0, None
+        if not c or c.get("exit_at") is not None:
+            return 0, None  # a signalled Portal closes its listener at once
         if port in self.unhealthy_ports:
             return 503, None
         return 200, {"status": "ok"}
@@ -125,6 +135,11 @@ class PortalFakeOps(FakeOps, portal.PortalOps):
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             Path(path).write_text(text)
             os.chmod(path, mode)
+
+
+
+class PortalFakeOps(portal.PortalOps, PortalSim):
+    """PortalOps.run (error conversion) on top of the simulation."""
 
     def path_mode(self, path):
         if path in self.modes:
@@ -376,24 +391,119 @@ class PortalTest(unittest.TestCase):
         self.assertEqual([], self.created())
 
     # handoff failures ------------------------------------------------------------------
-    def test_old_not_exiting_keeps_in_progress_and_kills_nothing(self):
+    def test_slow_old_exit_keeps_waiting_and_completes(self):
+        self.ops.exit_delay = 500  # longer than exit_timeout (420), shorter than the abort timeout
+        self.deploy()
+        warnings = [line for line in self.ops.logs if "WARNING" in line and OLD in line]
+        self.assertTrue(warnings, self.ops.logs)
+        self.assertIn("pages are unavailable", warnings[0])
+        self.assertIn("starts the new container as soon as it exits", warnings[0])
+        self.assertIn("will not kill anything", warnings[0])
+        self.assertEqual(1, sum(1 for c in self.ops.commands if c[:2] == ["docker", "kill"]))
+        self.assertNotIn("lock_refused", self.ops.containers[NEW_A])
+        self.assertEqual("a", self.state()["current"]["slot"])
+        self.assertEqual("ok", self.history()[-1]["result"])
+
+    def test_wait_notes_are_time_based(self):
+        self.ops.exit_delay = 100
+        self.deploy()
+        notes = [line for line in self.ops.logs if "still finishing in-flight work" in line]
+        self.assertEqual(3, len(notes), notes)  # at 30, 60 and 90 seconds
+        self.assertEqual(0.25, portal.POLL)
+
+    def test_old_never_exiting_aborts_without_killing(self):
         self.ops.ignore_term = {OLD}
         with self.assertRaises(portal.OldStillRunning) as ctx:
             self.deploy()
         message = str(ctx.exception)
-        self.assertIn("still finishing work", message)
+        self.assertGreaterEqual(self.ops.clock, self.cfg.exit_abort_timeout)
         self.assertIn("nothing was killed", message)
-        self.assertIn("operator", message)
+        self.assertIn("stays unavailable until that process exits", message)
+        self.assertIn("Docker will not restart it", message)
+        self.assertIn(f"docker start {OLD}", message)
+        self.assertIn("clears in_progress", message)
+        self.assertIn("created but never started", message)
+        self.assertNotIn("Docker starts it again", message)
         kills = [c for c in self.ops.commands if c[:2] == ["docker", "kill"]]
         self.assertEqual([["docker", "kill", "--signal=TERM", OLD]], kills)
         self.assertNotIn(["docker", "start", NEW_A], self.ops.commands)
+        self.assertIn(NEW_A, self.ops.containers)
         self.assertTrue(self.running(OLD))
-        self.assertEqual("unless-stopped", self.policy(OLD), "Docker restarts it once it exits")
+        self.assertEqual("unless-stopped", self.policy(OLD), "recorded policy restored (harmless)")
         self.assertEqual("handoff", self.state()["in_progress"]["step"])
         self.assertEqual("legacy", self.state()["current"]["slot"])
         self.assertFalse(self.ops.switched)
+        self.assertEqual(portal.render_upstream("sources_portal", PORT_OLD), self.upstream())
+        self.assertTrue(any("FAILED, NEEDS AN OPERATOR" in line for line in self.ops.logs))
         with self.assertRaises(deploy.DeployError):
             self.deploy("other@sha256:9")
+
+    def test_current_dying_between_preflight_and_handover_proceeds(self):
+        def die():
+            self.ops.containers[OLD]["State"].update(Running=False, Status="exited", ExitCode=2)
+        self.ops.on_create.append(die)
+        self.deploy()
+        self.assertFalse(any(c[:2] == ["docker", "kill"] for c in self.ops.commands))
+        self.assertTrue(any("is not running; nothing to stop" in line for line in self.ops.logs))
+        self.assertTrue(self.running(NEW_A))
+        self.assertEqual(portal.render_upstream("sources_portal", PORT_A), self.upstream())
+        self.assertEqual("a", self.state()["current"]["slot"])
+
+    def test_command_timeout_while_starting_new_restores_old(self):
+        self.ops.hang = {("docker", "start", NEW_A)}
+        with self.assertRaises(deploy.DeployError) as ctx:
+            self.deploy()
+        self.assertNotIsInstance(ctx.exception, deploy.FallbackFailed)
+        self.assertIn("timed out", str(ctx.exception))
+        self.assertIn("is serving again", str(ctx.exception))
+        self.assertTrue(self.running(OLD))
+        self.assertEqual(portal.render_upstream("sources_portal", PORT_OLD), self.upstream())
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual("failed", self.history()[-1]["result"])
+
+    def test_oserror_from_a_command_is_a_deploy_error(self):
+        with mock.patch.object(portal.deploy.subprocess, "run", side_effect=FileNotFoundError(2, "No such file")):
+            with self.assertRaises(deploy.DeployError) as ctx:
+                portal.PortalOps().run(["docker", "start", "x"], mutate=True)
+        self.assertIn("could not run", str(ctx.exception))
+        with mock.patch.object(portal.deploy.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired(["docker"], 5)):
+            with self.assertRaises(deploy.DeployError):
+                portal.PortalOps().run(["docker", "start", "x"], mutate=True, timeout=5)
+
+    def test_interrupt_during_guard_restores_old_and_fails(self):
+        def interrupt():
+            raise KeyboardInterrupt
+        self.ops.on_reload.append(lambda: self.ops.at_clock.append((self.ops.clock + 3, interrupt)))
+        try:
+            with self.assertRaises(deploy.DeployError) as ctx:
+                self.deploy()
+        except KeyboardInterrupt:
+            self.fail("the interrupt escaped without restoring the old Portal")
+        self.assertNotIsInstance(ctx.exception, deploy.FallbackFailed)
+        self.assertIn("interrupted", str(ctx.exception))
+        self.assertIn("is serving again", str(ctx.exception))
+        self.assertTrue(self.running(OLD))
+        self.assertFalse(self.running(NEW_A))
+        self.assertEqual(portal.render_upstream("sources_portal", PORT_OLD), self.upstream())
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+        self.assertEqual("failed", self.history()[-1]["result"])
+
+    def test_interrupt_while_old_drains_waits_then_restores_old(self):
+        def interrupt():
+            raise KeyboardInterrupt
+        self.ops.exit_delay = 5
+        self.ops.on_create.append(lambda: self.ops.at_clock.append((self.ops.clock + 1, interrupt)))
+        try:
+            with self.assertRaises(deploy.DeployError) as ctx:
+                self.deploy()
+        except KeyboardInterrupt:
+            self.fail("the interrupt escaped without restoring the old Portal")
+        self.assertNotIsInstance(ctx.exception, deploy.FallbackFailed)
+        self.assertIn("interrupted", str(ctx.exception))
+        self.assertTrue(self.running(OLD))
+        self.assertNotIn("lock_refused", self.ops.containers[OLD])
+        self.assertEqual(portal.render_upstream("sources_portal", PORT_OLD), self.upstream())
 
     def test_new_never_healthy_restarts_old(self):
         self.ops.unhealthy_ports = {PORT_A}
@@ -553,6 +663,19 @@ class PortalTest(unittest.TestCase):
         self.assertIsNone(state["in_progress"])
         self.assertEqual(("portal-rollback", "ok"), (self.history()[-1]["action"], self.history()[-1]["result"]))
 
+    def test_rollback_when_current_is_not_running(self):
+        self.deploy()
+        self.ops.local_images.add("old@sha256:1")
+        self.ops.containers[NEW_A]["State"].update(Running=False, Status="exited", ExitCode=2)
+        self.ops.commands.clear()
+        self.deployer().rollback_portal()
+        self.assertFalse(any(c[:2] == ["docker", "kill"] for c in self.ops.commands))
+        self.assertTrue(self.running(OLD))
+        self.assertEqual(portal.render_upstream("sources_portal", PORT_OLD), self.upstream())
+        state = self.state()
+        self.assertEqual((OLD, NEW_A), (state["current"]["container"], state["previous"]["container"]))
+        self.assertEqual("ok", self.history()[-1]["result"])
+
     def test_rollback_failure_keeps_current(self):
         self.deploy()
         self.ops.local_images.add("old@sha256:1")
@@ -637,6 +760,7 @@ class PortalTest(unittest.TestCase):
             ({**base, "slots": {"a": 9301, "b": 9301}}, "distinct"),
             ({**base, "slots": {"a": 9301}}, "exactly a and b"),
             ({**base, "networks": []}, "at least one network"),
+            ({**base, "exit_timeout": 420, "exit_abort_timeout": 60}, "exit_abort_timeout"),
             ({**base, "mounts": [{"source": "/x", "target": "/y", "rw": True}]}, "mounts[0]"),
         ):
             with self.subTest(expected):
@@ -645,8 +769,9 @@ class PortalTest(unittest.TestCase):
                 self.assertIn(expected, str(ctx.exception))
         cfg = portal.PortalConfig.from_dict({**base, "mounts": [{"source": "/x", "target": "/y"}]})
         self.assertTrue(cfg.mounts[0].readonly)
-        self.assertEqual((18090, 60, 420, 60, 5, 5, "sources_portal"),
-                         (cfg.container_port, cfg.ready_timeout, cfg.exit_timeout, cfg.guard_seconds,
+        self.assertEqual((18090, 60, 420, 3600, 60, 5, 5, "sources_portal"),
+                         (cfg.container_port, cfg.ready_timeout, cfg.exit_timeout, cfg.exit_abort_timeout,
+                          cfg.guard_seconds,
                           cfg.guard_interval, cfg.guard_connect_errors, cfg.upstream_name))
 
     def test_config_load_from_file(self):

@@ -11,7 +11,14 @@ non-blocking file lock taken at start), so the new process can only start
 after the old one has exited. The tool keeps that gap short: everything that
 can be checked or prepared happens before the old Portal is signalled, the
 new container already exists, and Nginx is switched as soon as the new one
-answers /health. It never sends SIGKILL.
+answers /health. It never sends SIGKILL, and Docker does not restart a
+container stopped by `docker kill --signal=TERM`, so once the old Portal is
+signalled the only way back is to wait for it to exit and start a container:
+after exit_timeout the tool warns every 30 s and keeps waiting; only after
+exit_abort_timeout does it stop and leave the rest to an operator. A current
+container that is not running is not signalled (rollback after a crash).
+Command timeouts and Ctrl-C between the signal and the end of the guard fall
+back to the old Portal and still end the run with an error.
 
 Settings live in /opt/sources-deploy/portal.json. Usage and failure handling:
 deploy/sources/README.md. Shared pieces (Ops, errors, lock, state files, port
@@ -23,7 +30,9 @@ import argparse
 import json
 import os
 import re
+import shlex
 import stat
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,7 +51,8 @@ DEFAULT_LOCK_FILE = "/var/lock/sources-clean-release.lock"
 ENTRYPOINT = "/app/sources-portal"
 CONFIG_OK = "SOURCES_PORTAL_CONFIG_OK"
 LEGACY = "legacy"
-POLL = 0.5
+POLL = 0.25
+NOTE_EVERY = 30
 NEW_EXIT_TIMEOUT = 120
 # Never copied from an adopted container into the env file: Docker sets the
 # first three itself and the tool sets the listen address.
@@ -50,7 +60,8 @@ ADOPT_DROP_ENV = {"PATH", "HOSTNAME", "HOME", "PORTAL_LISTEN"}
 
 
 class OldStillRunning(DeployError):
-    """The old Portal did not exit in time; it is still finishing work."""
+    """A signalled Portal did not exit within the abort timeout; nothing was
+    killed and nothing was started."""
 
 
 # --------------------------------------------------------------------------
@@ -88,6 +99,7 @@ class PortalConfig:
     container_port: int = 18090
     ready_timeout: int = 60
     exit_timeout: int = 420
+    exit_abort_timeout: int = 3600
     guard_seconds: int = 60
     guard_interval: int = 5
     guard_connect_errors: int = 5
@@ -136,6 +148,8 @@ class PortalConfig:
             raise DeployError("config: at least one network is required")
         if not isinstance(self.security_opts, list) or not isinstance(self.extra_env, dict):
             raise DeployError("config: security_opts must be a list and extra_env an object")
+        if not (0 < self.exit_timeout <= self.exit_abort_timeout):
+            raise DeployError("config: exit_abort_timeout must be at least exit_timeout")
         if not re.fullmatch(r"[A-Za-z0-9_]+", self.upstream_name):
             raise DeployError("config: upstream_name may only contain letters, digits and underscores")
 
@@ -152,6 +166,17 @@ class PortalConfig:
 
 
 class PortalOps(deploy.Ops):
+    def run(self, args: list[str], *, mutate: bool, timeout: float = 600,
+            check: bool = True) -> subprocess.CompletedProcess[str]:
+        """deploy.Ops.run, with a hung or unstartable command reported as a
+        DeployError so the handover falls back instead of ending in a traceback."""
+        try:
+            return super().run(args, mutate=mutate, timeout=timeout, check=check)
+        except subprocess.TimeoutExpired:
+            raise DeployError(f"command timed out after {int(timeout)}s: {shlex.join(args[:4])} ...") from None
+        except OSError as err:
+            raise DeployError(f"command could not run: {shlex.join(args[:4])} ...: {err.strerror or err}") from None
+
     def path_mode(self, path: str) -> int | None:
         """Permission bits of a path, or None when it does not exist."""
         try:
@@ -189,6 +214,7 @@ class PortalDeployer(deploy.Deployer):
 
     def __init__(self, cfg: PortalConfig, ops: PortalOps):
         super().__init__(cfg, ops)  # type: ignore[arg-type]
+        self.signalled_old = False
 
     # docker helpers -----------------------------------------------------------
     def common_args(self) -> list[str]:
@@ -248,9 +274,12 @@ class PortalDeployer(deploy.Deployer):
         for network in self.cfg.networks[1:]:
             self.ops.run(["docker", "network", "connect", "--alias", name, network, name], mutate=True)
 
-    def wait_exit_portal(self, name: str, timeout: float) -> int | None:
-        deadline = self.ops.monotonic() + timeout
-        next_note = self.ops.monotonic() + 30
+    def wait_exit_portal(self, name: str, warn_after: float, abort_after: float, draining_portal: bool) -> int | None:
+        """Wait for a signalled container to exit; never kill it. Notes every
+        NOTE_EVERY seconds (by the clock, not by iteration); after warn_after
+        they become warnings; after abort_after OldStillRunning is raised."""
+        start = self.ops.monotonic()
+        next_note = start + NOTE_EVERY
         while True:
             info = self.ops.inspect(name)
             if info is None:
@@ -258,11 +287,18 @@ class PortalDeployer(deploy.Deployer):
             state = info.get("State") or {}
             if not state.get("Running"):
                 return int(state.get("ExitCode", 0))
-            if self.ops.monotonic() >= deadline:
-                raise OldStillRunning(f"{name} is still running {int(timeout)}s after SIGTERM; nothing was killed")
+            elapsed = self.ops.monotonic() - start
+            if elapsed >= abort_after:
+                raise OldStillRunning(f"{name} is still running {int(elapsed)}s after SIGTERM; nothing was killed")
             if self.ops.monotonic() >= next_note:
-                self.log(f"   {name} still finishing in-flight work ...")
-                next_note += 30
+                if elapsed >= warn_after and draining_portal:
+                    self.log(f"   WARNING: {name} is still running {int(elapsed)}s after SIGTERM, longer than the "
+                             f"longest expected drain ({int(warn_after)}s). The Portal's pages are unavailable. The "
+                             "tool keeps waiting and starts the new container as soon as it exits; it will not "
+                             f"kill anything (it gives up after {int(abort_after)}s)")
+                else:
+                    self.log(f"   {name} still finishing in-flight work ({int(elapsed)}s since SIGTERM) ...")
+                next_note += NOTE_EVERY
             self.ops.sleep(POLL)
 
     def wait_healthy(self, name: str, port: int, timeout: float) -> None:
@@ -342,28 +378,43 @@ class PortalDeployer(deploy.Deployer):
         if problems:
             raise DeployError("preflight failed, nothing changed:\n  - " + "\n  - ".join(problems))
 
+    def stop_old(self, old: dict[str, Any], new: dict[str, Any]) -> None:
+        """Signal the old Portal once and wait for it to exit. A container
+        that is not running is left alone."""
+        # Harmless, and keeps a daemon restart during the gap from bringing it
+        # back while the new one starts.
+        self.ops.run(["docker", "update", "--restart=no", old["container"]], mutate=True)
+        if not self.running(old["container"]):
+            self.log(f"   {old['container']} is not running; nothing to stop")
+            return
+        self.log(f"   TERM {old['container']}; the Portal is unavailable until the switch (no SIGKILL)")
+        # Set before the signal: an interrupt while it drains must still make
+        # the fallback wait for it to exit before starting it again.
+        self.signalled_old = True
+        self.ops.run(["docker", "kill", "--signal=TERM", old["container"]], mutate=True)
+        if self.ops.dry_run:
+            return
+        try:
+            code = self.wait_exit_portal(old["container"], self.cfg.exit_timeout, self.cfg.exit_abort_timeout,
+                                         draining_portal=True)
+        except OldStillRunning as err:
+            self.ops.run(["docker", "update", f"--restart={old.get('restart_policy') or 'unless-stopped'}",
+                          old["container"]], mutate=True, check=False)
+            raise OldStillRunning(
+                f"{err}. The Portal stays unavailable until that process exits, and Docker will not restart it. "
+                f"Once it has exited, an operator restores service with 'docker start {old['container']}' (the "
+                "unchanged previous version) and then clears in_progress. The new container "
+                f"{new['container']} was created but never started; Nginx was not changed") from err
+        self.log(f"   {old['container']} exited with code {code}")
+
     def handover(self, state: dict[str, Any], old: dict[str, Any], new: dict[str, Any]) -> None:
-        """Steps 5-7: stop old, start new, switch, guard. Any failure after
-        the old Portal's restart policy was changed falls back to it."""
+        """Steps 5-7: stop old, start new, switch, guard. Any failure (an
+        interrupt included) after the old Portal was touched falls back to it."""
+        self.signalled_old = False
         try:
             self._mark(state, new, "handoff")
             with self.step("handoff"):
-                self.ops.run(["docker", "update", "--restart=no", old["container"]], mutate=True)
-                self.log(f"   TERM {old['container']}; the Portal is unavailable until the switch (no SIGKILL)")
-                self.ops.run(["docker", "kill", "--signal=TERM", old["container"]], mutate=True)
-                if not self.ops.dry_run:
-                    try:
-                        code = self.wait_exit_portal(old["container"], self.cfg.exit_timeout)
-                    except OldStillRunning as err:
-                        # Docker restarts it once it exits by itself; new is never started.
-                        self.ops.run(["docker", "update", f"--restart={old.get('restart_policy') or 'unless-stopped'}",
-                                      old["container"]], mutate=True, check=False)
-                        raise OldStillRunning(
-                            f"{err}. The old Portal is still finishing work and was not killed; its restart policy "
-                            f"was restored so Docker starts it again when it exits. The new container "
-                            f"{new['container']} was not started and Nginx was not changed. An operator must "
-                            "resume: wait for it, check 'portal-status', then clear in_progress") from err
-                    self.log(f"   {old['container']} exited with code {code}")
+                self.stop_old(old, new)
                 self.ops.run(["docker", "start", new["container"]], mutate=True)
                 if not self.ops.dry_run:
                     self.wait_healthy(new["container"], new["port"], self.cfg.ready_timeout)
@@ -378,18 +429,23 @@ class PortalDeployer(deploy.Deployer):
             self._mark(state, new, "guard")
             with self.step("guard"):
                 self.guard_portal(new)
-        except OldStillRunning:
-            raise
-        except FallbackFailed:
+        except (OldStillRunning, FallbackFailed):
             raise
         except DeployError as err:
             if self.ops.dry_run:
                 raise
-            self.fall_back(old, new, str(err))
+            self.fall_back(old, new, str(err), self.signalled_old)
+        except KeyboardInterrupt:
+            if self.ops.dry_run:
+                raise
+            # No signal handlers: an interrupt is treated as a failure, the
+            # previous Portal is restored, and the run still ends in an error.
+            self.fall_back(old, new, "interrupted", self.signalled_old)
 
-    def fall_back(self, old: dict[str, Any], new: dict[str, Any], cause: str) -> None:
+    def fall_back(self, old: dict[str, Any], new: dict[str, Any], cause: str, signalled: bool = True) -> None:
         """(a) stop the new Portal, which holds the state lock; (b) start the
-        old one; (c) point Nginx back at it if the upstream file was changed
+        old one (waiting first for it to exit if it was signalled and is still
+        draining); (c) point Nginx back at it if the upstream file was changed
         (a rejected file was already restored by install_upstreams)."""
         self.log(f"   {cause}; restoring {old['container']}")
         try:
@@ -397,9 +453,13 @@ class PortalDeployer(deploy.Deployer):
             if self.running(new["container"]):
                 self.ops.run(["docker", "kill", "--signal=TERM", new["container"]], mutate=True)
                 try:
-                    self.wait_exit_portal(new["container"], NEW_EXIT_TIMEOUT)
+                    self.wait_exit_portal(new["container"], NEW_EXIT_TIMEOUT, NEW_EXIT_TIMEOUT, draining_portal=False)
                 except OldStillRunning as err:
                     raise DeployError(f"new container still running: {err}") from err
+            if signalled and self.running(old["container"]):
+                # Its listener is already closed: it must exit before it can serve again.
+                self.wait_exit_portal(old["container"], self.cfg.exit_timeout, self.cfg.exit_abort_timeout,
+                                      draining_portal=True)
             policy = old.get("restart_policy") or "unless-stopped"
             self.ops.run(["docker", "update", f"--restart={policy}", old["container"]], mutate=True)
             self.ops.run(["docker", "start", old["container"]], mutate=True)

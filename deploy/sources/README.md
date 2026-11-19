@@ -93,10 +93,13 @@ Portal 用同一个入口发布：`deploy.py portal <镜像>`。逻辑在 `porta
 Portal 只有一个容器。它的状态目录只允许一个写入者：进程启动时对状态目录加非阻塞文件锁，第二个 Portal 拿不到锁会立即以代码 1 退出；监听端口要等锁和全部存储初始化之后才打开。所以新进程只能在旧进程退出之后启动，**从旧 Portal 收到 SIGTERM 到 Nginx 切到新容器之间，Portal 的页面不可用**。单写入者状态下这段间隔无法避免，工具只能让它尽量短：
 
 - 拉取镜像、预检、启动检查和创建新容器都在给旧 Portal 发信号之前完成；
-- 旧进程一退出就启动已经创建好的新容器，每 0.5 秒检查一次退出和 `/health`；
+- 旧进程一退出就启动已经创建好的新容器，每 0.25 秒检查一次退出和 `/health`；
 - 新容器 `/health` 返回 200 后立即切换 Nginx。
 
-旧 Portal 收到 SIGTERM 后立即停止接受连接，处理完在途请求后退出，通常只需几秒；极少数同步余额刷新最长约 375 秒，所以默认等待 420 秒（`exit_timeout`）。工具从不发送 SIGKILL。
+旧 Portal 收到 SIGTERM 后立即关闭监听、停止接受连接，处理完在途请求后退出，通常只需几秒；极少数同步余额刷新最长约 375 秒。工具从不发送 SIGKILL。Docker 也不会重新启动一个被 `docker kill --signal=TERM` 停下的容器（即使重启策略是 `unless-stopped`），所以信号发出后，恢复服务的唯一办法就是等它退出、再启动一个容器。两个超时：
+
+- `exit_timeout`（默认 420 秒，长于预期最长的排空时间）：超过后工具每 30 秒在日志里打印一条 `WARNING`，说明距信号已过多久、已超过预期最长排空时间、Portal 页面不可用、工具继续等待并会在旧进程退出后立即启动新容器、不会杀任何进程。旧进程在这之后退出时，发布照常继续完成。
+- `exit_abort_timeout`（默认 3600 秒，不得小于 `exit_timeout`）：到这时旧进程仍未退出，工具才停止，报告 `FAILED, NEEDS AN OPERATOR`，保留 `in_progress`。此时没有杀任何进程；新容器已创建但从未启动；Nginx 没有改动；Portal 一直不可用，直到旧进程自行退出，Docker 不会重启它。运维人员应等它退出（`docker ps -a` 看状态，`docker logs` 看它在处理什么），然后 `docker start <旧容器>`（原来的上一版本，未改动），确认 `portal-status` 正常后清除 `in_progress`，再重新发布。
 
 ### 每次发布
 
@@ -117,7 +120,7 @@ ssh <host> 'sudo -n journalctl -fu sources-deploy-portal'
 | 预检 | 已记录当前版本，其容器在运行且本机 `/health` 为 200；`nginx -T` 定义了 `upstream sources_portal` 并有 `proxy_pass http://sources_portal`；upstream 文件内容与工具为当前端口生成的完全一致；目标槽位容器没有在运行，目标端口空闲；env 文件存在且组和其他用户不可读；每个挂载源存在；公网健康返回 200。一次列出全部问题 | 退出，现场不变 |
 | 启动检查 | 用新镜像、真实环境和挂载（全部强制只读）、不发布端口运行一次 `-check-config`，必须输出 `SOURCES_PORTAL_CONFIG_OK` | 退出，错误里带检查输出的那一行；旧 Portal 没被碰过。没有该参数的旧镜像会因拿不到锁而失败，同样在这里停下 |
 | 创建 | 删除目标槽位上已停止的容器（上上个版本），创建新容器，重启策略 `no`，尚不启动 | 删除新容器，退出 |
-| 交接（不可用开始） | 旧容器重启策略改为 `no`，发送一次 SIGTERM，等它退出；随后启动新容器，等 `/health` 返回 200（默认 60 秒，容器退出则立即失败） | 见下文“回退”。旧容器 420 秒内没有退出：不杀进程，恢复它的重启策略（它自行退出后 Docker 会重新启动它），不启动新容器、不改 Nginx，保留 `in_progress`，需要人工接手 |
+| 交接（不可用开始） | 旧容器重启策略改为 `no`；如果它在运行，发送一次 SIGTERM 并等它退出（它已不在运行时直接跳过，例如当前 Portal 已经崩溃）；随后启动新容器，等 `/health` 返回 200（默认 60 秒，容器退出则立即失败） | 见下文“回退”。旧容器超过 `exit_timeout` 仍未退出：每 30 秒警告并继续等待；超过 `exit_abort_timeout`：见上文，需要人工接手 |
 | 切流（不可用结束） | 重写 upstream 文件，`nginx -t`，通过后 reload；然后新容器重启策略改为 `unless-stopped` | `nginx -t` 失败：恢复原文件，再回退 |
 | 守护 | 默认 60 秒、每 5 秒：新容器在运行且 `StartedAt`、重启次数不变、没有被 OOM 终止；本机 `/health` 为 200；公网健康连续 3 次失败算失败；Nginx 错误日志中连接新端口失败（`connect() failed`、`upstream timed out`）累计 5 次算失败 | 回退 |
 
@@ -125,7 +128,7 @@ ssh <host> 'sudo -n journalctl -fu sources-deploy-portal'
 
 ### 回退
 
-交接开始后的任何失败都按顺序：新容器改为不自动重启，如果在运行就发一次 SIGTERM 并最多等 120 秒（它持有状态锁，旧容器在它退出前无法启动）；恢复旧容器原来的重启策略并启动，等待 `/health`；如果 upstream 文件已经切到新端口，再切回旧端口。完成后报错说明旧 Portal 已重新服务，新容器停止并保留供排查。任何一步失败则报告 `FAILED AND NOT RESTORED` 并保留 `in_progress`，下一次运行会被拒绝，需要人工处理。交接之前的失败从不碰旧容器。
+交接开始后的任何失败都按顺序回退。命令超时或无法执行、以及在交接到守护之间按下 Ctrl-C（中断）也算失败：工具先回退，然后仍以错误结束本次运行（工具不安装信号处理器，回退过程中再次中断会直接终止）。回退顺序：新容器改为不自动重启，如果在运行就发一次 SIGTERM 并最多等 120 秒（它持有状态锁，旧容器在它退出前无法启动）；如果旧容器已收到信号但仍在排空，先等它退出（同样的两个超时）；然后恢复旧容器原来的重启策略并启动，等待 `/health`；如果 upstream 文件已经切到新端口，再切回旧端口。完成后报错说明旧 Portal 已重新服务，新容器停止并保留供排查。任何一步失败则报告 `FAILED AND NOT RESTORED` 并保留 `in_progress`，下一次运行会被拒绝，需要人工处理。交接之前的失败从不碰旧容器。
 
 ### 回滚和查看状态
 
@@ -137,7 +140,7 @@ ssh <host> 'sudo -n systemd-run --unit=sources-deploy-portal --collect /usr/bin/
 ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py portal-status'
 ```
 
-`portal-rollback` 要求记录了上一版本，且它的容器和镜像都还在；不做启动检查（上一版本的镜像可能还没有 `-check-config`），用同样的交接、切流、守护和回退流程反向切换，成功后交换 `current` 和 `previous`。注意：新版本可能已经改写了状态目录里的数据，较旧的 Portal 有可能拒绝较新版本写下的状态；回滚失败时会自动回到当前版本。`portal-status` 不取锁，输出 `in_progress` 以及当前、上一版本的容器状态、健康状态和重启次数。
+`portal-rollback` 要求记录了上一版本，且它的容器和镜像都还在；不做启动检查（上一版本的镜像可能还没有 `-check-config`），用同样的交接、切流、守护和回退流程反向切换，成功后交换 `current` 和 `previous`。当前容器已经不在运行（例如崩溃）时回滚照样可用：工具不向它发信号，直接启动上一版本。注意：新版本可能已经改写了状态目录里的数据，较旧的 Portal 有可能拒绝较新版本写下的状态；回滚失败时会自动回到当前版本。`portal-status` 不取锁，输出 `in_progress` 以及当前、上一版本的容器状态、健康状态和重启次数。
 
 运行没有走完时（`portal-status` 里 `in_progress` 不为空），下一次 `portal` 或 `portal-rollback` 会拒绝执行。先用 `portal-status`、`docker ps -a` 和 `docker logs` 看清哪个 Portal 在运行、Nginx upstream 文件指向哪个端口，恢复服务后再把 Portal 的 `state.json` 中 `in_progress` 改为 `null`。创建步骤会先删除目标槽位上已停止的容器，所以重新运行是安全的。
 
