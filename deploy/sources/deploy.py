@@ -764,13 +764,22 @@ class Deployer:
             if pending:
                 with self.step("migrate"):
                     self.one_off(image, "background", ["-migrate-only", ",".join(pending)], timeout=900, mutate=True)
+            # A dry run only prints -migrate-only, and the binary's startup
+            # check refuses a database with pending migrations, so running it
+            # here would report a failure a real run would not have.
+            skip_check = self.ops.dry_run and bool(pending)
             with self.step("startup check"):
-                # Serving and background use different env files, so a wrong
-                # value in either would otherwise only surface at the handoff,
-                # where the background gap lasts for the readiness timeout.
-                for role in ("serving", "background"):
-                    out = self.one_off(image, role, ["-check-startup"])
-                    self.log(f"   {role}: " + self.result_line(out, CHECK_PREFIX)[:120])
+                if skip_check:
+                    self.log("   startup check skipped because this is a dry run: pending migrations "
+                             f"{', '.join(pending)} are not applied; a real run applies them first, then checks "
+                             "the serving and background environments before creating any container")
+                else:
+                    # Serving and background use different env files, so a wrong
+                    # value in either would otherwise only surface at the handoff,
+                    # where the background gap lasts for the readiness timeout.
+                    for role in ("serving", "background"):
+                        out = self.one_off(image, role, ["-check-startup"])
+                        self.log(f"   {role}: " + self.result_line(out, CHECK_PREFIX)[:120])
             with self.step("export assets"):
                 self.export_assets(image)
             self._mark(state, target, "start serving")
@@ -785,6 +794,9 @@ class Deployer:
                         self.wait_ready(target.ports[role], self.token_for(target.view(), role), "serving",
                                         self.cfg.ready_timeout)
             self._finish_switch(state, current, target, record, create_background=True)
+            if skip_check:
+                self.log("note: this dry run did NOT verify the serving and background environment files "
+                         "(startup check skipped because migrations are pending)")
         except DeployError as err:
             record.update(result="failed", error=str(err), steps=self.timings, finished_at=now())
             self._abort(state, target, err)
