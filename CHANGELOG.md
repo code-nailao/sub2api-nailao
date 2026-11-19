@@ -12,6 +12,9 @@
 - Turn DeepSeek thinking off for a request that forces a tool call (`tool_choice` `required` or a named function). DeepSeek rejects a forced choice while thinking is on, so these requests failed with 400; `auto`, `none` and requests without a `tool_choice` are forwarded unchanged.
 - Keep DeepSeek requests working when the optional web tools cannot be used: a group with the tools off serves requests that carry a `web_search` or `web_fetch` tool on the ordinary path, and tools the gateway adds on its own no longer fail the request when the tool account is not ready. A request that names a server tool itself still gets the error.
 
+- The release tool (`deploy/sources/deploy.py`) sends an explicit `User-Agent` with every request, and its preflight requests the public health endpoint exactly as the guard does, stopping with nothing changed when it does not answer 200 (also in `--dry-run`). Before, edge protection in front of the public endpoint rejected the default urllib identity, so the guard rolled back a healthy release. `main --allow-public-health-failure` turns the preflight check into a warning for rolling forward out of an outage; the guard still requires 200, `rollback` is never blocked by it, and a guard failure names the last status.
+- A failed dry run of the release tool, or a failed dry-run rollback, no longer appends a `failed` record to `history.jsonl`.
+
 ## Main / background 0.2.79 — 2026-11-19
 
 - Sync official Sub2API v0.2.23: GPT-6.2 Sol and Astra (aliases, Codex model metadata, catalogue prices and long-context rates), an optional Ultra Fast multiplier on channel price cards (migration 252 is idempotent with the existing column), cache-creation tokens derived from the 5m/1h breakdown when the total is missing, an OpenAI pre-output idle failover, and the related upstream fixes and tests.
