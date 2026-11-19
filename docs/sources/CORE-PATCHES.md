@@ -106,9 +106,13 @@ GPT-6.2 价卡的 Ultrafast 倍率留空时，按本仓库既有售价固定为 
 
 ### DeepSeek 联网工具
 
-标签：`deepseek_tools`、`deepseek_builtin_tools`。
+标签：`deepseek_tools`、`deepseek_builtin_tools`、`deepseek_tool_compat`。
 
 托管工具执行器：保留客户端 `stream`，复用现有协议事件转换器实时转发公开文本，内部工具调用留在执行器内；首字在有效内容写出后记录。工具名在请求之间保持稳定。工具失败时降级为不联网回答。逐轮确认用量，预留、结算和去重沿用原有路径，客户端断开后不再启动新工具。
+
+可选工具不拖垮普通请求（`deepseek_tools_hosted.go` 入口）：分组未开启工具时，请求完全按原版路径处理，包括自带 `web_search` / `web_fetch` 工具的请求；网关自动附加的工具在准备阶段失败（工具账号未配置或不可用、请求形态不支持、用量日志不可写）时，此时尚未向上游发送或预留任何内容，请求按客户端原样转发并记一条警告。客户端自己声明了服务端工具的请求仍返回错误。
+
+强制工具调用（`deepseek_forced_tool_choice.go`，在 `openai_gateway_cc_pipeline.go` 的 Chat Completions 共用出站点调用一次）：DeepSeek 默认开启思考，并在思考开启时拒绝强制的 `tool_choice`（`required` 或指定函数）。对这类请求关闭思考并去掉 `reasoning_effort`，保留客户端要求的工具调用；`auto`、`none`、未设置以及其他上游的请求字节不变。三种入站协议都经过这个出站点。
 
 ### 工作台、Canvas 与智商检测嵌入
 

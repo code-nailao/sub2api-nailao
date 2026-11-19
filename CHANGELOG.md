@@ -2,10 +2,15 @@
 
 ## Unreleased
 
+- Portal: administrators can register workbench and canvas groups from the page. Ticking a group fetches its models to pick from, and a saved change applies to the next request, with no edit of the registry file and no restart. Media engine groups are still configured only in the registry file.
+- Portal: a user whose group is not registered can connect the workbench and the canvas with one of their own API keys. The host is always the site; the URL prefix can be changed and starts from the one served for the key's platform; models are fetched under it and picked. Only the key's ID is stored, and administrators can turn the feature off in the group settings.
+
 - Record the upstream response status and request identifiers (`X-Client-Request-ID`, `X-Request-ID`, `CF-Ray` and the header named by the account's `upstream_request_id_header`) in the content-rejection ledger for holds that end unknown or are released without charge, in addition to charged rejections, and keep them through the deadline release, so a hold can be matched to one supplier bill line. The recorded status is the one the response carried, never one the gateway made up for an error. They are evidence for reconciliation and never decide a charge. No migration; commands with nothing observed keep their earlier fingerprints.
 - A response header can no longer make a rejection settlement fail: a request id with bytes PostgreSQL cannot store (a control character, invalid UTF-8) is dropped instead of failing the write. Before, such a value in the account's request-id header left a charged rejection uncaptured until its hold was released.
 - Add the setting `upstream_rejection_deadline_release_paused`: `true` pauses the deadline release of content-rejection holds and keeps them frozen; a missing key or `false` keeps the 0.2.79 behaviour; any other value, an empty one included, pauses. It is read before every release, so setting it also stops a run that is under way. The release log line reports the longest overdue time of a run.
 - In a group that charges the content-rejection fee, a composer chat request with image input is refused with a 400 before anything is sent upstream, and its hold is released at once without charge. Before, the image-description request used up the one send a hold allows, so the request itself was never sent and the hold stayed frozen until its deadline. Groups that do not charge the fee still describe the images first.
+- Turn DeepSeek thinking off for a request that forces a tool call (`tool_choice` `required` or a named function). DeepSeek rejects a forced choice while thinking is on, so these requests failed with 400; `auto`, `none` and requests without a `tool_choice` are forwarded unchanged.
+- Keep DeepSeek requests working when the optional web tools cannot be used: a group with the tools off serves requests that carry a `web_search` or `web_fetch` tool on the ordinary path, and tools the gateway adds on its own no longer fail the request when the tool account is not ready. A request that names a server tool itself still gets the error.
 
 ## Main / background 0.2.79 — 2026-11-19
 
