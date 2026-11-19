@@ -829,7 +829,7 @@ func TestDeepSeekASRChargesTheSuppliersDurationNotTheDeclaredOne(t *testing.T) {
 	seconds, err := deepSeekAudioSeconds(forged)
 	require.NoError(t, err)
 	require.Less(t, seconds, 1.1)
-	limit := (len(forged) + 749) / 750
+	limit := (len(forged) + deepSeekASRMinBytesPerSecond - 1) / deepSeekASRMinBytesPerSecond
 	for _, tc := range []struct {
 		durationMS float64
 		seconds    int

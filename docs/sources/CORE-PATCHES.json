@@ -2505,7 +2505,7 @@
       "features": [
         "deepseek_tool_endpoints"
       ],
-      "sha256": "fd45f79416bc719086aedc42e5927c73067b0497d4b355c9f3ab78b97ccb5ab7",
+      "sha256": "f1f81e1252224a2a443b49e6bd1bcb190368459bbaed98417d7717bdfb193785",
       "reason": "Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields. Tests for this behaviour."
     },
     {
@@ -2513,7 +2513,7 @@
       "features": [
         "deepseek_tool_endpoints"
       ],
-      "sha256": "8641a404c885ee8d5ae2728071825a773ee3e12b2cd2e0641df5b52e212d4d24",
+      "sha256": "a888f32e43383cb3a18fdcca32995d90808610c4745e56281085a05be6080c09",
       "reason": "Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields."
     },
     {

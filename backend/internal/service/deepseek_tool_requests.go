@@ -36,11 +36,13 @@ const (
 	deepSeekOCRMaxFile       = 100 << 20
 	deepSeekOCRMaxBody       = 101 << 20
 	deepSeekOCRMaxPages      = 1000
-	// deepSeekASRMinBytesPerSecond bounds what an ASR answer may claim: no
-	// accepted audio is denser in time than 6 kbit/s, the lowest Opus bitrate
-	// (16-bit PCM needs at least 16 kB/s), so a file of n bytes holds at most
-	// n/750 seconds whatever its header declares.
-	deepSeekASRMinBytesPerSecond = 750
+	// deepSeekASRMinBytesPerSecond bounds what an ASR answer may claim, only to
+	// stop an absurd value. It must hold for silence, which is charged: Opus
+	// with discontinuous transmission sends almost nothing while silent, but
+	// common Ogg muxers still write a page (27 header bytes and more) about
+	// every second. 16-bit PCM needs at least 16 kB/s. So a file of n bytes
+	// holds at most n/16 seconds whatever its header declares.
+	deepSeekASRMinBytesPerSecond = 16
 	// Leading bytes kept for type detection.
 	deepSeekFileHeadBytes = 1024
 )
