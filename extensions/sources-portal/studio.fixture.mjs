@@ -7,7 +7,10 @@ const source = await readFile(new URL('./internal/portal/web/studio.js', import.
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const initialGroups = [{ id: 26, name: 'Images' }, { id: 27, name: 'Grok' }];
 
-export async function createStudioFixture({ remembered, groupList = initialGroups, connection, session, groupsResponse,
+export const CUSTOM_ID = 9000000000000001, SETUP_ID = 9000000000000002, MANAGE_ID = 9000000000000003;
+
+// custom: 'off' | 'available' | 'configured'; admin adds the group settings entry.
+export async function createStudioFixture({ remembered, groupList = initialGroups, connection, session, groupsResponse, custom = 'off', admin = false,
   origin = 'https://main.example', studioOrigin = 'https://studio.example' } = {}) {
   const window = new EventTarget();
   const parentMessages = [], studioMessages = [], calls = [];
@@ -20,15 +23,18 @@ export async function createStudioFixture({ remembered, groupList = initialGroup
   const select = { value: '', disabled: false, children: [], replaceChildren() { this.children = []; }, append(option) { this.children.push(option); } };
   const message = { textContent: '' }, keys = {}, lock = {}, reconnect = { hidden: true, disabled: false };
   const loadingPanel = {}, statusTitle = {}, connectionBar = {}, recoveryActions = {}, retry = {}, login = {};
+  const customButton = { hidden: true }, manageButton = { hidden: true }, ownKeyButton = { hidden: true }, manageRecoveryButton = { hidden: true };
+  const settings = [], state = { custom, admin, groupList, reloads: 0 };
   const connectionMenu = Object.assign(new EventTarget(), { open: false, querySelector: () => ({ focus() {} }) });
-  const elements = { '#studio': frame, '#groups': select, '#message': message, '#keys': keys, '#lock': lock, '#reconnect': reconnect, '#loading-panel': loadingPanel, '#status-title': statusTitle, '#connection-bar': connectionBar, '#recovery-actions': recoveryActions, '#retry': retry, '#login': login, '#connection-menu': connectionMenu };
+  const elements = { '#studio': frame, '#groups': select, '#message': message, '#keys': keys, '#lock': lock, '#reconnect': reconnect, '#loading-panel': loadingPanel, '#status-title': statusTitle, '#connection-bar': connectionBar, '#recovery-actions': recoveryActions, '#retry': retry, '#login': login, '#connection-menu': connectionMenu,
+    '#custom-connection': customButton, '#manage-groups': manageButton, '#use-own-key': ownKeyButton, '#manage-groups-recovery': manageRecoveryButton };
   const document = { body: { dataset: { state: 'loading' }, setAttribute(name, value) { this[name] = value; } }, documentElement: { style: {}, dataset: {} }, visibilityState: 'visible', querySelector: (selector) => elements[selector], createElement: (tag) => { assert.equal(tag, 'option'); return {}; } };
   const values = new Map(remembered ? [['sources:studio:last-group:9', remembered]] : []);
   const timers = new Map();
   let timerID = 0, locked = false;
   const context = vm.createContext({ window, document, URL, URLSearchParams, crypto: webcrypto,
-    location: new URL(origin + '/studio?ui_mode=embedded'),
-    localStorage: { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, value) },
+    location: Object.assign(new URL(origin + '/studio?ui_mode=embedded'), { reload: () => { state.reloads++; } }),
+    localStorage: { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), removeItem: (key) => values.delete(key) },
     setInterval: (callback, delay) => { timers.set(++timerID, { callback, delay }); return timerID; },
     clearInterval: (id) => timers.delete(id),
     setTimeout: (callback, delay) => { timers.set(++timerID, { callback, delay }); return timerID; },
@@ -39,15 +45,21 @@ export async function createStudioFixture({ remembered, groupList = initialGroup
     this.setExport('authorizedJSON', async (path, options) => {
       calls.push({ path, options });
       if (path === '/api/studio/groups' && groupsResponse) return groupsResponse();
-      if (path === '/api/studio/groups') return { ok: true, status: 200, data: { user_id: 9, groups: groupList, studio_url: studioOrigin, main_origin: origin, viewer: { displayName: 'Alice', balance: 0 } } };
+      if (path === '/api/studio/groups') return { ok: true, status: 200, data: { user_id: 9, groups: state.groupList, studio_url: studioOrigin, main_origin: origin, viewer: { displayName: 'Alice', balance: 0 },
+        custom: { group_id: CUSTOM_ID, setup_id: SETUP_ID, enabled: state.custom !== 'off', configured: state.custom === 'configured' }, can_manage: state.admin, manage_id: MANAGE_ID } };
       if (connection) return connection(options, config);
       return { ok: true, status: 200, data: config(options.body.group_id) };
     });
     this.setExport('clearSession', () => { locked = true; window.dispatchEvent(new Event('sources:locked')); });
     this.setExport('currentToken', async () => { if (locked) throw Error('locked'); await session?.(); return 'never-sent'; });
   }, { context });
+  // The dialogs need a real DOM; here they only record that they were opened.
+  const dialogs = new vm.SyntheticModule(['openCustomSettings', 'openGroupSettings'], function () {
+    this.setExport('openCustomSettings', (options) => settings.push({ kind: 'custom', ...options }));
+    this.setExport('openGroupSettings', (options) => settings.push({ kind: 'manage', ...options }));
+  }, { context });
   const module = new vm.SourceTextModule(source, { context });
-  await module.link(() => auth);
+  await module.link((specifier) => specifier === './session.js' ? auth : dialogs);
   await module.evaluate();
   await flush();
   const send = (data, { from = studioWindow, fromOrigin = studioOrigin } = {}) => window.dispatchEvent(Object.assign(new Event('message'), { data, source: from, origin: fromOrigin }));
@@ -73,5 +85,6 @@ export async function createStudioFixture({ remembered, groupList = initialGroup
     return ackShell();
   };
   return { window, parent, frame, select, reconnect, message, document, calls, loadingPanel, statusTitle, connectionBar, recoveryActions, retry, login, connectionMenu, studioMessages, parentMessages, send, host, last, ackConnection, ackShell, integrate, timers,
+    customButton, manageButton, ownKeyButton, manageRecoveryButton, settings, state, values,
     get frameSets() { return frameSets; }, get locked() { return locked; } };
 }

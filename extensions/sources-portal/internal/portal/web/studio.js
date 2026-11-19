@@ -1,4 +1,5 @@
 import { authorizedJSON, clearSession, currentToken } from "./session.js";
+import { openCustomSettings, openGroupSettings } from "./studio-settings.js";
 
 const frame = document.querySelector("#studio");
 const select = document.querySelector("#groups");
@@ -10,10 +11,17 @@ const connectionBar = document.querySelector("#connection-bar");
 const recoveryActions = document.querySelector("#recovery-actions");
 const retry = document.querySelector("#retry");
 const login = document.querySelector("#login");
+const customButton = document.querySelector("#custom-connection");
+const manageButton = document.querySelector("#manage-groups");
+const ownKeyButton = document.querySelector("#use-own-key");
+const manageRecoveryButton = document.querySelector("#manage-groups-recovery");
 const params = new URLSearchParams(location.search);
 const validRequestID = (value) => typeof value === "string" && /^[\w-]{16,80}$/.test(value);
 let studioURL, mainOrigin, storageKey, hostConfig;
 let groups = [], viewer = { displayName: "", balance: null };
+// custom is the user's own-key connection, addressed like a group by a reserved
+// ID. setupId and manageId are menu entries: choosing one opens a dialog.
+let custom = { groupId: 0, setupId: 0, enabled: false, configured: false }, manageId = 0;
 let selectedGroupId = null, authorizationName = "";
 let generation = 0, shellRevision = 0, appliedShellRevision = 0;
 let shellReady = false, integrated = false, locked = false, selectionUncertain = false;
@@ -120,7 +128,41 @@ function renderLegacyGroups() {
   reconnect.hidden = locked || integrated || shellRevision === 0;
   reconnect.disabled = Boolean(connectionPending) || selectionUncertain || locked;
   retry.disabled = Boolean(connectionPending) || bootstrapPending;
+  customButton.hidden = ownKeyButton.hidden = locked || !custom.enabled;
+  manageButton.hidden = manageRecoveryButton.hidden = locked || !manageId;
 }
+function normalizeCustom(value) {
+  const id = (candidate) => Number.isSafeInteger(candidate) && candidate > 0 ? candidate : 0;
+  const groupId = id(value?.group_id), setupId = id(value?.setup_id);
+  const enabled = value?.enabled === true && groupId > 0 && setupId > 0;
+  return { groupId, setupId, enabled, configured: enabled && value?.configured === true };
+}
+// What the client's group menu lists: the groups, then the entries that open settings.
+function shellGroups() {
+  const entries = [...groups];
+  if (custom.enabled) entries.push({ id: custom.setupId, name: custom.configured ? "修改自定义连接…" : "＋ 自定义连接（用我的密钥）…" });
+  if (manageId) entries.push({ id: manageId, name: "⚙ 管理工作台分组…" });
+  return entries;
+}
+function openSettings(kind) {
+  if (locked) return;
+  document.querySelector("#connection-menu").open = false;
+  if (kind === "manage") {
+    openGroupSettings({ onSaved: () => void refreshMetadata() });
+    return;
+  }
+  openCustomSettings({ onSaved: (configured) => {
+    // The client changes group only on its own request, so the page starts
+    // again on the saved connection. Drafts and submitted tasks are kept.
+    try {
+      if (configured) localStorage.setItem(storageKey, String(custom.groupId));
+      else if (localStorage.getItem(storageKey) === String(custom.groupId)) localStorage.removeItem(storageKey);
+    } catch { /* Storage is optional. */ }
+    location.reload();
+  } });
+}
+customButton.onclick = ownKeyButton.onclick = () => openSettings("custom");
+manageButton.onclick = manageRecoveryButton.onclick = () => openSettings("manage");
 
 function recoverShell() {
   if (locked || connectionPending || selectionUncertain || shellRevision === 0) return;
@@ -145,6 +187,9 @@ document.querySelector("#connection-menu").addEventListener("keydown", (event) =
 });
 function updateMetadata(data) {
   groups = normalizeGroups(data.groups);
+  custom = normalizeCustom(data.custom);
+  manageId = data.can_manage === true && Number.isSafeInteger(data.manage_id) && data.manage_id > 0 ? data.manage_id : 0;
+  if (custom.configured) groups.push({ id: custom.groupId, name: "自定义连接（我的密钥）" });
   viewer = {
     displayName: typeof data.viewer?.displayName === "string" ? data.viewer.displayName.slice(0, 200) : "",
     balance: typeof data.viewer?.balance === "number" && Number.isFinite(data.viewer.balance) ? data.viewer.balance : null,
@@ -162,7 +207,7 @@ function publishShell() {
     type: "sub2api:image-studio-shell-config", version: 1,
     requestId: crypto.randomUUID(), revision: ++shellRevision,
     shellMode: hostConfig?.shellMode || (window.parent === window ? "standalone" : "embedded"),
-    groups, selectedGroupId, viewer, mainOrigin, authorizationName,
+    groups: shellGroups(), selectedGroupId, viewer, mainOrigin, authorizationName,
     ...(hostConfig?.standaloneUrl ? { standaloneUrl: hostConfig.standaloneUrl } : {}),
     theme: hostConfig?.theme || (params.get("theme") === "dark" ? "dark" : "light"),
     lang: hostConfig?.lang || params.get("lang") || "zh",
@@ -184,11 +229,13 @@ function publishShell() {
     postStudio(pending);
   }, 500);
 }
+// text null sends an empty message: the client then shows no notice at all,
+// instead of its default "not confirmed" one.
 function selectionResult(pending, status, text = "", reconnectRequired = false) {
   if (!pending?.requestId) return;
   postStudio({ type: "sub2api:image-studio-select-group-result", version: 1,
     requestId: pending.requestId, revision: pending.revision, status,
-    ...(text ? { message: text } : {}), reconnectRequired });
+    ...(text === null ? { message: "" } : text ? { message: text } : {}), reconnectRequired });
 }
 function sendConnection() {
   const pending = connectionPending;
@@ -282,8 +329,16 @@ window.addEventListener("message", async (event) => {
     if (handledRequests.has(data.requestId)) return;
     handledRequests.add(data.requestId);
     if (handledRequests.size > 100) handledRequests.delete(handledRequests.values().next().value);
-    if (!integrated || shellPending || data.revision !== appliedShellRevision || connectionPending || !groups.some((group) => group.id === data.groupId)) {
+    const settings = custom.enabled && data.groupId === custom.setupId ? "custom" : manageId && data.groupId === manageId ? "manage" : "";
+    if (!integrated || shellPending || data.revision !== appliedShellRevision || connectionPending || (!settings && !groups.some((group) => group.id === data.groupId))) {
       selectionResult(data, "error", "分组信息已更新，请重新选择。", selectionUncertain);
+      return;
+    }
+    if (settings) {
+      // A menu entry, not a group: nothing is authorized and the group stays.
+      // The dialog is the feedback, so the client is told to show no notice.
+      selectionResult(data, "error", null, selectionUncertain);
+      openSettings(settings);
       return;
     }
     void connect(data.groupId, data);
@@ -320,6 +375,20 @@ frame.addEventListener("load", () => {
 });
 if (window.parent !== window) window.parent.postMessage({ type: "sources:studio-host-ready", version: 1 }, location.origin);
 
+async function refreshMetadata() {
+  if (locked || connectionPending) return;
+  try {
+    const fresh = await api("/api/studio/groups");
+    if (locked) return;
+    updateMetadata(fresh);
+    publishShell();
+  } catch (error) {
+    if (locked) return;
+    viewer = { displayName: viewer.displayName, balance: null };
+    message.textContent = error.message;
+    publishShell();
+  }
+}
 async function bootstrap() {
   if (bootstrapPending || locked) return;
   bootstrapPending = true;
@@ -350,21 +419,12 @@ async function bootstrap() {
       };
       frame.src = studioURL.href;
       if (initial) void connect(initial.id);
-      else recoverView(groups.length ? "上次使用的分组已不可用，请重新选择。" : "当前账号没有可用的生图分组，请联系管理员。");
+      else recoverView(groups.length ? "上次使用的分组已不可用，请重新选择。"
+        : custom.enabled ? "当前账号没有已登记的生图分组。可以点“使用我的密钥”，用自己的 API 密钥连接。"
+        : "当前账号没有可用的生图分组，请联系管理员。");
       publishShell();
       checkTimer = setInterval(async () => {
-        if (locked || document.visibilityState !== "visible" || connectionPending) return;
-        try {
-          const fresh = await api("/api/studio/groups");
-          if (locked) return;
-          updateMetadata(fresh);
-          publishShell();
-        } catch (error) {
-          if (locked) return;
-          viewer = { displayName: viewer.displayName, balance: null };
-          message.textContent = error.message;
-          publishShell();
-        }
+        if (document.visibilityState === "visible") await refreshMetadata();
       }, 30000);
     }
   } catch (error) {
