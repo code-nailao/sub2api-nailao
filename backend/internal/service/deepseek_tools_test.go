@@ -154,6 +154,14 @@ func (r deepSeekAccountFixture) GetByID(context.Context, int64) (*Account, error
 	return r.account, nil
 }
 
+// The group's only account is the fixture account.
+func (r deepSeekAccountFixture) ListSchedulableByGroupIDAndPlatform(context.Context, int64, string) ([]Account, error) {
+	if r.account == nil {
+		return nil, nil
+	}
+	return []Account{*r.account}, nil
+}
+
 type deepSeekHTTPFixture struct {
 	HTTPUpstream
 	fn func(*http.Request) (*http.Response, error)

@@ -57,11 +57,17 @@ func SetDeepSeekBillingInput(c *gin.Context, input *OpenAIRecordUsageInput) {
 }
 
 func (s *OpenAIGatewayService) BeginDeepSeekToolUsage(ctx context.Context, input *OpenAIRecordUsageInput) error {
+	return s.beginDeepSeekToolUsageUntil(ctx, input, time.Now().Add(deepSeekRequestTimeout+time.Minute))
+}
+
+// beginDeepSeekToolUsageUntil opens the journal entry; recovery leaves a pending
+// entry alone until deadline, which must outlive the supplier call.
+func (s *OpenAIGatewayService) beginDeepSeekToolUsageUntil(ctx context.Context, input *OpenAIRecordUsageInput, deadline time.Time) error {
 	repo, ok := s.usageBillingRepo.(DeepSeekUsageJournal)
 	if !ok || input == nil || input.Result == nil || input.APIKey == nil || input.User == nil || input.Account == nil {
 		return errors.New("DeepSeek tools require the durable usage journal")
 	}
-	if err := repo.BeginDeepSeekUsage(ctx, input.Result.RequestID, input.APIKey.ID, input.User.ID, input.Account.ID, time.Now().Add(deepSeekRequestTimeout+time.Minute)); err != nil {
+	if err := repo.BeginDeepSeekUsage(ctx, input.Result.RequestID, input.APIKey.ID, input.User.ID, input.Account.ID, deadline); err != nil {
 		return err
 	}
 	input.Result.deepSeekBilling = &deepSeekBillingState{input: *input}

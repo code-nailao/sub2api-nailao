@@ -369,6 +369,10 @@ func buildUsageBillingCommand(requestID string, usageLog *UsageLog, p *postUsage
 
 	if u := p.DeepSeekTools; u != nil {
 		cmd.DeepSeekToolFingerprint = fmt.Sprintf("%d:%d:%0.8f:%0.8f:%d:%0.8f:%0.8f", u.SearchCount, u.FetchCount, u.SearchPrice, u.FetchPrice, u.SupplierAccountID, u.SupplierSearchPrice, u.SupplierFetchPrice)
+		if u.usesMediaTools() {
+			// Search/Fetch-only fingerprints stay byte-identical.
+			cmd.DeepSeekToolFingerprint += fmt.Sprintf(":%d:%d:%d:%0.8f:%0.8f:%0.8f:%0.8f:%0.8f:%0.8f", u.OCRPages, u.ASRSeconds, u.TTSCharacters, u.OCRPricePer1KPages, u.ASRPricePerHour, u.TTSPricePer10KChars, u.SupplierOCRPricePer1KPages, u.SupplierASRPricePerHour, u.SupplierTTSPricePer10KChars)
+		}
 		if u.SupplierHasQuota {
 			if u.SupplierAccountID == cmd.AccountID {
 				cmd.AccountQuotaCost += u.SupplierCost()

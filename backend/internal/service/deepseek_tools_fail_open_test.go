@@ -114,7 +114,6 @@ func TestDeepSeekAutoInjectedToolsNeverFailTheRequest(t *testing.T) {
 	cases := map[string]deepSeekFailOpenSetup{
 		"tool_account_not_enabled":    {protocol: "chat", tools: enabled, extra: map[string]any{}},
 		"pinned_tool_account_not_set": {protocol: "chat", tools: DeepSeekToolsConfig{Enabled: true, AutoInject: true, AccountID: &pinned}, extra: map[string]any{"deepseek_tools_enabled": false}},
-		"supplier_costs_missing":      {protocol: "responses", tools: enabled, extra: map[string]any{"deepseek_tools_enabled": true}},
 		"request_shape_unsupported":   {protocol: "chat", tools: enabled, body: map[string]any{"n": 2}},
 		"previous_response_id":        {protocol: "responses", tools: enabled, body: map[string]any{"previous_response_id": "resp_1"}},
 		"background_request":          {protocol: "responses", tools: enabled, body: map[string]any{"background": true}},
@@ -133,7 +132,6 @@ func TestDeepSeekExplicitToolSetupFailureIsStillReported(t *testing.T) {
 	enabled := DeepSeekToolsConfig{Enabled: true}
 	cases := map[string]deepSeekFailOpenSetup{
 		"tool_account_not_enabled": {protocol: "chat", tools: enabled, extra: map[string]any{}},
-		"supplier_costs_missing":   {protocol: "messages", tools: enabled, extra: map[string]any{"deepseek_tools_enabled": true}},
 		"background_request":       {protocol: "responses", tools: enabled, body: map[string]any{"background": true}},
 	}
 	for name, setup := range cases {
