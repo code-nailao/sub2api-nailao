@@ -7,6 +7,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Lets a maintainer run the whole suite on a branch without pushing a commit.
+  workflow_dispatch:
 
 # A newer push to a pull request makes the run for the older commit pointless.
 # Runs on main are never cancelled: each one is the receipt for its commit.
