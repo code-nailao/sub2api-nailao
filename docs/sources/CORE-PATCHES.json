@@ -829,8 +829,16 @@
         "deepseek_builtin_tools",
         "deepseek_tool_endpoints"
       ],
-      "sha256": "5e184aeb5426b56c099ee4b8ff96a80c76abcbcc567d3a95b8548b0dd43fe08f",
+      "sha256": "b8f86bdb3e250016d850d2615e39f76b9c4e993d1eedb3bd696b4bd03a5850bd",
       "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields."
+    },
+    {
+      "path": "backend/internal/handler/openai_deepseek_tools_slots_test.go",
+      "features": [
+        "deepseek_tool_endpoints"
+      ],
+      "sha256": "0360027440747a8bedb39e8d6d9b8a9d0767da0741da0a7b7facc49300b901c8",
+      "reason": "Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields. Tests for this behaviour."
     },
     {
       "path": "backend/internal/handler/openai_deepseek_tools_test.go",
@@ -838,7 +846,7 @@
         "deepseek_builtin_tools",
         "deepseek_tool_endpoints"
       ],
-      "sha256": "fe6c21ef59b79e8b8580c5b70ceb8e27ea072a8f479da843f0f38c934ce2c36e",
+      "sha256": "9905f5c2d88aaa3c25f604b03bdbfe53b4d42b3a02cf9d903fcbabee70736f4c",
       "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields. Tests for this behaviour."
     },
     {

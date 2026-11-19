@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
@@ -48,7 +49,9 @@ func TestDeepSeekToolEndpointsRefuseBeforeAnySupplierCall(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			router := gin.New()
-			h := &OpenAIGatewayHandler{}
+			billing := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, &config.Config{RunMode: config.RunModeSimple}, nil)
+			t.Cleanup(billing.Stop)
+			h := &OpenAIGatewayHandler{billingCacheService: billing}
 			router.Use(func(c *gin.Context) {
 				c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{ID: 1, User: &service.User{ID: 1}, Group: &service.Group{Platform: service.PlatformDeepseek, SearchPricePer1k: &price, DeepSeekTools: tc.tools}})
 				c.Next()

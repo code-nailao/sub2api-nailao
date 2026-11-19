@@ -12,6 +12,7 @@ import (
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 func (h *OpenAIGatewayHandler) setDeepSeekUsageMetadata(c *gin.Context, key *service.APIKey, account *service.Account, fields service.ChannelUsageFields, pricingAt time.Time, body []byte) {
@@ -61,6 +62,12 @@ func (h *OpenAIGatewayHandler) DeepSeekTool(c *gin.Context) {
 		return
 	}
 	reqLog := requestLogger(c, "handler.deepseek.tools")
+	// Refuse a user who cannot pay before buffering up to 101 MiB of upload.
+	if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), key.User, key, key.Group, nil, service.PlatformDeepseek); err != nil {
+		status, _, message, _ := billingErrorDetails(err)
+		fail(status, message)
+		return
+	}
 	limit := service.DeepSeekToolMaxBody(operation)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 	body, err := pkghttputil.ReadRequestBodyWithPrealloc(c.Request)
@@ -99,22 +106,34 @@ func (h *OpenAIGatewayHandler) DeepSeekTool(c *gin.Context) {
 			return
 		}
 	}
-	streamStarted := false
-	release, acquired := h.acquireResponsesUserSlot(c, subject.UserID, subject.Concurrency, false, &streamStarted, reqLog)
+	release, acquired := h.acquireDeepSeekToolUserSlot(c, operation, subject.UserID, subject.Concurrency, reqLog)
 	if !acquired {
 		return
 	}
 	if release != nil {
 		defer release()
 	}
-	if err = h.billingCacheService.CheckBillingEligibility(c.Request.Context(), key.User, key, key.Group, nil, service.PlatformDeepseek); err != nil {
-		status, _, message, _ := billingErrorDetails(err)
-		fail(status, message)
-		return
-	}
 	meta := service.OpenAIRecordUsageInput{InboundEndpoint: c.Request.URL.Path, UserAgent: c.GetHeader("User-Agent"), IPAddress: ip.GetClientIP(c), APIKeyService: h.apiKeyService, PricingAt: started}
 	if err = h.gatewayService.ServeDeepSeekTool(c.Request.Context(), c.Writer, key, req, meta); err != nil {
 		status, _, message, _ := billingErrorDetails(err)
 		fail(status, message)
 	}
+}
+
+// acquireDeepSeekToolUserSlot takes the user's concurrency slot. OCR and ASR
+// keep their supplier call running after a client disconnect, so their slot is
+// held until the handler returns instead of being freed with the request
+// context; otherwise disconnecting and resending would run any number of them.
+func (h *OpenAIGatewayHandler) acquireDeepSeekToolUserSlot(c *gin.Context, operation string, userID int64, concurrency int, reqLog *zap.Logger) (func(), bool) {
+	streamStarted := false
+	if operation != service.DeepSeekToolOCR && operation != service.DeepSeekToolASR {
+		return h.acquireResponsesUserSlot(c, userID, concurrency, false, &streamStarted, reqLog)
+	}
+	release, err := h.concurrencyHelper.AcquireUserSlotWithWait(c, userID, concurrency, false, &streamStarted)
+	if err != nil {
+		reqLog.Warn("deepseek_tools.user_slot_acquire_failed", zap.Error(err))
+		h.handleConcurrencyError(c, err, "user", streamStarted)
+		return nil, false
+	}
+	return release, true
 }
