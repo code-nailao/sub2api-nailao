@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import unittest
 
 from check_pr_issue import verdict
@@ -22,9 +23,14 @@ class LinkedIssueTests(unittest.TestCase):
             with self.subTest(keyword=keyword):
                 self.assertTrue(passes(f'{keyword} #12'))
 
-    def test_refs_links_without_closing(self):
+    def test_refs_mentions_without_closing(self):
         self.assertTrue(passes('Refs #12'))
         self.assertTrue(passes('Ref #12'))
+
+    def test_the_revert_button_description_passes_as_written(self):
+        self.assertTrue(passes('Reverts example-owner/example-repo#12'))
+        self.assertTrue(passes('Reverts #12'))
+        self.assertFalse(passes('Revert "fix: stream timing"'))
 
     def test_reference_forms(self):
         for body in ('Closes: #12', 'Fixes example-owner/example-repo#12',
@@ -46,7 +52,8 @@ class LinkedIssueTests(unittest.TestCase):
 
     def test_a_keyword_without_a_number_is_not_a_link(self):
         for body in ('Closes', 'Closes #', 'Closes #N', 'Fixes the bug', 'Closes 12',
-                     'Closes\n#12', 'Closes #12abc'):
+                     'Closes\n#12', 'Closes #12abc', 'Closes #0', 'Closes #012',
+                     'Closes #１２', 'Closes #12３'):
             with self.subTest(body=body):
                 self.assertFalse(passes(body))
 
@@ -61,6 +68,9 @@ class NoIssueTests(unittest.TestCase):
         for body in ('No issue: typo in the developer guide', 'no issue: dependency bump',
                      'Issue: No issue: release preparation', '**No issue:** typo',
                      '**No issue**: typo', 'No issue：修正文档里的错别字',
+                     '**Issue:** No issue: typo', 'Issue: **No issue:** typo',
+                     'Issue：No issue：发版准备', '- No issue: typo', '> No issue: typo',
+                     '  No issue: typo', 'Summary first.\nIssue: No issue: typo\nMore.',
                      '## Summary\r\n\r\nNo issue: CI maintenance\r\n\r\n## Checks\r\n',
                      'No issue: rename the <Panel> prop'):
             with self.subTest(body=body):
@@ -69,12 +79,22 @@ class NoIssueTests(unittest.TestCase):
     def test_reason_missing(self):
         for body in ('No issue', 'No issue:', 'No issue:   ', 'No issue: \r\nNext line',
                      'No issue:\nreason on the next line', '**No issue:**', 'No issue: -',
-                     'No issue: <reason>', 'No issue: <原因>', 'Issue: No issue: `<reason>`'):
+                     'No issue: <reason>', 'No issue: <原因>', 'Issue: No issue: `<reason>`',
+                     'No issue: <typo in the guide>'):
             with self.subTest(body=body):
                 self.assertFalse(passes(body))
 
     def test_other_wording_is_not_the_marker(self):
         for body in ('No issues: none', 'There is no-issue: here', 'casino issue: chips'):
+            with self.subTest(body=body):
+                self.assertFalse(passes(body))
+
+    def test_the_phrase_inside_a_sentence_is_not_the_marker(self):
+        for body in ('There is no issue: all tests pass.',
+                     'A description needs a keyword or a line `No issue:` with a reason.',
+                     '- `No issue:` with a reason also passes',
+                     '正文要么关联 issue，要么写一行 `No issue:` 加原因。',
+                     'Tracking issue: no issue: none yet'):
             with self.subTest(body=body):
                 self.assertFalse(passes(body))
 
@@ -86,14 +106,33 @@ class DescriptionTests(unittest.TestCase):
                 passed, detail = verdict(body)
                 self.assertFalse(passed)
                 self.assertIn('Closes #N', detail)
-                self.assertIn('No issue: <reason>', detail)
+                self.assertIn('`No issue:`', detail)
+                # Text in angle brackets is hidden on GitHub and does not count
+                # as a reason, so the instruction must not suggest writing it.
+                self.assertNotIn('<', detail)
 
     def test_html_comments_do_not_count(self):
         self.assertFalse(passes('Issue: <!-- Closes #12 or No issue: typo -->'))
         self.assertFalse(passes('<!--\nCloses #12\nNo issue: typo\n-->\nText'))
-        self.assertFalse(passes('Text\n<!-- unclosed\nCloses #12'))
         self.assertTrue(passes('Issue: <!-- hint --> Closes #12'))
         self.assertTrue(passes('Issue: <!-- hint -->No issue: typo'))
+        self.assertTrue(passes('<!-- one -->\r\n\r\nIssue: Closes #12 <!-- two -->\r\n'))
+
+    def test_an_unclosed_comment_hides_the_rest_only_from_a_line_start(self):
+        self.assertFalse(passes('Text\n<!-- unclosed\nCloses #12'))
+        self.assertFalse(passes('Text\n  <!-- unclosed\n\nNo issue: typo'))
+        # Inside a line it is ordinary text, as GitHub renders it.
+        self.assertTrue(passes('Issue: <!-- hint Closes #12'))
+        self.assertTrue(passes('Strip `<!--` from the output.\n\nCloses #12'))
+        self.assertTrue(passes('Strip `<!--` from the output.\r\n\r\nCloses #12\r\n\r\n<!-- note -->'))
+
+    def test_long_runs_stay_fast(self):
+        for body in ('*' * 60000 + 'no issue', 'Issue:' + '*' * 30000 + ' ' * 30000 + 'no issue',
+                     'closes' + ' ' * 60000 + '#', 'No issue:\n' * 5000):
+            with self.subTest(body=body[:12]):
+                started = time.monotonic()
+                self.assertFalse(passes(body))
+                self.assertLess(time.monotonic() - started, 2)
 
     def test_untouched_template_fails(self):
         self.assertFalse(passes(TEMPLATE.read_text(encoding='utf-8')))

@@ -77,6 +77,8 @@ jobs:
     # push to main and a manual run have no description, so they skip it.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # It takes seconds; the limit only bounds a description built to be slow.
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
