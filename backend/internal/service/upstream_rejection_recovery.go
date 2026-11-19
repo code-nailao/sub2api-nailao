@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +21,18 @@ const rejectionUnsentReservationMaxAge = 5 * time.Minute
 // short transactions.
 const rejectionDeadlineReleaseMaxPerRun = 64
 const rejectionDeadlineReleaseTimeout = 5 * time.Second
+
+// SettingKeyUpstreamRejectionDeadlineReleasePaused pauses only the deadline
+// waiver. "true" keeps every due hold frozen until an operator has reviewed the
+// ledger; a missing key or "false" runs the waiver; any other value, including
+// an empty one, pauses. Requests, rejection charges, ordinary bills, the
+// recovery of unsent reservations and task settlement are not affected. Read
+// before every release, so setting it stops a run that is already under way.
+const SettingKeyUpstreamRejectionDeadlineReleasePaused = "upstream_rejection_deadline_release_paused"
+
+type rejectionSettingReader interface {
+	GetValue(ctx context.Context, key string) (string, error)
+}
 
 type rejectionDeadlineReleaser interface {
 	UpstreamRejectionDueSource
@@ -51,6 +64,10 @@ type UpstreamRejectionRecovery struct {
 	dueRepo          rejectionDeadlineReleaser
 	invalidateDue    func(context.Context, *UpstreamRejectionReservation)
 	dueCursor        *UpstreamRejectionDueCursor
+	settings         rejectionSettingReader
+	// releasePaused is the last pause state that was read, kept only to log a
+	// change once. Touched by the scan goroutine alone.
+	releasePaused bool
 
 	mu      sync.Mutex
 	cancel  context.CancelFunc
@@ -114,6 +131,7 @@ func ProvideUpstreamRejectionRecovery(gateway *OpenAIGatewayService, billing Usa
 			gateway.invalidateUpstreamRejectionCaches(ctx, &APIKey{ID: r.APIKeyID, UserID: r.UserID}, updater)
 		}
 	}
+	w.settings = rejectionPauseSettingReader(gateway)
 	processrole.StartBackground("UpstreamRejectionRecovery", w.Start)
 	return w
 }
@@ -289,15 +307,19 @@ func (w *UpstreamRejectionRecovery) recoverUnsentReservations(ctx context.Contex
 // racing rejection or normal bill wins safely and counts here as a lost race.
 // Rows without a deadline are never listed.
 func (w *UpstreamRejectionRecovery) releaseDueReservations(ctx context.Context) {
-	if w.dueRepo == nil || ctx.Err() != nil {
+	if w.dueRepo == nil || ctx.Err() != nil || w.deadlineReleasePaused(ctx) {
 		return
 	}
 	listed, released, lost, failed := 0, 0, 0, 0
 	amount := 0.0
+	// How long the oldest hold of this run waited past its deadline. The process
+	// clock is used for this log figure only; every decision uses the database
+	// clock.
+	maxOverdue := time.Duration(0)
 	defer func() {
 		// One line per run with work; never payloads, URLs or credentials.
 		if listed > 0 {
-			logger.LegacyPrintf("service.rejection_recovery", "deadline release: listed=%d released=%d amount=%.8f lost_races=%d failed=%d", listed, released, amount, lost, failed)
+			logger.LegacyPrintf("service.rejection_recovery", "deadline release: listed=%d released=%d amount=%.8f lost_races=%d failed=%d max_overdue_s=%.0f", listed, released, amount, lost, failed, maxOverdue.Seconds())
 		}
 	}()
 	for listed < rejectionDeadlineReleaseMaxPerRun && ctx.Err() == nil {
@@ -314,8 +336,19 @@ func (w *UpstreamRejectionRecovery) releaseDueReservations(ctx context.Context) 
 			if ctx.Err() != nil {
 				return
 			}
+			// Read again before every release: once the operator pauses, not
+			// one more hold is released, even in the middle of a backlog. The
+			// cursor stays, so the page is resumed after the pause.
+			if listed > 0 && w.deadlineReleasePaused(ctx) {
+				return
+			}
 			listed++
 			r := &page.Items[i]
+			if r.ReleaseAfter != nil {
+				if overdue := time.Since(*r.ReleaseAfter); overdue > maxOverdue {
+					maxOverdue = overdue
+				}
+			}
 			releaseCtx, cancel := context.WithTimeout(ctx, rejectionDeadlineReleaseTimeout)
 			result, err := w.dueRepo.FinalizeUpstreamRejection(releaseCtx, NewUpstreamRejectionDeadlineReleaseCommand(r.RequestID, r.APIKeyID))
 			cancel()
@@ -342,4 +375,46 @@ func (w *UpstreamRejectionRecovery) releaseDueReservations(ctx context.Context) 
 			return
 		}
 	}
+}
+
+// rejectionPauseSettingReader is the settings store behind the pause switch,
+// or nil when the gateway has none; a nil reader never pauses.
+func rejectionPauseSettingReader(gateway *OpenAIGatewayService) rejectionSettingReader {
+	if gateway == nil || gateway.settingService == nil || gateway.settingService.settingRepo == nil {
+		return nil
+	}
+	return gateway.settingService.settingRepo
+}
+
+// deadlineReleasePaused reads the operator's pause switch. Only a clear "not
+// paused" (no key, or "false") lets the waiver run: a retained hold can still
+// be released later, a release cannot be taken back. An unreadable switch stops
+// this run without changing the remembered state, so a database blip is not
+// logged as a pause.
+func (w *UpstreamRejectionRecovery) deadlineReleasePaused(ctx context.Context) bool {
+	if w.settings == nil {
+		return false
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	raw, err := w.settings.GetValue(readCtx, SettingKeyUpstreamRejectionDeadlineReleasePaused)
+	cancel()
+	var paused bool
+	switch {
+	case errors.Is(err, ErrSettingNotFound):
+		paused = false
+	case err != nil:
+		logger.LegacyPrintf("service.rejection_recovery", "deadline release skipped: pause switch unreadable; holds retained")
+		return true
+	default:
+		paused = strings.TrimSpace(raw) != "false"
+	}
+	if paused != w.releasePaused {
+		w.releasePaused = paused
+		if paused {
+			logger.LegacyPrintf("service.rejection_recovery", "deadline release paused by setting %s; due holds retained", SettingKeyUpstreamRejectionDeadlineReleasePaused)
+		} else {
+			logger.LegacyPrintf("service.rejection_recovery", "deadline release resumed")
+		}
+	}
+	return paused
 }
