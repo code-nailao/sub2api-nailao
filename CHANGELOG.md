@@ -1,6 +1,6 @@
 # Changes
 
-## Unreleased
+## Main / background 0.2.79 — 2026-11-19
 
 - Sync official Sub2API v0.2.23: GPT-6.2 Sol and Astra (aliases, Codex model metadata, catalogue prices and long-context rates), an optional Ultra Fast multiplier on channel price cards (migration 252 is idempotent with the existing column), cache-creation tokens derived from the 5m/1h breakdown when the total is missing, an OpenAI pre-output idle failover, and the related upstream fixes and tests.
 - Keep the existing price of GPT-6.2 price cards whose Ultra Fast value is empty: 6x at every date instead of upstream's 3x before 2027-03-01 08:00 UTC. A value set on the card still wins; requests without a card follow upstream.
@@ -12,6 +12,7 @@
 - Add the one-shot commands `-list-pending-migrations`, `-check-startup` and `-export-web-assets` for the fixed-slot release tool in `deploy/sources/`.
 - Reject destructive migrations in CI unless they are explicitly marked as `contract` migrations.
 - Release content-rejection fee holds of synchronous requests whose outcome is still unknown after a durable deadline (migrations 272 and 273, the index built concurrently). A late rejection is recorded and never charged; a late ordinary bill is recorded and not charged after a release from `unknown`, and charged once through the ordinary path after a release from `sent`. Task-bound holds and holds already waiting before this change are unchanged.
+- A dry run of the release tool (`deploy.py --dry-run main <image>`) skips the startup check while migrations are pending and says so, instead of reporting a failure a real run would not have: a dry run only prints the migration command.
 
 ## Main / background 0.2.78 — 2026-11-18
 
