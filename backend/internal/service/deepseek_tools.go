@@ -180,12 +180,15 @@ func (s *OpenAIGatewayService) deepSeekToolAccount(ctx context.Context, key *API
 		return nil, nil, err
 	}
 	pin := key.Group.DeepSeekTools.AccountID
-	if modelAccount != nil && ((pin == nil && deepSeekToolCapable(modelAccount)) || (pin != nil && *pin == modelAccount.ID)) {
+	if modelAccount != nil && (pin == nil || *pin == modelAccount.ID) {
+		// Judge the stored account, not the copy the request was scheduled with.
 		fresh, err := s.reloadDeepSeekToolAccount(ctx, key, modelAccount.ID, modelAccount)
-		if err != nil {
+		if err == nil {
+			return fresh, func() {}, nil
+		}
+		if pin != nil {
 			return nil, nil, err
 		}
-		return fresh, func() {}, nil
 	}
 	return s.selectDeepSeekToolAccount(ctx, key, nil)
 }
@@ -241,12 +244,14 @@ func (s *OpenAIGatewayService) selectDeepSeekToolAccount(ctx context.Context, ke
 	for id := range excluded {
 		skip[id] = struct{}{}
 	}
+	// The scheduler snapshot lists a metadata projection without the tool
+	// setting, so each candidate is judged on its full account record.
 	candidates := 0
 	for i := range accounts {
 		if _, done := skip[accounts[i].ID]; done {
 			continue
 		}
-		if deepSeekToolCapable(&accounts[i]) {
+		if full, err := s.getSchedulableAccount(ctx, accounts[i].ID); err == nil && deepSeekToolCapable(full) {
 			candidates++
 		} else {
 			skip[accounts[i].ID] = struct{}{}

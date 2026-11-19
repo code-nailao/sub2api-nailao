@@ -791,3 +791,47 @@ func TestDeepSeekHostedToolAccountChoice(t *testing.T) {
 	_, _, err = only.svc.deepSeekToolAccount(context.Background(), key, &model)
 	require.Error(t, err, "without any tool account the hosted path still reports unavailable tools")
 }
+
+// deepSeekProjectedAccountRepo lists accounts the way the scheduler snapshot
+// does: a metadata projection whose Extra lacks deepseek_tools_enabled. Loading
+// one account by ID returns the full row.
+type deepSeekProjectedAccountRepo struct{ stubOpenAIAccountRepo }
+
+func (r deepSeekProjectedAccountRepo) ListSchedulableByGroupIDAndPlatform(ctx context.Context, groupID int64, platform string) ([]Account, error) {
+	accounts, err := r.stubOpenAIAccountRepo.ListSchedulableByGroupIDAndPlatform(ctx, groupID, platform)
+	projected := make([]Account, len(accounts))
+	for i, account := range accounts {
+		account.Extra = map[string]any{"quota_limit": 0.0}
+		projected[i] = account
+	}
+	return projected, err
+}
+
+func TestDeepSeekToolAccountsAreRecognizedBehindTheSchedulerProjection(t *testing.T) {
+	accounts := []Account{deepSeekToolsTestAccount(11, false), deepSeekToolsTestAccount(12, true)}
+	h := newDeepSeekToolsHarness(t, accounts, func(call deepSeekToolsCall) (*http.Response, error) {
+		require.Equal(t, int64(12), call.account, "only the tool account may be used")
+		return deepSeekJSONResponse(200, `{"results":[{"url":"https://example.com/a"}]}`), nil
+	})
+	h.svc.accountRepo = deepSeekProjectedAccountRepo{stubOpenAIAccountRepo{accounts: accounts}}
+	key := deepSeekToolsTestKey(deepSeekToolsAllPrices(), 10)
+	rec := httptest.NewRecorder()
+	h.serve(t, context.Background(), rec, key, DeepSeekToolSearch, "", []byte(`{"query":"x"}`))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Equal(t, 1, h.callCount())
+
+	// The hosted path borrows the same account for a model account without tools.
+	model := accounts[0]
+	model.Extra = map[string]any{}
+	supplier, release, err := h.svc.deepSeekToolAccount(context.Background(), key, &model)
+	require.NoError(t, err)
+	require.Equal(t, int64(12), supplier.ID)
+	release()
+	// A model account handed over as a projection is still recognized as a tool account.
+	projected := accounts[1]
+	projected.Extra = map[string]any{}
+	supplier, release, err = h.svc.deepSeekToolAccount(context.Background(), key, &projected)
+	require.NoError(t, err)
+	require.Equal(t, int64(12), supplier.ID)
+	release()
+}
