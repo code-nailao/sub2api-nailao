@@ -105,11 +105,20 @@ GPT-6.2 价卡的 Ultrafast 倍率留空时，按本仓库既有售价固定为 
 
 ### DeepSeek 联网工具
 
-标签：`deepseek_tools`、`deepseek_builtin_tools`、`deepseek_tool_compat`。
+标签：`deepseek_tools`、`deepseek_builtin_tools`、`deepseek_tool_compat`、`deepseek_tool_endpoints`。
 
 托管工具执行器：保留客户端 `stream`，复用现有协议事件转换器实时转发公开文本，内部工具调用留在执行器内；首字在有效内容写出后记录。工具名在请求之间保持稳定。工具失败时降级为不联网回答。逐轮确认用量，预留、结算和去重沿用原有路径，客户端断开后不再启动新工具。
 
 可选工具不拖垮普通请求（`deepseek_tools_hosted.go` 入口）：分组未开启工具时，请求完全按原版路径处理，包括自带 `web_search` / `web_fetch` 工具的请求；网关自动附加的工具在准备阶段失败（工具账号未配置或不可用、请求形态不支持、用量日志不可写）时，此时尚未向上游发送或预留任何内容，请求按客户端原样转发并记一条警告。客户端自己声明了服务端工具的请求仍返回错误。
+
+独立工具接口（`deepseek_tool_requests.go`、`deepseek_tool_endpoints.go`，路由在 `routes/gateway.go`，入口 `handler/openai_deepseek_tools.go`，标签 `deepseek_tool_endpoints`）：`POST /v1/tools/search|fetch|ocr|asr|tts` 按原版独立工具端点（`gateway_web_search.go`）的做法实现为单次转发，不进入网关工具循环。
+
+- 准入：分组须是开启工具的 DeepSeek 标准分组，且该工具有售价；Search/Fetch 沿用 `search_price_per_1k` 与 `fetch_price_per_1k`，OCR、ASR、TTS 的售价是 `groups.deepseek_tools` JSONB 中的新键 `ocr_price_per_1k_pages`、`asr_price_per_hour`、`tts_price_per_10k_chars`，`null` 表示不提供，`0` 为免费，无迁移。价格按单位固定，不乘分组或用户倍率。
+- 请求检查在任何供应商调用之前：每个工具有请求体上限（Search/Fetch 1 MiB、TTS 64 KiB、ASR 9 MiB、OCR 101 MiB）；OCR 与 ASR 必须是只含文档所列字段的 multipart，按文件签名识别类型，ASR 只接受 16 位 PCM WAV 或 Ogg Opus 并读取时长（≤120 秒）；TTS 只接受 `text`、`voice_id`、`format`，计费字符 ≤1 万。Search 查询、Fetch 地址和 TTS 文本经过内容审核。
+- 计费：只按供应商成功响应确认的单位结算——OCR 为 `page_count`（至少一页结果，最多 1000），ASR 为 `ceil(duration_ms/1000)` 秒（有识别文本，最多 120），TTS 为请求文本的计费字符（汉字计 2）。失败、空结果和错误包体不计费。五个工具共用 `DeepSeekToolUsage` 快照与 journal；Search/Fetch 的快照字段和账单指纹保持原样。供应商采购价（含三个新工具）改为可选，缺失按 0 计入利润统计。
+- 预留：按请求预估金额（1 次；ASR 120 秒；TTS 实际字符；OCR 按 PDF 页对象或文件大小估算，1–1000 页）做固定费准入与在途预留，请求结束时释放一次。
+- 账号：在本分组可调度、启用了工具的 DeepSeek API Key 账号中用原生调度器选择，`account_id` 仍可固定。只有供应商在转发任何内容之前明确拒绝（401、402、403、429、500、503 或请求无法构建）才换下一个账号，每次尝试使用独立的 journal 条目；发出后连接失败、502、504 视为结果未知，不重发并告知客户端不要自动重试。对话内托管工具在模型账号不提供工具时，同样改为从本分组的工具账号中选择。
+- 超时与断开：Search/Fetch 60 秒，ASR 5 分钟，OCR 10 分钟，TTS 15 分钟；OCR 与 ASR 在客户端断开后让供应商调用完成并计费，TTS 随客户端断开取消上游。OCR 在等待期间转发供应商发送的前导空白以保持连接，并在结算后再发送结果；TTS 音频直接流式转发，开始收到音频后客户端断开仍按输入字符计费，供应商中途中断不计费。
 
 强制工具调用（`deepseek_forced_tool_choice.go`，在 `openai_gateway_cc_pipeline.go` 的 Chat Completions 共用出站点调用一次）：DeepSeek 默认开启思考，并在思考开启时拒绝强制的 `tool_choice`（`required` 或指定函数）。对这类请求关闭思考并去掉 `reasoning_effort`，保留客户端要求的工具调用；`auto`、`none`、未设置以及其他上游的请求字节不变。三种入站协议都经过这个出站点。
 
