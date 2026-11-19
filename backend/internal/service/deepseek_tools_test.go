@@ -250,7 +250,7 @@ func TestDeepSeekHostedMoreThanThreeRounds(t *testing.T) {
 				c.Request = httptest.NewRequest("POST", "/v1/test", strings.NewReader(string(wire)))
 				c.Set("api_key", key)
 				SetDeepSeekBillingInput(c, &OpenAIRecordUsageInput{APIKey: key, User: key.User, Account: account, PricingAt: time.Now()})
-				result, handled, err := svc.tryForwardDeepSeekTools(context.Background(), c, account, wire, protocol, "")
+				result, _, handled, err := svc.tryForwardDeepSeekTools(context.Background(), c, account, wire, protocol, "")
 				require.True(t, handled)
 				require.NoError(t, err)
 				require.NotNil(t, result)

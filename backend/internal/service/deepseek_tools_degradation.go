@@ -2,7 +2,11 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
+
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // This result is gateway-owned evidence of unavailability, never a fabricated
@@ -55,10 +59,14 @@ func deepSeekCanFallbackWithoutTools(err error, httpStatus int) bool {
 	return false
 }
 
+// deepSeekToolsUnavailableNotice tells the model that the web tools it was
+// offered cannot be used, so it answers without claiming to have searched.
+const deepSeekToolsUnavailableNotice = "The gateway's optional web tools are unavailable for this request. Answer using the conversation and existing knowledge when appropriate. If live information is needed, tell the user it could not be verified. Do not claim to have searched, fetched, or verified sources."
+
 // First-turn fallback has no tool-result slot, so explicitly disclose the
 // unavailable web capability in the model input without changing user history.
 func (r *deepSeekHostedRequest) addUnavailableNotice() {
-	const notice = "The gateway's optional web tools are unavailable for this request. Answer using the conversation and existing knowledge when appropriate. If live information is needed, tell the user it could not be verified. Do not claim to have searched, fetched, or verified sources."
+	const notice = deepSeekToolsUnavailableNotice
 	switch r.Protocol {
 	case "messages":
 		switch system := r.Body["system"].(type) {
@@ -81,5 +89,93 @@ func (r *deepSeekHostedRequest) addUnavailableNotice() {
 	default:
 		messages, _ := r.Body["messages"].([]any)
 		r.Body["messages"] = append(messages, map[string]any{"role": "system", "content": notice})
+	}
+}
+
+// withoutDeepSeekWebTools removes the tools entries whose type match selects,
+// editing the request in place so every other byte stays as the client sent it.
+// A tool_choice that forced a removed tool no longer forces one; when no tool
+// is left, tools and tool_choice are both deleted, as disableServerTools does.
+// With notice set, the unavailable-web notice is added where
+// addUnavailableNotice puts it. It reports whether anything was removed.
+func withoutDeepSeekWebTools(body []byte, protocol string, match func(typ string) bool, notice bool) ([]byte, bool, error) {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.IsArray() {
+		return body, false, nil
+	}
+	items := tools.Array()
+	removedNames := map[string]bool{}
+	var removed []int
+	for i, item := range items {
+		if typ := item.Get("type").String(); match(typ) {
+			removed = append(removed, i)
+			removedNames[typ] = true
+			if name := item.Get("name").String(); name != "" {
+				removedNames[name] = true
+			}
+		}
+	}
+	if len(removed) == 0 {
+		return body, false, nil
+	}
+	out, err := body, error(nil)
+	if len(removed) == len(items) {
+		if out, err = sjson.DeleteBytes(out, "tools"); err == nil && gjson.GetBytes(out, "tool_choice").Exists() {
+			out, err = sjson.DeleteBytes(out, "tool_choice")
+		}
+	} else {
+		for i := len(removed) - 1; i >= 0 && err == nil; i-- {
+			out, err = sjson.DeleteBytes(out, fmt.Sprintf("tools.%d", removed[i]))
+		}
+		choice := gjson.GetBytes(out, "tool_choice")
+		typ, name := choice.Get("type").String(), choice.Get("name").String()
+		forced := choice.IsObject() && (removedNames[typ] || match(typ) || (typ == "tool" && (removedNames[name] || match(name))))
+		if err == nil && forced {
+			auto := `"auto"`
+			if protocol == "messages" {
+				auto = `{"type":"auto"}`
+			}
+			out, err = sjson.SetRawBytes(out, "tool_choice", []byte(auto))
+		}
+	}
+	if err == nil && notice {
+		out, err = withDeepSeekUnavailableNotice(out, protocol)
+	}
+	if err != nil {
+		return body, false, err
+	}
+	return out, true, nil
+}
+
+// withDeepSeekUnavailableNotice adds deepSeekToolsUnavailableNotice in the
+// place addUnavailableNotice uses, without re-encoding the rest of the body.
+func withDeepSeekUnavailableNotice(body []byte, protocol string) ([]byte, error) {
+	message := map[string]any{"role": "system", "content": deepSeekToolsUnavailableNotice}
+	switch protocol {
+	case "messages":
+		system := gjson.GetBytes(body, "system")
+		switch {
+		case system.Type == gjson.String:
+			return sjson.SetBytes(body, "system", system.String()+"\n\n"+deepSeekToolsUnavailableNotice)
+		case system.IsArray():
+			return sjson.SetBytes(body, "system.-1", map[string]any{"type": "text", "text": deepSeekToolsUnavailableNotice})
+		default:
+			return sjson.SetBytes(body, "system", deepSeekToolsUnavailableNotice)
+		}
+	case "responses":
+		input := gjson.GetBytes(body, "input")
+		switch {
+		case input.IsArray():
+			return sjson.SetBytes(body, "input.-1", message)
+		case input.Type == gjson.String:
+			return sjson.SetBytes(body, "input", []any{map[string]any{"role": "user", "content": input.String()}, message})
+		default:
+			return sjson.SetBytes(body, "input", []any{message})
+		}
+	default:
+		if gjson.GetBytes(body, "messages").IsArray() {
+			return sjson.SetBytes(body, "messages.-1", message)
+		}
+		return sjson.SetBytes(body, "messages", []any{message})
 	}
 }

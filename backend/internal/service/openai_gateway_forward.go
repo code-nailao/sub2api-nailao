@@ -27,8 +27,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		return nil, fixedErr
 	}
 	body = fixedBody
-	if result, handled, err := s.tryForwardDeepSeekTools(ctx, c, account, body, "responses", ""); handled {
+	if result, next, handled, err := s.tryForwardDeepSeekTools(ctx, c, account, body, "responses", ""); handled {
 		return result, err
+	} else {
+		body = next
 	}
 	beginUpstreamResponseModelObservation(c)
 	ClearActualOpenAIUpstreamEndpoint(c)

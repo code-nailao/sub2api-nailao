@@ -61,7 +61,7 @@ func TestDeepSeekNativeFailedStreamPreservesConfirmedUsage(t *testing.T) {
 			c.Set("api_key", key)
 			SetDeepSeekBillingInput(c, &OpenAIRecordUsageInput{APIKey: key, User: key.User, Account: account, PricingAt: time.Now()})
 
-			result, handled, err := svc.tryForwardDeepSeekTools(context.Background(), c, account, body, "responses", "")
+			result, _, handled, err := svc.tryForwardDeepSeekTools(context.Background(), c, account, body, "responses", "")
 			require.True(t, handled)
 			require.ErrorContains(t, err, "upstream response failed")
 			require.Equal(t, 1, requests)
