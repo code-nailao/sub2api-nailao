@@ -3596,7 +3596,7 @@
       "features": [
         "grok_content_rejection_billing"
       ],
-      "sha256": "8b43c93b36d2d2831c0b56b2cdb3f1c04c74c3941e4e43208d95100c2868f5f8",
+      "sha256": "3d31662695bc685ecb280f69eab090200251f881329e1e9aff39fc333a98f432",
       "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. This file unit tests for the pause switch of the deadline release."
     },
     {
@@ -3612,7 +3612,7 @@
       "features": [
         "grok_content_rejection_billing"
       ],
-      "sha256": "d2654c5715a69a1c7bf546bf5beb0f0b23863e948874287cb74ff5f06f3051d9",
+      "sha256": "586ac1dbc11b20d6dbaa8c596c0930acef1f4286f290e5635e66efbbf2a3f565",
       "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks."
     },
     {
