@@ -26,6 +26,9 @@ type UpstreamRejectionBillingAttempt struct {
 	SendUncertain            bool
 	VideoBasePricePerSecond  *float64
 	VideoFinalPricePerSecond *float64
+	// trace is the upstream's response to the one request this attempt sent,
+	// recorded at the transport seam. Guarded by mu.
+	trace *upstreamRejectionTrace
 }
 
 func (s *OpenAIGatewayService) BeginUpstreamRejectionBilling(ctx context.Context, key *APIKey, account *Account, model string, payload []byte) (*UpstreamRejectionBillingAttempt, error) {
@@ -134,7 +137,7 @@ func (s *OpenAIGatewayService) FinishUpstreamRejectionBillingAttempt(ctx context
 		}
 		// Partial usage is not a terminal normal bill. The provider may still
 		// finish as a fixed-charge rejection after this connection failed.
-		if err := s.markUpstreamRejectionUnknown(ctx, r); err != nil {
+		if err := s.markUpstreamRejectionUnknownWith(ctx, r, attempt.observedEvidence(result)); err != nil {
 			return err
 		}
 		return ErrUpstreamRejectionOutcomeUnknown
@@ -165,6 +168,17 @@ func (s *OpenAIGatewayService) FinishUpstreamRejectionBillingAttempt(ctx context
 		switch status {
 		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusUnprocessableEntity, http.StatusTooManyRequests:
 			cmd.Outcome, cmd.ConfirmedNoCharge = UpstreamRejectionReleased, true
+		}
+	}
+	if sent {
+		// What the upstream answered, for supplier reconciliation only: neither
+		// the status nor an identifier changes the outcome decided above. The
+		// stored status is the one the response carried. An error can carry a
+		// status that no upstream sent (a transport failure is reported as 502),
+		// so the error's status is kept only for a release, which was decided
+		// on it, and only when the response itself was not seen.
+		cmd.Evidence = attempt.observedEvidence(nil)
+		if cmd.Evidence.OriginalStatus == 0 && cmd.Outcome == UpstreamRejectionReleased {
 			cmd.Evidence.OriginalStatus = status
 		}
 	}
@@ -400,19 +414,32 @@ func rejectionBillingEvidence(account *Account, result *OpenAIForwardResult, ori
 	e, u := result.UpstreamRejection, result.Usage
 	out := UpstreamRejectionBillingEvidence{RuleID: e.RuleID, RuleVersion: e.RuleVersion, OriginalStatus: e.HTTPStatus, ResponseDigest: e.ResponseHash, InputTokens: max(0, u.InputTokens-u.CacheReadInputTokens-u.CacheCreationInputTokens), OutputTokens: u.OutputTokens, CacheReadTokens: u.CacheReadInputTokens, CacheWriteTokens: u.CacheCreationInputTokens, OriginalModel: originalModel, UpstreamModel: result.UpstreamModel, UpstreamResponseModel: result.UpstreamResponseModel, UpstreamEndpoint: result.UpstreamEndpoint, Stream: result.Stream, DurationMs: int(result.Duration.Milliseconds())}
 	if upstreamID := usageUpstreamRequestIDPtr(account, result.UpstreamHeaders, result.OpenAIWSMode); upstreamID != nil {
-		out.UpstreamRequestID = *upstreamID
+		// An id that storage would refuse is dropped: losing it must not lose the charge.
+		out.UpstreamRequestID = storableUpstreamRequestID(*upstreamID)
+	}
+	if !result.OpenAIWSMode {
+		// Read from the result alone, so the attempt and the usage task build
+		// byte-identical evidence for the same rejection.
+		trace := upstreamRejectionTraceFromHeaders(nil, result.UpstreamHeaders)
+		out.XClientRequestID, out.XRequestID, out.CFRay = trace.XClientRequestID, trace.XRequestID, trace.CFRay
 	}
 	return out
 }
 
 func (s *OpenAIGatewayService) markUpstreamRejectionUnknown(ctx context.Context, r *UpstreamRejectionReservation) error {
+	return s.markUpstreamRejectionUnknownWith(ctx, r, UpstreamRejectionBillingEvidence{})
+}
+
+// markUpstreamRejectionUnknownWith keeps what was observed of the upstream's
+// response with the unknown outcome. The repository retains the first evidence.
+func (s *OpenAIGatewayService) markUpstreamRejectionUnknownWith(ctx context.Context, r *UpstreamRejectionReservation, observed UpstreamRejectionBillingEvidence) error {
 	repo, ok := s.usageBillingRepo.(UpstreamRejectionBillingRepository)
 	if !ok {
 		return ErrUpstreamRejectionBillingUnavailable
 	}
 	billingCtx, cancel := detachedBillingContext(ctx)
 	defer cancel()
-	_, err := repo.FinalizeUpstreamRejection(billingCtx, &UpstreamRejectionFinalizeCommand{RequestID: r.RequestID, APIKeyID: r.APIKeyID, Outcome: UpstreamRejectionUnknown})
+	_, err := repo.FinalizeUpstreamRejection(billingCtx, &UpstreamRejectionFinalizeCommand{RequestID: r.RequestID, APIKeyID: r.APIKeyID, Outcome: UpstreamRejectionUnknown, Evidence: observed})
 	if errors.Is(err, ErrUpstreamRejectionWaived) {
 		// Already released at its deadline; there is no hold left to retain.
 		return nil
