@@ -25,6 +25,13 @@ type Status struct {
 	UnresolvedImages   int               `json:"unresolved_images"`
 	BackgroundServices map[string]string `json:"background_services"`
 	Admission          *AdmissionStatus  `json:"admission,omitempty"`
+	// Background owner only (handoff.go): what admin requests a draining
+	// owner still answers, in-flight admin requests it would refuse while
+	// draining (writes and side-effect reads), and cleanup steps that have not
+	// finished.
+	AdminDuringDrain  string   `json:"admin_during_drain,omitempty"`
+	ActiveAdminWrites int      `json:"active_admin_writes,omitempty"`
+	Stopping          []string `json:"stopping,omitempty"`
 }
 
 func (r *Runtime) Status() Status {
@@ -37,6 +44,7 @@ func (r *Runtime) Status() Status {
 	status := Status{InstanceID: r.id, Role: r.config.Role, Ready: r.ready && !r.drain, Draining: r.drain,
 		OwnsBackground: r.owner != nil, ActiveHTTP: r.http, ActiveImages: r.images,
 		Hijacked: r.hijack, UnresolvedImages: r.failed, BackgroundServices: services}
+	r.handoffStatusLocked(&status)
 	if r.admission != nil {
 		admission := r.admission.Status()
 		status.Admission = &admission
@@ -213,6 +221,15 @@ func (r *Runtime) Wrap(next http.Handler) http.Handler {
 		if r.config.Role == Background && !adminPath(req.URL.Path) && req.URL.Path != "/health" {
 			http.Error(w, "public requests must use a serving instance", http.StatusServiceUnavailable)
 			return
+		}
+		if r.config.Role == Background && adminPath(req.URL.Path) {
+			admitted, finish, ok := r.admitOwnerAdmin(req)
+			if !ok {
+				refuseDuringHandoff(w)
+				return
+			}
+			defer finish()
+			req = admitted
 		}
 		end := r.add(&r.http)
 		defer end()

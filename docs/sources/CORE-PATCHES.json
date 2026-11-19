@@ -14,7 +14,7 @@
     },
     {
       "path": "backend/cmd/server/VERSION",
-      "sha256": "d4f488b94993f5de863c240e39f6885f344dd57f97692c3c51384da8ec0d023f",
+      "sha256": "bfc5d8f311fd47f8a89a901c343efb9d31d4de68e72e507e665cbfc05b39f029",
       "reason": "Adds a default-off setting that hands usage-log retention to an external owner; while it is on, native usage cleanup refuses to run, and deduplication, audit and other maintenance continue. Keeps compact per-group usage statistics for the admin dashboard after detailed usage rows are removed by retention, so admin history survives log cleanup; this touches the dashboard aggregation and rollup repositories and adds a migration. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Marks the fork version that carried the embedded Studio changes. Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds to the admin V1 channel-monitor list the billing group that each probe key currently belongs to, resolved in one bounded batch from local API keys and returned as null when unknown, without exposing key material. Marks the fork version that made the optional image ledger and pending-hold interfaces safe to construct at start-up and made start-up diagnostics visible regardless of log level. This file holds the fork's own version number, which does not follow upstream.",
       "features": [
         "external_log_cleanup_owner",
@@ -31,21 +31,23 @@
     },
     {
       "path": "backend/cmd/server/main.go",
-      "sha256": "31fab0943c672b6a795f57ec394bea5f415272465e999d01a8a0b8f14122e13a",
+      "sha256": "2bf95a2bdee2460b3842f8d332db6a0dc3bfecd9daf2bca203d9da81a059675b",
       "features": [
         "native_process_lifecycle",
-        "release_handoff_p1"
+        "release_handoff_p1",
+        "background_handoff_read_only"
       ],
-      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Adds the one-shot -list-pending-migrations and -check-startup commands used when handing traffic to a new build, and makes OAuth refreshes, channel probes and scheduled tests stop promptly and cleanly on shutdown. Here main makes one call to the deploy-command dispatcher after flag parsing."
+      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Adds the one-shot -list-pending-migrations and -check-startup commands used when handing traffic to a new build, and makes OAuth refreshes, channel probes and scheduled tests stop promptly and cleanly on shutdown. Here main makes one call to the deploy-command dispatcher after flag parsing. Shutdown runs through the ordered sequence in sources_shutdown.go; the background owner keeps its listener until its background services have stopped, and the cleanup and settings-refresh defers stay as idempotent fallbacks."
     },
     {
       "path": "backend/cmd/server/sources_deploy_commands.go",
       "features": [
         "release_handoff_p1",
-        "release_handoff_p2"
+        "release_handoff_p2",
+        "background_handoff_read_only"
       ],
-      "sha256": "36f7434891f8989829408cd29c8ea6874d9526e0f01e1097b2323ba13ed62131",
-      "reason": "Adds the one-shot -list-pending-migrations and -check-startup commands used when handing traffic to a new build, and makes OAuth refreshes, channel probes and scheduled tests stop promptly and cleanly on shutdown. Adds the one-shot -export-web-assets command, which copies the embedded frontend assets to a directory without overwriting and reports when a build has no embedded frontend. Implements the one-shot commands, which are mutually exclusive; -check-startup checks database and Redis reachability, then builds the full Wire graph with serving semantics under a throwaway lock and starts no HTTP or background work."
+      "sha256": "3cc6fcc9e7c3aaccd23ce8cab2bf85da1b1eedc4f08ed84696c68cff2242d2c5",
+      "reason": "Adds the one-shot -list-pending-migrations and -check-startup commands used when handing traffic to a new build, and makes OAuth refreshes, channel probes and scheduled tests stop promptly and cleanly on shutdown. Adds the one-shot -export-web-assets command, which copies the embedded frontend assets to a directory without overwriting and reports when a build has no embedded frontend. Implements the one-shot commands, which are mutually exclusive; -check-startup checks database and Redis reachability, then builds the full Wire graph with serving semantics under a throwaway lock and starts no HTTP or background work. The startup check runs the whole cleanup through applicationCleanup.Run."
     },
     {
       "path": "backend/cmd/server/sources_deploy_commands_test.go",
@@ -74,6 +76,22 @@
       "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Tests for this behaviour."
     },
     {
+      "path": "backend/cmd/server/sources_shutdown.go",
+      "sha256": "c27e87151705f465a6f930314501c55c9cf0d43644f706c7645dcdf147b8b746",
+      "features": [
+        "background_handoff_read_only"
+      ],
+      "reason": "Defines the shutdown order and the two-phase cleanup. Serving and standalone keep Drain, Shutdown, Wait, then settings refresh and cleanup; the background owner waits for admin writes admitted before Drain, stops its background services while still answering admin reads, cancels upgraded admin connections and only then closes its listener. The ownership lock is still released only by process exit. newSourcesShutdown wires the sequence to the live runtime and application, and the cleanup logs the total time across both phases."
+    },
+    {
+      "path": "backend/cmd/server/sources_shutdown_test.go",
+      "sha256": "531dc0b0afb46b308069698ad995f4773f89e6ab6a9ae28f320412edfd95ab19",
+      "features": [
+        "background_handoff_read_only"
+      ],
+      "reason": "Pins the shutdown order per role, the two-phase cleanup and the wiring main uses (observed through a live listener and the real runtime), and checks over a real loopback listener that a draining owner answers admin reads, refuses writes, closes an upgraded admin connection before the listener and leaves ordinary in-flight requests alone."
+    },
+    {
       "path": "backend/cmd/server/startup_fatal_test.go",
       "features": [
         "native_process_lifecycle"
@@ -89,10 +107,11 @@
         "account_wallet_refresh",
         "grok_content_rejection_billing",
         "deepseek_builtin_tools",
-        "upstream_022_request_speed_root_upstream_integration"
+        "upstream_022_request_speed_root_upstream_integration",
+        "background_handoff_read_only"
       ],
-      "sha256": "33dd7c4e2a87a397477b2675889ce48ce9797fb1881f730cc2c69137871a1673",
-      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour."
+      "sha256": "6d4a6692f43b6744851d80c0c4103f07913f30d793f721861243b2b0da60a51b",
+      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. provideCleanup returns an applicationCleanup with two phases, background services and the rest, run once each in the old order; each background step is reported as stopping in the runtime status while it runs."
     },
     {
       "path": "backend/cmd/server/wire_gen.go",
@@ -102,10 +121,11 @@
         "account_wallet_refresh",
         "grok_content_rejection_billing",
         "deepseek_builtin_tools",
-        "upstream_022_request_speed_root_upstream_integration"
+        "upstream_022_request_speed_root_upstream_integration",
+        "background_handoff_read_only"
       ],
-      "sha256": "193e234fda29605cad85ddfd4c4dcaa4b117b4bfd2ff1b1bd35777db6a31b6bf",
-      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Generated Wire injector."
+      "sha256": "35881b437c92f753059cc6b3e29f48281f206e9618c285d8cbef218f3dada95f",
+      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Generated Wire injector. provideCleanup returns an applicationCleanup with two phases, background services and the rest, run once each in the old order; each background step is reported as stopping in the runtime status while it runs."
     },
     {
       "path": "backend/cmd/server/wire_gen_test.go",
@@ -114,10 +134,11 @@
         "account_wallet_refresh",
         "grok_content_rejection_billing",
         "deepseek_builtin_tools",
-        "upstream_022_request_speed_root_upstream_integration"
+        "upstream_022_request_speed_root_upstream_integration",
+        "background_handoff_read_only"
       ],
-      "sha256": "a406ec530a9a7694435478d9147f015834bf31ec58b4da35b70d4577fb8cc30e",
-      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Tests for this behaviour."
+      "sha256": "eae047e95aefb94b63faab9509839fd82866e936459fa6ac3594f7bdd2c95a2d",
+      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Tests for this behaviour. Covers the split cleanup path: StopBackground followed by Run, and a repeated Run."
     },
     {
       "path": "backend/ent/accountgroup.go",
@@ -1097,6 +1118,22 @@
       "reason": "Controls which writer may submit media engine image tasks through a durable, revisioned admission journal with hold barriers and stale-revision rejection, and returns only neutral validation and failure fields to users. Tests for this behaviour."
     },
     {
+      "path": "backend/internal/processrole/handoff.go",
+      "sha256": "7926d6fea53b07b96bac7be59a642b66b5df0c24c16d559621c9cac6db429651",
+      "features": [
+        "background_handoff_read_only"
+      ],
+      "reason": "Read-only drain of the background owner: after Drain it answers admin GET and HEAD only, except reviewed reads that reach an upstream provider or the stopped media engine store; everything else is refused with 503, the native error envelope and Retry-After before any handler runs. Counts the admin requests it would refuse while draining (writes, MCP and the refused reads, but not upgrades) that were admitted before Drain and waits for them, cancels the contexts of upgraded admin connections, and reports cleanup steps still stopping."
+    },
+    {
+      "path": "backend/internal/processrole/handoff_test.go",
+      "sha256": "5ade9c966e1f15f885ccbfe206c42364d1af394533b7c5e84111604198986a6f",
+      "features": [
+        "background_handoff_read_only"
+      ],
+      "reason": "Covers the read-only drain policy, the unchanged serving and standalone behaviour, waiting for writes and refused reads admitted before Drain while an open upgrade is not waited for, cancelling only upgraded admin requests and the stopping report."
+    },
+    {
       "path": "backend/internal/processrole/mcp_test.go",
       "sha256": "ab3be38c9ab3c1fda95e023d6fdd3108ea40eeb2a994529acd53733f45d2ebcc",
       "features": [
@@ -1106,20 +1143,22 @@
     },
     {
       "path": "backend/internal/processrole/role.go",
-      "sha256": "20394578afb5977512355444f66d7025b8404e490af0b2c1f0e7ffc32f199175",
+      "sha256": "077d589b61fcf0cc969ed5fb94edca72cc6cb7aa62f8394fd74959283c6176d1",
       "features": [
-        "native_process_lifecycle"
+        "native_process_lifecycle",
+        "background_handoff_read_only"
       ],
-      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services."
+      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. The runtime holds the handoff state: in-flight admin writes, cancel functions of upgraded admin connections and cleanup steps still stopping."
     },
     {
       "path": "backend/internal/processrole/runtime.go",
-      "sha256": "b1acaef361ce878b032a8ca0d0e17b870743854c4f406ca6cf1c9a7ae1919841",
+      "sha256": "87ec32a5d9be8978711b2791615d911755aad8aa8540018c952f931b5f241d8d",
       "features": [
         "native_process_lifecycle",
-        "account_wallet_refresh"
+        "account_wallet_refresh",
+        "background_handoff_read_only"
       ],
-      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address."
+      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Background admin requests pass the handoff admission check before the handler, and the runtime status reports admin_during_drain, active_admin_writes and stopping for the background role."
     },
     {
       "path": "backend/internal/processrole/runtime_test.go",

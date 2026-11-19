@@ -169,7 +169,7 @@ func runSourcesStartupCheck(w io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("initialize application: %w", err)
 	}
-	app.Cleanup()
+	app.Cleanup.Run()
 
 	services := make([]string, 0)
 	for name := range runtime.Status().BackgroundServices {

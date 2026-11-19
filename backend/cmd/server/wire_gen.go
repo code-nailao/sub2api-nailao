@@ -13,6 +13,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/handler"
 	"github.com/Wei-Shaw/sub2api/internal/handler/admin"
 	"github.com/Wei-Shaw/sub2api/internal/payment"
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 	"github.com/Wei-Shaw/sub2api/internal/repository"
 	"github.com/Wei-Shaw/sub2api/internal/securityaudit"
 	"github.com/Wei-Shaw/sub2api/internal/server"
@@ -389,7 +390,7 @@ type Application struct {
 	Settings      *service.SettingService
 	PromptAudit   *securityaudit.PromptService
 	PluginManager *service.PluginManager
-	Cleanup       func()
+	Cleanup       *applicationCleanup
 }
 
 func providePrivacyClientFactory() service.PrivacyClientFactory {
@@ -467,8 +468,8 @@ func provideCleanup(
 	openAIAutoReset *service.OpenAIQuotaAutoResetService,
 	promptAudit *securityaudit.PromptService,
 	pluginManager *service.PluginManager,
-) func() {
-	return func() {
+) *applicationCleanup {
+	return newApplicationCleanup(func(phase cleanupPhase) {
 		ctx := context.Background()
 		started := time.Now()
 
@@ -795,6 +796,8 @@ func provideCleanup(
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
+					// Visible in the runtime status while the owner drains.
+					defer processrole.Stopping(step.name)()
 					if err := step.fn(); err != nil {
 						log.Printf("[Cleanup] %s failed: %v", step.name, err)
 						return
@@ -835,13 +838,18 @@ func provideCleanup(
 				background = append(background, step)
 			}
 		}
-		runParallel(background)
+		// A background owner stops these first while it still answers admin
+		// reads (sources_shutdown.go); the rest always follows, in order.
+		if phase == cleanupBackgroundServices {
+			runParallel(background)
+			return
+		}
 		for _, name := range localOrder {
 			if step := local[name]; step.fn != nil {
 				runSequential([]cleanupStep{step})
 			}
 		}
 		runSequential(infraSteps)
-		log.Printf("[Cleanup] All cleanup steps completed in %s", time.Since(started))
-	}
+		log.Printf("[Cleanup] Remaining cleanup steps completed in %s", time.Since(started))
+	})
 }

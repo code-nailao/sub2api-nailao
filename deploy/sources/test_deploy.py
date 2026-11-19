@@ -1,5 +1,8 @@
+import http.client
 import json
 import os
+import socketserver
+import threading
 import subprocess
 import sys
 import tempfile
@@ -48,6 +51,11 @@ class FakeOps(deploy.Ops):
         self.public_status = 200
         self.public_status_after_reload: int | None = None
         self.public_requests = 0
+        # Seconds a container keeps running after TERM (inf: never exits), and
+        # extra runtime fields per container (e.g. what a draining owner reports).
+        self.drain_seconds: dict[str, float] = {}
+        self.runtime_extra: dict[str, dict] = {}
+        self.sleeps: list[float] = []
         self.files["/proc/sys/net/ipv4/ip_local_port_range"] = "10240\t65535\n"
         self.files["/proc/sys/net/ipv4/ip_local_reserved_ports"] = "9400-9404,9410-9414,9500\n"
 
@@ -104,10 +112,13 @@ class FakeOps(deploy.Ops):
                 elif cmd[0] == "-export-web-assets":
                     out = f"{deploy.ASSETS_PREFIX} 3\n"
             else:
+                c.pop("draining_until", None)
                 c["State"].update(Running=True, Status="running", StartedAt=f"t{self.clock}")
         elif args[:2] == ["docker", "kill"]:
             c = self.containers.get(args[-1])
-            if c:
+            if c and args[-1] in self.drain_seconds and c["State"]["Running"]:
+                c["draining_until"] = self.clock + self.drain_seconds[args[-1]]
+            elif c:
                 c["State"].update(Running=False, Status="exited", ExitCode=0)
         elif args[:2] == ["docker", "rm"]:
             self.containers.pop(args[-1], None)
@@ -129,9 +140,15 @@ class FakeOps(deploy.Ops):
             raise deploy.DeployError(f"command failed: {args[:3]}")
         return subprocess.CompletedProcess(args, rc, out, "")
 
+    def settle_drain(self, c):
+        if c and "draining_until" in c and self.clock >= c["draining_until"]:
+            c.pop("draining_until")
+            c["State"].update(Running=False, Status="exited", ExitCode=0)
+
     def inspect(self, name):
         c = self.containers.get(name)
-        return json.loads(json.dumps(c)) if c else None
+        self.settle_drain(c)
+        return json.loads(json.dumps(c, default=str)) if c else None
 
     def by_port(self, port):
         return next((c for c in self.containers.values() if c["port"] == port), None)
@@ -142,8 +159,13 @@ class FakeOps(deploy.Ops):
             return self.public_status, ("ok" if self.public_status == 200 else None)
         port = int(url.split(":")[2].split("/")[0])
         c = self.by_port(port)
+        self.settle_drain(c)
         if not c or not c["State"]["Running"]:
             return 0, None
+        extra = self.runtime_extra.get(c["Name"][1:], {})
+        if "draining_until" in c and url.endswith("/internal/sources/runtime") and token == "tok":
+            return 200, {"ready": False, "draining": True, "role": c["role"],
+                         "owns_background": c["role"] == "background", "instance_id": c["Id"], **extra}
         if url.endswith("/health"):
             return 200, "ok"
         if url.endswith("/drain"):
@@ -151,7 +173,8 @@ class FakeOps(deploy.Ops):
         if token != "tok" or port in self.unready_ports:
             return (404, None) if token != "tok" else (200, {"ready": False, "role": c["role"]})
         return 200, {"ready": True, "role": c["role"], "owns_background": c["role"] == "background",
-                     "instance_id": c["Id"], "active_http": c.get("active_http", 0)}
+                     "instance_id": c["Id"], "active_http": c.get("active_http", 0),
+                     **{k: v for k, v in extra.items() if k == "admin_during_drain"}}
 
     def read_text(self, path):
         if path in self.files:
@@ -185,6 +208,7 @@ class FakeOps(deploy.Ops):
         return self.error_log
 
     def sleep(self, seconds):
+        self.sleeps.append(seconds)
         self.clock += seconds
 
     def monotonic(self):
@@ -449,6 +473,139 @@ class DeployTest(unittest.TestCase):
         self.assertIn("did not finish", str(ctx.exception))
         self.assertEqual([], self.ops.commands)
 
+    def test_handoff_says_admin_stays_read_only_when_the_old_owner_reports_it(self):
+        self.ops.runtime_extra["old-bg"] = {"admin_during_drain": "read-only"}
+        self.deploy()
+        text = "\n".join(self.ops.logs)
+        self.assertIn("while old-bg drains it answers admin reads and refuses admin writes with 503", text)
+        self.assertNotIn("admin API is unavailable", text)
+
+    def test_handoff_says_admin_is_unavailable_for_an_old_binary(self):
+        self.deploy()
+        self.assertIn("the admin API is unavailable until the new background is ready",
+                      "\n".join(self.ops.logs))
+
+    def test_handoff_reports_what_the_old_owner_is_still_stopping(self):
+        self.ops.drain_seconds["old-bg"] = 130
+        self.ops.runtime_extra["old-bg"] = {"admin_during_drain": "read-only", "active_admin_writes": 1,
+                                            "stopping": ["BackupService", "TokenRefreshService"]}
+        self.deploy()
+        notes = [line for line in self.ops.logs if "old-bg still finishing in-flight work" in line]
+        self.assertGreaterEqual(len(notes), 3, "first note a few seconds after TERM, then one per minute")
+        self.assertIn("1 admin request(s) in flight; still stopping BackupService, TokenRefreshService", notes[0])
+        self.assertEqual("a", self.state()["current"]["slot"])
+
+    def test_handoff_polls_every_half_second_and_nothing_else_does(self):
+        calls = []
+        real_exit, real_ready = deploy.Deployer.wait_exit, deploy.Deployer.wait_ready
+
+        def wait_exit(deployer, name, timeout, **kw):
+            calls.append(("exit", name, kw.get("poll", 2)))
+            return real_exit(deployer, name, timeout, **kw)
+
+        def wait_ready(deployer, port, token, role, timeout, **kw):
+            calls.append(("ready", role, kw.get("poll", 2)))
+            return real_ready(deployer, port, token, role, timeout, **kw)
+
+        self.ops.drain_seconds["old-bg"] = 3
+        with mock.patch.object(deploy.Deployer, "wait_exit", wait_exit), \
+                mock.patch.object(deploy.Deployer, "wait_ready", wait_ready):
+            self.deploy()
+        self.assertIn(("exit", "old-bg", deploy.HANDOFF_POLL_SECONDS), calls)
+        self.assertIn(("ready", "background", deploy.HANDOFF_POLL_SECONDS), calls)
+        self.assertEqual({2}, {poll for kind, role, poll in calls if role == "serving"})
+        self.assertEqual(0.5, deploy.HANDOFF_POLL_SECONDS)
+        self.assertIn(0.5, self.ops.sleeps)
+
+    def test_old_owner_that_never_exits_keeps_in_progress_with_instructions(self):
+        self.ops.drain_seconds["old-bg"] = float("inf")
+        with self.assertRaises(deploy.FallbackFailed) as ctx:
+            self.deploy()
+        message = str(ctx.exception)
+        for part in ("old-bg is still draining after 2100s", "nothing was killed",
+                     "sources-main-a-background was not started", "Traffic is on slot legacy",
+                     "no background owner runs",
+                     "Left running without traffic: sources-main-a-serving, sources-main-a-standby",
+                     "start the background of slot legacy: 'docker update --restart=unless-stopped old-bg' "
+                     "and 'docker start old-bg'", "Do not deploy again"):
+            self.assertIn(part, message)
+        self.assertTrue(self.ops.containers["sources-main-a-serving"]["State"]["Running"],
+                        "as the message says, the new serving containers are left running")
+        old = self.ops.containers["old-bg"]
+        self.assertTrue(old["State"]["Running"], "never killed")
+        self.assertEqual("no", old["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertFalse(self.ops.containers["sources-main-a-background"]["State"]["Running"])
+        self.assertFalse(self.ops.switched, "traffic never moved")
+        in_progress = self.state()["in_progress"]
+        self.assertEqual("background handoff", in_progress["step"])
+        self.assertEqual(message, in_progress["failed"])
+        self.assertIn("failed_at", in_progress)
+        # 'status' shows it, and the next deploy refuses until a person clears it.
+        report = deploy.status(self.cfg, self.ops)
+        self.assertEqual(message, report["in_progress"]["failed"])
+        self.assertEqual("running", report["current"]["containers"]["background"]["status"])
+        self.assertEqual("no", report["current"]["containers"]["background"]["restart_policy"])
+        self.assertIn("FAILED AND NOT RESTORED", "\n".join(self.ops.logs))
+        commands = len(self.ops.commands)
+        with self.assertRaises(deploy.DeployError) as again:
+            self.deploy()
+        self.assertIn("did not finish", str(again.exception))
+        self.assertIn("Do not deploy again", str(again.exception))
+        self.assertEqual(commands, len(self.ops.commands))
+
+    def test_rollback_with_an_owner_that_never_exits_keeps_in_progress(self):
+        self.deploy()
+        self.ops.drain_seconds["sources-main-a-background"] = float("inf")
+        with self.assertRaises(deploy.FallbackFailed):
+            deploy.Deployer(self.cfg, self.ops).rollback()
+        in_progress = self.state()["in_progress"]
+        self.assertEqual("background handoff", in_progress["step"])
+        # Traffic is still on slot a while its background drains; the restarted
+        # previous serving containers have none.
+        for part in ("sources-main-a-background is still draining", "Traffic is on slot a.",
+                     "Left running without traffic: old-serving, old-spare",
+                     "'docker start sources-main-a-background'"):
+            self.assertIn(part, in_progress["failed"])
+
+    def test_handing_back_to_an_owner_that_never_exits_names_the_previous_background(self):
+        # Guard fails, traffic goes back to the previous slot, and the new
+        # background never exits: the person must start the previous release's
+        # background, not restart the newer one.
+        self.ops.memory_after_switch = 20 * GIB
+        self.ops.drain_seconds["sources-main-a-background"] = float("inf")
+        with self.assertRaises(deploy.FallbackFailed) as ctx:
+            self.deploy()
+        message = str(ctx.exception)
+        for part in ("sources-main-a-background is still draining", "old-bg was not started",
+                     "Traffic is on slot legacy",
+                     "Left running without traffic: sources-main-a-serving, sources-main-a-standby",
+                     "start the background of slot legacy (not sources-main-a-background): "
+                     "'docker update --restart=unless-stopped old-bg' and 'docker start old-bg'"):
+            self.assertIn(part, message)
+        self.assertNotIn("docker start sources-main-a-background", message)
+        self.assertIn("127.0.0.1:9426 max_fails", self.ops.files[self.cfg.upstream_file], "traffic is back")
+        self.assertEqual(message, self.state()["in_progress"]["failed"])
+
+    def test_a_reply_cut_off_mid_way_never_ends_the_handoff(self):
+        # The old owner exits while answering a runtime read: the progress note
+        # and the pre-signal read must not raise out of the handoff.
+        self.ops.drain_seconds["old-bg"] = 70
+        real = self.ops.http_json
+        broken = iter([http.client.IncompleteRead(b"{\"ready\": tr"), ValueError("truncated JSON"),
+                       http.client.BadStatusLine("")] * 10)
+
+        def http_json(url, token=None, method="GET", body=None, timeout=5):
+            if url == "http://127.0.0.1:9430/internal/sources/runtime":
+                raise next(broken)
+            return real(url, token=token, method=method, body=body, timeout=timeout)
+
+        self.ops.http_json = http_json
+        self.deploy()
+        self.assertEqual("a", self.state()["current"]["slot"])
+        text = "\n".join(self.ops.logs)
+        self.assertIn("the admin API is unavailable", text)
+        self.assertIn("old-bg still finishing in-flight work ...", text)
+
     def test_rollback_reuses_previous_containers(self):
         self.deploy()
         created_before = len(self.created())
@@ -520,6 +677,32 @@ class DeployTest(unittest.TestCase):
         self.assertEqual((200, "ok"), (status, body))
         self.assertEqual(deploy.USER_AGENT, seen[0].get_header("User-agent"))
         self.assertNotIn("urllib", seen[0].get_header("User-agent"))
+
+    def test_http_json_treats_a_reply_cut_off_mid_way_as_no_reply(self):
+        # Real sockets: a process that exits while answering leaves one of these.
+        replies = {
+            "bad status line": b"garbage\r\n\r\n",
+            "short body": b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n{\"ready\": tr",
+            "truncated JSON": b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"ready\": tr",
+        }
+        for name, reply in replies.items():
+            with self.subTest(name):
+                class Handler(socketserver.BaseRequestHandler):
+                    def handle(self):
+                        data = b""
+                        while b"\r\n\r\n" not in data:
+                            chunk = self.request.recv(4096)
+                            if not chunk:
+                                break
+                            data += chunk
+                        self.request.sendall(reply)
+
+                with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
+                    thread = threading.Thread(target=server.handle_request, daemon=True)
+                    thread.start()
+                    url = f"http://127.0.0.1:{server.server_address[1]}/internal/sources/runtime"
+                    self.assertEqual((0, None), deploy.Ops().http_json(url, token="tok", timeout=5))
+                    thread.join(5)
 
     def assert_public_health_stops_before_any_change(self, status):
         state_before = Path(self.cfg.state_file).read_text()
