@@ -14,6 +14,8 @@
     <details id="canvas-connection-menu">
       <summary>连接与授权</summary>
       <div class="canvas-connection-actions">
+        <button id="canvas-custom" type="button" hidden>自定义连接</button>
+        <button id="canvas-manage" type="button" hidden>分组设置</button>
         <a id="keys" href="/keys" target="_top">管理授权</a>
         <button id="lock" type="button">锁定画布</button>
       </div>
@@ -26,6 +28,7 @@
     <p id="message" role="status" aria-live="polite">正在连接画布，请稍候…</p>
     <div id="canvas-recovery" hidden>
       <button id="canvas-retry" type="button">重试连接</button>
+      <button id="canvas-own-key" type="button" hidden>使用我的密钥</button>
       <a id="canvas-login" href="/login" target="_top" hidden>重新登录</a>
       <a href="/" target="_top">返回主站</a>
     </div>

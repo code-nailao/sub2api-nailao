@@ -23,3 +23,28 @@ body[data-surface="canvas"] a{color:var(--studio-accent);text-underline-offset:3
 body[data-surface="canvas"]>iframe{flex:1;width:100%;min-height:0;height:auto;border:0}body[data-surface="canvas"][data-state="recovery"]:has(>iframe:not([hidden])) #canvas-status{flex:none;padding:12px 18px;gap:6px}body[data-surface="canvas"][data-state="recovery"]:has(>iframe:not([hidden])) #canvas-status-title{font-size:14px}
 @media(max-width:560px){#canvas-controls{padding:6px 10px;gap:4px 8px}#canvas-controls .canvas-group{flex:1 0 100%}#canvas-controls select{flex:1;max-width:none}#canvas-connection-menu{margin-left:auto}body[data-surface="canvas"] :is(a,button,summary,select){min-height:44px}#canvas-status{padding:24px 16px}}
 @media(prefers-reduced-motion:reduce){.canvas-loading-mark{animation:none}}
+/* Settings dialogs shared by Image Studio and Canvas; they open above the client frame. */
+.portal-dialog{width:min(640px,calc(100vw - 24px));max-height:calc(100dvh - 24px);padding:0;border:1px solid var(--studio-border);border-radius:14px;background:var(--studio-surface);color:var(--studio-text);box-shadow:0 18px 48px #0004;font-size:14px;line-height:1.6}
+.portal-dialog[open]{display:flex;flex-direction:column}.portal-dialog::backdrop{background:#0f172a80}.portal-dialog *{box-sizing:border-box}
+.portal-dialog h2{margin:0;padding:18px 20px 0;font-size:17px;font-weight:600}.portal-dialog-hint{margin:0;padding:6px 20px 12px;color:var(--studio-muted);font-size:13px}
+.portal-dialog-body{flex:1;min-height:0;overflow:auto;padding:4px 20px 12px;display:flex;flex-direction:column;gap:14px}.portal-dialog-body p{margin:0}
+.portal-dialog-status{margin:0;padding:0 20px;min-height:22px;color:var(--studio-muted);font-size:13px;overflow-wrap:anywhere}.portal-dialog-status[data-kind="error"]{color:#c2410c}
+.portal-dialog-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:10px;padding:12px 20px 18px}
+.portal-dialog label{margin-left:0}.portal-dialog a{color:var(--studio-accent);min-height:0;display:inline}
+.portal-dialog :is(button,select,input[type="text"]){min-height:40px;padding:8px 12px;border:1px solid var(--studio-border);border-radius:10px;background:var(--studio-surface);color:inherit;font:inherit}
+.portal-dialog :is(select,input[type="text"]){width:100%;min-width:0}.portal-dialog input[type="checkbox"]{width:18px;height:18px;flex:none;accent-color:var(--studio-accent)}
+.portal-dialog button{cursor:pointer}.portal-dialog :is(button,select,input):disabled{cursor:default;opacity:.55}.portal-dialog :is(button,select,input,a):focus-visible{outline:2px solid var(--studio-accent);outline-offset:2px}
+.portal-dialog button.portal-primary,.portal-dialog button.portal-candidate[aria-pressed="true"]{background:var(--studio-accent);border-color:var(--studio-accent);color:var(--studio-surface)}
+.portal-toggle,.portal-row-head{display:flex;align-items:center;flex-wrap:wrap;gap:6px 10px}.portal-rows{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:10px}
+.portal-row{padding:12px;border:1px solid var(--studio-border);border-radius:12px;display:flex;flex-direction:column;gap:8px}.portal-row-name{font-weight:600;overflow-wrap:anywhere}.portal-row-meta{color:var(--studio-muted);font-size:12px}
+.portal-tags{display:flex;align-items:center;flex-wrap:wrap;gap:6px}.portal-tags:empty{display:none}.portal-tag{padding:1px 8px;border:1px solid var(--studio-border);border-radius:999px;color:var(--studio-muted);font-size:12px}
+.portal-note,.portal-empty,.portal-fixed-models{margin:0;color:var(--studio-muted);font-size:12px;font-weight:400;overflow-wrap:anywhere}
+.portal-dialog button.portal-link{min-height:32px;padding:2px 8px;border:0;background:none;color:var(--studio-accent);text-decoration:underline;font-size:12px}
+.portal-models{display:flex;flex-direction:column;gap:8px}.portal-models-head{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.portal-candidates{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.portal-model-add{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}.portal-model-add input[type="text"]{flex:1 1 180px;width:auto}
+.portal-manual>summary{cursor:pointer;color:var(--studio-muted);font-size:12px}.portal-note[data-kind="error"]{color:#c2410c}
+.portal-address{display:flex;flex-wrap:wrap;align-items:stretch;gap:8px}.portal-address .portal-fixed{display:flex;align-items:center}.portal-address input[type="text"]{flex:1 1 140px;width:auto}
+.portal-candidates{max-height:168px;overflow:auto;padding:8px;border:1px dashed var(--studio-border);border-radius:10px}.portal-dialog button.portal-candidate{min-height:32px;padding:2px 10px;border-radius:999px;font-size:13px;overflow-wrap:anywhere}
+.portal-field{display:flex;flex-direction:column;gap:6px;font-weight:600}.portal-field>*{font-weight:400}.portal-dialog .portal-field :is(select,input,button){font-weight:400}
+.portal-fixed{padding:6px 10px;border-radius:8px;background:var(--studio-bg);border:1px solid var(--studio-border);font-size:13px;overflow-wrap:anywhere}
+@media(max-width:500px){.portal-dialog h2,.portal-dialog-hint,.portal-dialog-status,.portal-dialog-actions{padding-left:14px;padding-right:14px}.portal-dialog-body{padding-left:14px;padding-right:14px}}

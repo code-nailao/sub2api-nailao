@@ -40,13 +40,23 @@ type StudioBinding struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 type StudioService struct {
-	mu           sync.Mutex
-	locks        map[string]chan struct{}
-	failed       error
-	path         string
-	bindings     map[string]StudioBinding
-	Capabilities []StudioCapability
-	APIOrigin    string
+	mu       sync.Mutex
+	locks    map[string]chan struct{}
+	failed   error
+	path     string
+	bindings map[string]StudioBinding
+	// Capabilities is the operator's registry file and does not change while
+	// the process runs. Users are served from capabilities(), which applies the
+	// groups an administrator manages in the browser on top of it.
+	Capabilities   []StudioCapability
+	effective      []StudioCapability
+	registry       studioRegistryState
+	registryPath   string
+	registryFailed bool
+	custom         map[string]StudioCustomBinding
+	customPath     string
+	customFailed   bool
+	APIOrigin      string
 	// mediaEngine is the canonical engine value of media engine capabilities
 	// and the value the Studio client receives.
 	mediaEngine string
@@ -92,7 +102,7 @@ func OpenStudio(dir, origin string, capabilities []StudioCapability, mediaEngine
 	}
 	// Copy before canonicalizing so the caller's configuration is not rewritten.
 	capabilities = append([]StudioCapability(nil), capabilities...)
-	s := &StudioService{path: filepath.Join(dir, "studio-bindings.json"), bindings: map[string]StudioBinding{}, locks: map[string]chan struct{}{}, APIOrigin: origin, Capabilities: capabilities, mediaEngine: mediaEngine}
+	s := &StudioService{path: filepath.Join(dir, "studio-bindings.json"), registryPath: filepath.Join(dir, "studio-registry.json"), customPath: filepath.Join(dir, "studio-custom.json"), bindings: map[string]StudioBinding{}, custom: map[string]StudioCustomBinding{}, locks: map[string]chan struct{}{}, APIOrigin: origin, Capabilities: capabilities, mediaEngine: mediaEngine}
 	seen := map[int64]bool{}
 	for i, c := range capabilities {
 		if c.Engine == studioMediaEngineNeutral || c.Engine == mediaEngine {
@@ -100,7 +110,7 @@ func OpenStudio(dir, origin string, capabilities []StudioCapability, mediaEngine
 		} else if c.Engine != "sub2api" {
 			return nil, errors.New("invalid_studio_config_or_engine_not_integrated")
 		}
-		if c.GroupID < 1 || seen[c.GroupID] || len(c.Models) == 0 || len(c.Models) > 32 {
+		if c.GroupID < 1 || c.GroupID >= studioReservedGroupID || seen[c.GroupID] || len(c.Models) == 0 || len(c.Models) > 32 {
 			return nil, errors.New("invalid_studio_config_or_engine_not_integrated")
 		}
 		seen[c.GroupID] = true
@@ -113,6 +123,12 @@ func OpenStudio(dir, origin string, capabilities []StudioCapability, mediaEngine
 	} else if !os.IsNotExist(e) {
 		return nil, e
 	}
+	if e = s.loadRegistry(); e != nil {
+		return nil, errors.New("invalid_studio_registry")
+	}
+	if e = s.loadCustom(); e != nil {
+		return nil, errors.New("invalid_studio_custom_connections")
+	}
 	return s, nil
 }
 func (s *Server) studioGroups(r *http.Request) ([]StudioGroup, error) {
@@ -121,8 +137,9 @@ func (s *Server) studioGroups(r *http.Request) ([]StudioGroup, error) {
 		return nil, e
 	}
 	out := []StudioGroup{}
+	capabilities := s.Studio.capabilities()
 	for _, g := range groups {
-		for _, c := range s.Studio.Capabilities {
+		for _, c := range capabilities {
 			if g.ID == c.GroupID && g.Status == "active" && g.AllowImages && ((c.Engine == "sub2api" && (g.Platform == "openai" || g.Platform == "grok" || g.Platform == "gemini")) || (c.Engine == s.Studio.mediaEngine && (g.Platform == "openai" || g.Platform == "gemini"))) {
 				out = append(out, g)
 				break
@@ -155,7 +172,7 @@ func (s *Server) studioConnection(r *http.Request, groupID int64) (studioKey, St
 		return studioKey{}, StudioCapability{}, ErrCredential
 	}
 	var capability StudioCapability
-	for _, c := range s.Studio.Capabilities {
+	for _, c := range s.Studio.capabilities() {
 		if c.GroupID == groupID {
 			capability = c
 			capability.DisplayName = groupName
@@ -280,7 +297,7 @@ func (s *Server) studioRoutes(mux *http.ServeMux) {
 			return
 		}
 		user := r.Context().Value(identityKey{}).(Identity)
-		jsonResponse(w, 200, map[string]any{"user_id": user.ID, "groups": groups, "studio_url": s.StudioURL, "main_origin": s.SubOrigin, "viewer": studioViewer(user)})
+		jsonResponse(w, 200, map[string]any{"user_id": user.ID, "groups": groups, "studio_url": s.StudioURL, "main_origin": s.SubOrigin, "viewer": studioViewer(user), "custom": s.studioCustomInfo(user), "can_manage": user.Role == "admin", "manage_id": studioManageID})
 	})
 	connection := func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
@@ -291,17 +308,35 @@ func (s *Server) studioRoutes(mux *http.ServeMux) {
 			jsonResponse(w, 400, map[string]string{"error": "invalid_json"})
 			return
 		}
-		if in.RestoreOnly {
-			user := r.Context().Value(identityKey{}).(Identity)
-			s.Studio.mu.Lock()
-			binding := s.Studio.bindings[fmt.Sprintf("%d:%d", user.ID, in.GroupID)]
-			s.Studio.mu.Unlock()
-			if binding.KeyID == 0 {
+		var key studioKey
+		var c StudioCapability
+		var task map[string]any
+		var e error
+		// basePath is set only by a custom connection under a prefix the Studio
+		// client must be given as part of its base address.
+		basePath := ""
+		if in.GroupID == studioCustomGroupID {
+			// The user's own key: nothing is created here, so a restore and a
+			// first connection read the same saved binding.
+			key, c, basePath, task, e = s.studioCustomConnection(r, r.URL.Path == "/api/canvas/connection")
+			if errors.Is(e, errStudioCustomNone) {
 				jsonResponse(w, 403, map[string]string{"error": "existing_authorization_required"})
 				return
 			}
+		} else {
+			if in.RestoreOnly {
+				user := r.Context().Value(identityKey{}).(Identity)
+				s.Studio.mu.Lock()
+				binding := s.Studio.bindings[fmt.Sprintf("%d:%d", user.ID, in.GroupID)]
+				s.Studio.mu.Unlock()
+				if binding.KeyID == 0 {
+					jsonResponse(w, 403, map[string]string{"error": "existing_authorization_required"})
+					return
+				}
+			}
+			key, c, e = s.studioConnection(r, in.GroupID)
+			task = studioTask(c.Engine, c.Protocol)
 		}
-		key, c, e := s.studioConnection(r, in.GroupID)
 		if e != nil {
 			status := 503
 			if errors.Is(e, ErrCredential) || errors.Is(e, ErrNotFound) {
@@ -318,14 +353,9 @@ func (s *Server) studioRoutes(mux *http.ServeMux) {
 		for i, m := range c.Models {
 			models = append(models, map[string]any{"id": m, "label": m, "isDefault": i == 0, "parameters": studioModelParameters(c.Engine == s.Studio.mediaEngine, c.Protocol, m)})
 		}
-		transport := map[string]any{"baseUrl": s.Studio.APIOrigin, "credentialRef": key.Key}
+		transport := map[string]any{"baseUrl": s.Studio.APIOrigin + basePath, "credentialRef": key.Key}
 		if key.ExpiresAt != nil {
 			transport["expiresAt"] = key.ExpiresAt.Unix()
-		}
-		task := map[string]any{"engine": c.Engine, "modes": []string{"async"}, "createPath": "/v1/images/generations/async", "editPath": "/v1/images/edits/async", "statusPathTemplate": "/v1/images/tasks/{task_id}", "resultKind": "image"}
-		if c.Protocol == "gemini_native" {
-			// 原生 Gemini 同步返回 inlineData，不宣称存在异步任务查询接口。
-			task = map[string]any{"engine": c.Engine, "modes": []string{"sync"}, "createPath": "/v1beta/models/{model}:generateContent", "editPath": "/v1beta/models/{model}:generateContent", "resultKind": "image"}
 		}
 		payload := map[string]any{"version": 2, "surface": "image_studio", "retainGrantedConnections": true, "connections": []any{map[string]any{"id": id, "protocol": c.Protocol, "transport": transport}}, "capabilities": []any{map[string]any{"id": id, "displayName": c.DisplayName, "connectionId": id, "protocol": c.Protocol, "mediaType": "image", "inputModes": []string{"text", "image"}, "models": models, "task": task}}, "defaults": map[string]string{"image": id + ":" + c.Models[0]}, "limits": map[string]int{"maxParallelRequests": 2, "timeoutSeconds": 1800}}
 		payload["selectedConnectionId"] = id
@@ -341,6 +371,8 @@ func (s *Server) studioRoutes(mux *http.ServeMux) {
 		jsonResponse(w, 200, payload)
 	}
 	mux.HandleFunc("POST /api/studio/connection", connection)
+	s.studioRegistryRoutes(mux)
+	s.studioCustomRoutes(mux)
 	if s.CanvasURL != "" {
 		mux.HandleFunc("POST /api/canvas/connection", connection)
 		mux.HandleFunc("GET /api/canvas/groups", func(w http.ResponseWriter, r *http.Request) {
@@ -349,7 +381,8 @@ func (s *Server) studioRoutes(mux *http.ServeMux) {
 				apiError(w, e)
 				return
 			}
-			jsonResponse(w, 200, map[string]any{"user_id": r.Context().Value(identityKey{}).(Identity).ID, "groups": groups, "canvas_url": s.CanvasURL, "main_origin": s.SubOrigin})
+			user := r.Context().Value(identityKey{}).(Identity)
+			jsonResponse(w, 200, map[string]any{"user_id": user.ID, "groups": groups, "canvas_url": s.CanvasURL, "main_origin": s.SubOrigin, "custom": s.studioCustomInfo(user), "can_manage": user.Role == "admin"})
 		})
 		mux.HandleFunc("GET /canvas", func(w http.ResponseWriter, r *http.Request) { http.ServeFileFS(w, r, webFiles, "web/canvas.html") })
 	}
@@ -390,6 +423,16 @@ func (s *StudioService) save(index string, binding StudioBinding) error {
 		s.failed = e
 	}
 	return e
+}
+
+// studioTask is the request contract of a registered group: native Gemini
+// answers in the same request, every other protocol submits a task and polls.
+func studioTask(engine, protocol string) map[string]any {
+	if protocol == "gemini_native" {
+		// 原生 Gemini 同步返回 inlineData，不宣称存在异步任务查询接口。
+		return map[string]any{"engine": engine, "modes": []string{"sync"}, "createPath": "/v1beta/models/{model}:generateContent", "editPath": "/v1beta/models/{model}:generateContent", "resultKind": "image"}
+	}
+	return map[string]any{"engine": engine, "modes": []string{"async"}, "createPath": "/v1/images/generations/async", "editPath": "/v1/images/edits/async", "statusPathTemplate": "/v1/images/tasks/{task_id}", "resultKind": "image"}
 }
 
 // These declarations describe the adapter contract, not inferred capabilities

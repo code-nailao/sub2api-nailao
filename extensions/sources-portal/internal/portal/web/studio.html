@@ -14,6 +14,8 @@
       <div class="connection-controls">
         <label>生图分组 <select id="groups" aria-label="生图分组"></select></label>
         <button id="reconnect" hidden>恢复连接</button>
+        <button id="custom-connection" type="button" hidden>自定义连接</button>
+        <button id="manage-groups" type="button" hidden>分组设置</button>
         <a id="keys" href="/keys" target="_top">管理授权</a>
         <button id="lock">锁定工作台</button>
       </div>
@@ -25,6 +27,8 @@
     <p id="message" role="status" aria-live="polite">正在连接工作台，请稍候…</p>
     <div id="recovery-actions" hidden>
       <button id="retry" type="button">重试连接</button>
+      <button id="use-own-key" type="button" hidden>使用我的密钥</button>
+      <button id="manage-groups-recovery" type="button" hidden>分组设置</button>
       <a id="login" href="/login" target="_top" hidden>重新登录</a>
       <a id="open-main" href="/" target="_top">返回主站</a>
     </div>
