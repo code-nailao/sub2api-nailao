@@ -110,7 +110,11 @@ func TestProvideCleanup_WithMinimalDependencies_NoPanic(t *testing.T) {
 		nil, // pluginManager
 	)
 
+	// The background owner's split path; Run after StopBackground must not
+	// stop the background group a second time, and Run stays idempotent.
 	require.NotPanics(t, func() {
-		cleanup()
+		cleanup.StopBackground()
+		cleanup.Run()
+		cleanup.Run()
 	})
 }
