@@ -37,6 +37,7 @@ func TestEveryGatewayPOSTRouteIsClassifiedForPromptAuditCoverage(t *testing.T) {
 		"/alpha/search":             {"openai_alpha_search.go"},
 		"/tools/search":             {"openai_deepseek_tools.go"},
 		"/tools/fetch":              {"openai_deepseek_tools.go"},
+		"/tools/tts":                {"openai_deepseek_tools.go"},
 		"/live":                     {"openai_live.go"},
 		"/realtime/calls":           {"openai_live.go"},
 		"/images/generations":       {"openai_images.go", "grok_media.go"},
@@ -58,6 +59,8 @@ func TestEveryGatewayPOSTRouteIsClassifiedForPromptAuditCoverage(t *testing.T) {
 		"/messages/count_tokens":     "tokenization only; it does not execute a model request",
 		"/images/batches/:id/cancel": "control-plane cancellation with no user prompt",
 		"/stt":                       "speech transcription is not a text-generation prompt",
+		"/tools/ocr":                 "document recognition uploads a file and carries no text prompt",
+		"/tools/asr":                 "speech recognition uploads audio and carries no text prompt",
 		"/custom-voices":             "voice profile management has no model prompt",
 	}
 
