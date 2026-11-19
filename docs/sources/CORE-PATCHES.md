@@ -106,11 +106,17 @@ GPT-6.2 价卡的 Ultrafast 倍率留空时，按本仓库既有售价固定为 
 
 ### DeepSeek 联网工具
 
-标签：`deepseek_tools`、`deepseek_builtin_tools`、`deepseek_tool_compat`、`deepseek_tool_endpoints`。
+标签：`deepseek_tools`、`deepseek_builtin_tools`、`deepseek_tool_compat`、`deepseek_tool_endpoints`、`deepseek_in_chat_tool_types`。
 
 托管工具执行器：保留客户端 `stream`，复用现有协议事件转换器实时转发公开文本，内部工具调用留在执行器内；首字在有效内容写出后记录。工具名在请求之间保持稳定。工具失败时降级为不联网回答。逐轮确认用量，预留、结算和去重沿用原有路径，客户端断开后不再启动新工具。
 
-可选工具不拖垮普通请求（`deepseek_tools_hosted.go` 入口）：分组未开启工具时，请求完全按原版路径处理，包括自带 `web_search` / `web_fetch` 工具的请求；网关自动附加的工具在准备阶段失败（工具账号未配置或不可用、请求形态不支持、用量日志不可写）时，此时尚未向上游发送或预留任何内容，请求按客户端原样转发并记一条警告。客户端自己声明了服务端工具的请求仍返回错误。
+可选工具不拖垮普通请求（`deepseek_tools_hosted.go` 入口；`tryForwardDeepSeekTools` 不接手时把要走普通路径的请求体交还 `openai_gateway_forward.go`、`openai_gateway_chat_completions.go`、`openai_gateway_messages.go` 的调用点）：
+
+- 识别两族联网工具类型：`web_search`、`web_search_preview`、`web_search_20*`、`web_fetch`、`web_fetch_20*`，以及供应商风格的 `deepseek_web_search`（等同搜索）和 `deepseek_read_url`（等同抓取）。工具可用时两族都由托管循环执行并计费，三种协议一致；强制选择供应商风格工具与强制 `web_search` 相同。
+- 托管循环不接手（分组未开启工具，或 `tool_choice` 为 `none`）时，转发前移除供应商风格的条目：普通路径会把它们原样发给供应商，由供应商执行按次收费的工具，而这类请求只按 token 计费。`tool_choice` 不是 `none` 时附上联网不可用提示。`web_search*` / `web_fetch*` 在这种情况下保持原有处理（Messages 路径之后还有原版的搜索模拟）。移除是对请求体的就地编辑，其余字节保持客户端原样。
+- 准备阶段失败（后台请求、没有可用的工具账号、价格未配置、请求形态不支持、用量日志不可写）时尚未向上游发送或预留任何内容，并记一条警告：只有网关自动附加的工具时，请求按客户端原样转发；客户端自己声明了联网工具时，移除两族的全部条目和 `max_tool_calls`，附上不可用提示，按普通请求转发和计费，不再返回错误。
+- 移除工具后，`tool_choice` 若强制的正是被移除的工具，改为不强制；`tools` 为空时连同 `tool_choice` 一起删除。提示文案与托管循环降级时使用的是同一条。
+- 原生透传分支已删除：原来在账号开启 `deepseek_native_tools_enabled` 且使用原生 Responses 协议时把工具交给供应商执行并按其计数结算（原 `deepseek_tools_native.go`），并在共用的 `openai_gateway_response_handling.go` 中挂接了 SSE 观察。账号上已保存的 `deepseek_native_tools_enabled` 仍可通过校验，但不再有任何行为依赖它，账号表单上的开关也已移除。
 
 独立工具接口（`deepseek_tool_requests.go`、`deepseek_tool_endpoints.go`，路由在 `routes/gateway.go`，入口 `handler/openai_deepseek_tools.go`，标签 `deepseek_tool_endpoints`）：`POST /v1/tools/search|fetch|ocr|asr|tts` 按原版独立工具端点（`gateway_web_search.go`）的做法实现为单次转发，不进入网关工具循环。
 
