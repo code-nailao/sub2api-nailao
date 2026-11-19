@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -180,8 +181,10 @@ func runMainServer(runtime *processrole.Runtime) {
 	if err != nil {
 		fatalStartupError("initialize application", err)
 	}
-	defer app.Cleanup()
-	stopSettingsRefresh := app.Settings.StartSourcesSettingsRefresh()
+	// Both are idempotent: the shutdown sequence below calls them in order,
+	// and these defers only matter when that sequence does not complete.
+	defer app.Cleanup.Run()
+	stopSettingsRefresh := sync.OnceFunc(app.Settings.StartSourcesSettingsRefresh())
 	defer stopSettingsRefresh()
 	app.Server.Handler = runtime.Wrap(app.Server.Handler)
 	if app.PluginManager != nil {
@@ -215,19 +218,34 @@ func runMainServer(runtime *processrole.Runtime) {
 	<-quit
 
 	log.Println("Shutting down server...")
-	runtime.Drain()
-	// A release removes this generation from routing before TERM. Keep active
-	// streams alive; the operator must never escalate a slow drain to SIGKILL.
-	if err := app.Server.Shutdown(context.Background()); err != nil {
-		log.Printf("Server shutdown: %v", err)
-	}
-	// net/http does not wait for native 202 image tasks or hijacked connections.
-	// Their result persistence must finish before native queues/clients close.
-	if err := runtime.Wait(context.Background()); err != nil {
-		log.Printf("Instance drain: %v", err)
-	}
-
-	log.Println("Server exited")
+	sourcesShutdown{
+		role:  runtime.Role(),
+		drain: runtime.Drain,
+		waitWrites: func() {
+			if err := runtime.WaitAdminWrites(context.Background()); err != nil {
+				log.Printf("Admin write drain: %v", err)
+			}
+		},
+		stopBackground: app.Cleanup.StopBackground,
+		closeUpgrades:  runtime.CloseAdminUpgrades,
+		// A release removes this generation from routing before TERM. Keep active
+		// streams alive; the operator must never escalate a slow drain to SIGKILL.
+		shutdownHTTP: func() {
+			if err := app.Server.Shutdown(context.Background()); err != nil {
+				log.Printf("Server shutdown: %v", err)
+			}
+		},
+		// net/http does not wait for native 202 image tasks or hijacked connections.
+		// Their result persistence must finish before native queues/clients close.
+		waitIdle: func() {
+			if err := runtime.Wait(context.Background()); err != nil {
+				log.Printf("Instance drain: %v", err)
+			}
+		},
+		exited:       func() { log.Println("Server exited") },
+		stopSettings: stopSettingsRefresh,
+		cleanup:      app.Cleanup.Run,
+	}.run()
 }
 
 func fatalStartupError(stage string, err error) {

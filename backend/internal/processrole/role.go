@@ -3,6 +3,7 @@
 package processrole
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -126,6 +127,13 @@ type Runtime struct {
 	services    map[string]string
 	admission   *AdmissionGate
 	releaseHeld func(string) (int, error)
+	// Background owner handoff (handoff.go): in-flight admin requests that are
+	// not reads, cancel functions of upgraded admin connections, and cleanup
+	// steps that have not finished yet.
+	writes   int
+	upgrades map[uint64]context.CancelFunc
+	upgradeN uint64
+	stopping map[string]int
 }
 
 func (r *Runtime) AttachAdmission(g *AdmissionGate, release, inspect func(string) (int, error)) {
@@ -142,7 +150,8 @@ func New(cfg Config) *Runtime {
 	if cfg.Role == "" {
 		cfg.Role = Standalone
 	}
-	return &Runtime{config: cfg, id: randomID(), change: make(chan struct{}), services: make(map[string]string)}
+	return &Runtime{config: cfg, id: randomID(), change: make(chan struct{}), services: make(map[string]string),
+		upgrades: make(map[uint64]context.CancelFunc), stopping: make(map[string]int)}
 }
 
 func randomID() string {

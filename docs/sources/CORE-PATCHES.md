@@ -25,7 +25,7 @@ python3 scripts/sources_extensions/check_boundaries.py
 
 ### 进程角色、唯一后台与发布命令
 
-标签：`native_process_lifecycle`、`live_instance_concurrency_preservation`、`media_engine_admission_isolation`、`release_handoff_p1`、`release_handoff_p2`、`native_startup077`、`release_validation`。
+标签：`native_process_lifecycle`、`live_instance_concurrency_preservation`、`media_engine_admission_isolation`、`release_handoff_p1`、`release_handoff_p2`、`native_startup077`、`release_validation`、`background_handoff_read_only`。
 
 - `internal/processrole`：serving / background 角色、后台唯一文件锁、只读 serving 初始化、`/internal/sources/runtime` 与 `/drain` 接口；排空时让已有 HTTP、流式、图片和 WebSocket 请求完成，并保留活跃并发槽位。
 - `-migrate-only`：只执行经审查的待执行迁移，复用原版校验与执行器，不实例化完整服务。
@@ -33,6 +33,7 @@ python3 scripts/sources_extensions/check_boundaries.py
 - `token_refresh_service.go`：停止时不再发起新的刷新轮次、重试和限速等待，但不取消已经在和供应商通信的刷新；该刷新使用与调用方解耦的上下文，仍受单次超时限制，完成后照常保存，超过宽限期才强制取消。降级路径在单次超时后一律不保存凭据。
 - `channel_monitor_runner.go`、`channel_monitor_service.go`、`scheduled_test_runner_service.go`：停止时取消在途探测和测试；被调用方取消的探测不写历史，被中断的定时测试不保存结果、计划保持到期。
 - `cmd/server`：`-list-pending-migrations`、`-check-startup`、`-export-web-assets` 三个一次性命令，`main.go` 只增加一处调用；启动阶段的致命错误直接写 stderr，不受日志级别过滤。设计见 [DEPLOY](DEPLOY.md)。
+- 后台只读排空（`background_handoff_read_only`）：`processrole/handoff.go` 在 background 排空后只放行管理 `GET`/`HEAD`（会访问上游供应商的查询和媒体引擎审阅除外，清单逐项写明原因），其它方法、MCP、WebSocket 升级在处理器之前返回 503（原生错误信封、`Retry-After`）；统计 SIGTERM 前进入的非只读管理请求并可等待其结束；取消已升级管理连接的请求上下文；运行时状态报告 `admin_during_drain`、`active_admin_writes`、`stopping`。`cmd/server/sources_shutdown.go` 定义关闭顺序：serving、standalone 不变（排空、关监听、等在途请求、停其余服务）；background 先等写请求、停后台服务、关升级连接，最后才关监听。`wire.go`、`wire_gen.go` 的 `provideCleanup` 拆成“后台服务”和“其余”两段，各执行一次、顺序不变，后台服务每一步在停止期间计入 `stopping`。锁的取得与释放不变。
 
 ### V1 渠道监控
 
