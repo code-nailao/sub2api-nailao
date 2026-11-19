@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -157,4 +158,66 @@ func TestUpstreamRejectionPauseSwitchReadsTheGatewaySettingsStore(t *testing.T) 
 	w = &UpstreamRejectionRecovery{settings: reader}
 	require.True(t, w.deadlineReleasePaused(context.Background()))
 	require.Equal(t, 1, store.reads)
+}
+
+// The lines an operator relies on must survive a deployment that logs at warn
+// and above: the summary of a run that released holds, and every change of the
+// pause switch. Only a run in which a release failed is an error.
+func TestUpstreamRejectionDeadlineReleaseLogLevels(t *testing.T) {
+	sink, restore := captureStructuredLog(t)
+	defer restore()
+	levels := func(substr string) []string {
+		sink.mu.Lock()
+		defer sink.mu.Unlock()
+		var found []string
+		for _, ev := range sink.events {
+			if ev != nil && strings.Contains(ev.Message, substr) {
+				found = append(found, strings.ToLower(ev.Level))
+			}
+		}
+		return found
+	}
+	ctx := context.Background()
+
+	// A run that released holds is a warning, not an error, although the line
+	// names its "failed" counter.
+	w := &UpstreamRejectionRecovery{dueRepo: &dueReleaserStub{rows: dueRows(2), finalize: applied}}
+	w.releaseDueReservations(ctx)
+	require.Equal(t, []string{"warn"}, levels("deadline release: listed=2 released=2 amount=0.20000000 lost_races=0 failed=0"))
+
+	// A run in which a release failed is an error.
+	failing := &dueReleaserStub{rows: dueRows(1), finalize: func(context.Context, *UpstreamRejectionFinalizeCommand) (*UpstreamRejectionBillingResult, error) {
+		return nil, errors.New("database unavailable")
+	}}
+	w = &UpstreamRejectionRecovery{dueRepo: failing}
+	w.releaseDueReservations(ctx)
+	require.Equal(t, []string{"error"}, levels("deadline release: listed=1 released=0 amount=0.00000000 lost_races=0 failed=1"))
+
+	// Pausing is said once, then resuming, then an unreadable switch.
+	settings := &rejectionPauseSettings{value: "true"}
+	w = &UpstreamRejectionRecovery{dueRepo: &dueReleaserStub{rows: dueRows(1), finalize: applied}, settings: settings}
+	w.releaseDueReservations(ctx)
+	w.releaseDueReservations(ctx)
+	require.Equal(t, []string{"warn"}, levels("deadline release paused by setting "+SettingKeyUpstreamRejectionDeadlineReleasePaused))
+	settings.value = "false"
+	w.releaseDueReservations(ctx)
+	require.Equal(t, []string{"warn"}, levels("deadline release resumed"))
+	settings.err = errors.New("database unavailable")
+	w.releaseDueReservations(ctx)
+	require.Equal(t, []string{"warn"}, levels("deadline release skipped: pause switch unreadable"))
+
+	// Every line of the deadline release carries its component and none is
+	// below warn.
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	seen := 0
+	for _, ev := range sink.events {
+		if ev == nil || !strings.HasPrefix(ev.Message, "deadline release") {
+			continue
+		}
+		seen++
+		require.Contains(t, []string{"warn", "error"}, strings.ToLower(ev.Level), ev.Message)
+		require.Equal(t, "service.rejection_recovery", ev.Fields["component"], ev.Message)
+	}
+	require.Equal(t, 6, seen)
 }
