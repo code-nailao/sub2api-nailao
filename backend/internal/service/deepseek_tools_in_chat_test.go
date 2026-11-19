@@ -158,6 +158,21 @@ func TestDeepSeekForcedProviderStyleToolBecomesTheGatewayFunction(t *testing.T) 
 	}
 }
 
+// A saved deepseek_native_tools_enabled is accepted and has no effect: such an
+// account runs the hosted loop like any other.
+func TestDeepSeekNativeToolsSettingIsIgnored(t *testing.T) {
+	extra := map[string]any{"deepseek_tools_enabled": true, "deepseek_native_tools_enabled": true}
+	require.NoError(t, ValidateDeepSeekToolAccountConfig(PlatformDeepseek, AccountTypeAPIKey, extra))
+	require.Error(t, ValidateDeepSeekToolAccountConfig(PlatformDeepseek, AccountTypeAPIKey, map[string]any{"deepseek_tools_enabled": true, "deepseek_native_tools_enabled": "yes"}))
+	run := runDeepSeekInChat(t, "responses", map[string]any{"tools": []any{map[string]any{"type": "web_search"}}}, extra, true)
+	require.NoError(t, run.err)
+	require.True(t, run.handled)
+	require.NotContains(t, string(run.firstTurn), `"web_search"`, "the provider receives the gateway's function, not its native tool")
+	require.Equal(t, 1, run.toolCalls, "the search ran through the standalone tool endpoint")
+	require.Equal(t, 1, run.result.DeepSeekTools.SearchCount)
+	require.Contains(t, run.clientReply, "Final answer")
+}
+
 // Without the hosted loop the provider's own tool types are removed and every
 // other byte is forwarded as sent; web_search stays for the ordinary path.
 func TestDeepSeekProviderStyleToolsAreRemovedWithoutTheHostedLoop(t *testing.T) {

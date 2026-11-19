@@ -14,7 +14,6 @@ const optionalPrice = (value: unknown): number | null => typeof value === 'numbe
 export type DeepSeekToolMode = 'inherit' | 'enabled' | 'disabled'
 export interface DeepSeekToolAccountForm {
   deepseek_tools_enabled: boolean
-  deepseek_native_tools_enabled: boolean
   deepseek_tools_base_url: string
   deepseek_search_cost_per_call: number | null
   deepseek_fetch_cost_per_call: number | null
@@ -24,7 +23,6 @@ export interface DeepSeekToolAccountForm {
 }
 export const deepSeekToolAccountForm = (extra: Record<string, unknown> = {}): DeepSeekToolAccountForm => ({
   deepseek_tools_enabled: extra.deepseek_tools_enabled === true,
-  deepseek_native_tools_enabled: extra.deepseek_native_tools_enabled === true,
   deepseek_tools_base_url: typeof extra.deepseek_tools_base_url === 'string' ? extra.deepseek_tools_base_url : '',
   deepseek_search_cost_per_call: optionalPrice(extra.deepseek_search_cost_per_call),
   deepseek_fetch_cost_per_call: optionalPrice(extra.deepseek_fetch_cost_per_call),

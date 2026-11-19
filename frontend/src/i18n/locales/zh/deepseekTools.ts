@@ -16,7 +16,6 @@ export default {
   "urlPreview": "工具地址",
   "searchCost": "搜索采购价（上游单位/次，可选）",
   "fetchCost": "抓取采购价（上游单位/次，可选）",
-  "nativeHint": "已确认此账号的 Pro Responses 原生工具返回成功计数时启用原生执行；Flash 使用网关执行。",
   "keyMode": "自动联网工具",
   "inherit": "继承分组设置",
   "keyEnabled": "开启自动联网",

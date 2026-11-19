@@ -552,7 +552,6 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		if data, ok := extractOpenAISSEDataLine(line); ok {
 			dataBytes := []byte(data)
 			eventType := effectiveOpenAISSEEventType(dataBytes, pendingSSEEventType)
-			observeDeepSeekNativeSSE(c, dataBytes, eventType)
 			if keepaliveEventDirect || forwardsKeepaliveDirect(eventType) {
 				keepaliveEventDirect = true
 				eventInProgress = true

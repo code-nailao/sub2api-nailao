@@ -76,32 +76,6 @@ func TestDeepSeekToolValidationAndSuccess(t *testing.T) {
 	require.True(t, deepSeekToolSucceeded("fetch", 200, []byte(`{"content":"actual page"}`)))
 }
 
-func TestDeepSeekNativeCounts(t *testing.T) {
-	var counts deepSeekCapture
-	counts.observeNativeTerminal([]byte(`{"output":[{"type":"web_search_call","action":{"queries":["query","internal marker"]}}],"usage":{"server_tool_use":{"tool_search":1,"tool_fetch":2}}}`))
-	require.True(t, counts.nativeObserved)
-	require.Equal(t, 1, counts.nativeSearch)
-	require.Equal(t, 2, counts.nativeFetch)
-	counts = deepSeekCapture{}
-	counts.observeNativeTerminal([]byte(`{"usage":{"web_search_requests":9},"output":[{"type":"tool_search_call"}]}`))
-	require.False(t, counts.nativeObserved)
-	counts = deepSeekCapture{}
-	counts.observeNativeTerminal([]byte(`{"type":"response.in_progress","response":{"usage":{"server_tool_use":{"tool_search":9}}}}`))
-	require.False(t, counts.nativeObserved)
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	capture := newDeepSeekCapture(c.Writer, true)
-	event := `data: {"type":"response.completed","response":{"usage":{"server_tool_use":{"tool_search":1,"tool_fetch":1}}}}` + "\n\n"
-	for i := 0; i < 2; i++ {
-		for _, ch := range []byte(event) {
-			_, err := capture.Write([]byte{ch})
-			require.NoError(t, err)
-		}
-	}
-	require.True(t, capture.nativeObserved)
-	require.Equal(t, 1, capture.nativeSearch)
-	require.Equal(t, 1, capture.nativeFetch)
-}
-
 func TestDeepSeekHostedOwnershipAndChoice(t *testing.T) {
 	for _, body := range []string{`{"tool_choice":"none"}`, `{"tool_choice":{"type":"none"}}`} {
 		_, handled, err := prepareDeepSeekHosted([]byte(body), "responses", true)

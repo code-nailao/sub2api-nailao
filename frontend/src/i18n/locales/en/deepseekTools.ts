@@ -16,7 +16,6 @@ export default {
   "urlPreview": "Tool endpoint",
   "searchCost": "Search supplier cost (upstream units/call, optional)",
   "fetchCost": "Fetch supplier cost (upstream units/call, optional)",
-  "nativeHint": "Enable native Pro Responses tools only after verifying successful tool usage counters. Flash uses gateway execution.",
   "keyMode": "Automatic web tools",
   "inherit": "Inherit group setting",
   "keyEnabled": "Enable automatic web tools",

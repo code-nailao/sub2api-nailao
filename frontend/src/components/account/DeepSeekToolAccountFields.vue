@@ -14,7 +14,6 @@
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <label v-for="item in deepSeekMediaTools" :key="item.tool" class="input-label">{{ t(`deepseekTools.${item.tool}Cost`) }}<input v-model.number="costs[item.cost].value" class="input mt-1" type="number" min="0" step="0.01" /></label>
       </div>
-      <label class="flex items-start gap-2 text-xs"><input v-model="form.deepseek_native_tools_enabled" type="checkbox" class="mt-0.5" />{{ t('deepseekTools.nativeHint') }}</label>
     </div>
   </section>
 </template>

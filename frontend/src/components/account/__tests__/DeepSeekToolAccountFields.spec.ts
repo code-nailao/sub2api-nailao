@@ -28,6 +28,9 @@ describe('DeepSeek tool supplier costs', () => {
     expect(form.value.deepseek_asr_cost_per_hour).toBe(0.2)
     expect(wrapper.text()).toContain('deepseekTools.costHint')
     expect(wrapper.text()).toContain('https://provider.example/v1/tools')
+    // The native tool switch is gone: tools always run through the gateway.
+    expect(wrapper.findAll('input[type=checkbox]')).toHaveLength(1)
+    expect(wrapper.text()).not.toContain('nativeHint')
     wrapper.unmount()
   })
 })

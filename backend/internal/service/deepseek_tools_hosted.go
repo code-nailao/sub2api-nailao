@@ -228,59 +228,32 @@ func prepareDeepSeekHosted(body []byte, protocol string, auto bool) (*deepSeekHo
 }
 
 // deepSeekCapture buffers non-streaming turns or delegates SSE to the hosted
-// incremental writer. Native mode tees exact bytes and only observes usage.
+// incremental writer; nothing reaches the client directly.
 type deepSeekCapture struct {
 	incremental        *deepSeekIncrementalTurn
 	rejectedHTTPStatus int
 	gin.ResponseWriter
-	header                    http.Header
-	body                      bytes.Buffer
-	status                    int
-	tee                       bool
-	overflow                  bool
-	nativeLine                []byte
-	nativeSearch, nativeFetch int
-	nativeObserved            bool
-	nativeUsage               OpenAIUsage
-	nativeUsageObserved       bool
+	header   http.Header
+	body     bytes.Buffer
+	status   int
+	overflow bool
 }
 
-func newDeepSeekCapture(w gin.ResponseWriter, tee bool) *deepSeekCapture {
-	return &deepSeekCapture{ResponseWriter: w, header: make(http.Header), status: 200, tee: tee}
+func newDeepSeekCapture(w gin.ResponseWriter) *deepSeekCapture {
+	return &deepSeekCapture{ResponseWriter: w, header: make(http.Header), status: 200}
 }
-func (w *deepSeekCapture) Header() http.Header {
-	if w.tee {
-		return w.ResponseWriter.Header()
-	}
-	return w.header
-}
-func (w *deepSeekCapture) WriteHeader(n int) {
-	w.status = n
-	if w.tee {
-		w.ResponseWriter.WriteHeader(n)
-	}
-}
-func (w *deepSeekCapture) WriteHeaderNow() {
-	if w.tee {
-		w.ResponseWriter.WriteHeaderNow()
-	}
-}
+func (w *deepSeekCapture) Header() http.Header { return w.header }
+func (w *deepSeekCapture) WriteHeader(n int)   { w.status = n }
+func (w *deepSeekCapture) WriteHeaderNow()     {}
 func (w *deepSeekCapture) Write(b []byte) (int, error) {
 	if w.incremental != nil {
 		return w.incremental.write(b)
 	}
-	w.observeNative(b)
 	if w.body.Len()+len(b) > deepSeekToolResponseLimit {
 		w.overflow = true
-		if !w.tee {
-			return 0, errors.New("DeepSeek model response exceeds buffer limit")
-		}
-	} else {
-		_, _ = w.body.Write(b)
+		return 0, errors.New("DeepSeek model response exceeds buffer limit")
 	}
-	if w.tee {
-		return w.ResponseWriter.Write(b)
-	}
+	_, _ = w.body.Write(b)
 	return len(b), nil
 }
 func (w *deepSeekCapture) WriteString(v string) (int, error) { return w.Write([]byte(v)) }
@@ -292,13 +265,9 @@ func (w *deepSeekCapture) Size() int {
 	return w.body.Len()
 }
 func (w *deepSeekCapture) Written() bool { return w.Size() > 0 }
-func (w *deepSeekCapture) Flush() {
-	if w.tee {
-		w.ResponseWriter.Flush()
-	}
-}
+func (w *deepSeekCapture) Flush()        {}
 
-func (s *OpenAIGatewayService) deepSeekModelTurn(ctx context.Context, c *gin.Context, account *Account, body []byte, protocol, defaultModel string, tee bool) (*OpenAIForwardResult, *deepSeekCapture, error) {
+func (s *OpenAIGatewayService) deepSeekModelTurn(ctx context.Context, c *gin.Context, account *Account, body []byte, protocol, defaultModel string) (*OpenAIForwardResult, *deepSeekCapture, error) {
 	heartbeatValue, _ := c.Get("sources.deepseek.heartbeat")
 	heartbeat, _ := heartbeatValue.(*deepSeekHeartbeat)
 	if heartbeat != nil {
@@ -309,8 +278,8 @@ func (s *OpenAIGatewayService) deepSeekModelTurn(ctx context.Context, c *gin.Con
 		heartbeat.mu.Unlock()
 	}
 	child.Request = c.Request.WithContext(ctx)
-	capture := newDeepSeekCapture(c.Writer, tee)
-	if value, ok := c.Get(deepSeekIncrementalKey); ok && !tee {
+	capture := newDeepSeekCapture(c.Writer)
+	if value, ok := c.Get(deepSeekIncrementalKey); ok {
 		if output, valid := value.(*deepSeekIncremental); valid {
 			capture.incremental = output.turn(protocol)
 		}
@@ -338,7 +307,7 @@ func (s *OpenAIGatewayService) deepSeekModelTurn(ctx context.Context, c *gin.Con
 			}
 		}
 	}
-	// Preserve the native, sanitized diagnostics across the private turn context.
+	// Preserve the forwarder's sanitized diagnostics across the private turn context.
 	for _, name := range []string{OpsUpstreamStatusCodeKey, OpsUpstreamErrorMessageKey, OpsUpstreamErrorDetailKey, OpsUpstreamErrorsKey, OpsUpstreamModelKey} {
 		if value, ok := child.Get(name); ok {
 			c.Set(name, value)
@@ -358,7 +327,7 @@ func (s *OpenAIGatewayService) deepSeekModelTurn(ctx context.Context, c *gin.Con
 			_, _ = capture.body.Write(wire)
 		}
 	}
-	if capture.overflow && !tee && err == nil {
+	if capture.overflow && err == nil {
 		err = errors.New("DeepSeek model response exceeds buffer limit")
 	}
 	return result, capture, err
@@ -569,10 +538,6 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 	if err != nil {
 		return unavailable(err)
 	}
-	if deepSeekCanUseNative(account, supplier, body, protocol) {
-		out, e := s.forwardDeepSeekNative(ctx, c, account, body, key, snapshot)
-		return out, nil, true, e
-	}
 	req, _, err := prepareDeepSeekHosted(body, protocol, key.DeepSeekToolsAutoInject())
 	if err != nil {
 		return unavailable(err)
@@ -630,7 +595,7 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 		if int64(len(current)) > limit {
 			return result, nil, true, errors.New("DeepSeek conversation exceeds request body limit")
 		}
-		turn, capture, turnErr := s.deepSeekModelTurn(loopCtx, c, account, current, protocol, defaultModel, false)
+		turn, capture, turnErr := s.deepSeekModelTurn(loopCtx, c, account, current, protocol, defaultModel)
 		if turn != nil {
 			firstVisible := result.FirstTokenMs
 			result.addDeepSeekTurn(turn)
