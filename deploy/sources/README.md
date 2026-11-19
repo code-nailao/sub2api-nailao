@@ -5,6 +5,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | `deploy.py` | 唯一的发布入口：`main <image>`、`rollback`、`status`、`watch`、`adopt` |
+| `portal.py` | Portal 的发布逻辑，由 `deploy.py` 的 `portal <image>`、`portal-rollback`、`portal-status`、`portal-adopt` 调用（见下文“Portal”） |
 | `migration_lint.py` | CI 检查：新迁移只能扩展结构，破坏性变更必须放进带 `contract` 的迁移 |
 | `sources-main-watch.service` | 常驻监测（只写 journal，第一版不推送） |
 
@@ -82,3 +83,78 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 `deploy.py` 创建的每个 serving 容器（主和备）都在它所在的每个网络上带一个固定别名 `sources-main-serving`（`main.json` 的 `serving_alias`），后台容器没有。旧版本容器退役停止后，会自动从这个名字的解析结果里消失，所以同一 Docker 网络内的调用方（例如 Portal）应使用 `http://sources-main-serving:8080`，不要写死某个容器的 IP 或名称，否则那个容器就无法退役。
 
 注意：Docker 只能在创建容器时附加网络别名。`adopt` 记录的旧容器没有这个别名，只有经 `deploy.py` 发布后的容器才有；调用方应在第一次正式发版之后再切换到别名，并在确认旧地址不再有连接后再退役旧容器。
+
+## Portal
+
+Portal 用同一个入口发布：`deploy.py portal <镜像>`。逻辑在 `portal.py`，复用 `deploy.py` 的执行、锁、状态文件和 Nginx 安装步骤。设置文件默认是 `/opt/sources-deploy/portal.json`（全局 `--config` 显式给出时以它为准；Main 命令的默认值不变）。
+
+### 为什么会有一小段不可用
+
+Portal 只有一个容器。它的状态目录只允许一个写入者：进程启动时对状态目录加非阻塞文件锁，第二个 Portal 拿不到锁会立即以代码 1 退出；监听端口要等锁和全部存储初始化之后才打开。所以新进程只能在旧进程退出之后启动，**从旧 Portal 收到 SIGTERM 到 Nginx 切到新容器之间，Portal 的页面不可用**。单写入者状态下这段间隔无法避免，工具只能让它尽量短：
+
+- 拉取镜像、预检、启动检查和创建新容器都在给旧 Portal 发信号之前完成；
+- 旧进程一退出就启动已经创建好的新容器，每 0.5 秒检查一次退出和 `/health`；
+- 新容器 `/health` 返回 200 后立即切换 Nginx。
+
+旧 Portal 收到 SIGTERM 后立即停止接受连接，处理完在途请求后退出，通常只需几秒；极少数同步余额刷新最长约 375 秒，所以默认等待 420 秒（`exit_timeout`）。工具从不发送 SIGKILL。
+
+### 每次发布
+
+和 Main 一样用临时 systemd 单元运行：
+
+```bash
+ssh <host> 'sudo -n systemd-run --unit=sources-deploy-portal --collect /usr/bin/python3 /opt/sources-deploy/bin/deploy.py portal ghcr.io/<owner>/<portal-image>@sha256:<digest>'
+```
+
+```bash
+ssh <host> 'sudo -n journalctl -fu sources-deploy-portal'
+```
+
+演练：`deploy.py --dry-run portal <镜像>`。它真实执行拉取、预检和启动检查（这些不改变任何东西），然后只打印创建、交接、切流和守护会执行的命令，不写状态，也不写历史。`--allow-public-health-failure` 与 `main` 含义相同：预检时公网健康失败只打印警告，守护仍要求切流后返回 200。
+
+| 步骤 | 内容 | 失败时 |
+| --- | --- | --- |
+| 预检 | 已记录当前版本，其容器在运行且本机 `/health` 为 200；`nginx -T` 定义了 `upstream sources_portal` 并有 `proxy_pass http://sources_portal`；upstream 文件内容与工具为当前端口生成的完全一致；目标槽位容器没有在运行，目标端口空闲；env 文件存在且组和其他用户不可读；每个挂载源存在；公网健康返回 200。一次列出全部问题 | 退出，现场不变 |
+| 启动检查 | 用新镜像、真实环境和挂载（全部强制只读）、不发布端口运行一次 `-check-config`，必须输出 `SOURCES_PORTAL_CONFIG_OK` | 退出，错误里带检查输出的那一行；旧 Portal 没被碰过。没有该参数的旧镜像会因拿不到锁而失败，同样在这里停下 |
+| 创建 | 删除目标槽位上已停止的容器（上上个版本），创建新容器，重启策略 `no`，尚不启动 | 删除新容器，退出 |
+| 交接（不可用开始） | 旧容器重启策略改为 `no`，发送一次 SIGTERM，等它退出；随后启动新容器，等 `/health` 返回 200（默认 60 秒，容器退出则立即失败） | 见下文“回退”。旧容器 420 秒内没有退出：不杀进程，恢复它的重启策略（它自行退出后 Docker 会重新启动它），不启动新容器、不改 Nginx，保留 `in_progress`，需要人工接手 |
+| 切流（不可用结束） | 重写 upstream 文件，`nginx -t`，通过后 reload；然后新容器重启策略改为 `unless-stopped` | `nginx -t` 失败：恢复原文件，再回退 |
+| 守护 | 默认 60 秒、每 5 秒：新容器在运行且 `StartedAt`、重启次数不变、没有被 OOM 终止；本机 `/health` 为 200；公网健康连续 3 次失败算失败；Nginx 错误日志中连接新端口失败（`connect() failed`、`upstream timed out`）累计 5 次算失败 | 回退 |
+
+成功后 `state.json` 的 `previous` 是旧版本、`current` 是新版本，`history.jsonl` 追加一行 `action` 为 `portal` 的记录（演练不写）。
+
+### 回退
+
+交接开始后的任何失败都按顺序：新容器改为不自动重启，如果在运行就发一次 SIGTERM 并最多等 120 秒（它持有状态锁，旧容器在它退出前无法启动）；恢复旧容器原来的重启策略并启动，等待 `/health`；如果 upstream 文件已经切到新端口，再切回旧端口。完成后报错说明旧 Portal 已重新服务，新容器停止并保留供排查。任何一步失败则报告 `FAILED AND NOT RESTORED` 并保留 `in_progress`，下一次运行会被拒绝，需要人工处理。交接之前的失败从不碰旧容器。
+
+### 回滚和查看状态
+
+```bash
+ssh <host> 'sudo -n systemd-run --unit=sources-deploy-portal --collect /usr/bin/python3 /opt/sources-deploy/bin/deploy.py portal-rollback'
+```
+
+```bash
+ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py portal-status'
+```
+
+`portal-rollback` 要求记录了上一版本，且它的容器和镜像都还在；不做启动检查（上一版本的镜像可能还没有 `-check-config`），用同样的交接、切流、守护和回退流程反向切换，成功后交换 `current` 和 `previous`。注意：新版本可能已经改写了状态目录里的数据，较旧的 Portal 有可能拒绝较新版本写下的状态；回滚失败时会自动回到当前版本。`portal-status` 不取锁，输出 `in_progress` 以及当前、上一版本的容器状态、健康状态和重启次数。
+
+运行没有走完时（`portal-status` 里 `in_progress` 不为空），下一次 `portal` 或 `portal-rollback` 会拒绝执行。先用 `portal-status`、`docker ps -a` 和 `docker logs` 看清哪个 Portal 在运行、Nginx upstream 文件指向哪个端口，恢复服务后再把 Portal 的 `state.json` 中 `in_progress` 改为 `null`。创建步骤会先删除目标槽位上已停止的容器，所以重新运行是安全的。
+
+### 首次接入
+
+1. **记录现状**（只写文件，不动运行中的容器和 Nginx）：
+
+   ```bash
+   sudo -n /opt/sources-deploy/bin/deploy.py portal-adopt --container <运行中的 Portal 容器> \
+     --slot-ports <A 端口>,<B 端口> --upstream-file /etc/nginx/conf.d/<portal-upstream>.conf \
+     --public-health-url https://example.com/health
+   ```
+
+   它从运行中的容器生成只有 root 可读的 `<work_dir>/portal.env`（不含 `PATH`、`HOSTNAME`、`HOME`、`PORTAL_LISTEN`，不打印任何值）和 `portal.json`（网络、用户、资源限制、安全选项、日志选项和绑定挂载取自该容器），并把它记为当前版本（槽位 `legacy`）。`--work-dir` 默认 `/opt/sources-deploy/portal`，`--name-prefix` 默认 `sources-portal`，`--nginx-bin`、`--nginx-error-log`、`--lock-file` 的默认值与 Main 的 `adopt` 相同。配置或状态文件已存在、容器不在运行、或没有在 127.0.0.1 上发布端口时拒绝执行。工具从不删除 `legacy` 容器，确认不再需要后手动删除。
+2. **准备 Nginx**：按工具生成的格式为当前端口手写 upstream 文件，把 Portal 的 location 改为 `proxy_pass http://sources_portal`，`nginx -t` 后 reload。预检正是核对这两项。upstream 文件之后由工具重写，不要手工编辑。
+3. **第一次发布**：`deploy.py portal <镜像>`，镜像必须支持 `-check-config`。
+
+### 与 Main 共用发布锁
+
+`portal.json` 的 `lock_file` 应与 `main.json` 相同（`portal-adopt` 默认就是同一个文件），这样 Portal 和 Main 的发布不会同时进行；一方运行时另一方会立即报告锁被占用并退出，现场不变。
