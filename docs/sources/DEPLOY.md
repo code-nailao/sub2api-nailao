@@ -100,3 +100,15 @@
 - 守护只覆盖切流后的短时间窗口，较晚出现的问题依赖常驻监测和 serving 的主备结构。
 - 只在后台持锁时才执行的分支（应用迁移、以引擎方式打开媒体引擎）无法被 `-check-startup` 覆盖，由后台交接的自动回退兜底。
 - 本方案针对单台主机。若以后扩展到多台主机，可以把文件锁换成 PostgreSQL 会话级 advisory lock（连接断开时同样自动释放），其余设计不变。
+
+## Portal
+
+Portal 用同一个工具发布：`deploy.py portal <镜像>`，代码在 `deploy/sources/portal.py`，命令和失败处理见 [deploy/sources/README.md](../../deploy/sources/README.md) 的“Portal”一节。它与 Main 的设计有三点不同。
+
+**一个容器，一段无法避免的不可用。** Portal 的状态目录只有一个写入者：进程启动时对状态目录加非阻塞文件锁，第二个进程拿不到锁会立即以代码 1 退出；监听端口在锁和全部存储初始化之后才打开，所以新进程在旧进程退出之前无法回答 `/health`。因此不能像 Main 的 serving 那样先启动新实例再切流，从旧 Portal 收到 SIGTERM 到 Nginx 切到新容器之间，Portal 的页面不可用。工具把所有能提前做的事放在发信号之前（拉取镜像、预检、`-check-config` 启动检查、创建新容器），旧进程一退出就启动新容器，每 0.25 秒检查一次，新容器 `/health` 返回 200 就立即切换 Nginx。旧 Portal 收到 SIGTERM 后立即关闭监听，处理完在途请求后退出（通常几秒，极少数同步余额刷新最长约 375 秒）。工具从不发送 SIGKILL，Docker 也不会重启被 `docker kill --signal=TERM` 停下的容器，所以信号发出后只能等它退出再启动容器：超过 `exit_timeout`（默认 420 秒）每 30 秒打印警告并继续等待，旧进程一退出就照常继续；超过 `exit_abort_timeout`（默认 3600 秒）才停止，保留 `in_progress`，新容器已创建但未启动、Nginx 未改动，Portal 在旧进程退出前一直不可用，由运维人员在它退出后 `docker start` 旧容器恢复服务再清除 `in_progress`。当前容器在交接时已经不在运行（例如崩溃）则不发信号，直接启动目标容器，所以 `portal-rollback` 在当前 Portal 崩溃时同样可用。交接到守护之间的命令超时、命令无法执行和 Ctrl-C 中断都按失败处理：先回退到旧容器，再以错误结束。
+
+**应用提供的支持。** Portal 只有 `GET /health`（200 `{"status":"ok"}` 或 503），没有 Main 的运行时接口、角色、令牌和排空。新镜像提供 `/app/sources-portal -check-config`：只读的启动检查，不取锁、不写任何东西、不打开监听端口，校验环境变量和磁盘上的状态，成功时输出 `SOURCES_PORTAL_CONFIG_OK` 并以 0 退出，失败时输出一行错误并以 1 退出。工具用真实的环境和挂载（全部强制只读）运行它，在碰旧容器之前就发现配置错误。没有该参数的旧镜像会按正常启动处理、拿不到锁而失败，工具同样视为检查失败。
+
+**固定结构。** 两个槽位 A、B 轮流使用，容器名为 `<前缀>-{a,b}`，每个槽位的本机端口在 `portal.json` 中固定；Nginx 只引用固定的 `upstream sources_portal`，切流时只重写这个 upstream 文件（与 Main 相同的“写入、`nginx -t`、失败恢复原文件、成功 reload”顺序）。首次接入用 `portal-adopt` 记录运行中的容器（槽位 `legacy`，工具从不删除它）。交接后任何失败都按“停新容器（它持有锁）→ 启动旧容器并等 `/health` → 如已切流则切回”回退；回退本身失败时报告 `FAILED AND NOT RESTORED` 并保留 `in_progress`。`portal-rollback` 用同样的流程切回上一容器，但较旧的 Portal 可能拒绝较新版本写下的状态，此时自动回到当前版本。
+
+Portal 和 Main 共用一把发布锁（`portal.json` 与 `main.json` 的 `lock_file` 是同一个文件），两者的发布不会重叠。
