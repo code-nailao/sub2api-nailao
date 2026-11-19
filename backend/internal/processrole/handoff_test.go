@@ -182,43 +182,72 @@ func TestServingAndStandaloneKeepTheirAdminBehaviorWhileDraining(t *testing.T) {
 
 func TestWaitAdminWritesCoversWritesAdmittedBeforeDrain(t *testing.T) {
 	r := New(Config{Role: Background})
-	entered := make(chan string, 2)
-	release := map[string]chan struct{}{http.MethodPost: make(chan struct{}), http.MethodGet: make(chan struct{})}
+	type inFlight struct {
+		label string
+		req   *http.Request
+	}
+	upgrade := handoffRequest(http.MethodGet, "/api/v1/admin/ops/ws/qps")
+	upgrade.Header.Set("Connection", "Upgrade")
+	upgrade.Header.Set("Upgrade", "websocket")
+	requests := []inFlight{
+		{"write", handoffRequest(http.MethodPost, "/api/v1/admin/users")},
+		// A read the draining owner refuses: it probes upstream and writes
+		// account state, so it must finish before any service stops.
+		{"probe", handoffRequest(http.MethodGet, "/api/v1/admin/accounts/7/usage")},
+		{"read", handoffRequest(http.MethodGet, "/api/v1/admin/users")},
+		// Upgraded connections are closed later; counting them would wait for
+		// the ops realtime page forever.
+		{"upgrade", upgrade},
+	}
+	entered := make(chan string, len(requests))
+	release := map[string]chan struct{}{}
+	for _, rq := range requests {
+		release[rq.label] = make(chan struct{})
+	}
 	h := r.Wrap(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		entered <- req.Method
-		<-release[req.Method]
+		label := req.Header.Get("X-Label")
+		entered <- label
+		if label == "upgrade" {
+			<-req.Context().Done()
+			return
+		}
+		<-release[label]
 		w.WriteHeader(http.StatusOK)
 	}))
 	var served sync.WaitGroup
-	for _, method := range []string{http.MethodPost, http.MethodGet} {
+	for _, rq := range requests {
+		rq.req.Header.Set("X-Label", rq.label)
 		served.Add(1)
-		go func(method string) {
+		go func(req *http.Request) {
 			defer served.Done()
-			h.ServeHTTP(httptest.NewRecorder(), handoffRequest(method, "/api/v1/admin/users"))
-		}(method)
+			h.ServeHTTP(httptest.NewRecorder(), req)
+		}(rq.req)
 		<-entered
 	}
-	if got := r.Status().ActiveAdminWrites; got != 1 {
-		t.Fatalf("in-flight admin writes = %d, want 1 (reads are not counted)", got)
+	if got := r.Status().ActiveAdminWrites; got != 2 {
+		t.Fatalf("counted in-flight admin requests = %d, want 2 (the write and the refused read)", got)
 	}
 	r.Drain()
 	waited := make(chan error, 1)
 	go func() { waited <- r.WaitAdminWrites(context.Background()) }()
-	close(release[http.MethodGet])
-	select {
-	case err := <-waited:
-		t.Fatalf("returned while a write admitted before Drain was in flight: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	for _, label := range []string{"read", "write"} {
+		close(release[label])
+		select {
+		case err := <-waited:
+			t.Fatalf("returned after %q while a refused read admitted before Drain was in flight: %v", label, err)
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
-	close(release[http.MethodPost])
+	close(release["probe"])
 	select {
 	case err := <-waited:
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("did not return after the last write finished")
+		t.Fatal("did not return after the last counted request finished (the open upgrade must not count)")
 	}
+	r.CloseAdminUpgrades()
 	served.Wait()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()

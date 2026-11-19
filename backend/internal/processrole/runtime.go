@@ -26,8 +26,9 @@ type Status struct {
 	BackgroundServices map[string]string `json:"background_services"`
 	Admission          *AdmissionStatus  `json:"admission,omitempty"`
 	// Background owner only (handoff.go): what admin requests a draining
-	// owner still answers, admin requests that are not reads still in flight,
-	// and cleanup steps that have not finished.
+	// owner still answers, in-flight admin requests it would refuse while
+	// draining (writes and side-effect reads), and cleanup steps that have not
+	// finished.
 	AdminDuringDrain  string   `json:"admin_during_drain,omitempty"`
 	ActiveAdminWrites int      `json:"active_admin_writes,omitempty"`
 	Stopping          []string `json:"stopping,omitempty"`

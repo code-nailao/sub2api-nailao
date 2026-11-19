@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ type applicationCleanup struct {
 	run        func(cleanupPhase)
 	background sync.Once
 	remaining  sync.Once
+	started    time.Time
 }
 
 func newApplicationCleanup(run func(cleanupPhase)) *applicationCleanup {
@@ -35,15 +37,18 @@ func newApplicationCleanup(run func(cleanupPhase)) *applicationCleanup {
 
 func (c *applicationCleanup) StopBackground() {
 	c.background.Do(func() {
-		started := time.Now()
+		c.started = time.Now()
 		c.run(cleanupBackgroundServices)
-		log.Printf("[Cleanup] Background services stopped in %s", time.Since(started))
+		log.Printf("[Cleanup] Background services stopped in %s", time.Since(c.started))
 	})
 }
 
 func (c *applicationCleanup) Run() {
 	c.StopBackground()
-	c.remaining.Do(func() { c.run(cleanupRemaining) })
+	c.remaining.Do(func() {
+		c.run(cleanupRemaining)
+		log.Printf("[Cleanup] All cleanup steps completed in %s", time.Since(c.started))
+	})
 }
 
 // sourcesShutdown is the order in which Main stops after SIGINT or SIGTERM.
@@ -68,8 +73,10 @@ type sourcesShutdown struct {
 func (s sourcesShutdown) run() {
 	s.drain()
 	if s.role == processrole.Background {
-		// Writes admitted before Drain finish before any service stops, as
-		// they did when Shutdown came first; new ones are already refused.
+		// Requests a draining owner refuses (writes, MCP, reads that probe
+		// upstream or write account state) that were admitted before Drain
+		// finish before any service stops, as they did when Shutdown came
+		// first; new ones are already refused.
 		s.waitWrites()
 		s.stopBackground()
 		s.closeUpgrades()
@@ -79,4 +86,37 @@ func (s sourcesShutdown) run() {
 	s.exited()
 	s.stopSettings()
 	s.cleanup()
+}
+
+// newSourcesShutdown wires the sequence to the live runtime and application.
+// Kept apart from main so a test can check the wiring, not only the order.
+func newSourcesShutdown(runtime *processrole.Runtime, app *Application, stopSettings func()) sourcesShutdown {
+	return sourcesShutdown{
+		role:  runtime.Role(),
+		drain: runtime.Drain,
+		waitWrites: func() {
+			if err := runtime.WaitAdminWrites(context.Background()); err != nil {
+				log.Printf("Admin write drain: %v", err)
+			}
+		},
+		stopBackground: app.Cleanup.StopBackground,
+		closeUpgrades:  runtime.CloseAdminUpgrades,
+		// A release removes this generation from routing before TERM. Keep active
+		// streams alive; the operator must never escalate a slow drain to SIGKILL.
+		shutdownHTTP: func() {
+			if err := app.Server.Shutdown(context.Background()); err != nil {
+				log.Printf("Server shutdown: %v", err)
+			}
+		},
+		// net/http does not wait for native 202 image tasks or hijacked connections.
+		// Their result persistence must finish before native queues/clients close.
+		waitIdle: func() {
+			if err := runtime.Wait(context.Background()); err != nil {
+				log.Printf("Instance drain: %v", err)
+			}
+		},
+		exited:       func() { log.Println("Server exited") },
+		stopSettings: stopSettings,
+		cleanup:      app.Cleanup.Run,
+	}
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -272,4 +273,89 @@ func TestBackgroundOwnerAnswersAdminReadsUntilItsServicesStop(t *testing.T) {
 	require.Equal(t, []string{
 		"admin writes done", "stop background services", "close admin upgrades", "close listener", "idle", "cleanup",
 	}, log.list())
+}
+
+// The wiring main uses: the real runtime and an Application whose cleanup
+// records, for each phase, whether the listener still answers. A miswired
+// field (say stopBackground bound to Cleanup.Run, a fixed role, or no upgrade
+// cancellation) changes what is observed or leaves Wait blocked.
+func TestNewSourcesShutdownWiresTheLiveRuntimeAndApplication(t *testing.T) {
+	for _, role := range []processrole.Role{processrole.Background, processrole.Serving, processrole.Standalone} {
+		t.Run(string(role), func(t *testing.T) {
+			runtime := processrole.New(processrole.Config{Role: role})
+			runtime.Ready()
+			upgrader := websocket.Upgrader{}
+			mux := http.NewServeMux()
+			mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") })
+			mux.HandleFunc("/api/v1/admin/ops/ws/qps", func(w http.ResponseWriter, req *http.Request) {
+				conn, err := upgrader.Upgrade(w, req, nil)
+				if err != nil {
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				_ = conn.WriteMessage(websocket.TextMessage, []byte("tick"))
+				<-req.Context().Done()
+				_ = conn.WriteControl(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+			})
+			server := &http.Server{Handler: runtime.Wrap(mux), ReadHeaderTimeout: 5 * time.Second}
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			go func() { _ = server.Serve(ln) }()
+			t.Cleanup(func() { _ = server.Close() })
+			client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
+			listener := func() string {
+				resp, err := client.Get("http://" + ln.Addr().String() + "/health")
+				if err != nil {
+					return "closed"
+				}
+				_ = resp.Body.Close()
+				return "open"
+			}
+
+			log := &stepLog{}
+			phases := map[cleanupPhase]string{cleanupBackgroundServices: "background services", cleanupRemaining: "remaining"}
+			app := &Application{Server: server, Cleanup: newApplicationCleanup(func(phase cleanupPhase) {
+				log.add(fmt.Sprintf("%s: listener %s, draining %v", phases[phase], listener(), runtime.Status().Draining))
+			})}
+			var ws *websocket.Conn
+			if role == processrole.Background {
+				ws, _, err = websocket.DefaultDialer.Dial("ws://"+ln.Addr().String()+"/api/v1/admin/ops/ws/qps", nil)
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = ws.Close() })
+				_, _, err = ws.ReadMessage()
+				require.NoError(t, err)
+			}
+
+			done := make(chan struct{})
+			go func() {
+				newSourcesShutdown(runtime, app, func() { log.add("stop settings refresh: listener " + listener()) }).run()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("shutdown did not finish; an open upgraded admin connection would hold Wait")
+			}
+
+			want := []string{
+				"stop settings refresh: listener closed",
+				"background services: listener closed, draining true",
+				"remaining: listener closed, draining true",
+			}
+			if role == processrole.Background {
+				want = []string{
+					"background services: listener open, draining true",
+					"stop settings refresh: listener closed",
+					"remaining: listener closed, draining true",
+				}
+				_ = ws.SetReadDeadline(time.Now().Add(time.Second))
+				_, _, err = ws.ReadMessage()
+				var closeErr *websocket.CloseError
+				require.True(t, errors.As(err, &closeErr), "want a close frame, got %v", err)
+				require.Equal(t, websocket.CloseNormalClosure, closeErr.Code)
+			}
+			require.Equal(t, want, log.list())
+		})
+	}
 }

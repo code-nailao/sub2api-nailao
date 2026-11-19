@@ -1,5 +1,8 @@
+import http.client
 import json
 import os
+import socketserver
+import threading
 import subprocess
 import sys
 import tempfile
@@ -489,7 +492,7 @@ class DeployTest(unittest.TestCase):
         self.deploy()
         notes = [line for line in self.ops.logs if "old-bg still finishing in-flight work" in line]
         self.assertGreaterEqual(len(notes), 3, "first note a few seconds after TERM, then one per minute")
-        self.assertIn("1 admin write(s) in flight; still stopping BackupService, TokenRefreshService", notes[0])
+        self.assertIn("1 admin request(s) in flight; still stopping BackupService, TokenRefreshService", notes[0])
         self.assertEqual("a", self.state()["current"]["slot"])
 
     def test_handoff_polls_every_half_second_and_nothing_else_does(self):
@@ -520,10 +523,14 @@ class DeployTest(unittest.TestCase):
             self.deploy()
         message = str(ctx.exception)
         for part in ("old-bg is still draining after 2100s", "nothing was killed",
-                     "sources-main-a-background was not started", "no background owner runs",
-                     "docker update --restart=unless-stopped old-bg", "docker start old-bg",
-                     "Do not deploy again"):
+                     "sources-main-a-background was not started", "Traffic is on slot legacy",
+                     "no background owner runs",
+                     "Left running without traffic: sources-main-a-serving, sources-main-a-standby",
+                     "start the background of slot legacy: 'docker update --restart=unless-stopped old-bg' "
+                     "and 'docker start old-bg'", "Do not deploy again"):
             self.assertIn(part, message)
+        self.assertTrue(self.ops.containers["sources-main-a-serving"]["State"]["Running"],
+                        "as the message says, the new serving containers are left running")
         old = self.ops.containers["old-bg"]
         self.assertTrue(old["State"]["Running"], "never killed")
         self.assertEqual("no", old["HostConfig"]["RestartPolicy"]["Name"])
@@ -553,7 +560,51 @@ class DeployTest(unittest.TestCase):
             deploy.Deployer(self.cfg, self.ops).rollback()
         in_progress = self.state()["in_progress"]
         self.assertEqual("background handoff", in_progress["step"])
-        self.assertIn("sources-main-a-background is still draining", in_progress["failed"])
+        # Traffic is still on slot a while its background drains; the restarted
+        # previous serving containers have none.
+        for part in ("sources-main-a-background is still draining", "Traffic is on slot a.",
+                     "Left running without traffic: old-serving, old-spare",
+                     "'docker start sources-main-a-background'"):
+            self.assertIn(part, in_progress["failed"])
+
+    def test_handing_back_to_an_owner_that_never_exits_names_the_previous_background(self):
+        # Guard fails, traffic goes back to the previous slot, and the new
+        # background never exits: the person must start the previous release's
+        # background, not restart the newer one.
+        self.ops.memory_after_switch = 20 * GIB
+        self.ops.drain_seconds["sources-main-a-background"] = float("inf")
+        with self.assertRaises(deploy.FallbackFailed) as ctx:
+            self.deploy()
+        message = str(ctx.exception)
+        for part in ("sources-main-a-background is still draining", "old-bg was not started",
+                     "Traffic is on slot legacy",
+                     "Left running without traffic: sources-main-a-serving, sources-main-a-standby",
+                     "start the background of slot legacy (not sources-main-a-background): "
+                     "'docker update --restart=unless-stopped old-bg' and 'docker start old-bg'"):
+            self.assertIn(part, message)
+        self.assertNotIn("docker start sources-main-a-background", message)
+        self.assertIn("127.0.0.1:9426 max_fails", self.ops.files[self.cfg.upstream_file], "traffic is back")
+        self.assertEqual(message, self.state()["in_progress"]["failed"])
+
+    def test_a_reply_cut_off_mid_way_never_ends_the_handoff(self):
+        # The old owner exits while answering a runtime read: the progress note
+        # and the pre-signal read must not raise out of the handoff.
+        self.ops.drain_seconds["old-bg"] = 70
+        real = self.ops.http_json
+        broken = iter([http.client.IncompleteRead(b"{\"ready\": tr"), ValueError("truncated JSON"),
+                       http.client.BadStatusLine("")] * 10)
+
+        def http_json(url, token=None, method="GET", body=None, timeout=5):
+            if url == "http://127.0.0.1:9430/internal/sources/runtime":
+                raise next(broken)
+            return real(url, token=token, method=method, body=body, timeout=timeout)
+
+        self.ops.http_json = http_json
+        self.deploy()
+        self.assertEqual("a", self.state()["current"]["slot"])
+        text = "\n".join(self.ops.logs)
+        self.assertIn("the admin API is unavailable", text)
+        self.assertIn("old-bg still finishing in-flight work ...", text)
 
     def test_rollback_reuses_previous_containers(self):
         self.deploy()
@@ -626,6 +677,32 @@ class DeployTest(unittest.TestCase):
         self.assertEqual((200, "ok"), (status, body))
         self.assertEqual(deploy.USER_AGENT, seen[0].get_header("User-agent"))
         self.assertNotIn("urllib", seen[0].get_header("User-agent"))
+
+    def test_http_json_treats_a_reply_cut_off_mid_way_as_no_reply(self):
+        # Real sockets: a process that exits while answering leaves one of these.
+        replies = {
+            "bad status line": b"garbage\r\n\r\n",
+            "short body": b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n{\"ready\": tr",
+            "truncated JSON": b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"ready\": tr",
+        }
+        for name, reply in replies.items():
+            with self.subTest(name):
+                class Handler(socketserver.BaseRequestHandler):
+                    def handle(self):
+                        data = b""
+                        while b"\r\n\r\n" not in data:
+                            chunk = self.request.recv(4096)
+                            if not chunk:
+                                break
+                            data += chunk
+                        self.request.sendall(reply)
+
+                with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
+                    thread = threading.Thread(target=server.handle_request, daemon=True)
+                    thread.start()
+                    url = f"http://127.0.0.1:{server.server_address[1]}/internal/sources/runtime"
+                    self.assertEqual((0, None), deploy.Ops().http_json(url, token="tok", timeout=5))
+                    thread.join(5)
 
     def assert_public_health_stops_before_any_change(self, status):
         state_before = Path(self.cfg.state_file).read_text()

@@ -33,16 +33,18 @@
 
 同一时刻只能有一个后台。这由操作系统文件锁保证：background 在构造任何依赖之前对锁目录中的 `native-background.lock` 加 `flock`，媒体引擎存储在打开时再取一把自己的锁。进程退出时内核自动释放锁，所以新后台只有在旧后台真正退出后才能拿到锁。发布脚本只负责安排顺序，不需要证明“没有两个后台”，也从不发送 SIGKILL。
 
-每个实例通过内部接口 `/internal/sources/runtime` 报告角色、`ready` 和 `owns_background`；`/internal/sources/drain` 让 serving 实例进入排空状态。两个接口都需要运行令牌。background 还报告 `admin_during_drain`（值为 `read-only`，表示排空期间管理接口只读，见下节）、`active_admin_writes`（仍在处理的非只读管理请求数）和 `stopping`（尚未停完的后台服务）。对 background 调用 `/internal/sources/drain` 同样会让它进入只读排空，直到进程退出；发布工具只对 serving 调用这个接口。
+每个实例通过内部接口 `/internal/sources/runtime` 报告角色、`ready` 和 `owns_background`；`/internal/sources/drain` 让 serving 实例进入排空状态。两个接口都需要运行令牌。background 还报告 `admin_during_drain`（值为 `read-only`，表示排空期间管理接口只读，见下节）、`active_admin_writes`（排空期间会被拒绝、仍在处理的管理请求数）和 `stopping`（尚未停完的后台服务）。对 background 调用 `/internal/sources/drain` 同样会让它进入只读排空，直到进程退出；发布工具只对 serving 调用这个接口。
 
 ## 应用为发布提供的支持
 
 - **后台优雅退出。** serving 和 standalone 收到 SIGTERM 后先关闭 HTTP，等在途请求结束，再停止各项服务后退出，顺序不变。background 不同，它在停止后台服务的整个过程中保持监听，让管理页面在交接期间继续可用：
   1. 进入只读排空：管理接口只应答 `GET` 和 `HEAD`。其它方法、MCP（`/api/v1/mcp`）、WebSocket 升级，以及少数 `GET`——媒体引擎审阅（它读的存储会在第 3 步关闭）和会访问上游供应商的查询（账号用量的主动查询、刷新余额、OpenAI/Grok/国内供应商额度与余额、Claude 重置额度、账号模型列表；它们会探测上游、可能刷新并保存 OAuth 凭据、写账号状态或启动超出请求的后台工作，清单在 `processrole/handoff.go`）——在进入处理器之前返回 503，使用原生错误信封（`reason` 为 `BACKGROUND_HANDOFF_READ_ONLY`，`message` 说明正在发版、暂时只读、请稍后重试），带 `Retry-After: 5`。请求没有执行任何部分，所以重试总是安全的。只读是因为写请求可能把工作交给已经停止的服务，或启动进程退出时会被截断的 goroutine。
-  2. 等 SIGTERM 之前已经进入的非只读管理请求处理完，与原来“先等在途请求、再停服务”的顺序一致。
+  2. 等 SIGTERM 之前已经进入、排空期间会被拒绝的管理请求（写、MCP、上面那些会访问上游的查询；WebSocket 除外）处理完，与原来“先等在途请求、再停服务”的顺序一致。
   3. 并行停止所有后台服务（下面各项的语义不变）。
   4. 结束打开着的管理 WebSocket：取消它们的请求上下文，运维实时页发送关闭帧后自动重连。否则被劫持的连接不会随 HTTP 关闭而结束，会一直拖住进程退出。
   5. 关闭 HTTP 监听，等在途读请求结束，停止其余服务（用量、计费缓存、OAuth、日志等）和 Redis、数据库连接，退出。锁仍然只在进程退出时由内核释放。
+
+  管理界面与 API 同源部署时浏览器不发 CORS 预检；如果跨源部署，排空期间的 `OPTIONS` 预检同样得到不带 CORS 头的 503，浏览器会把它当作网络错误显示。
 
   排空期间 `/health` 照常返回 200：进程仍在应答管理读请求。是否就绪以运行时接口为准：排空时 `ready` 为 false、`draining` 为 true。常驻监测和巡检读 `/health` 时，这段时间不会被当作故障。
 
@@ -104,7 +106,12 @@
 
 如果恢复步骤本身也失败（例如切回旧槽位时 `nginx -t` 失败，或新后台失败后旧后台也无法重新就绪），脚本报告 `FAILED AND NOT RESTORED` 并保留 `in_progress`，原因写在 `in_progress.failed`。此时下一次发布会被拒绝，需要人工用 `deploy.py status` 和 `docker ps` 查看现场、恢复服务后再清除该标记。
 
-旧后台在 `background_exit_timeout` 内没有退出也属于这种情况。工具没有杀任何进程，新后台已创建但没有启动，Nginx 没有改动。旧后台仍在排空，管理读接口仍由它应答；但它已设为不自动重启，Docker 也不会重启被 `docker kill` 停下的容器，所以它退出后就没有后台进程了。`deploy.py status` 里它的 `status` 为 `running`、`restart_policy` 为 `no`。处理方法：等它退出（`docker ps -a` 看状态，`docker logs` 看它在等什么），然后 `docker update --restart=unless-stopped <旧后台容器>` 和 `docker start <旧后台容器>`，用 `status` 确认它重新运行，再清除 `in_progress`。在此之前不要再次发布。
+正在排空的后台在 `background_exit_timeout` 内没有退出也属于这种情况。工具没有杀任何进程，接手的后台已创建（或已停止）但没有启动；排空中的后台已设为不自动重启，Docker 也不会重启被 `docker kill` 停下的容器，所以它退出后就没有后台进程了，直到有人手动启动一个。它在排空期间仍应答管理读请求。`deploy.py status` 里它的 `status` 为 `running`、`restart_policy` 为 `no`，原因和处理步骤写在 `in_progress.failed`。错误信息写明当前哪个槽位在服务流量、哪些 serving 容器留着运行但没有流量、应该启动哪一个后台：
+
+- 正向发布或 `rollback` 时（切流之前）：流量仍在当前槽位；排空中的是当前槽位的后台；目标槽位的主、备 serving 留着运行、没有流量，可在恢复后手动停止。等它退出后启动的就是它本身：`docker update --restart=unless-stopped <当前槽位后台>`、`docker start <当前槽位后台>`。
+- 交还时（切流失败或守护失败、流量已经回到上一槽位之后）：排空中的是新版本的后台，不要重启它；新版本的主、备 serving 留着运行、没有流量，可在恢复后手动停止。等它退出后启动上一槽位（正在服务流量的那个）的后台：`docker update --restart=unless-stopped <上一槽位后台>`、`docker start <上一槽位后台>`。
+
+然后用 `status` 确认后台在运行，再清除 `in_progress`。在此之前不要再次发布。
 
 ## 已知取舍
 

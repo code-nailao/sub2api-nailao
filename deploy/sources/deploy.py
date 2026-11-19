@@ -28,6 +28,7 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import http.client
 import json
 import os
 import re
@@ -250,7 +251,10 @@ class Ops:
                 return resp.status, json.loads(raw) if raw.strip().startswith(b"{") else raw.decode(errors="replace")
         except urllib.error.HTTPError as err:
             return err.code, None
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError,
+                http.client.HTTPException, ValueError):
+            # A process that exits mid-response leaves a bad status line, a
+            # short read or truncated JSON: no usable answer, same as no answer.
             return 0, None
 
     # filesystem / time ------------------------------------------------------------
@@ -623,31 +627,60 @@ class Deployer:
         self.ops.run(["cp", "-Rn", staging + "/.", self.cfg.assets_dir + "/"], mutate=True)
 
     def owner_runtime(self, view: dict[str, Any]) -> dict[str, Any] | None:
-        """Runtime of a slot's background owner, or None when it cannot be read."""
+        """Runtime of a slot's background owner, or None when it cannot be read.
+        Only informs the log: nothing here may end a handoff, so any failure
+        (including one from a process exiting mid-response) is None."""
         try:
-            token = self.token_for(view, "background")
-        except OSError:
+            return self.runtime(view["ports"]["background"], self.token_for(view, "background"))
+        except Exception:  # noqa: BLE001 - informational read inside the handoff
             return None
-        return self.runtime(view["ports"]["background"], token)
 
-    @staticmethod
-    def drain_progress(runtime: dict[str, Any] | None) -> str | None:
-        """What a draining owner still waits for, from its runtime status."""
-        if not runtime:
+    def drain_progress(self, view: dict[str, Any]) -> str | None:
+        """What a draining owner still waits for, from its runtime status. It
+        runs inside the wait after TERM, so it never raises."""
+        try:
+            runtime = self.owner_runtime(view)
+            if not runtime:
+                return None
+            parts = []
+            if runtime.get("active_admin_writes"):
+                parts.append(f"{int(runtime['active_admin_writes'])} admin request(s) in flight")
+            if runtime.get("stopping"):
+                parts.append("still stopping " + ", ".join(str(name) for name in runtime["stopping"]))
+            return "; ".join(parts) or None
+        except Exception:  # noqa: BLE001 - a progress note must never end the wait
             return None
-        parts = []
-        if runtime.get("active_admin_writes"):
-            parts.append(f"{runtime['active_admin_writes']} admin write(s) in flight")
-        if runtime.get("stopping"):
-            parts.append("still stopping " + ", ".join(runtime["stopping"]))
-        return "; ".join(parts) or None
 
-    def handoff_background(self, current: dict[str, Any], target: Target, create: bool) -> None:
+    def stuck_owner(self, current: dict[str, Any], target: Target, back: bool, timeout: int) -> FallbackFailed:
+        """The old owner did not exit in time. Say which slot serves traffic,
+        what is left running and which background a person has to start."""
+        old = current["containers"]["background"]
+        new = target.containers["background"]
+        if back:
+            # Traffic already went back to target's slot; old is the newer
+            # release's background and must not be restarted.
+            traffic, start = target.slot, new
+            idle = [current["containers"][r] for r in SERVING_ROLES if current["containers"].get(r)]
+        else:
+            traffic, start = current["slot"], old
+            idle = [target.containers[r] for r in SERVING_ROLES]
+        not_this = f" (not {old})" if start != old else ""
+        return FallbackFailed(
+            f"{old} is still draining after {timeout}s; nothing was killed and {new} was not started. "
+            f"Traffic is on slot {traffic}. {old} is set not to restart, so once it exits no background owner runs. "
+            f"Left running without traffic: {', '.join(idle) or 'none'}. "
+            f"Wait for {old} to exit (docker ps -a), then start the background of slot {traffic}{not_this}: "
+            f"'docker update --restart=unless-stopped {start}' and 'docker start {start}'; check 'status', "
+            "then clear in_progress. Do not deploy again before that")
+
+    def handoff_background(self, current: dict[str, Any], target: Target, create: bool,
+                           back: bool = False) -> None:
         """Move background ownership from current to target. The old owner gets
         one SIGTERM and finishes in-flight work; the kernel lock passes when it
         exits. If the new owner does not become ready, the old one restarts.
         An old owner that reports admin_during_drain keeps answering admin
-        reads until it closes its listener, just before it exits."""
+        reads until it closes its listener, just before it exits. back: the
+        handoff returns ownership to target after traffic already moved there."""
         old = current["containers"]["background"]
         new = target.containers["background"]
         before = self.owner_runtime(current)  # read-only, also in a dry run
@@ -669,18 +702,13 @@ class Deployer:
             try:
                 code = self.wait_exit(old, timeout, poll=HANDOFF_POLL_SECONDS,
                                       first_note=HANDOFF_FIRST_NOTE_SECONDS,
-                                      progress=lambda: self.drain_progress(self.owner_runtime(current)))
+                                      progress=lambda: self.drain_progress(current))
             except DeployError as err:
                 # The old owner will exit by itself later, and Docker does not
                 # restart a container stopped with docker kill: from then on no
                 # background owner runs. Keep in_progress so nothing deploys
-                # over this until a person has started it again.
-                raise FallbackFailed(
-                    f"{old} is still draining after {timeout}s; nothing was killed and {new} was not started. "
-                    f"{old} is set not to restart, so once it exits no background owner runs: wait for it to "
-                    f"exit (docker ps -a), then 'docker update --restart=unless-stopped {old}' and "
-                    f"'docker start {old}', check 'status', and clear in_progress. Do not deploy again "
-                    "before that") from err
+                # over this until a person has started one again.
+                raise self.stuck_owner(current, target, back, timeout) from err
             self.log(f"   {old} exited with code {code}")
         self.ops.run(["docker", "start", new], mutate=True)
         if self.ops.dry_run:
@@ -768,7 +796,7 @@ class Deployer:
         is already back on it."""
         try:
             self.handoff_background(target.view(), Target.from_view(previous, self.cfg.runtime_token_file),
-                                    create=False)
+                                    create=False, back=True)
         except FallbackFailed:
             raise
         except DeployError as err:

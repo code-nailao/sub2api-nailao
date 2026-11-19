@@ -127,9 +127,9 @@ type Runtime struct {
 	services    map[string]string
 	admission   *AdmissionGate
 	releaseHeld func(string) (int, error)
-	// Background owner handoff (handoff.go): in-flight admin requests that are
-	// not reads, cancel functions of upgraded admin connections, and cleanup
-	// steps that have not finished yet.
+	// Background owner handoff (handoff.go): in-flight admin requests a
+	// draining owner would refuse, cancel functions of upgraded admin
+	// connections, and cleanup steps that have not finished yet.
 	writes   int
 	upgrades map[uint64]context.CancelFunc
 	upgradeN uint64

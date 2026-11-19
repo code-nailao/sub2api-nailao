@@ -850,6 +850,6 @@ func provideCleanup(
 			}
 		}
 		runSequential(infraSteps)
-		log.Printf("[Cleanup] All cleanup steps completed in %s", time.Since(started))
+		log.Printf("[Cleanup] Remaining cleanup steps completed in %s", time.Since(started))
 	})
 }

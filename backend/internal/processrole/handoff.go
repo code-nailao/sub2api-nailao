@@ -96,14 +96,17 @@ func readableDuringHandoff(req *http.Request) bool {
 	return !refusedReadDuringHandoff(req)
 }
 
-// admitOwnerAdmin admits an admin request on the background owner. The drain
-// check and the write count change under one lock, so WaitAdminWrites cannot
-// miss a write that was admitted just before Drain. Upgraded connections get a
-// context that CloseAdminUpgrades cancels; their handlers end on Done.
+// admitOwnerAdmin admits an admin request on the background owner. Every
+// request a draining owner would refuse, other than an upgrade, is counted as
+// a write: writes, MCP and the refused reads that probe upstream or write
+// account state. The drain check and the count change under one lock, so
+// WaitAdminWrites cannot miss one admitted just before Drain. Upgraded
+// connections stay out of the count (they would hold it open) and instead get
+// a context that CloseAdminUpgrades cancels; their handlers end on Done.
 func (r *Runtime) admitOwnerAdmin(req *http.Request) (*http.Request, func(), bool) {
 	readable := readableDuringHandoff(req)
-	write := !readMethod(req.Method)
 	upgrade := upgradeRequest(req)
+	write := !upgrade && !readable
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.drain && !readable {
@@ -139,9 +142,10 @@ func (r *Runtime) admitOwnerAdmin(req *http.Request) (*http.Request, func(), boo
 	}, true
 }
 
-// WaitAdminWrites returns once every admin request that is not a read and was
-// admitted before Drain has finished. After Drain no new ones are admitted, so
-// the count only falls. There is no deadline, as for net/http Shutdown.
+// WaitAdminWrites returns once every counted admin request (see
+// admitOwnerAdmin) admitted before Drain has finished. After Drain no new ones
+// are admitted, so the count only falls. There is no deadline, as for net/http
+// Shutdown.
 func (r *Runtime) WaitAdminWrites(ctx context.Context) error {
 	for {
 		r.mu.Lock()

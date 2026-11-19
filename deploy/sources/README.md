@@ -57,7 +57,7 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 
 如果某次运行没有走完（`status` 里 `in_progress` 不为空），下一次 `main` 会拒绝执行。先用 `status` 和 `docker ps` 看清现场，处理完后再把 `state.json` 的 `in_progress` 清空。`FAILED AND NOT RESTORED` 时原因写在 `in_progress.failed`；`status` 里每个容器的 `restart_policy` 为 `no` 且仍在运行，说明它已收到 SIGTERM、正在排空，退出后不会自动重启。
 
-旧后台超过 `background_exit_timeout` 仍未退出时，新后台没有启动，旧后台继续排空。等它退出后，`docker update --restart=unless-stopped <旧后台容器>`、`docker start <旧后台容器>`，`status` 确认它在运行，再清空 `in_progress`；在此之前不要再次发布。详见 [DEPLOY.md](../../docs/sources/DEPLOY.md) 的“无法自动恢复的情况”。
+正在排空的后台超过 `background_exit_timeout` 仍未退出时，接手的后台没有启动，排空中的后台退出后就没有后台进程。错误信息（也写在 `in_progress.failed`）写明哪个槽位在服务流量、哪些 serving 容器留着运行但没有流量、要启动哪一个后台：切流之前是当前槽位那个正在排空的后台本身，交还时（流量已回到上一槽位）是上一槽位的后台，不是正在排空的新版本后台。等它退出后按信息执行 `docker update --restart=unless-stopped` 和 `docker start`，`status` 确认后台在运行，再清空 `in_progress`；在此之前不要再次发布。详见 [DEPLOY.md](../../docs/sources/DEPLOY.md) 的“无法自动恢复的情况”。
 
 ## 首次接入
 
