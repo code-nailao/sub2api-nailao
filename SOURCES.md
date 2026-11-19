@@ -26,7 +26,7 @@
 | V2 渠道卡片 | 按品牌分区的卡片，显示倍率、缓存率、可用率、首 Token 延迟和状态条；管理员可两级排序、覆盖分类、选择生图分组方式，配置与版本号同事务保存；普通用户只看授权展示的数据；V1 保留 | `features/sources/monitor-v2-cards`、`channel_monitor_v2_display_order*`；本地预览见 [extensions/sources-monitor-local](extensions/sources-monitor-local/README.md) |
 | 用量缓存列 | 管理员用量表的“性能”列改为缓存比例；缺失或零分母显示为未知；原生 TPS 保留 | `features/sources/usage` |
 | Fast / Ultrafast 档位 | 分组档位策略、自定义价卡、倍率预设和不可变账单快照；显式开启的分组可按 Key 档位选择固定供应商账号，普通分组行为不变；覆盖 HTTP、SSE、WebSocket | `request_speed*`、`openai_group_service_tier*`、`features/sources/pricing` |
-| Grok 内容拒绝费 | 可选的固定拒绝费：请求前预留余额和 Key 额度，每个请求只结算一次；已发送的同步请求结果未知时，超过持久化截止时间（30 分钟生命周期+10 分钟宽限，未知时缩短为 10 分钟）由后台释放固定费预留；从未知释放的迟到结果只记录不扣费，从已发送释放（进程推定已停止）后迟到的普通用量仍按普通路径扣一次，迟到拒绝不扣费；绑定任务的请求与升级前已在等待的历史冻结仍待人工核对；规范化 Grok 模型名 | `grok_media_rejection*`、`group_upstream_rejection_billing*`、`handler/upstream_rejection_*` |
+| Grok 内容拒绝费 | 可选的固定拒绝费：请求前预留余额和 Key 额度，每个请求只结算一次；已发送的同步请求结果未知时，超过持久化截止时间（30 分钟生命周期+10 分钟宽限，未知时缩短为 10 分钟）由后台释放固定费预留；从未知释放的迟到结果只记录不扣费，从已发送释放（进程推定已停止）后迟到的普通用量仍按普通路径扣一次，迟到拒绝不扣费；绑定任务的请求与升级前已在等待的历史冻结仍待人工核对；一次预留只覆盖一个上游请求，因此开启该策略的分组里 composer 模型不接受图片输入（原版会先为每张图另发一次描述请求），直接返回 400，不发出上游请求、预留立即释放，未开启的分组照常桥接；规范化 Grok 模型名 | `grok_media_rejection*`、`group_upstream_rejection_billing*`、`handler/upstream_rejection_*` |
 | DeepSeek Search / Fetch | 可选的联网搜索与抓取：分组售价、共享供应凭据、Key 级自动工具；在 Responses、Chat、Messages 三种协议中执行；保持真实流式；按确认的用量结算并可从检查点恢复；工具失败时降级为不联网回答；注入的工具名稳定，以利于前缀缓存 | `deepseek*`、工具 journal |
 | 媒体引擎持久图片任务 | 专用分组的异步图片任务：冻结价格快照、唯一执行者、提交结果未知不重发、结算与释放互斥 | `extensions/sources-media-engine`、`sources_media_engine*.go`、`sources_image_ledger.go`；[媒体引擎实施](docs/sources/MEDIA-ENGINE.md) |
 | 图片任务自动收尾 | 可选的恢复策略：有上游任务号只查询；超期且无成功证据时按原冻结释放客户余额，供应结果仍标为未知；不重新生成 | 媒体引擎恢复器、`features/sources/ImageTaskReview.vue` |

@@ -98,6 +98,8 @@ GPT-6.2 价卡的 Ultrafast 倍率留空时，按本仓库既有售价固定为 
 
 可选的固定内容拒绝费：请求前预留余额和 Key 额度，每个请求只结算一次，未确定的保留待核对；面向用户的说明不暴露供应商细节。导入规范的 Grok 模型名。
 
+- `openai_gateway_grok.go`、`openai_gateway_chat_completions_raw.go`：原版为 composer 模型的每张输入图片先发一次描述请求，再发正式请求。一次预留只覆盖一个上游请求，所以请求带着预留时，桥接在发出第一个描述请求之前返回，直转入口据此回 400（该分组下此模型不支持图片输入）。此时没有任何上游请求，预留按“未发送”立即释放、不收费。没有预留的请求（未开启该策略的分组）桥接行为不变。判断与错误定义在 `upstream_rejection_gateway.go`。
+
 ### DeepSeek 联网工具
 
 标签：`deepseek_tools`、`deepseek_builtin_tools`。
