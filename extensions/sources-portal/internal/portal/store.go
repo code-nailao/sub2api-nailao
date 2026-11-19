@@ -59,6 +59,10 @@ type Store struct {
 	failed   error
 }
 
+// errReadOnlyCheck marks a store loaded by CheckStore: every write path sees a
+// failed store and refuses, so a check can never persist anything.
+var errReadOnlyCheck = errors.New("read_only_startup_check")
+
 func OpenStore(dir string, key []byte) (*Store, error) {
 	if len(key) != 32 {
 		return nil, errors.New("encryption_key_must_be_32_bytes")
@@ -74,40 +78,89 @@ func OpenStore(dir string, key []byte) (*Store, error) {
 		lock.Close()
 		return nil, errors.New("store_already_open")
 	}
-	block, err := aes.NewCipher(key)
+	s, err := loadStore(dir, key)
 	if err != nil {
 		lock.Close()
+		return nil, err
+	}
+	s.lock = lock
+	return s, nil
+}
+
+// CheckStore reads and validates the state OpenStore would load, without
+// taking the lock or creating anything. dir must already exist; the running
+// owner may hold the lock, which is safe because files are replaced atomically.
+// The returned store refuses every write.
+func CheckStore(dir string, key []byte) (*Store, error) {
+	if len(key) != 32 {
+		return nil, errors.New("encryption_key_must_be_32_bytes")
+	}
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		return nil, errors.New("data_directory_required")
+	}
+	if err := checkCreatable(filepath.Join(dir, "portal.lock"), false); err != nil {
+		return nil, err
+	}
+	s, err := loadStore(dir, key)
+	if err != nil {
+		return nil, err
+	}
+	s.failed = errReadOnlyCheck
+	return s, nil
+}
+
+// checkCreatable fails when a path the normal start would create or open
+// already exists with the wrong type. A missing path is not an error.
+func checkCreatable(path string, dir bool) error {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if dir && !info.IsDir() || !dir && !info.Mode().IsRegular() {
+		return errors.New("unexpected_state_file_type")
+	}
+	return nil
+}
+
+// loadStore is the read, decode and validate step shared by OpenStore and
+// CheckStore.
+func loadStore(dir string, key []byte) (*Store, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
 		return nil, err
 	}
 	aead, err := cipher.NewGCM(block)
 	if err != nil {
-		lock.Close()
 		return nil, err
 	}
-	s := &Store{path: filepath.Join(dir, "sources.json"), lock: lock, aead: aead, state: diskState{Version: 1, Records: map[string]record{}}}
+	s := &Store{path: filepath.Join(dir, "sources.json"), aead: aead, state: diskState{Version: 1, Records: map[string]record{}}}
 	b, err := os.ReadFile(s.path)
 	if err == nil {
 		if json.Unmarshal(b, &s.state) != nil || s.state.Version != 1 || s.state.Records == nil {
-			s.Close()
 			return nil, errors.New("invalid_store")
 		}
 		for _, r := range s.state.Records {
 			if _, err = s.decrypt(r); err != nil {
-				s.Close()
 				return nil, errors.New("store_key_mismatch")
 			}
 		}
 	} else if !os.IsNotExist(err) {
-		s.Close()
 		return nil, err
 	}
 	if err = s.loadBindings(); err != nil {
-		s.Close()
 		return nil, err
 	}
 	return s, nil
 }
-func (s *Store) Close() error { return s.lock.Close() }
+func (s *Store) Close() error {
+	if s.lock == nil {
+		return nil
+	}
+	return s.lock.Close()
+}
 func randomID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {

@@ -9,6 +9,8 @@ One command replaces Main serving and the unique background with one image:
     deploy.py status           current/previous slot and container health
     deploy.py watch            resident sampler for systemd (journal only)
     deploy.py adopt ...        one-time: record running legacy containers
+    deploy.py portal ...       the Portal (portal.py): portal <image>,
+                               portal-rollback, portal-status, portal-adopt
 
 Usage: deploy/sources/README.md. Two fixed slots (a, b)
 with fixed container names and ports alternate; Nginx references only the
@@ -1083,7 +1085,9 @@ def adopt(cfg_path: str, ops: Ops, serving: str, standby: str, background: str, 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--config", default=None,
+                        help=f"settings file (default: {DEFAULT_CONFIG} for Main commands, "
+                             "/opt/sources-deploy/portal.json for portal commands)")
     parser.add_argument("--dry-run", action="store_true", help="print mutating commands instead of running them")
     sub = parser.add_subparsers(dest="command", required=True)
     p_main = sub.add_parser("main", help="deploy an image to Main serving and background")
@@ -1102,7 +1106,38 @@ def main(argv: list[str] | None = None) -> int:
     p_adopt.add_argument("--work-dir", default="/opt/sources-deploy/main")
     p_adopt.add_argument("--public-health-url", required=True,
                          help="public health endpoint checked during the guard, e.g. https://example.com/health")
+    p_portal = sub.add_parser("portal", help="deploy an image to the Portal (one container, short gap)")
+    p_portal.add_argument("image", help="image reference, preferably pinned by digest")
+    p_portal.add_argument("--allow-public-health-failure", action="store_true",
+                          help="warn instead of stopping when the public health check fails before the switch "
+                               "(the guard still requires 200 after it)")
+    sub.add_parser("portal-rollback", help="switch the Portal back to the previous container")
+    sub.add_parser("portal-status", help="show current and previous Portal release")
+    p_padopt = sub.add_parser("portal-adopt", help="one-time: record the running Portal container")
+    p_padopt.add_argument("--container", required=True, help="the running Portal container")
+    p_padopt.add_argument("--slot-ports", required=True, help="loopback host ports for slots a and b: A,B")
+    p_padopt.add_argument("--upstream-file", required=True, help="Nginx file the tool will own for the upstream")
+    p_padopt.add_argument("--public-health-url", required=True,
+                          help="public health endpoint checked during the guard, e.g. https://example.com/health")
+    p_padopt.add_argument("--work-dir", default="/opt/sources-deploy/portal")
+    p_padopt.add_argument("--name-prefix", default="sources-portal")
+    p_padopt.add_argument("--nginx-bin", default="/usr/sbin/nginx")
+    p_padopt.add_argument("--nginx-error-log", default="/var/log/nginx/error.log")
+    p_padopt.add_argument("--lock-file", default="/var/lock/sources-clean-release.lock",
+                          help="release lock; keep Main's so Portal and Main releases never overlap")
     args = parser.parse_args(argv)
+    if args.command.startswith("portal"):
+        try:
+            # portal.py imports this module as `deploy`; when this file runs as
+            # a script it is `__main__`, so register it under that name first
+            # so both share one DeployError and one Ops.
+            sys.modules["deploy"] = sys.modules[__name__]
+            import portal
+            return portal.run(args, args.config or portal.DEFAULT_CONFIG)
+        except DeployError as err:
+            print(f"deploy: {err}", file=sys.stderr)
+            return 1
+    args.config = args.config or DEFAULT_CONFIG
     ops = Ops(dry_run=args.dry_run)
     try:
         if args.command == "adopt":
