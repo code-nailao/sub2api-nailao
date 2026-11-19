@@ -8,9 +8,9 @@
       <p v-if="fixedChargeAmount !== null" class="text-gray-300">{{ t('upstreamRejection.hint', { price: fixedChargeAmount }) }}</p>
     </template>
     <template v-else-if="snapshot.deepseek_tools">
-      <div v-for="tool in ['search', 'fetch'] as const" :key="tool" class="flex justify-between gap-4">
-        <span>{{ tool === 'search' ? t('deepseekTools.search') : t('deepseekTools.fetch') }} × {{ snapshot.deepseek_tools[`${tool}_count`] }}</span>
-        <span class="font-mono">{{ (snapshot.deepseek_tools[`${tool}_count`] * snapshot.deepseek_tools[`${tool}_price_per_call`]).toFixed(6) }}u</span>
+      <div v-for="row in deepSeekToolRows" :key="row.tool" class="flex justify-between gap-4" :data-testid="`deepseek-tool-${row.tool}`">
+        <span>{{ t(`deepseekTools.${row.tool}`) }} × {{ row.units }}{{ row.unitLabel ? ` ${t(row.unitLabel)}` : '' }}</span>
+        <span class="font-mono">{{ row.amount.toFixed(6) }}u</span>
       </div>
       <p class="text-xs text-gray-400">{{ t('deepseekTools.priceHint') }}</p>
     </template>
@@ -40,6 +40,7 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { isContentRejectionKind } from '@/utils/billingMode'
+import { deepSeekMediaTools } from '@/utils/deepseekTools'
 import type { UsageBillingSnapshot } from '@/types'
 
 const props = defineProps<{ snapshot?: UsageBillingSnapshot | null }>()
@@ -54,6 +55,23 @@ const fixedChargeAmount = computed(() => {
 const fixedChargeText = computed(() => fixedChargeAmount.value !== null
   ? t('upstreamRejection.customerPrice', { price: fixedChargeAmount.value })
   : t('usage.snapshotNotRecorded'))
+
+// A receipt of a standalone document or speech tool shows that tool; other
+// receipts keep the Search / Fetch rows they always had.
+const deepSeekToolRows = computed(() => {
+  const u = props.snapshot?.deepseek_tools
+  if (!u) return []
+  const media = deepSeekMediaTools
+    .filter(item => typeof u[item.units] === 'number' || typeof u[item.price] === 'number')
+    .map(item => {
+      const units = u[item.units] ?? 0
+      return { tool: item.tool, units, unitLabel: `deepseekTools.${item.tool}Unit`, amount: units * (u[item.price] ?? 0) / item.per }
+    })
+  const calls = (['search', 'fetch'] as const).map(tool => ({
+    tool, units: u[`${tool}_count`], unitLabel: '', amount: u[`${tool}_count`] * u[`${tool}_price_per_call`],
+  }))
+  return media.length ? [...calls.filter(row => row.units > 0), ...media] : calls
+})
 
 const tierRows = computed(() => {
   const s = props.snapshot

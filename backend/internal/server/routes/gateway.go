@@ -190,6 +190,9 @@ func RegisterGatewayRoutes(
 	{
 		gateway.POST("/tools/search", h.OpenAIGateway.DeepSeekTool)
 		gateway.POST("/tools/fetch", h.OpenAIGateway.DeepSeekTool)
+		gateway.POST("/tools/ocr", h.OpenAIGateway.DeepSeekTool)
+		gateway.POST("/tools/asr", h.OpenAIGateway.DeepSeekTool)
+		gateway.POST("/tools/tts", h.OpenAIGateway.DeepSeekTool)
 		// /v1/messages: auto-route based on group platform
 		gateway.POST("/messages", func(c *gin.Context) {
 			if isOpenAIResponsesCompatibleGatewayPlatform(c) {

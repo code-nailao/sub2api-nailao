@@ -576,7 +576,11 @@ export interface GroupLocaleText {
 export type GroupI18n = Record<string, GroupLocaleText>
 
 // 用户侧接口返回的 name / description 已由后端按请求语言（Accept-Language）选好
-export interface DeepSeekToolsConfig { enabled: boolean; auto_inject: boolean; account_id?: number | null; fetch_price_per_1k: number | null }
+export interface DeepSeekToolsConfig {
+  enabled: boolean; auto_inject: boolean; account_id?: number | null; fetch_price_per_1k: number | null
+  /** Standalone tools: null means the group does not offer the tool; 0 is free. */
+  ocr_price_per_1k_pages?: number | null; asr_price_per_hour?: number | null; tts_price_per_10k_chars?: number | null
+}
 
 export type RequestSpeedTier = 'fast' | 'ultrafast'
 
@@ -1857,7 +1861,10 @@ export type ImageSizeBreakdown = Record<string, number>
 // Content-fee customer snapshots contain only charge_kind and fixed_charge.
 // Normal usage retains its historical tier-pricing fields.
 export interface UsageBillingSnapshot {
-  deepseek_tools?: { search_count: number; fetch_count: number; search_price_per_call: number; fetch_price_per_call: number; standalone?: boolean }
+  deepseek_tools?: {
+    search_count: number; fetch_count: number; search_price_per_call: number; fetch_price_per_call: number; standalone?: boolean
+    ocr_pages?: number; ocr_price_per_1k_pages?: number; asr_seconds?: number; asr_price_per_hour?: number; tts_characters?: number; tts_price_per_10k_chars?: number
+  }
   version?: number
   charge_kind?: string
   fixed_charge?: number
