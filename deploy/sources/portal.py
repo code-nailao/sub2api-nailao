@@ -457,9 +457,14 @@ class PortalDeployer(deploy.Deployer):
                 except OldStillRunning as err:
                     raise DeployError(f"new container still running: {err}") from err
             if signalled and self.running(old["container"]):
-                # Its listener is already closed: it must exit before it can serve again.
-                self.wait_exit_portal(old["container"], self.cfg.exit_timeout, self.cfg.exit_abort_timeout,
-                                      draining_portal=True)
+                if self.health(old["port"]) == 200:
+                    # The signal never arrived (the kill failed or was interrupted).
+                    self.log(f"   {old['container']} is still serving; nothing to wait for")
+                else:
+                    # A draining Portal has closed its listener: it must exit
+                    # before it can serve again.
+                    self.wait_exit_portal(old["container"], self.cfg.exit_timeout, self.cfg.exit_abort_timeout,
+                                          draining_portal=True)
             policy = old.get("restart_policy") or "unless-stopped"
             self.ops.run(["docker", "update", f"--restart={policy}", old["container"]], mutate=True)
             self.ops.run(["docker", "start", old["container"]], mutate=True)

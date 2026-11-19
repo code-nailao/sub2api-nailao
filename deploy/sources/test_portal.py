@@ -489,6 +489,20 @@ class PortalTest(unittest.TestCase):
         self.assertEqual("legacy", self.state()["current"]["slot"])
         self.assertEqual("failed", self.history()[-1]["result"])
 
+    def test_failed_kill_with_old_still_serving_falls_back_without_waiting(self):
+        self.ops.hang = {("docker", "kill", "--signal=TERM", OLD)}
+        started = self.ops.clock
+        with self.assertRaises(deploy.DeployError) as ctx:
+            self.deploy()
+        self.assertNotIsInstance(ctx.exception, deploy.FallbackFailed)
+        self.assertIn(f"the previous Portal {OLD} is serving again", str(ctx.exception))
+        self.assertLess(self.ops.clock - started, 10, "no waiting for a Portal that was never signalled")
+        self.assertTrue(any("is still serving; nothing to wait for" in line for line in self.ops.logs))
+        self.assertTrue(self.running(OLD))
+        self.assertNotIn(["docker", "start", NEW_A], self.ops.commands)
+        self.assertEqual(portal.render_upstream("sources_portal", PORT_OLD), self.upstream())
+        self.assertIsNone(self.state()["in_progress"])
+
     def test_interrupt_while_old_drains_waits_then_restores_old(self):
         def interrupt():
             raise KeyboardInterrupt
