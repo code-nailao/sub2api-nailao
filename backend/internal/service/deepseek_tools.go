@@ -171,24 +171,23 @@ func (s *OpenAIGatewayService) checkDeepSeekToolsEnabled(key *APIKey) error {
 
 var errDeepSeekToolAccountUnavailable = errors.New("DeepSeek tool account unavailable")
 
-// deepSeekToolAccount picks the supplier for a hosted tool call. The model
-// account is used when it supplies tools itself (or is the pinned account),
-// because the model request already holds its slot. Otherwise the group's
-// tool accounts are scheduled like a standalone call.
+// deepSeekToolAccount picks the supplier for a hosted tool call: the pinned
+// account when the group pins one, otherwise the model account itself, which
+// must supply tools (judged on its stored row, not the copy it was scheduled
+// with). Hosted calls never borrow another account; when the model account has
+// no tools, the tools are unavailable and the caller's fallback applies.
 func (s *OpenAIGatewayService) deepSeekToolAccount(ctx context.Context, key *APIKey, modelAccount *Account) (*Account, func(), error) {
 	if err := s.checkDeepSeekToolsEnabled(key); err != nil {
 		return nil, nil, err
 	}
 	pin := key.Group.DeepSeekTools.AccountID
 	if modelAccount != nil && (pin == nil || *pin == modelAccount.ID) {
-		// Judge the stored account, not the copy the request was scheduled with.
+		// The model request already holds this account's slot.
 		fresh, err := s.reloadDeepSeekToolAccount(ctx, key, modelAccount.ID, modelAccount)
-		if err == nil {
-			return fresh, func() {}, nil
-		}
-		if pin != nil {
+		if err != nil {
 			return nil, nil, err
 		}
+		return fresh, func() {}, nil
 	}
 	return s.selectDeepSeekToolAccount(ctx, key, nil)
 }

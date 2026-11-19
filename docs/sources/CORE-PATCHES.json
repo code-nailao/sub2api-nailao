@@ -2497,7 +2497,7 @@
       "features": [
         "deepseek_tool_endpoints"
       ],
-      "sha256": "90037acfb6c980a4a40ef60ac767c9f7d3d2792bdc2d19e0ff5cc7ab208c40f1",
+      "sha256": "5bc414f065940dc867b7eac7d5d804151db4fd5abe8c1c6c997f479318a42b0b",
       "reason": "Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields."
     },
     {
@@ -2505,7 +2505,7 @@
       "features": [
         "deepseek_tool_endpoints"
       ],
-      "sha256": "e48d0afd644fe0bbe1f1317c2722d27b50116e844035043d7c851eaddc122cf8",
+      "sha256": "a097ff5240428bb6db0fe72f9154e6e503ea5dea509d8cda2651610989885556",
       "reason": "Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields. Tests for this behaviour."
     },
     {
@@ -2513,7 +2513,7 @@
       "features": [
         "deepseek_tool_endpoints"
       ],
-      "sha256": "f26708a4911cc6f71c4ac4b7f59ef66109326d2244157e5d68088e015d032f82",
+      "sha256": "8641a404c885ee8d5ae2728071825a773ee3e12b2cd2e0641df5b52e212d4d24",
       "reason": "Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields."
     },
     {
@@ -2522,7 +2522,7 @@
         "deepseek_builtin_tools",
         "deepseek_tool_endpoints"
       ],
-      "sha256": "d6a51f4ed98037761282a186626397cb76e243de249f53b95a1440069d89af07",
+      "sha256": "f6bb7a063b2182205b87eed12cc4e80af0bb2f145ba4bc86d383917b7fcd8f21",
       "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields."
     },
     {

@@ -11,7 +11,6 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
-	"regexp"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -37,9 +36,13 @@ const (
 	deepSeekOCRMaxFile       = 100 << 20
 	deepSeekOCRMaxBody       = 101 << 20
 	deepSeekOCRMaxPages      = 1000
-	// A file the page count cannot be read from is reserved as one page per
-	// this many bytes, within 1 and deepSeekOCRMaxPages.
-	deepSeekOCRBytesPerEstimatedPage = 256 << 10
+	// deepSeekASRMinBytesPerSecond bounds what an ASR answer may claim: no
+	// accepted audio is denser in time than 6 kbit/s, the lowest Opus bitrate
+	// (16-bit PCM needs at least 16 kB/s), so a file of n bytes holds at most
+	// n/750 seconds whatever its header declares.
+	deepSeekASRMinBytesPerSecond = 750
+	// Leading bytes kept for type detection.
+	deepSeekFileHeadBytes = 1024
 )
 
 // IsDeepSeekToolOperation reports whether operation is one of the five tools.
@@ -74,8 +77,13 @@ type DeepSeekToolRequest struct {
 	// AuditText is the text passed to the content audit ("" for files).
 	AuditText string
 	// EstimateUnits sizes the in-flight reservation: one call, 120 seconds of
-	// audio, the actual billable characters, or a bounded page estimate.
+	// audio, the actual billable characters, or the page maximum unless the
+	// file is a single image.
 	EstimateUnits int
+	// MaxUnits is the most a supplier answer can be charged for: the documented
+	// page maximum for OCR, what the file size allows for ASR, the request's own
+	// units otherwise.
+	MaxUnits int
 }
 
 // DeepSeekToolInputError is a request the gateway refuses without calling the supplier.
@@ -110,7 +118,7 @@ func PrepareDeepSeekToolRequest(operation, contentType string, body []byte) (*De
 		var fields map[string]any
 		_ = json.Unmarshal(normalized, &fields)
 		audit, _ := fields[field].(string)
-		return &DeepSeekToolRequest{Operation: operation, Body: normalized, ContentType: "application/json", AuditText: audit, EstimateUnits: 1}, nil
+		return &DeepSeekToolRequest{Operation: operation, Body: normalized, ContentType: "application/json", AuditText: audit, EstimateUnits: 1, MaxUnits: 1}, nil
 	case DeepSeekToolTTS:
 		return prepareDeepSeekTTS(body)
 	case DeepSeekToolASR, DeepSeekToolOCR:
@@ -173,7 +181,7 @@ func prepareDeepSeekTTS(body []byte) (*DeepSeekToolRequest, error) {
 	if err != nil {
 		return nil, deepSeekInputError("invalid tts request")
 	}
-	return &DeepSeekToolRequest{Operation: DeepSeekToolTTS, Body: normalized, ContentType: "application/json", AuditText: text, EstimateUnits: chars}, nil
+	return &DeepSeekToolRequest{Operation: DeepSeekToolTTS, Body: normalized, ContentType: "application/json", AuditText: text, EstimateUnits: chars, MaxUnits: chars}, nil
 }
 
 // prepareDeepSeekUpload checks a multipart upload without copying it: only the
@@ -212,7 +220,6 @@ func prepareDeepSeekUpload(operation, contentType string, body []byte) (*DeepSee
 			if _, readErr := io.Copy(file, io.LimitReader(part, maxFile+1)); readErr != nil {
 				return nil, deepSeekInputError("malformed multipart body")
 			}
-			file.finish()
 			if file.size > maxFile {
 				return nil, &DeepSeekToolInputError{Status: http.StatusRequestEntityTooLarge, Message: fmt.Sprintf("file exceeds %d bytes", maxFile)}
 			}
@@ -235,8 +242,10 @@ func prepareDeepSeekUpload(operation, contentType string, body []byte) (*DeepSee
 	if operation == DeepSeekToolOCR && !purposeSeen {
 		return nil, deepSeekInputError("purpose must be text_recognition")
 	}
-	units := deepSeekASRMaxSeconds
+	units, maxUnits := deepSeekASRMaxSeconds, int((file.size+deepSeekASRMinBytesPerSecond-1)/deepSeekASRMinBytesPerSecond)
 	if operation == DeepSeekToolASR {
+		// The declared length is checked here; the charge follows the supplier's
+		// answer, which a forged header cannot lower.
 		seconds, err := deepSeekAudioSeconds(file.data)
 		if err != nil {
 			return nil, deepSeekInputError("%s", err.Error())
@@ -245,14 +254,18 @@ func prepareDeepSeekUpload(operation, contentType string, body []byte) (*DeepSee
 			return nil, deepSeekInputError("audio exceeds %d seconds", deepSeekASRMaxSeconds)
 		}
 	} else {
-		kind := deepSeekDocumentKind(file.head)
-		if kind == "" {
+		if deepSeekDocumentKind(file.head) == "" {
 			return nil, deepSeekInputError("file must be a PDF, Word or PowerPoint document, or an image")
 		}
-		units = deepSeekOCRPageEstimate(kind, file)
+		// Anything that may hold several pages is reserved at the maximum the
+		// supplier accepts; the charge uses the page count it confirms.
+		units, maxUnits = deepSeekOCRMaxPages, deepSeekOCRMaxPages
+		if deepSeekSingleImage(file.head, file.size) {
+			units = 1
+		}
 	}
 	normalizedType := mime.FormatMediaType("multipart/form-data", map[string]string{"boundary": params["boundary"]})
-	return &DeepSeekToolRequest{Operation: operation, Body: body, ContentType: normalizedType, EstimateUnits: units}, nil
+	return &DeepSeekToolRequest{Operation: operation, Body: body, ContentType: normalizedType, EstimateUnits: units, MaxUnits: maxUnits}, nil
 }
 
 // deepSeekDocumentKind sniffs the accepted OCR inputs by their signature.
@@ -275,80 +288,51 @@ func deepSeekDocumentKind(file []byte) string {
 	return ""
 }
 
-// deepSeekFileInspector receives an uploaded file once, keeping its size, the
-// leading bytes for type detection and a running count of PDF page objects.
-type deepSeekFileInspector struct {
-	keep  bool
-	data  []byte
-	head  []byte
-	size  int64
-	carry []byte
-	pages int
+// deepSeekSingleImage accepts only image formats that hold one frame, checked
+// beyond their magic number, and nothing a lenient reader could take for a PDF.
+// TIFF, GIF and extended WebP may hold several frames and are not included.
+func deepSeekSingleImage(head []byte, size int64) bool {
+	if bytes.Contains(head, []byte("%PDF")) {
+		return false
+	}
+	switch {
+	case len(head) >= 16 && bytes.HasPrefix(head, []byte("\x89PNG\r\n\x1a\n")):
+		return string(head[12:16]) == "IHDR"
+	case len(head) >= 4 && head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF:
+		return head[3] >= 0xC0 && head[3] != 0xFF // a segment marker follows SOI
+	case len(head) >= 16 && string(head[:4]) == "RIFF" && string(head[8:12]) == "WEBP":
+		return string(head[12:16]) == "VP8 " || string(head[12:16]) == "VP8L"
+	case len(head) >= 18 && head[0] == 'B' && head[1] == 'M':
+		// File size, reserved words and a known DIB header size must all agree.
+		switch binary.LittleEndian.Uint32(head[14:18]) {
+		case 12, 40, 52, 56, 64, 108, 124:
+		default:
+			return false
+		}
+		return int64(binary.LittleEndian.Uint32(head[2:6])) == size && binary.LittleEndian.Uint32(head[6:10]) == 0 &&
+			int64(binary.LittleEndian.Uint32(head[10:14])) < size
+	}
+	return false
 }
 
-// A page object is "/Type /Page" followed by a non-letter ("/Pages" is the tree).
-var (
-	deepSeekPDFPageObject      = regexp.MustCompile(`/Type\s*/Page[^a-zA-Z]`)
-	deepSeekPDFFinalPageObject = regexp.MustCompile(`/Type\s*/Page(?:[^a-zA-Z]|$)`)
-)
-
-const deepSeekPDFCarry = 64
+// deepSeekFileInspector receives an uploaded file once, keeping its size and
+// leading bytes; ASR also keeps the (at most 8 MiB) audio to read its length.
+type deepSeekFileInspector struct {
+	keep bool
+	data []byte
+	head []byte
+	size int64
+}
 
 func (f *deepSeekFileInspector) Write(p []byte) (int, error) {
 	f.size += int64(len(p))
 	if f.keep {
 		f.data = append(f.data, p...)
 	}
-	if missing := 16 - len(f.head); missing > 0 {
+	if missing := deepSeekFileHeadBytes - len(f.head); missing > 0 {
 		f.head = append(f.head, p[:min(missing, len(p))]...)
 	}
-	if len(f.head) >= 5 && !bytes.HasPrefix(f.head, []byte("%PDF-")) {
-		return len(p), nil // only PDFs are counted
-	}
-	window := append(f.carry, p...)
-	f.countPages(window, deepSeekPDFPageObject)
-	f.carry = append([]byte(nil), window[max(0, len(window)-deepSeekPDFCarry):]...)
 	return len(p), nil
-}
-
-// countPages counts matches ending in the new bytes; the carry only joins
-// matches split across writes, so none is counted twice.
-func (f *deepSeekFileInspector) countPages(window []byte, pattern *regexp.Regexp) {
-	if f.pages > deepSeekOCRMaxPages {
-		return
-	}
-	for _, m := range pattern.FindAllIndex(window, -1) {
-		if m[1] > len(f.carry) {
-			f.pages++
-		}
-	}
-}
-
-// finish counts a page object that ends exactly at the end of the file.
-func (f *deepSeekFileInspector) finish() {
-	if n := len(f.carry); n > 0 {
-		for _, m := range deepSeekPDFFinalPageObject.FindAllIndex(f.carry, -1) {
-			if m[1] == n && !deepSeekPDFPageObject.Match(f.carry[m[0]:m[1]]) {
-				f.pages++
-			}
-		}
-	}
-}
-
-// deepSeekOCRPageEstimate sizes the reservation only; the charge always uses
-// the page count the supplier confirms.
-func deepSeekOCRPageEstimate(kind string, file *deepSeekFileInspector) int {
-	if kind == "image" {
-		return 1
-	}
-	pages := 0
-	if kind == "pdf" {
-		pages = file.pages
-	}
-	if pages == 0 {
-		pages = int((file.size + deepSeekOCRBytesPerEstimatedPage - 1) / deepSeekOCRBytesPerEstimatedPage)
-	}
-	return min(max(pages, 1), deepSeekOCRMaxPages)
 }
 
 // deepSeekAudioSeconds reads the duration of a 16-bit PCM WAV or Ogg Opus file.

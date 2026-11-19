@@ -342,7 +342,7 @@ func TestDeepSeekASRChargesStartedSecondsPerHour(t *testing.T) {
 	for _, tc := range []struct {
 		durationMS float64
 		seconds    int
-	}{{61001, 62}, {1, 1}, {60000, 60}, {125000, 120}} {
+	}{{61001, 62}, {1, 1}, {60000, 60}} {
 		t.Run(fmt.Sprint(tc.durationMS), func(t *testing.T) {
 			h := newDeepSeekToolsHarness(t, []Account{deepSeekToolsTestAccount(11, true)}, func(call deepSeekToolsCall) (*http.Response, error) {
 				require.Equal(t, "/v1/tools/asr", call.path)
@@ -725,40 +725,198 @@ func TestDeepSeekToolRequestAcceptsDocumentedInputs(t *testing.T) {
 	require.Equal(t, 1, req.EstimateUnits)
 }
 
-func TestDeepSeekOCRPageEstimate(t *testing.T) {
-	pdf := func(pages int) []byte {
-		var b bytes.Buffer
-		b.WriteString("%PDF-1.4\n1 0 obj << /Type /Pages /Count 3 >> endobj\n")
-		for i := 0; i < pages; i++ {
-			fmt.Fprintf(&b, "%d 0 obj << /Type /Page /Parent 1 0 R >> endobj\n", i+2)
-			b.Write(make([]byte, 40000)) // spread page objects across reads
-		}
-		return b.Bytes()
+// Only a well-formed single image is reserved as one page; anything that may
+// hold several pages is reserved at the supplier's maximum.
+func TestDeepSeekOCRReservesThePageMaximumUnlessSingleImage(t *testing.T) {
+	bmp := func(size int, dib uint32) []byte {
+		b := make([]byte, size)
+		copy(b, "BM")
+		binary.LittleEndian.PutUint32(b[2:], uint32(size))
+		binary.LittleEndian.PutUint32(b[10:], 54)
+		binary.LittleEndian.PutUint32(b[14:], dib)
+		return b
 	}
 	for _, tc := range []struct {
 		name  string
 		file  []byte
 		pages int
 	}{
-		{"pdf_pages", pdf(3), 3},
-		{"pdf_page_at_end", []byte("%PDF-1.4 /Type /Page"), 1},
-		{"pdf_compressed_falls_back_to_size", append([]byte("%PDF-1.5 "), make([]byte, 600<<10)...), 3},
-		{"image", []byte("\xFF\xD8\xFFjpeg"), 1},
-		{"office_by_size", append([]byte("PK\x03\x04"), make([]byte, 10)...), 1},
-		{"large_office_by_size", append([]byte("PK\x03\x04"), make([]byte, 50<<20-4)...), 200},
+		{"pdf", []byte("%PDF-1.4\n1 0 obj << /Type /Page >> endobj"), 1000},
+		{"pdf_object_streams", append([]byte("%PDF-1.5 "), make([]byte, 300<<10)...), 1000},
+		{"office", append([]byte("PK\x03\x04"), make([]byte, 10)...), 1000},
+		{"tiff", []byte("II*\x00tiff"), 1000},
+		{"gif", []byte("GIF89a..."), 1000},
+		{"png", []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDRdata"), 1},
+		{"png_without_ihdr", []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\x0dXXXXdata"), 1000},
+		{"jpeg", []byte("\xFF\xD8\xFF\xE0\x00\x10JFIF"), 1},
+		{"webp", []byte("RIFF\x00\x00\x00\x00WEBPVP8 data"), 1},
+		{"webp_extended", []byte("RIFF\x00\x00\x00\x00WEBPVP8Xdata"), 1000},
+		{"bmp", bmp(64, 40), 1},
+		{"bmp_magic_only", append([]byte("BM"), make([]byte, 62)...), 1000},
+		{"bmp_unknown_header", bmp(64, 7), 1000},
+		{"image_hiding_a_pdf", append([]byte("\xFF\xD8\xFF\xE0 %PDF-1.4 "), make([]byte, 20)...), 1000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			contentType, body := deepSeekMultipart(t, map[string]string{"purpose": "text_recognition"}, "f", tc.file)
 			req, err := PrepareDeepSeekToolRequest(DeepSeekToolOCR, contentType, body)
 			require.NoError(t, err)
 			require.Equal(t, tc.pages, req.EstimateUnits)
+			require.Equal(t, 1000, req.MaxUnits)
 		})
 	}
-	// A count above the accepted maximum is still bounded.
-	f := &deepSeekFileInspector{}
-	_, _ = f.Write([]byte("%PDF-" + strings.Repeat("/Type /Page ", 1200)))
-	f.finish()
-	require.Equal(t, deepSeekOCRMaxPages, deepSeekOCRPageEstimate("pdf", f))
+}
+
+// The reservation covers whatever page count the supplier can confirm, so a
+// user whose balance covers a few pages cannot start a document that is
+// charged for hundreds.
+func TestDeepSeekOCRReservationIsAnUpperBound(t *testing.T) {
+	file := append([]byte("%PDF-1.7 "), make([]byte, 300<<10)...) // say, 500 pages in object streams
+	contentType, body := deepSeekMultipart(t, map[string]string{"purpose": "text_recognition"}, "big.pdf", file)
+	t.Run("refused_when_the_maximum_is_not_covered", func(t *testing.T) {
+		h := newDeepSeekToolsHarness(t, []Account{deepSeekToolsTestAccount(11, true)}, func(deepSeekToolsCall) (*http.Response, error) {
+			t.Fatal("no supplier call may be made")
+			return nil, nil
+		})
+		rec := httptest.NewRecorder()
+		// 1,000 pages at 3 per 1,000 need 3; this user has 1.
+		h.serve(t, context.Background(), rec, deepSeekToolsTestKey(deepSeekToolsAllPrices(), 1), DeepSeekToolOCR, contentType, body)
+		require.Equal(t, http.StatusPaymentRequired, rec.Code)
+	})
+	t.Run("reserves_the_maximum_and_charges_the_confirmed_pages", func(t *testing.T) {
+		var reserved float64
+		var h *deepSeekToolsHarness
+		h = newDeepSeekToolsHarness(t, []Account{deepSeekToolsTestAccount(11, true)}, func(deepSeekToolsCall) (*http.Response, error) {
+			h.cache.mu.Lock()
+			for _, amount := range h.cache.res {
+				reserved += amount
+			}
+			h.cache.mu.Unlock()
+			return deepSeekJSONResponse(200, `{"pages":[{"text":"x"}],"page_count":500}`), nil
+		})
+		rec := httptest.NewRecorder()
+		h.serve(t, context.Background(), rec, deepSeekToolsTestKey(deepSeekToolsAllPrices(), 10), DeepSeekToolOCR, contentType, body)
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.InDelta(t, 3.0, reserved, 1e-12, "1,000 pages at 3 per 1,000")
+		require.InDelta(t, 1.5, h.journal.settled(t).Command.BalanceCost, 1e-12, "500 confirmed pages")
+		h.requireReservationReleased(t)
+	})
+}
+
+// The audio length a client declares is only checked before sending; the
+// charge follows the supplier's answer, bounded by what the file size allows.
+func TestDeepSeekASRChargesTheSuppliersDurationNotTheDeclaredOne(t *testing.T) {
+	forged := deepSeekWAV(5)                                        // 160,000 bytes of 16 kHz audio
+	binary.LittleEndian.PutUint32(forged[28:], uint32(len(forged))) // the header claims about one second
+	seconds, err := deepSeekAudioSeconds(forged)
+	require.NoError(t, err)
+	require.Less(t, seconds, 1.1)
+	limit := (len(forged) + 749) / 750
+	for _, tc := range []struct {
+		durationMS float64
+		seconds    int
+	}{{150000, 150}, {1e10, limit}} {
+		t.Run(fmt.Sprint(tc.durationMS), func(t *testing.T) {
+			h := newDeepSeekToolsHarness(t, []Account{deepSeekToolsTestAccount(11, true)}, func(deepSeekToolsCall) (*http.Response, error) {
+				return deepSeekJSONResponse(200, fmt.Sprintf(`{"text":"long speech","duration_ms":%v}`, tc.durationMS)), nil
+			})
+			rec := httptest.NewRecorder()
+			contentType, body := deepSeekMultipart(t, nil, "a.wav", forged)
+			h.serve(t, context.Background(), rec, deepSeekToolsTestKey(deepSeekToolsAllPrices(), 10), DeepSeekToolASR, contentType, body)
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.Equal(t, tc.seconds, h.journal.settled(t).Usage.BillingSnapshot.DeepSeekTools.ASRSeconds)
+		})
+	}
+}
+
+// A client that reads slowly until the gateway's own deadline ends the stream
+// still pays for the audio it got; only the supplier cutting it short is free.
+func TestDeepSeekTTSGatewayDeadlineIsCharged(t *testing.T) {
+	saved := deepSeekToolTimeouts[DeepSeekToolTTS]
+	deepSeekToolTimeouts[DeepSeekToolTTS] = 100 * time.Millisecond
+	t.Cleanup(func() { deepSeekToolTimeouts[DeepSeekToolTTS] = saved })
+	h := newDeepSeekToolsHarness(t, []Account{deepSeekToolsTestAccount(11, true)}, func(call deepSeekToolsCall) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		go func() {
+			_, _ = pw.Write([]byte("RIFFfirst"))
+			<-call.ctx.Done() // the rest would arrive after the gateway's deadline
+			_ = pw.CloseWithError(call.ctx.Err())
+		}()
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"audio/wav"}}, Body: pr}, nil
+	})
+	rec := httptest.NewRecorder()
+	h.serve(t, context.Background(), rec, deepSeekToolsTestKey(deepSeekToolsAllPrices(), 10), DeepSeekToolTTS, "", []byte(`{"text":"hello"}`))
+	require.Equal(t, "RIFFfirst", rec.Body.String())
+	settled := h.journal.settled(t)
+	require.NotNil(t, settled)
+	require.Equal(t, 5, settled.Usage.BillingSnapshot.DeepSeekTools.TTSCharacters)
+	h.requireReservationReleased(t)
+}
+
+// One account setting enables all five tools; an upstream without this tool
+// answers 404 or 405 and another account is tried.
+func TestDeepSeekToolsFailOverWhenAnUpstreamLacksTheTool(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusMethodNotAllowed} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			first := true
+			h := newDeepSeekToolsHarness(t, []Account{deepSeekToolsTestAccount(11, true), deepSeekToolsTestAccount(12, true)}, func(deepSeekToolsCall) (*http.Response, error) {
+				if first {
+					first = false
+					return deepSeekJSONResponse(status, `{"error":{"message":"no such route"}}`), nil
+				}
+				return deepSeekJSONResponse(200, `{"pages":[{"text":"x"}],"page_count":1}`), nil
+			})
+			rec := httptest.NewRecorder()
+			contentType, body := deepSeekMultipart(t, map[string]string{"purpose": "text_recognition"}, "a.png", []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"))
+			h.serve(t, context.Background(), rec, deepSeekToolsTestKey(deepSeekToolsAllPrices(), 10), DeepSeekToolOCR, contentType, body)
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.Equal(t, 2, h.callCount())
+			require.Equal(t, 1, h.journal.settled(t).Usage.BillingSnapshot.DeepSeekTools.OCRPages)
+		})
+	}
+}
+
+// A 200 whose body is cut short or unreadable may follow completed, metered
+// work: it is not charged, and clients are told not to retry it.
+func TestDeepSeekToolsUnreadableSuccessIsNotRetried(t *testing.T) {
+	pdfType, pdfBody := deepSeekMultipart(t, map[string]string{"purpose": "text_recognition"}, "a.pdf", []byte("%PDF-1.4"))
+	wavType, wavBody := deepSeekMultipart(t, nil, "a.wav", deepSeekWAV(1))
+	for name, tc := range map[string]struct {
+		op, contentType string
+		body            []byte
+		answer          func() *http.Response
+	}{
+		"ocr_cut_short": {DeepSeekToolOCR, pdfType, pdfBody, func() *http.Response {
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(io.MultiReader(strings.NewReader(`{"pages":[`), iotestErrReader{}))}
+		}},
+		"ocr_not_json":    {DeepSeekToolOCR, pdfType, pdfBody, func() *http.Response { return deepSeekJSONResponse(200, `{"pages":[`) }},
+		"asr_not_json":    {DeepSeekToolASR, wavType, wavBody, func() *http.Response { return deepSeekJSONResponse(200, `<html>`) }},
+		"search_not_json": {DeepSeekToolSearch, "application/json", []byte(`{"query":"x"}`), func() *http.Response { return deepSeekJSONResponse(200, `{"results":`) }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newDeepSeekToolsHarness(t, []Account{deepSeekToolsTestAccount(11, true), deepSeekToolsTestAccount(12, true)}, func(deepSeekToolsCall) (*http.Response, error) { return tc.answer(), nil })
+			rec := httptest.NewRecorder()
+			h.serve(t, context.Background(), rec, deepSeekToolsTestKey(deepSeekToolsAllPrices(), 10), tc.op, tc.contentType, tc.body)
+			require.Equal(t, 1, h.callCount())
+			require.Equal(t, http.StatusBadGateway, rec.Code)
+			require.Equal(t, "false", rec.Header().Get("x-should-retry"))
+			require.Nil(t, h.journal.settled(t))
+			h.requireReservationReleased(t)
+		})
+	}
+}
+
+// The audio's length is announced only with the audio itself.
+func TestDeepSeekTTSFailingFirstReadSendsNoAudioLength(t *testing.T) {
+	h := newDeepSeekToolsHarness(t, []Account{deepSeekToolsTestAccount(11, true)}, func(deepSeekToolsCall) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"audio/wav"}, "Content-Length": []string{"48000"}}, Body: io.NopCloser(iotestErrReader{})}, nil
+	})
+	rec := httptest.NewRecorder()
+	h.serve(t, context.Background(), rec, deepSeekToolsTestKey(deepSeekToolsAllPrices(), 10), DeepSeekToolTTS, "", []byte(`{"text":"hello"}`))
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Empty(t, rec.Header().Get("Content-Length"))
+	require.True(t, gjson.Valid(rec.Body.String()))
+	require.Equal(t, "false", rec.Header().Get("x-should-retry"))
+	require.Nil(t, h.journal.settled(t))
 }
 
 func TestDeepSeekAudioDuration(t *testing.T) {
@@ -770,26 +928,26 @@ func TestDeepSeekAudioDuration(t *testing.T) {
 	require.InDelta(t, 3, seconds, 1e-9)
 }
 
-// Hosted tools keep using a model account that supplies tools; a model account
-// without tools now borrows a tool account of the group instead of failing.
+// Hosted tools use the model account when it supplies tools itself, or the
+// pinned account; they never borrow another tool account of the group.
 func TestDeepSeekHostedToolAccountChoice(t *testing.T) {
 	model, tools := deepSeekToolsTestAccount(11, false), deepSeekToolsTestAccount(12, true)
 	h := newDeepSeekToolsHarness(t, []Account{model, tools}, func(deepSeekToolsCall) (*http.Response, error) { return nil, errors.New("unused") })
 	key := deepSeekToolsTestKey(deepSeekToolsAllPrices(), 10)
-	supplier, release, err := h.svc.deepSeekToolAccount(context.Background(), key, &model)
+	_, _, err := h.svc.deepSeekToolAccount(context.Background(), key, &model)
+	require.Error(t, err, "a model account without tools leaves the tools unavailable")
+
+	supplier, release, err := h.svc.deepSeekToolAccount(context.Background(), key, &tools)
 	require.NoError(t, err)
 	require.Equal(t, int64(12), supplier.ID)
 	release()
 
-	capable := deepSeekToolsTestAccount(12, true)
-	supplier, release, err = h.svc.deepSeekToolAccount(context.Background(), key, &capable)
+	pinned := int64(12)
+	key.Group.DeepSeekTools.AccountID = &pinned
+	supplier, release, err = h.svc.deepSeekToolAccount(context.Background(), key, &model)
 	require.NoError(t, err)
-	require.Equal(t, int64(12), supplier.ID)
+	require.Equal(t, int64(12), supplier.ID, "a pinned tool account still serves any model account")
 	release()
-
-	only := newDeepSeekToolsHarness(t, []Account{model}, func(deepSeekToolsCall) (*http.Response, error) { return nil, errors.New("unused") })
-	_, _, err = only.svc.deepSeekToolAccount(context.Background(), key, &model)
-	require.Error(t, err, "without any tool account the hosted path still reports unavailable tools")
 }
 
 // deepSeekProjectedAccountRepo lists accounts the way the scheduler snapshot
@@ -820,17 +978,10 @@ func TestDeepSeekToolAccountsAreRecognizedBehindTheSchedulerProjection(t *testin
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.Equal(t, 1, h.callCount())
 
-	// The hosted path borrows the same account for a model account without tools.
-	model := accounts[0]
-	model.Extra = map[string]any{}
-	supplier, release, err := h.svc.deepSeekToolAccount(context.Background(), key, &model)
-	require.NoError(t, err)
-	require.Equal(t, int64(12), supplier.ID)
-	release()
-	// A model account handed over as a projection is still recognized as a tool account.
+	// A hosted model account handed over as a projection is still recognized.
 	projected := accounts[1]
 	projected.Extra = map[string]any{}
-	supplier, release, err = h.svc.deepSeekToolAccount(context.Background(), key, &projected)
+	supplier, release, err := h.svc.deepSeekToolAccount(context.Background(), key, &projected)
 	require.NoError(t, err)
 	require.Equal(t, int64(12), supplier.ID)
 	release()

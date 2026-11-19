@@ -33,14 +33,16 @@ var (
 	errDeepSeekToolIncomplete     = errors.New("incomplete or oversized DeepSeek tool response")
 )
 
+// deepSeekToolTimeouts bounds one supplier call; Search and Fetch keep 60 s.
+var deepSeekToolTimeouts = map[string]time.Duration{
+	DeepSeekToolOCR: 10 * time.Minute,
+	DeepSeekToolASR: 5 * time.Minute,
+	DeepSeekToolTTS: 15 * time.Minute,
+}
+
 func deepSeekToolTimeout(operation string) time.Duration {
-	switch operation {
-	case DeepSeekToolOCR:
-		return 10 * time.Minute
-	case DeepSeekToolASR:
-		return 5 * time.Minute
-	case DeepSeekToolTTS:
-		return 15 * time.Minute
+	if timeout, ok := deepSeekToolTimeouts[operation]; ok {
+		return timeout
 	}
 	return 60 * time.Second
 }
@@ -135,12 +137,13 @@ func (e *deepSeekToolRejection) Error() string {
 }
 
 // failover reports a refusal that says the supplier did not do the work on this
-// account (credentials, balance, rate limit, availability), so another tool
+// account (credentials, balance, rate limit, availability, or an upstream
+// without this tool: one account setting enables all five), so another tool
 // account may be tried. Gateway timeouts (502/504) leave the outcome unknown.
 func (e *deepSeekToolRejection) failover() bool {
 	switch e.status {
-	case 0, http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests,
-		http.StatusInternalServerError, http.StatusServiceUnavailable:
+	case 0, http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed,
+		http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusServiceUnavailable:
 		return true
 	}
 	return false
@@ -150,7 +153,7 @@ func (e *deepSeekToolRejection) failover() bool {
 // would refuse as well.
 func (e *deepSeekToolRejection) inputRejected() bool {
 	switch e.status {
-	case http.StatusBadRequest, http.StatusNotFound, http.StatusRequestEntityTooLarge, http.StatusUnsupportedMediaType, http.StatusUnprocessableEntity:
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnsupportedMediaType, http.StatusUnprocessableEntity:
 		return true
 	}
 	return false
@@ -158,12 +161,13 @@ func (e *deepSeekToolRejection) inputRejected() bool {
 
 // deepSeekToolReply is one supplier answer with HTTP 200.
 type deepSeekToolReply struct {
-	units       int    // confirmed billable units; 0 is not charged
-	body        []byte // JSON to send after settlement (nil once audio streamed)
-	contentType string
-	committed   bool // the status line was written (OCR heartbeat or audio)
-	streamed    bool // the audio itself was written
-	clientGone  bool
+	units         int    // confirmed billable units; 0 is not charged
+	body          []byte // JSON to send after settlement (nil once audio streamed)
+	contentType   string
+	contentLength string // the audio's length, sent only with the audio
+	committed     bool   // the status line was written (OCR heartbeat or audio)
+	streamed      bool   // the audio itself was written
+	clientGone    bool
 }
 
 func (r *deepSeekToolReply) commit(w http.ResponseWriter) {
@@ -172,6 +176,9 @@ func (r *deepSeekToolReply) commit(w http.ResponseWriter) {
 	}
 	w.Header().Set("Content-Type", r.contentType)
 	w.Header().Set("X-Accel-Buffering", "no")
+	if r.contentLength != "" {
+		w.Header().Set("Content-Length", r.contentLength)
+	}
 	w.WriteHeader(http.StatusOK)
 	r.committed = true
 }
@@ -240,7 +247,7 @@ func (s *OpenAIGatewayService) ServeDeepSeekTool(ctx context.Context, w http.Res
 	excluded := map[int64]struct{}{}
 	var last *deepSeekToolRejection
 	for attempt := 0; attempt < deepSeekToolMaxAttempts; attempt++ {
-		account, release, err := s.selectDeepSeekToolAccount(ctx, key, excluded)
+		account, rejection, done, err := s.attemptDeepSeekToolOnNextAccount(ctx, w, key, req, meta, excluded)
 		if err != nil {
 			if last == nil {
 				WriteDeepSeekToolError(w, http.StatusServiceUnavailable, "deepseek_tool_error", err.Error(), "", false)
@@ -248,8 +255,6 @@ func (s *OpenAIGatewayService) ServeDeepSeekTool(ctx context.Context, w http.Res
 			}
 			break
 		}
-		rejection, done := s.attemptDeepSeekTool(ctx, w, key, req, meta, account)
-		release()
 		if done {
 			return nil
 		}
@@ -265,6 +270,18 @@ func (s *OpenAIGatewayService) ServeDeepSeekTool(ctx context.Context, w http.Res
 	}
 	WriteDeepSeekToolError(w, status, "deepseek_tool_error", last.Error(), "", false)
 	return nil
+}
+
+// attemptDeepSeekToolOnNextAccount selects an account not yet excluded and
+// makes one attempt on it; the account slot is released when it returns.
+func (s *OpenAIGatewayService) attemptDeepSeekToolOnNextAccount(ctx context.Context, w http.ResponseWriter, key *APIKey, req *DeepSeekToolRequest, meta OpenAIRecordUsageInput, excluded map[int64]struct{}) (*Account, *deepSeekToolRejection, bool, error) {
+	account, release, err := s.selectDeepSeekToolAccount(ctx, key, excluded)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	defer release()
+	rejection, done := s.attemptDeepSeekTool(ctx, w, key, req, meta, account)
+	return account, rejection, done, nil
 }
 
 // attemptDeepSeekTool makes one supplier call on account and finishes the
@@ -314,7 +331,11 @@ func (s *OpenAIGatewayService) attemptDeepSeekTool(ctx context.Context, w http.R
 		s.failDeepSeekTool(w, reply, err, result.RequestID)
 		return nil, true
 	}
-	setDeepSeekToolUnits(usage, req.Operation, reply.units)
+	units := reply.units
+	if req.MaxUnits > 0 {
+		units = min(units, req.MaxUnits)
+	}
+	setDeepSeekToolUnits(usage, req.Operation, units)
 	result.Duration = time.Since(started)
 	// Settle before returning a buffered result. A disconnect cannot cancel
 	// accounting for an already completed supplier operation.
@@ -323,7 +344,10 @@ func (s *OpenAIGatewayService) attemptDeepSeekTool(ctx context.Context, w http.R
 	if err = s.RecordUsage(billingCtx, &input); err != nil {
 		logger.L().Error("deepseek tools: usage settlement pending", zap.String("request_id", result.RequestID), zap.String("operation", req.Operation), zap.Error(err))
 		if reply.streamed {
-			return nil, true // the audio is out; the journal keeps the confirmed usage
+			// The audio is out. Recovery settles the usage only if its checkpoint
+			// was saved; if saving failed, nothing is charged for it.
+			logger.L().Error("deepseek tools: audio delivered without confirmed billing", zap.String("request_id", result.RequestID), zap.Int("units", reply.units))
+			return nil, true
 		}
 		message := "Tool completed but billing could not be confirmed; do not automatically retry."
 		if reply.committed {
@@ -366,9 +390,11 @@ func (s *OpenAIGatewayService) failDeepSeekTool(w http.ResponseWriter, reply *de
 	case reply != nil && reply.committed:
 		reply.write(w, deepSeekToolErrorBody("deepseek_tool_error", message, requestID))
 	default:
-		// A lost connection or a gateway timeout leaves the outcome unknown.
-		unknown := errors.Is(err, errDeepSeekToolOutcomeUnknown) || (rejection != nil && (rejection.status == http.StatusBadGateway || rejection.status == http.StatusGatewayTimeout))
-		WriteDeepSeekToolError(w, http.StatusBadGateway, "deepseek_tool_error", message, requestID, unknown)
+		// Only an HTTP error answer says the supplier did not do the work. A lost
+		// connection, a gateway timeout or a 200 whose body was cut short or
+		// unreadable may follow completed, metered work.
+		maybeDone := rejection == nil || rejection.status == http.StatusBadGateway || rejection.status == http.StatusGatewayTimeout
+		WriteDeepSeekToolError(w, http.StatusBadGateway, "deepseek_tool_error", message, requestID, maybeDone)
 	}
 }
 
@@ -402,7 +428,7 @@ func (s *OpenAIGatewayService) relayDeepSeekTool(ctx context.Context, w http.Res
 	case DeepSeekToolOCR:
 		return relayDeepSeekOCR(w, resp.Body)
 	case DeepSeekToolTTS:
-		return relayDeepSeekTTS(ctx, cancel, w, resp, req.EstimateUnits)
+		return relayDeepSeekTTS(ctx, upstreamCtx, cancel, w, resp, req.EstimateUnits)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, deepSeekToolResponseLimit+1))
 	if err != nil || len(data) > deepSeekToolResponseLimit {
@@ -477,7 +503,8 @@ func deepSeekOCRBillablePages(data []byte) int {
 }
 
 // deepSeekASRBillableSeconds is duration_ms rounded up to whole seconds, for a
-// result with recognized text; never more than the accepted audio length.
+// result with recognized text. The duration the client's file declared is not
+// trusted here; the request's size-derived bound caps an absurd answer.
 func deepSeekASRBillableSeconds(data []byte) int {
 	if gjson.GetBytes(data, "error").Exists() {
 		return 0
@@ -486,14 +513,15 @@ func deepSeekASRBillableSeconds(data []byte) int {
 	if text.Type != gjson.String || strings.TrimSpace(text.String()) == "" || duration.Type != gjson.Number || duration.Float() <= 0 || math.IsInf(duration.Float(), 0) {
 		return 0
 	}
-	return int(min(math.Ceil(duration.Float()/1000), deepSeekASRMaxSeconds))
+	return int(min(math.Ceil(duration.Float()/1000), math.MaxInt32))
 }
 
 // relayDeepSeekTTS streams the audio through. The request's billable
 // characters are charged once the supplier has started sending audio and the
-// stream ended or the client left; a JSON answer, an empty answer or an audio
-// stream the supplier cuts short is not charged.
-func relayDeepSeekTTS(ctx context.Context, cancel context.CancelFunc, w http.ResponseWriter, resp *http.Response, characters int) (*deepSeekToolReply, error) {
+// stream ended, the client left, or the gateway's own deadline ended it (a
+// client that reads slowly must not get the audio for free). A JSON answer, an
+// empty answer or an audio stream the supplier cuts short is not charged.
+func relayDeepSeekTTS(ctx, upstreamCtx context.Context, cancel context.CancelFunc, w http.ResponseWriter, resp *http.Response, characters int) (*deepSeekToolReply, error) {
 	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
 	mediaType, _, _ := mime.ParseMediaType(contentType)
 	if mediaType == "application/json" || strings.HasSuffix(mediaType, "+json") || strings.HasPrefix(mediaType, "text/") {
@@ -509,10 +537,7 @@ func relayDeepSeekTTS(ctx context.Context, cancel context.CancelFunc, w http.Res
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	reply := &deepSeekToolReply{contentType: contentType}
-	if length := resp.Header.Get("Content-Length"); length != "" {
-		w.Header().Set("Content-Length", length)
-	}
+	reply := &deepSeekToolReply{contentType: contentType, contentLength: resp.Header.Get("Content-Length")}
 	buf := make([]byte, 32<<10)
 	for {
 		n, err := resp.Body.Read(buf)
@@ -532,11 +557,14 @@ func relayDeepSeekTTS(ctx context.Context, cancel context.CancelFunc, w http.Res
 				reply.clientGone = true
 				break
 			}
+			if reply.streamed && errors.Is(upstreamCtx.Err(), context.DeadlineExceeded) {
+				logger.L().Warn("deepseek tools: tts stream reached the gateway deadline; the input is charged")
+				break
+			}
 			return reply, errors.New("DeepSeek TTS audio was interrupted by the provider")
 		}
 	}
 	if !reply.streamed {
-		w.Header().Del("Content-Length")
 		return nil, errors.New("DeepSeek TTS returned no audio")
 	}
 	reply.units = characters
