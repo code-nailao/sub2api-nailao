@@ -1554,6 +1554,64 @@ class DeployTest(unittest.TestCase):
         self.assertFalse(self.ops.containers[new]["State"]["Running"])
         self.assertIsNone(self.state()["in_progress"])
 
+    def run_handback_with_slow_serving_cleanup(self, *, guard_failure):
+        current = self.state()["current"]
+        previous_bg = current["containers"]["background"]
+        candidate_bg = self.cfg.container("a", "background")
+        candidate_serving = self.cfg.container("a", "serving")
+        candidate_standby = self.cfg.container("a", "standby")
+        cleanup = ["docker", "update", "--restart=no"] if guard_failure else ["docker", "rm", "-f"]
+        self.cfg.background_exit_timeout = 2
+        self.ops.drain_seconds[candidate_bg] = 8
+        if guard_failure:
+            self.ops.memory_after_switch = 20 * GIB
+        else:
+            self.ops.nginx_test_rc = 1
+        original_run = self.ops.run
+        term_at = None
+        cleanup_attempts = []
+
+        def run(args, **kwargs):
+            nonlocal term_at
+            if args == ["docker", "kill", "--signal=TERM", candidate_bg]:
+                term_at = self.ops.clock
+            if term_at is not None and args[:3] == cleanup and args[-1] in (candidate_serving, candidate_standby):
+                cleanup_attempts.append(args[-1])
+                if args[-1] == candidate_serving:
+                    self.assertTrue(self.ops.inspect(previous_bg)["State"]["Running"])
+                    self.assertFalse(self.ops.inspect(candidate_bg)["State"]["Running"])
+                    timeout = kwargs.get("timeout", 600)
+                    self.ops.clock += min(40, timeout)
+                    if timeout < 40:
+                        raise subprocess.TimeoutExpired(args, timeout)
+            return original_run(args, **kwargs)
+
+        reason = "guard failed" if guard_failure else "nginx -t rejected"
+        with mock.patch.object(self.ops, "run", run), deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaisesRegex(deploy.DeployError, reason):
+                self.deploy()
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertIsNotNone(term_at)
+            self.assertLess(self.ops.clock - term_at, 33, "serving cleanup outlasted the handback window")
+            self.assertEqual(current, self.state()["current"])
+            self.assertIn("serving cleanup", self.state()["in_progress"]["failed"])
+        self.assertEqual([candidate_serving], cleanup_attempts)
+        self.assertTrue(self.ops.containers[previous_bg]["State"]["Running"])
+        self.assertFalse(self.ops.containers[candidate_bg]["State"]["Running"])
+        if guard_failure:
+            ports = current["ports"]
+            self.assertEqual(deploy.render_upstreams(ports["serving"], ports["standby"], ports["background"]),
+                             self.ops.files[self.cfg.upstream_file])
+            self.assertIn(candidate_serving, self.ops.containers)
+        else:
+            self.assertFalse(self.ops.switched)
+
+    def test_switch_failure_bounds_serving_cleanup_after_background_handback(self):
+        self.run_handback_with_slow_serving_cleanup(guard_failure=False)
+
+    def test_guard_failure_bounds_serving_cleanup_after_background_handback(self):
+        self.run_handback_with_slow_serving_cleanup(guard_failure=True)
+
     def test_a_reply_cut_off_mid_way_never_ends_the_handoff(self):
         # The old owner exits while answering a runtime read: the progress note
         # and the pre-signal read must not raise out of the handoff.
