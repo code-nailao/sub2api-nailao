@@ -1855,14 +1855,6 @@ class Deployer:
             except (Exception, KeyboardInterrupt) as err:
                 raise AliasPublicationFailed(str(err) or type(err).__name__) from err
 
-    def planned_aliases(self, target: Target) -> dict[str, list[str]]:
-        if not self.cfg.serving_alias or self.ops.dry_run:
-            return {}
-        return {
-            role: list((self.ops.inspect(target.containers[role]) or {}).get("NetworkSettings", {}).get("Networks", {}))
-            for role in SERVING_ROLES
-        }
-
     def configure_rollback_aliases(self, target: Target, identities: dict[str, str],
                                    endpoints: list[ServingEndpoint], *, shared: bool) -> None:
         if self.ops.dry_run:
@@ -2153,7 +2145,7 @@ class Deployer:
         return networks
 
     def configure_held_networks(self, target: Target, identities: dict[str, str],
-                                endpoints: list[ServingEndpoint], *, shared: bool) -> None:
+                                endpoints: list[ServingEndpoint], *, shared: bool, start: bool = True) -> None:
         if not self.cfg.serving_alias:
             return
         self.drain_serving_group(target, identities)
@@ -2194,6 +2186,8 @@ class Deployer:
                 info = self.ops.inspect(target.containers[role]) or {}
                 if info.get("Id") != identities[role] or not self.has_expected_held_networks(info, expected, shared=shared):
                     raise DeployError(f"prepared networking for held {role} is unconfirmed")
+        if not start:
+            return
         for role in SERVING_ROLES:
             self.ops.run(["docker", "start", identities[role]], mutate=True)
         if not self.ops.dry_run:
@@ -2224,12 +2218,17 @@ class Deployer:
         return True
 
     def activate_hold(self, state: dict[str, Any], held: dict[str, Any], active: MainRoute, target: Target,
-                      identities: dict[str, str], endpoints: list[ServingEndpoint]) -> None:
+                      identities: dict[str, str], endpoints: list[ServingEndpoint], *, publish: bool) -> None:
         changed_networks = False
         try:
             if self.cfg.serving_alias:
                 changed_networks = True
-                self.configure_held_networks(target, identities, endpoints, shared=True)
+                self.configure_held_networks(target, identities, endpoints, shared=True, start=publish)
+                if not publish:
+                    # Exercise the requested endpoint setup before changing the
+                    # route or background. The existing owner still serves the
+                    # alias, so the candidates must start in isolation.
+                    self.configure_held_networks(target, identities, endpoints, shared=False)
             # Drain and reconnect can take time. Check again before the handoff.
             self.check_held_background_port(target)
             self.check_held_environment(held)
@@ -2574,12 +2573,10 @@ class Deployer:
                 identities = {role: held["containers"][role]["id"] for role in SERVING_ROLES}
                 assert endpoints is not None
                 self.verify_topology(state, active, target.view())
-                if not self.alias_networks(current):
-                    self.activate_hold(state, held, active, target, identities, endpoints)
-                else:
-                    self.check_held_background_port(target)
-                    self.check_held_environment(held)
-                    alias_plan = self.planned_aliases(target)
+                publish = not self.alias_networks(current)
+                self.activate_hold(state, held, active, target, identities, endpoints, publish=publish)
+                if not publish:
+                    alias_plan = {role: [ep.network for ep in endpoints if ep.role == role] for role in SERVING_ROLES}
         try:
             if create_background:
                 self._mark(state, target, "background handoff")

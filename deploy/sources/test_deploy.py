@@ -1381,7 +1381,10 @@ class DeployTest(unittest.TestCase):
     def test_resume_persistent_second_network_failure_with_existing_provider_leaves_abortable_hold(self):
         self.assert_resume_second_alias_network_failure(persistent=True)
 
-    def assert_resume_second_alias_network_failure(self, *, persistent):
+    def test_resume_alias_network_failure_after_switch_attempts_to_restore_hold(self):
+        self.assert_resume_second_alias_network_failure(persistent=False, only_after_switch=True)
+
+    def assert_resume_second_alias_network_failure(self, *, persistent, only_after_switch=False):
         self.deploy()
         paused = self.hold()
         original, target = paused["current"], paused["target"]
@@ -1393,7 +1396,10 @@ class DeployTest(unittest.TestCase):
             if (args[:3] == ["docker", "network", "connect"] and args[-1] in ids
                     and self.ops.network_name(args[-2]) == self.cfg.networks[1]
                     and (self.cfg.serving_alias in args or persistent)):
-                attempted.append(args)
+                activated = self.upstreams_only(self.ops.loaded_upstreams) == self.upstreams_for(target)
+                if only_after_switch and not activated:
+                    return run(args, **kw)
+                attempted.append(activated)
                 raise deploy.DeployError("fixture second alias network unavailable")
             return run(args, **kw)
 
@@ -1402,6 +1408,7 @@ class DeployTest(unittest.TestCase):
             with self.assertRaisesRegex(deploy.DeployError, "second alias network unavailable"):
                 runner.resume()
         self.assertTrue(attempted)
+        self.assertEqual({only_after_switch}, set(attempted))
         self.assert_live_release(original)
         self.assertEqual(original, self.state()["current"])
         self.assert_release_failure("held")
