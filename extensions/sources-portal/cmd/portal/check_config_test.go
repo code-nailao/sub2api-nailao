@@ -376,25 +376,32 @@ func TestCheckConfigFailsLikeStart(t *testing.T) {
 }
 
 func TestCheckConfigListenAddressFailsLikeStart(t *testing.T) {
-	for _, addr := range []string{"nonsense", "127.0.0.1:99999", "127.0.0.1:no-such-service-name"} {
+	for _, addr := range []string{"nonsense", "127.0.0.1:99999", "127.0.0.1:no-such-service-name", "bad host:0"} {
 		t.Run(addr, func(t *testing.T) {
 			start := newCheckFixture(t)
 			start.env["PORTAL_LISTEN"] = addr
 			var logged bytes.Buffer
-			if code := serve(start.getenv, log.New(&logged, "", 0)); code != 1 || strings.TrimSpace(logged.String()) != errListener {
+			if code := serve(start.getenv, log.New(&logged, "", 0)); code != 1 || strings.TrimSpace(logged.String()) != errListenAddress {
 				t.Fatalf("start: code=%d log=%q", code, logged.String())
 			}
 			check := newCheckFixture(t)
 			check.env["PORTAL_LISTEN"] = addr
-			if code, _, stderr := runCheck(check); code != 1 || stderr != errListener+"\n" {
+			if code, _, stderr := runCheck(check); code != 1 || stderr != errListenAddress+"\n" {
 				t.Fatalf("check: code=%d stderr=%q", code, stderr)
 			}
 		})
 	}
-	f := newCheckFixture(t)
-	f.env["PORTAL_LISTEN"] = ""
-	if code, _, stderr := runCheck(f); code != 0 {
-		t.Fatalf("default listen address: %s", stderr)
+}
+
+func TestCheckConfigAcceptsListenHostFormats(t *testing.T) {
+	for _, addr := range []string{"", ":0", "127.0.0.1:0", "[::1]:0", "portal-test:0", "portal-test.example.:0"} {
+		t.Run(addr, func(t *testing.T) {
+			f := newCheckFixture(t)
+			f.env["PORTAL_LISTEN"] = addr
+			if code, _, stderr := runCheck(f); code != 0 {
+				t.Fatalf("check: code=%d stderr=%q", code, stderr)
+			}
+		})
 	}
 }
 

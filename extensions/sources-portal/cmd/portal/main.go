@@ -56,6 +56,7 @@ const (
 	errStudioURL          = "STUDIO_URL requires a fixed HTTPS page with a canonical ASCII host and port (no Unicode, trailing dot or port padding)"
 	errStudioOrigin       = "STUDIO_URL must use a separate origin so the workbench cannot read Main login storage"
 	errCanvasURL          = "CANVAS_URL requires a fixed HTTPS page on a separate origin with a canonical ASCII host and port (no Unicode, trailing dot or port padding)"
+	errListenAddress      = "PORTAL_LISTEN requires a valid host:port address"
 	errListener           = "extension HTTP listener unavailable"
 	errServer             = "extension HTTP server failed"
 )
@@ -107,9 +108,8 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 	}
 }
 
-// checkConfig runs every start-up validation without taking the state lock,
-// writing state, listening or starting workers, so a deploy can verify a new
-// build against the real configuration while the old process still runs.
+// checkConfig validates startup settings and readable state while the old
+// process can still hold the lock. Only serve binds the listener.
 func checkConfig(getenv func(string) string) error {
 	setup, err := prepare(getenv, checkState)
 	if err != nil {
@@ -146,11 +146,11 @@ func serve(getenv func(string) string, logger *log.Logger) int {
 // the server. On failure it releases the store it opened and returns the message.
 func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup, failure error) {
 	fail := func(message string) (*portalSetup, error) { return nil, startupError(message) }
-	sub, err := canonicalBrowserOrigin(getenv("SUB_ORIGIN"))
+	sub, err := canonicalMainSiteOrigin(getenv("SUB_ORIGIN"))
 	if err != nil {
 		return fail(errSubOrigin)
 	}
-	public, err := canonicalBrowserOrigin(getenv("PORTAL_ORIGIN"))
+	public, err := canonicalMainSiteOrigin(getenv("PORTAL_ORIGIN"))
 	if err != nil {
 		return fail(errPortalOrigin)
 	}
@@ -288,10 +288,12 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 	}
 	// Only binding proves an address; both modes validate its form before any
 	// lock file, directory or migration can be written.
-	if _, port, err := net.SplitHostPort(addr); err != nil {
-		return fail(errListener)
-	} else if _, err := net.LookupPort("tcp", port); err != nil {
-		return fail(errListener)
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || !validListenHost(host) {
+		return fail(errListenAddress)
+	}
+	if _, err := net.LookupPort("tcp", port); err != nil {
+		return fail(errListenAddress)
 	}
 	if open.check {
 		// A start creates a missing directory and would come up with empty state;
@@ -333,4 +335,15 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 		}
 	}
 	return &portalSetup{store: store, svc: svc, server: server, addr: addr}, nil
+}
+
+func validListenHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	// Listen addresses may use fully qualified DNS names with a root dot.
+	return validDNSHostname(strings.TrimSuffix(host, "."))
 }
