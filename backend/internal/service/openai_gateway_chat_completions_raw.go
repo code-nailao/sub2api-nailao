@@ -131,6 +131,13 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 		return nil, policyErr
 	}
 	upstreamBody = updatedBody
+	if targetsDeepSeekAPIHost(account) {
+		pairedBody, err := normalizeDeepSeekChatToolPairing(ctx, upstreamBody)
+		if err != nil {
+			return nil, rejectDeepSeekChatFilter(c, err)
+		}
+		upstreamBody = pairedBody
+	}
 	// Keep the final outbound tier separate from the observed response tier so
 	// usage recording can apply the selected credential's response contract.
 	serviceTier := extractOpenAIServiceTierFromBody(upstreamBody)

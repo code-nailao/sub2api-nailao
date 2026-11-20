@@ -2516,6 +2516,22 @@
       ]
     },
     {
+      "path": "backend/internal/service/deepseek_chat_tool_pairing.go",
+      "features": [
+        "deepseek_chat_tool_pairing"
+      ],
+      "reason": "Repairs native DeepSeek Chat history by removing orphan tool results, moving unambiguously matched results next to their calls and supplying empty results for unanswered calls. Keeps valid history unchanged and copies retained messages from their original byte spans.",
+      "sha256": "ab92ea5f77df56ed924fd11619bd629b10993e28adfb4e571a6f1f841b2ca4b8"
+    },
+    {
+      "path": "backend/internal/service/deepseek_chat_tool_pairing_test.go",
+      "features": [
+        "deepseek_chat_tool_pairing"
+      ],
+      "reason": "Checks outgoing stream and buffered Chat payloads for orphan, missing, and displaced tool messages, byte preservation, repeated IDs and protocol scope.",
+      "sha256": "4d4cd450662061f038ec8ebd7f1ed6083a89ec63f7e22c254a74a6e42ba31198"
+    },
+    {
       "path": "backend/internal/service/deepseek_forced_tool_choice.go",
       "features": [
         "deepseek_tool_compat"
@@ -2534,10 +2550,11 @@
     {
       "path": "backend/internal/service/deepseek_request_json.go",
       "features": [
-        "deepseek_in_chat_tool_types"
+        "deepseek_in_chat_tool_types",
+        "deepseek_chat_tool_pairing"
       ],
-      "sha256": "9185a4e8a3f545aabe06730d09de5e2bc1c7d46132d9f3f407a31c17c9a7e935",
-      "reason": "Scans the Chat request envelope once for groups with tools turned off. Filters web tools by type prefix and rejects duplicates only in the tool fields. Adds the unavailable notice to the last messages field or to input for raw Responses-shaped requests. Normalizes tool choices by type and name, gives explicitly named surviving tools priority, and downgrades choices for removed tools and bare tool or function selectors. Preserves unrelated bytes and drops required when filtering empties the tool list."
+      "sha256": "b586c8bde5e422fe77a40300cd0d0010759072c0847550677aebb4796a36f74a",
+      "reason": "Scans the Chat request envelope once for groups with tools turned off. Filters web tools by type prefix and rejects duplicates only in the tool fields. Adds the unavailable notice to the last messages field or to input for raw Responses-shaped requests. Normalizes tool choices by type and name, gives explicitly named surviving tools priority, and downgrades choices for removed tools and bare tool or function selectors. Preserves unrelated bytes and drops required when filtering empties the tool list. The shared scanner also recognizes array scalar boundaries and escaped tool_call_id keys for Chat history pairing."
     },
     {
       "path": "backend/internal/service/deepseek_stream_timing_test.go",
@@ -2982,10 +2999,11 @@
     {
       "path": "backend/internal/service/openai_gateway_chat_completions_raw.go",
       "features": [
-        "grok_content_rejection_billing"
+        "grok_content_rejection_billing",
+        "deepseek_chat_tool_pairing"
       ],
-      "sha256": "c057c67443e8140621fc3c0bd657578dd4eadaea9c4b7f6dc539821cfe7dd949",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks."
+      "sha256": "fae25504416764fcd477eeeb30838b2894cb638d1a1dabe872e22b6b3facfeba",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Normalizes tool call and result pairing before streaming or buffered native Chat forwarding to DeepSeek."
     },
     {
       "path": "backend/internal/service/openai_gateway_forward.go",
