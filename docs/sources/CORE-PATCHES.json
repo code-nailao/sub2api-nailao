@@ -2532,6 +2532,14 @@
       "sha256": "79856294998a4a8b8c4cbf25494b6fec2ab99c8e80f26b3526e3c96e0adf64ce"
     },
     {
+      "path": "backend/internal/service/deepseek_request_json.go",
+      "features": [
+        "deepseek_tools"
+      ],
+      "reason": "For Chat requests in groups with tools turned off, scans the body once for raw top-level spans and strictly parses only tools and tool_choice. Rejects duplicate keys in those fields, excessive nesting and oversized arrays with cancellation checks. Copies untouched fields and retained tools directly into a single output, adjusts choices targeting removed tools and reuses the existing unavailable notice.",
+      "sha256": "8153cf8c1e37f09ebf1f7eae5fbc2475951a7ebf954d8c43b858890e4cc3fa57"
+    },
+    {
       "path": "backend/internal/service/deepseek_tool_endpoints.go",
       "features": [
         "deepseek_tool_endpoints"
@@ -2597,16 +2605,16 @@
         "deepseek_tools",
         "deepseek_in_chat_tool_types"
       ],
-      "reason": "Keeps evidence-bound hosted-tool fallback and no-replay rules. Ordinary Chat removes unavailable web tool families and resolves nested forced choices, including a versioned tool forced by its base name, while preserving valid client functions. Uses a single JSON token pass with scoped decoded keys, a bounded container-depth stack and cancellation checks between tokens and bounded refills; duplicate or excessive-depth ordinary Chat requests stop before forwarding and billing without re-encoding other bytes.",
-      "sha256": "7c339923dd4247133cbe30a62511a866f260a75480c8d931d779c240f253615d"
+      "reason": "Provides the unavailable notice and evidence-bound hosted-tool fallback, including preservation of client-owned forced choices and no replay of unknown outcomes. Also handles the existing ordinary-path tool edits for protocols and enabled groups outside the disabled-group Chat filter.",
+      "sha256": "401c1b1fde6b397b4e1784e223cfee073429826d663ffde47af7fa1965684c46"
     },
     {
       "path": "backend/internal/service/deepseek_tools_degradation_review_test.go",
       "features": [
         "deepseek_tools"
       ],
-      "reason": "Tests hosted fallback, forced client choices and unknown/partial-outcome no-replay boundaries. Also checks cancellation during large-string and multi-token scans, exact object/array depth boundaries, escaped equivalent keys and independent object scopes.",
-      "sha256": "222e0643148eba740a599013bc1ae48f253904866b784875cbe33998413a2b28"
+      "reason": "Tests hosted fallback and no-replay boundaries, plus byte preservation, exact depth boundaries, escaped duplicate keys and cancellation during opaque envelope and strict tool scans.",
+      "sha256": "b59d4b92c1e18a1c5185981fc558b9c3d9511a6071d74c607e5e938a6d878468"
     },
     {
       "path": "backend/internal/service/deepseek_tools_degradation_test.go",
@@ -2623,7 +2631,7 @@
         "deepseek_tool_endpoints",
         "deepseek_in_chat_tool_types"
       ],
-      "reason": "Serves a DeepSeek request on the ordinary path when the group has the web tools off, or when tools the gateway adds on its own cannot be set up, instead of failing the request; a request that names a server tool itself still gets the error. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook. Tests for this behaviour. On the Chat Completions path, which forwards the request without conversion, web_search and web_fetch entries are removed as well when the loop does not take the request.",
+      "reason": "Tests optional tool setup fallback for DeepSeek. Ordinary requests remain available with tools disabled or unavailable. When setup fails for client-declared web tools, the gateway removes the declarations and adds an unavailable notice before ordinary forwarding.",
       "sha256": "dbbf8eb706729b1d1108b9e35f577e3613469395f40c315c739565d7076afd8e"
     },
     {
@@ -2642,16 +2650,16 @@
         "deepseek_tool_compat",
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "38f465fe9f767244e92540b73d0ce3d0427759dc8d6728593adcbb935ca053cc",
-      "reason": "Adds optional hosted web search and fetch for DeepSeek groups using group pricing, shared tool credentials, per-key automatic tools, protocol streaming, confirmed usage checkpoints and stable tool names. Optional setup failures continue through ordinary forwarding after removing unavailable declarations and adding a notice. Centralizes web-tool family prefixes and operations; Chat and hosted recognition accept base types and underscore-delimited preview or version suffixes. Responses/Messages ordinary filtering retains its existing native-base-only byte contract. Stops canceled Chat requests before parsing and validates ordinary/fallback Chat bodies before forwarding or billing. Removes the unused native-tool execution branch."
+      "sha256": "0890910eab707972a7495c8511141395252f7572342d732e8f8a2dcc085be381",
+      "reason": "Adds optional hosted web search and fetch for DeepSeek groups using group pricing, shared tool credentials, per-key automatic tools, protocol streaming, confirmed usage checkpoints and stable tool names. Centralizes web-tool family matching. Only Chat requests for groups with tools turned off use the strict span filter, with validation failures returned before forwarding or billing. Enabled groups and Responses/Messages keep their existing hosted and ordinary fallback handling, including the unavailable notice when setup fails for client-declared tools."
     },
     {
       "path": "backend/internal/service/deepseek_tools_in_chat_test.go",
       "features": [
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "de98b939408460231b38b265db16c459d37bea67a0eced2ac0964a711a8f6338",
-      "reason": "Tests hosted web-tool execution and ordinary-path degradation with mock upstream and in-memory billing doubles. Covers official preview and synthetic future families, nested and base-name forced choices, retained client functions, duplicate/escaped fields, streamed and non-streamed outbound bodies, ordinary billing parity, unchanged other-protocol bytes, and bounded canceled or excessive-depth metadata validation."
+      "sha256": "9002f30efdc49d668ceec5ca94df6fbf853190dfc7888979ab891726833c4ec9",
+      "reason": "Tests with mock upstream and in-memory billing. Covers streamed and non-streamed forwarding, ordinary billing parity, future web-tool families, forced choices, byte preservation, protocol and enabled-group bypass, and bounded handling of large lists, excessive depth, duplicate keys and canceled requests."
     },
     {
       "path": "backend/internal/service/deepseek_tools_incremental.go",

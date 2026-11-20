@@ -517,6 +517,13 @@ func (s *OpenAIGatewayService) deepSeekBodyWithout(body []byte, protocol string,
 	return next
 }
 
+func rejectDeepSeekChatFilter(c *gin.Context, err error) error {
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+	}
+	return err
+}
+
 // tryForwardDeepSeekTools runs the hosted web tool loop when the request is
 // its to serve (handled). Otherwise it returns the body to forward on the
 // ordinary path, which may differ from the one passed in: web tool entries the
@@ -534,32 +541,26 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 		if err := ctx.Err(); err != nil {
 			return nil, body, true, err
 		}
-	}
-	if protocol == "chat" && !gjson.GetBytes(body, "messages").Exists() && gjson.GetBytes(body, "input").Exists() {
-		protocol = "responses"
-	}
-	// Only ordinary Chat processing needs this guard. The hosted loop decodes
-	// its request, and the other protocols keep their existing byte contract.
-	rejectAmbiguousChat := func() error {
-		if protocol != "chat" {
-			return nil
+		if !key.Group.DeepSeekTools.Enabled {
+			top, err := scanDeepSeekChatEnvelope(ctx, body)
+			if err != nil {
+				return nil, body, true, rejectDeepSeekChatFilter(c, err)
+			}
+			if top.messages != nil || !top.hasInput {
+				next, err := filterDeepSeekChatWebTools(ctx, body, top)
+				if err != nil {
+					return nil, body, true, rejectDeepSeekChatFilter(c, err)
+				}
+				return nil, next, false, nil
+			}
+			protocol = "responses"
+		} else if !gjson.GetBytes(body, "messages").Exists() && gjson.GetBytes(body, "input").Exists() {
+			protocol = "responses"
 		}
-		err := validateDeepSeekChatJSON(ctx, body)
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
-		}
-		return err
 	}
-	// Without the hosted loop (tools off for the group, or tool_choice none)
-	// the web tool entries the ordinary path must not carry are removed, with
-	// the notice unless tool_choice is none: the provider's own types in every
-	// protocol, and on Chat Completions, which is forwarded without conversion,
-	// web_search* and web_fetch* as well. Responses and Messages keep those for
-	// their lowering and for Messages search emulation.
+	// Enabled groups and other protocols keep their existing hosted loop and
+	// ordinary fallback behavior, including provider-specific tool removal.
 	if !key.Group.DeepSeekTools.Enabled || !deepSeekWantsTools(body, key.DeepSeekToolsAutoInject()) {
-		if err := rejectAmbiguousChat(); err != nil {
-			return nil, body, true, err
-		}
 		return nil, s.deepSeekBodyWithout(body, protocol, deepSeekOrdinaryPathDrops(protocol), deepSeekWantsTools(body, true), key, account), false, nil
 	}
 	// The tools are optional. When they cannot be set up, nothing has been sent
@@ -568,9 +569,6 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 	// tools the client declared are removed with a notice that live information
 	// could not be checked.
 	unavailable := func(cause error) (*OpenAIForwardResult, []byte, bool, error) {
-		if err := rejectAmbiguousChat(); err != nil {
-			return nil, body, true, err
-		}
 		logger.L().Warn("deepseek tools: optional tools unavailable, forwarding without them",
 			zap.Int64("account_id", account.ID), zap.Int64("group_id", key.Group.ID), zap.Error(cause))
 		if !deepSeekWantsTools(body, false) {

@@ -31,21 +31,38 @@ func (c *deepSeekCancelDuringScan) Err() error {
 	return c.Context.Err()
 }
 
+func runDeepSeekChatFilter(ctx context.Context, body []byte) ([]byte, error) {
+	top, err := scanDeepSeekChatEnvelope(ctx, body)
+	if err != nil {
+		return nil, err
+	}
+	return filterDeepSeekChatWebTools(ctx, body, top)
+}
+
 func TestDeepSeekChatJSONCancellationDuringScan(t *testing.T) {
-	for _, tc := range []struct{ name, value string }{
-		{"large_string", `"` + strings.Repeat("x", 8<<20) + `"`},
-		{"many_tokens", `[` + strings.Repeat(`null,`, 1<<16) + `null]`},
+	for _, tc := range []struct {
+		name, fields string
+		duringTools  bool
+	}{
+		{"opaque_string", `"metadata":"` + strings.Repeat("x", 8<<20) + `","tools":[]`, false},
+		{"tool_string", `"tools":[{"type":"web_search","description":"` + strings.Repeat("x", 8<<20) + `"}]`, true},
+		{"tool_array", `"tools":[` + strings.Repeat(`{"type":"web_search"},`, 20_000) + `null]`, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			body := []byte(`{` + tc.fields + `}`)
 			probe := &deepSeekCancelDuringScan{Context: ctx, cancel: cancel, after: 16}
-			body := []byte(`{"metadata":` + tc.value + `}`)
+			if tc.duringTools {
+				// Let the envelope scan finish, then cancel during the
+				// strict decoder's refills or token reads.
+				probe.after += len(body) / deepSeekJSONChunk
+			}
 			started := time.Now()
-			err := validateDeepSeekChatJSON(probe, body)
+			out, err := runDeepSeekChatFilter(probe, body)
 			require.Less(t, time.Since(started), 2*time.Second)
 			require.ErrorIs(t, err, context.Canceled)
-			require.GreaterOrEqual(t, probe.checks, probe.after)
+			require.Nil(t, out)
 		})
 	}
 }
@@ -58,10 +75,13 @@ func TestDeepSeekChatJSONDepthBoundary(t *testing.T) {
 				if array {
 					open, close = `[`, `]`
 				}
-				body := []byte(`{"metadata":` + strings.Repeat(open, depth-1) + `null` + strings.Repeat(close, depth-1) + `}`)
-				err := validateDeepSeekChatJSON(context.Background(), body)
+				body := []byte(`{"tools":[],"tool_choice":` + strings.Repeat(open, depth-1) + `null` + strings.Repeat(close, depth-1) + `}`)
+				started := time.Now()
+				out, err := runDeepSeekChatFilter(context.Background(), body)
+				require.Less(t, time.Since(started), 2*time.Second)
 				if depth == deepSeekChatJSONMaxDepth {
 					require.NoError(t, err)
+					require.Equal(t, body, out)
 				} else {
 					require.ErrorContains(t, err, "nesting")
 				}
@@ -72,20 +92,41 @@ func TestDeepSeekChatJSONDepthBoundary(t *testing.T) {
 
 func TestDeepSeekChatJSONKeepsObjectScopesAndDecodedKeys(t *testing.T) {
 	for _, tc := range []struct{ name, body, failure string }{
-		{"siblings", `{"metadata":[{"name":"lookup"},{"name":"lookup"}],"seed":123456789012345678901234567890}`, ""},
-		{"nested_scope", `{"metadata":{"nested":{"name":"lookup"},"name":"lookup","empty":{}},"array":[[],{},true,false,null]}`, ""},
-		{"escaped_duplicate", `{"metadata":[{"\u006eame":"lookup","name":"lookup"}]}`, "duplicate"},
-		{"escaped_quotes", `{"metadata":{"a\"b":null,"a\u0022b":null}}`, "duplicate"},
+		{"siblings", `{"tools":[{"type":"function","function":{"name":"lookup"},"other":[{"name":"lookup"},{"name":"lookup"}]}],"seed":123456789012345678901234567890}`, ""},
+		{"nested_scope", `{"tools":[{"nested":{"name":"lookup"},"name":"lookup","empty":{}}],"array":[[],{},true,false,null]}`, ""},
+		{"opaque_duplicates", `{"metadata":[{"\u006eame":"first","name":"second"}],"metadata":{},"tools":[{"type":"function"}]}`, ""},
+		{"escaped_duplicate", `{"tools":[{"metadata":[{"\u006eame":"lookup","name":"lookup"}]}]}`, "duplicate"},
+		{"escaped_quotes", `{"tools":[],"tool_choice":{"a\"b":null,"a\u0022b":null}}`, "duplicate"},
 		{"trailing_document", `{"metadata":null}{}`, "invalid"},
 		{"unfinished_object", `{"metadata":`, "invalid"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateDeepSeekChatJSON(context.Background(), []byte(tc.body))
+			body := []byte(tc.body)
+			out, err := runDeepSeekChatFilter(context.Background(), body)
 			if tc.failure == "" {
 				require.NoError(t, err)
+				require.Equal(t, body, out)
 			} else {
 				require.ErrorContains(t, err, tc.failure)
 			}
+		})
+	}
+}
+
+func TestDeepSeekChatFilterEditsOnlySelectedSpans(t *testing.T) {
+	for _, tc := range []struct{ name, body, want string }{
+		{"leading_fields_removed", ` {"tool_choice":{"type":"web_search"}, "\u0074ools":[{"type":"web_search"}], "meta":{"key":1,"key":2}} `, ` { "meta":{"key":1,"key":2},"messages":[` + deepSeekChatNoticeMessage + `]} `},
+		{"nonadjacent_fields_removed", `{"tools":[{"type":"web_fetch"}], "metadata":{"literal":"[}\"","big":12345678901234567890}, "tool_choice":{"type":"function","function":{"name":"missing"}}}`, `{ "metadata":{"literal":"[}\"","big":12345678901234567890},"messages":[` + deepSeekChatNoticeMessage + `]}`},
+		{"all_fields_removed", `{"tools":[{"type":"web_fetch"}], "tool_choice":"web_fetch" }`, `{ "messages":[` + deepSeekChatNoticeMessage + `]}`},
+		{"none_preserved", `{"tools":[{"type":"web_search"}],"tool_choice": "none"}`, `{"tool_choice": "none"}`},
+		{"generic_auto_preserved", `{"tool_choice": "auto", "tools":[{"type":"web_search"}],"messages":[  ]}`, `{"tool_choice": "auto","messages":[  ` + deepSeekChatNoticeMessage + `]}`},
+		{"retained_bytes", `{"tools" : [ 99e100 , {"type":"web_fetch_preview_future"}, {"type":"web_searchable"}, { "type": "function", "function":{"name":"web_search"}}], "messages":[{"role":"user","content":"literal \\ \" [ ]"}],"meta": {"z":1,"z":2}}`, `{"tools" : [99e100,{"type":"web_searchable"},{ "type": "function", "function":{"name":"web_search"}}], "messages":[{"role":"user","content":"literal \\ \" [ ]"},` + deepSeekChatNoticeMessage + `],"meta": {"z":1,"z":2}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runDeepSeekChatFilter(context.Background(), []byte(tc.body))
+			require.NoError(t, err)
+			require.True(t, gjson.ValidBytes(out), "%s", out)
+			require.Equal(t, tc.want, string(out))
 		})
 	}
 }

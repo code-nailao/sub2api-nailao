@@ -1,11 +1,8 @@
 package service
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 
 	"github.com/tidwall/gjson"
@@ -65,118 +62,6 @@ func deepSeekCanFallbackWithoutTools(err error, httpStatus int) bool {
 // deepSeekToolsUnavailableNotice tells the model that the web tools it was
 // offered cannot be used, so it answers without claiming to have searched.
 const deepSeekToolsUnavailableNotice = "The gateway's optional web tools are unavailable for this request. Answer using the conversation and existing knowledge when appropriate. If live information is needed, tell the user it could not be verified. Do not claim to have searched, fetched, or verified sources."
-
-const (
-	deepSeekChatJSONMaxDepth  = 128
-	deepSeekChatJSONReadChunk = 4 << 10
-)
-
-// Bound each decoder refill so cancellation is observed even inside one large
-// string token. The request bytes were already bounded by ingress middleware.
-type deepSeekChatJSONReader struct {
-	ctx  context.Context
-	body []byte
-}
-
-func (r *deepSeekChatJSONReader) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
-	}
-	if len(r.body) == 0 {
-		return 0, io.EOF
-	}
-	if len(p) > deepSeekChatJSONReadChunk {
-		p = p[:deepSeekChatJSONReadChunk]
-	}
-	n := copy(p, r.body)
-	r.body = r.body[n:]
-	return n, nil
-}
-
-// Read tokens once in wire order instead of rescanning each ancestor's raw
-// subtree. Decoded object keys catch escaped duplicates without re-encoding the
-// request, and UseNumber avoids float conversion of otherwise untouched values.
-func validateDeepSeekChatJSON(ctx context.Context, body []byte) error {
-	decoder := json.NewDecoder(&deepSeekChatJSONReader{ctx: ctx, body: body})
-	decoder.UseNumber()
-	invalid := errors.New("invalid JSON in Chat request")
-	next := func() (json.Token, error) {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		token, err := decoder.Token()
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-			if err != io.EOF {
-				return nil, invalid
-			}
-		}
-		return token, err
-	}
-	first, err := next()
-	if err != nil && err != io.EOF {
-		return err
-	}
-	if first != json.Delim('{') {
-		return invalid
-	}
-	type scope struct {
-		keys    map[string]struct{}
-		wantKey bool
-	}
-	stack := []scope{{keys: make(map[string]struct{}), wantKey: true}}
-	for len(stack) > 0 {
-		token, err := next()
-		if err != nil {
-			if err == io.EOF {
-				return invalid
-			}
-			return err
-		}
-		delim, container := token.(json.Delim)
-		if container && (delim == '}' || delim == ']') {
-			stack[len(stack)-1] = scope{}
-			stack = stack[:len(stack)-1]
-			continue
-		}
-		current := &stack[len(stack)-1]
-		if current.keys != nil {
-			if current.wantKey {
-				key, ok := token.(string)
-				if !ok {
-					return invalid
-				}
-				if _, duplicate := current.keys[key]; duplicate {
-					return errors.New("duplicate JSON fields are not supported in Chat requests without web tools")
-				}
-				current.keys[key] = struct{}{}
-				current.wantKey = false
-				continue
-			}
-			current.wantKey = true
-		}
-		if container {
-			if len(stack) >= deepSeekChatJSONMaxDepth {
-				return errors.New("chat request JSON exceeds maximum nesting depth")
-			}
-			child := scope{}
-			if delim == '{' {
-				child.keys = make(map[string]struct{})
-				child.wantKey = true
-			}
-			stack = append(stack, child)
-		}
-	}
-	if _, err := next(); err != io.EOF {
-		if err != nil {
-			return err
-		}
-		return invalid
-	}
-	return nil
-}
 
 // First-turn fallback has no tool-result slot, so explicitly disclose the
 // unavailable web capability in the model input without changing user history.
