@@ -70,7 +70,7 @@ func ConflictingField(contentType string, body []byte) (string, bool) {
 	// preamble），前导内容可以是任意 JSON。
 	looksJSON := LooksLikeJSON(TrimUTF8BOM(body))
 	if looksJSON {
-		if field, conflict := scanDuplicateMember(TrimUTF8BOM(body)); conflict {
+		if field, conflict := scanDuplicateMember(TrimUTF8BOM(body), false); conflict {
 			return field, true
 		}
 	}
@@ -90,6 +90,12 @@ func ConflictingField(contentType string, body []byte) (string, bool) {
 	return "", false
 }
 
+// ConflictingClaudeMetadataField scans the metadata object bound by Antigravity.
+// Its user_id field follows the case folding of encoding/json struct fields.
+func ConflictingClaudeMetadataField(body []byte) (string, bool) {
+	return scanDuplicateMember(body, true)
+}
+
 // maxConflictDepth 与 encoding/json 的嵌套上限一致。
 const maxConflictDepth = 10000
 
@@ -101,10 +107,9 @@ const conflictLinearScanLimit = 32
 var conflictHashSeed = maphash.MakeSeed()
 
 type scanFrame struct {
-	object   bool
-	fold     bool // 是否按大小写折叠比较本对象的协议成员名
-	metadata bool // 顶层 metadata 对象，仅 user_id 按结构体绑定规则折叠
-	wantKey  bool // object：下一个字符串是成员名
+	object  bool
+	fold    bool // 是否按大小写折叠比较本对象的协议成员名
+	wantKey bool // object：下一个字符串是成员名
 	// 当前成员名在请求体中的原始范围（不含引号），用于路径与自由键判定。
 	keyStart, keyEnd int
 	keyEscaped       bool
@@ -114,16 +119,17 @@ type scanFrame struct {
 }
 
 type duplicateScanner struct {
-	body   []byte
-	stack  []scanFrame
-	hashes []uint64
-	hash   maphash.Hash
-	runes  []byte
-	names  []byte
+	body           []byte
+	claudeMetadata bool
+	stack          []scanFrame
+	hashes         []uint64
+	hash           maphash.Hash
+	runes          []byte
+	names          []byte
 }
 
-func scanDuplicateMember(body []byte) (string, bool) {
-	s := duplicateScanner{body: body}
+func scanDuplicateMember(body []byte, claudeMetadata bool) (string, bool) {
+	s := duplicateScanner{body: body, claudeMetadata: claudeMetadata}
 	s.hash.SetSeed(conflictHashSeed)
 	overflow := 0 // 超过 maxConflictDepth 后未闭合的括号数
 	for i := 0; i < len(body); {
@@ -176,27 +182,23 @@ func scanDuplicateMember(body []byte) (string, bool) {
 }
 
 func (s *duplicateScanner) push(object bool) {
-	fold := true
-	metadata := false
+	fold := !s.claudeMetadata
 	if n := len(s.stack); n > 0 {
 		parent := &s.stack[n-1]
 		fold = parent.fold
 		if fold && parent.object {
 			s.names = appendMemberName(s.names[:0], s.body[parent.keyStart:parent.keyEnd], parent.keyEscaped, false)
-			metadata = object && n == 1 && bytes.EqualFold(s.names, []byte("metadata"))
 			fold = !isFreeformMember(s.names, n > 1)
 		}
 	}
-	s.stack = append(s.stack, scanFrame{object: object, fold: fold, metadata: metadata, wantKey: object, hashStart: len(s.hashes)})
+	s.stack = append(s.stack, scanFrame{object: object, fold: fold, wantKey: object, hashStart: len(s.hashes)})
 }
 
 // repeated 登记 top 的当前成员名，返回它是否与本对象中更早的成员重名。
 func (s *duplicateScanner) repeated(top *scanFrame) bool {
 	s.hash.Reset()
 	s.runes = appendMemberName(s.runes[:0], s.body[top.keyStart:top.keyEnd], top.keyEscaped, top.fold)
-	if top.metadata && bytes.EqualFold(s.runes, []byte("user_id")) {
-		// Antigravity binds this particular field case-insensitively. Other
-		// metadata keys belong to the caller and keep their exact spelling.
+	if s.claudeMetadata && len(s.stack) == 1 && bytes.EqualFold(s.runes, []byte("user_id")) {
 		_, _ = s.hash.WriteString("user_id")
 	} else {
 		_, _ = s.hash.Write(s.runes)
@@ -246,11 +248,10 @@ func (s *duplicateScanner) path() string {
 }
 
 // freeformMembers 的值是用户自定义键空间：JSON Schema 的属性表与取值、工具调用
-// 参数、提示词模板变量、MCP 请求头、标签。这些子树内的成员名只做精确比较（成员名
-// 解码后不区分大小写地匹配本表）。它们都不在网关计费/策略读取、也不被结构体绑定
-// 的字段路径上；input / response 只在非顶层时算（顶层 input 是 Responses 的输入
-// 列表，顶层 response 是 realtime response.create 的参数）。顶层 metadata.user_id
-// 是结构体绑定的协议字段，例外规则见 repeated。
+// 参数、提示词模板变量、MCP 请求头、标签与元数据。通用扫描在这些子树内对成员名
+// 只做精确比较（成员名解码后不区分大小写地匹配本表）。input / response 只在非顶层
+// 时算（顶层 input 是 Responses 的输入列表，顶层 response 是 realtime
+// response.create 的参数）。
 var freeformMembers = []string{
 	"properties", "patternProperties", "$defs", "definitions", "dependentSchemas",
 	"dependentRequired", "dependencies", "default", "const", "examples", "enum",
@@ -472,7 +473,7 @@ func multipartConflictingField(contentType string, body []byte) (field string, c
 			continue
 		}
 		if doc := TrimUTF8BOM(data); LooksLikeJSON(doc) {
-			if field, conflict := scanDuplicateMember(doc); conflict {
+			if field, conflict := scanDuplicateMember(doc, false); conflict {
 				return "session." + field, true, parts
 			}
 		}

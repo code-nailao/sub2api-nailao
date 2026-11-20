@@ -128,7 +128,7 @@ func (s *OpenAIGatewayService) forwardChatCompletionsViaNativeAnthropic(
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if err := stopHostedToolTimeout(c, resp.StatusCode, forwardedBody, APIProtocolChatCompletions); err != nil {
+	if err := stopNativeAnthropicHostedToolTimeout(c, resp.StatusCode, forwardedBody, APIProtocolChatCompletions); err != nil {
 		return nil, err
 	}
 

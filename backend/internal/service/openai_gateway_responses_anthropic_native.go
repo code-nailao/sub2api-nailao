@@ -132,7 +132,7 @@ func (s *OpenAIGatewayService) forwardResponsesViaNativeAnthropic(
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if err := stopHostedToolTimeout(c, resp.StatusCode, forwardedBody, APIProtocolResponses); err != nil {
+	if err := stopNativeAnthropicHostedToolTimeout(c, resp.StatusCode, forwardedBody, APIProtocolResponses); err != nil {
 		return nil, err
 	}
 

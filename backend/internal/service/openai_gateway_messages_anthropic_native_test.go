@@ -83,6 +83,71 @@ data: {"type":"message_stop"}
 	}
 }
 
+func TestNativeAnthropic408UsesTheEffectiveToolSelection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const responseShape = `{"model":"minimax-m3","input":"fixture","tools":[{"type":"web_search"},{"type":"function","name":"local_lookup","parameters":{"type":"object"}}],"tool_choice":{"type":"function","name":%q}}`
+	const messagesShape = `{"model":"minimax-m3","max_tokens":32,"messages":[{"role":"user","content":"fixture"}],"tools":[{"type":"web_search_20250305","name":"web_search"},{"type":"custom","name":"local_lookup","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":%q}}`
+	for _, ingress := range []struct {
+		path, template string
+	}{
+		{"/v1/responses", responseShape},
+		{"/v1/chat/completions", responseShape},
+		{"/v1/messages", messagesShape},
+	} {
+		for _, scenario := range []struct {
+			selected string
+			failover bool
+		}{
+			{"local_lookup", true},
+			{"web_search", false},
+			{"undeclared", false},
+		} {
+			t.Run(strings.TrimPrefix(ingress.path, "/v1/")+"/"+scenario.selected, func(t *testing.T) {
+				body := []byte(fmt.Sprintf(ingress.template, scenario.selected))
+				c := adaptiveProtocolTestContext(ingress.path, body)
+				upstream := &httpUpstreamRecorder{resp: &http.Response{
+					StatusCode: http.StatusRequestTimeout,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"fixture timeout"}}`)),
+				}}
+				svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+				account := &Account{ID: 2, Platform: PlatformOpenCodeGo, Type: AccountTypeAPIKey, Credentials: map[string]any{
+					"api_key": "fixture-key", "account_mode": AccountModeGo,
+					"api_base_urls": map[string]any{APIProtocolAnthropic: "https://anthropic.example"},
+				}}
+				var result *OpenAIForwardResult
+				var err error
+				switch ingress.path {
+				case "/v1/chat/completions":
+					result, err = svc.ForwardAsChatCompletions(c.Request.Context(), c, account, body, "", "")
+				case "/v1/messages":
+					result, err = svc.ForwardAsAnthropic(c.Request.Context(), c, account, body, "", "")
+				default:
+					result, err = svc.Forward(c.Request.Context(), c, account, body)
+				}
+
+				require.Len(t, upstream.requests, 1)
+				require.Equal(t, "/v1/messages", upstream.lastReq.URL.Path)
+				require.Equal(t, "tool", gjson.GetBytes(upstream.lastBody, "tool_choice.type").String())
+				require.Equal(t, scenario.selected, gjson.GetBytes(upstream.lastBody, "tool_choice.name").String())
+				require.Equal(t, "web_search_20250305", gjson.GetBytes(upstream.lastBody, "tools.0.type").String())
+				require.Equal(t, "local_lookup", gjson.GetBytes(upstream.lastBody, "tools.1.name").String())
+				require.Nil(t, result)
+				var failover *UpstreamFailoverError
+				if scenario.failover {
+					require.ErrorAs(t, err, &failover, "only a client tool could run on this request")
+					require.Equal(t, http.StatusRequestTimeout, failover.StatusCode)
+					require.False(t, IsResponseCommitted(c))
+				} else {
+					require.NotErrorAs(t, err, &failover)
+					require.ErrorContains(t, err, "outcome unknown")
+					require.True(t, IsResponseCommitted(c))
+				}
+			})
+		}
+	}
+}
+
 func TestNativeAnthropicPassthroughRecordsOutputConfigEffort(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	body := []byte(`{"model":"k3","max_tokens":32,"stream":false,` +

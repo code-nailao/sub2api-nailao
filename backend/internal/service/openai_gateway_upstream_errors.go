@@ -115,6 +115,30 @@ func containsClientFunction(tools gjson.Result, name string) bool {
 	return false
 }
 
+// Native Anthropic tool choices name a tool, including server tools. Only a
+// unique client tool declaration proves that hosted tools cannot run.
+func selectsDeclaredAnthropicClientTool(body []byte) bool {
+	choice := gjson.GetBytes(body, "tool_choice")
+	name := choice.Get("name")
+	if choice.Get("type").String() != "tool" || name.Type != gjson.String || name.Str == "" {
+		return false
+	}
+	found := false
+	for _, declaration := range gjson.GetBytes(body, "tools").Array() {
+		declaredName := declaration.Get("name")
+		if declaredName.Type != gjson.String || declaredName.Str != name.Str {
+			continue
+		}
+		kind := declaration.Get("type")
+		isClient := !kind.Exists() || kind.Str == "custom"
+		if found || !isClient || !declaration.Get("input_schema").IsObject() {
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
 func responsesToolsMayRunOnProvider(tools gjson.Result) bool {
 	if !tools.IsArray() {
 		return false
@@ -191,6 +215,15 @@ func stopPaidResponsesSubmissionAfterTimeout(c *gin.Context, model string) (*Ope
 		c.Writer.Flush()
 	}
 	return nil, outcomeErr
+}
+
+// Apply the outbound Messages tool choice even when the client expects an
+// OpenAI error response.
+func stopNativeAnthropicHostedToolTimeout(c *gin.Context, status int, outbound []byte, inboundProtocol string) error {
+	if status != http.StatusRequestTimeout || selectsDeclaredAnthropicClientTool(outbound) {
+		return nil
+	}
+	return stopHostedToolTimeout(c, status, outbound, inboundProtocol)
 }
 
 // Call before error recovery can send the request again, using the request

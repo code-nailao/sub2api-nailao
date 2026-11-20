@@ -97,7 +97,10 @@ func TestGatewayRoutesMetadataAllowsDistinctUserKeys(t *testing.T) {
 		status                  int
 	}{
 		{"distinct", `{"trace":"first","TRACE":"second"}`, "User context not found", http.StatusInternalServerError},
+		{"distinct-user-id", `{"user_id":"first","USER_ID":"second"}`, "User context not found", http.StatusInternalServerError},
 		{"duplicate", `{"trace":"first","trace":"second"}`, "metadata.trace", http.StatusBadRequest},
+		{"duplicate-user-id", `{"user_id":"first","user_id":"second"}`, "metadata.user_id", http.StatusBadRequest},
+		{"escaped-duplicate-user-id", `{"user_id":"first","\u0075ser_id":"second"}`, "metadata.user_id", http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"fixture","input":"test","metadata":`+tc.metadata+`}`))

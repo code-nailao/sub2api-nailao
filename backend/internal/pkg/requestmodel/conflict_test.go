@@ -47,7 +47,6 @@ func TestConflictingFieldJSONReportsDuplicates(t *testing.T) {
 		{name: "深层嵌套", body: `{"a":[[{"b":{"c":1,"c":2}}]]}`, want: "a[0][0].b.c"},
 		{name: "session 内嵌套", body: `{"session":{"audio":{"voice":"a","voice":"b"}}}`, want: "session.audio.voice"},
 		{name: "自由键空间内的精确重复", body: `{"tools":[{"input_schema":{"properties":{"id":{},"id":{}}}}]}`, want: "tools[0].input_schema.properties.id"},
-		{name: "metadata 大小写变体（Antigravity 结构体绑定）", body: `{"metadata":{"user_id":"A","USER_ID":"B"}}`, want: "metadata.USER_ID"},
 		{name: "前导控制字节（gjson 当空白跳过）", body: "\x0b{\"model\":\"a\",\"model\":\"b\"}", want: "model"},
 		{name: "顶层 input 仍做折叠", body: `{"input":[{"role":"user","Role":"system","content":"x"}]}`, want: "input[0].Role"},
 		{name: "超深子树之后的同层重复", body: `{"model":"a","x":` + strings.Repeat("[", maxConflictDepth+5) + strings.Repeat("]", maxConflictDepth+5) + `,"model":"b"}`, want: "model"},
@@ -98,6 +97,7 @@ func TestConflictingFieldJSONAcceptsUnambiguousBodies(t *testing.T) {
 func TestConflictingFieldMetadataUsesExactUserKeys(t *testing.T) {
 	for _, body := range []string{
 		`{"metadata":{"trace":"a","TRACE":"b"}}`,
+		`{"metadata":{"user_id":"a","USER_ID":"b"}}`,
 		`{"METADATA":{"trace":{"A":1,"a":2},"TRACE":"b"}}`,
 	} {
 		field, conflict := ConflictingField("application/json", []byte(body))

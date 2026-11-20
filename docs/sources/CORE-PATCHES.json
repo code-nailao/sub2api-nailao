@@ -1136,20 +1136,36 @@
       "reason": "Adds a native BEpusdt (USDT) payment provider and verifies payments before fulfilment: active order lookup, one payment-proof transaction with unique receipts, configuration versions for older orders, late and duplicate callback handling, a pending-verification order state and durable post-commit compensation."
     },
     {
-      "path": "backend/internal/pkg/requestmodel/conflict.go",
-      "sha256": "1c748c185091cb25c880d6679285a4b91d0bc25af30f617ef3d655ddbabd0480",
+      "path": "backend/internal/pkg/antigravity/claude_types.go",
       "features": [
         "upstream_metadata_key_compatibility"
       ],
-      "reason": "Allows distinct case-sensitive keys in user metadata while retaining duplicate detection and case folding for the structured metadata.user_id field."
+      "sha256": "9aed29dd67166617524f239d6e21365694e44d2d35c631d2db6719807957a826",
+      "reason": "Rejects duplicate user_id aliases when Antigravity binds Claude metadata to its case-insensitive struct field."
+    },
+    {
+      "path": "backend/internal/pkg/antigravity/claude_types_test.go",
+      "features": [
+        "upstream_metadata_key_compatibility"
+      ],
+      "sha256": "c967be2276348bce06f1f5f59e7a4916fbda87ac8d96546ae2722d97baaed620",
+      "reason": "Covers rejection of equivalent user_id aliases at Claude metadata binding and acceptance of an unambiguous alias."
+    },
+    {
+      "path": "backend/internal/pkg/requestmodel/conflict.go",
+      "sha256": "0ec3c0b7252fdadee39699fbbd1cf9f324762753d51abb703242f6fdd75487d7",
+      "features": [
+        "upstream_metadata_key_compatibility"
+      ],
+      "reason": "Compares user metadata keys exactly at gateway ingress and provides a scoped scan for the case-insensitive user_id field bound by Antigravity."
     },
     {
       "path": "backend/internal/pkg/requestmodel/conflict_test.go",
-      "sha256": "ad84601880aafb86b3b804970783f857683de3af68fa4fb8a94ab2299fa50e6a",
+      "sha256": "6b6400fdb8d90fcb5cd91e35ac3bb0b61931fd0ded9f00b0f431e80dac17d339",
       "features": [
         "upstream_metadata_key_compatibility"
       ],
-      "reason": "Tests distinct mixed-case metadata keys and rejects repeated keys including equivalent JSON spellings."
+      "reason": "Tests distinct mixed-case metadata keys including user_id and rejects repeated keys including equivalent JSON spellings."
     },
     {
       "path": "backend/internal/pkg/websearch/brave.go",
@@ -2071,11 +2087,11 @@
     },
     {
       "path": "backend/internal/server/routes/gateway_request_field_conflict_test.go",
-      "sha256": "7048e8d6428751c96922c10aee7ec17212596c70f175cb5e4f4e5c87023298ae",
+      "sha256": "9e764981ecd9b528683015003414669ed2179c4cf887cbe78c9bed67a3af0a7b",
       "features": [
         "upstream_metadata_key_compatibility"
       ],
-      "reason": "Verifies that metadata with distinct case-sensitive keys reaches the real gateway handler and a repeated key is rejected at ingress."
+      "reason": "Verifies that distinct metadata keys including user_id and USER_ID reach the native Responses handler and that exact and escaped duplicates are rejected at ingress."
     },
     {
       "path": "backend/internal/server/routes/payment.go",
@@ -3182,8 +3198,8 @@
       "features": [
         "paid_submission_no_replay"
       ],
-      "sha256": "8d6f5534b9fb8b22bea9dcca56ead251cbe9110ad2e9cea37fb9336559d01b82",
-      "reason": "Stops hosted-tool timeouts when Chat requests are converted to the native Anthropic endpoint."
+      "sha256": "67f261f309d4e34255572faeec3c7728a472ea3f3cc00ec9bb004500603770c9",
+      "reason": "Applies native Anthropic tool selection to 408 classification after converting a Chat request."
     },
     {
       "path": "backend/internal/service/openai_gateway_chat_completions_raw.go",
@@ -3240,8 +3256,16 @@
       "features": [
         "paid_submission_no_replay"
       ],
-      "sha256": "89fe6c07f16898ea90e498826f9e4f38566b66c7c2296aa8149d4eb122c0f677",
-      "reason": "Stops hosted-tool timeouts in Messages sent to the native Anthropic endpoint."
+      "sha256": "03360c9e45995cc92490d1d6b87eb534a0d1d9759aa6e7109a22fc00aa0017bf",
+      "reason": "Applies native Anthropic tool selection to 408 classification for Messages sent to the native endpoint."
+    },
+    {
+      "path": "backend/internal/service/openai_gateway_messages_anthropic_native_test.go",
+      "features": [
+        "paid_submission_no_replay"
+      ],
+      "sha256": "fd5ad1c85d5d2a22fdbfe559de20a7f698f1415fa39b3ed2dfdc91348d404cd0",
+      "reason": "Covers Responses, Responses-shaped Chat and Messages forwarded to a native Anthropic endpoint. Verifies 408 failover for a forced client tool and terminal errors when the selected tool is hosted or unresolved."
     },
     {
       "path": "backend/internal/service/openai_gateway_messages_chat_fallback.go",
@@ -3310,8 +3334,8 @@
       "features": [
         "paid_submission_no_replay"
       ],
-      "sha256": "cd52b6d2eba868dafbfb554bac1464cabd36118d0e21d19a29042524a7ea7187",
-      "reason": "Stops hosted-tool timeouts on the native Anthropic path shared by Responses and Responses-shaped Chat."
+      "sha256": "b2f1c66899c4fd7299d3e06a412031dc7dd6f4d15059b8c1d7314bfbe2a3590d",
+      "reason": "Applies native Anthropic tool selection to 408 classification on the shared Responses and Responses-shaped Chat path."
     },
     {
       "path": "backend/internal/service/openai_gateway_responses_chat_fallback.go",
@@ -3345,8 +3369,8 @@
       "features": [
         "paid_submission_no_replay"
       ],
-      "sha256": "362fe89e9d79e7d5ddcb8fc22222c33a214ec748c82ed1bb9be554cf77be538d",
-      "reason": "Recognizes hosted Responses search declarations and reports a terminal HTTP 408 for paid submissions with an unknown outcome. Classifies provider-hosted retrieval and connector tools by category, protects unknown hosted tool types and keeps confirmed client-executed tools separate. Classifies effective hosted tools after protocol conversion, preserves a 408 failover for a forced declared client function and returns a terminal error in the client protocol. Resolves client-only tool restrictions and namespaced function selections before excluding hosted tools. Encodes a terminal response.failed event for a paid timeout after Responses streaming has started."
+      "sha256": "fa8791899ab39b9793402b0231ae4843045902f84c2220a9a99e066d9f724f38",
+      "reason": "Recognizes hosted Responses search declarations and reports a terminal HTTP 408 for paid submissions with an unknown outcome. Classifies provider-hosted retrieval and connector tools by category, protects unknown hosted tool types and keeps confirmed client-executed tools separate. Classifies effective hosted tools after protocol conversion, preserves a 408 failover for a forced declared client function and returns a terminal error in the client protocol. Resolves client-only tool restrictions and namespaced function selections before excluding hosted tools. Encodes a terminal response.failed event for a paid timeout after Responses streaming has started. Resolves native Anthropic tool choices against unambiguous client-tool declarations while preserving the inbound error protocol."
     },
     {
       "path": "backend/internal/service/openai_gateway_usage.go",
