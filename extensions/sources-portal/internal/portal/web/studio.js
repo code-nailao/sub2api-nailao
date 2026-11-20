@@ -37,13 +37,10 @@ const isCurrent = (started) => !locked && rounds.isCurrent(started);
 const isConnecting = () => rounds.isWaiting() && connectionPending?.round === rounds.current;
 const isBootstrapping = () => rounds.isWaiting() && bootstrapRound === rounds.current;
 const ordinaryGroups = () => groups.filter(({ id }) => id !== custom.groupId);
-// A shell that acknowledged its menu can offer another group before this
-// connection is authorized. It has no configuration for the failed group.
-const canShowRecoveryFrame = () => connectionApplied || (integrated && ordinaryGroups().length > 0);
 const connectionTimeout = "连接用时较长。可以重试连接，或稍后从主站重新进入。已有作品与草稿会保留。";
 
 function updateControls() {
-  const canSelect = needsCustomResave ? ordinaryGroups().length > 0 : groups.length > 0 && shellRevision === 0;
+  const canSelect = needsCustomResave ? ordinaryGroups().length > 0 : groups.length > 0 && (!connectionApplied || shellRevision === 0);
   select.disabled = locked || isConnecting() || isBootstrapping() || !canSelect;
   reconnect.hidden = locked || integrated || shellRevision === 0;
   reconnect.disabled = locked || isConnecting() || selectionUncertain;
@@ -58,7 +55,7 @@ function showState(state, text) {
   const resave = needsCustomResave && !locked;
   if (resave) {
     state = "recovery";
-    frame.hidden = !canShowRecoveryFrame();
+    frame.hidden = !connectionApplied;
     text = text && text !== CUSTOM_RESAVE_HINT ? `${CUSTOM_RESAVE_HINT} ${text}` : CUSTOM_RESAVE_HINT;
   }
   document.body.dataset.state = state;
@@ -96,16 +93,16 @@ function notifyHost(ready) {
     requestId: hostConfig.requestId, revision: hostConfig.revision,
     shellMode: hostConfig.shellMode, integrated: ready }, location.origin);
 }
-function setIntegrated(ready) {
-  integrated = ready;
-  if (ready) {
-    frame.hidden = needsCustomResave && !canShowRecoveryFrame();
+function setIntegrated(shellApplied) {
+  integrated = shellApplied && connectionApplied;
+  if (integrated) {
+    frame.hidden = false;
     // A shell ACK does not fix a stale connection. Keep its recovery action visible.
     if (!needsCustomResave) { clearTimeout(compatibilityTimer); showState("ready"); }
-  }
-  document.body.dataset.integrated = String(ready);
+  } else if (!connectionApplied) frame.hidden = true;
+  document.body.dataset.integrated = String(integrated);
   renderLegacyGroups();
-  notifyHost(ready);
+  notifyHost(integrated);
 }
 function lock(text) {
   if (locked) return;
@@ -121,6 +118,7 @@ function lock(text) {
   clearInterval(shellTimer);
   clearInterval(checkTimer);
   clearTimeout(compatibilityTimer);
+  connectionApplied = false;
   setIntegrated(false);
   rounds.newDocument();
   frame.src = "about:blank";
@@ -338,7 +336,7 @@ async function connect(groupId, request) {
   clearTimeout(compatibilityTimer);
   const expired = expiredLegacyAttempt;
   expiredLegacyAttempt = undefined;
-  const replacePeer = !pending.requestId && (expired?.target || (needsCustomResave && shellRevision > 0));
+  const replacePeer = !pending.requestId && (expired?.target || (shellRevision > 0 && (needsCustomResave || !connectionApplied)));
   const authorizing = rounds.capture();
   // Retry custom connections through Portal so it checks the Key's current group.
   const cached = !pending.requestId && !needsCustomResave && groupId !== custom.groupId && expired?.groupId === groupId
@@ -425,7 +423,8 @@ window.addEventListener("message", async (event) => {
     shellPending = null;
     clearInterval(shellTimer);
     appliedShellRevision = pending.config.revision;
-    if (!needsCustomResave) message.textContent = "";
+    if (!connectionApplied) showState("recovery");
+    else if (!needsCustomResave) message.textContent = "";
     setIntegrated(true);
     return;
   }
@@ -529,7 +528,7 @@ async function bootstrap() {
     select.onchange = () => {
       const id = Number(select.value);
       if (needsCustomResave && id === custom.groupId) return;
-      if (shellRevision > 0 && !needsCustomResave) { recoverShell(); return; }
+      if (shellRevision > 0 && connectionApplied && !needsCustomResave) { recoverShell(); return; }
       if (id > 0) void connect(id);
     };
     rounds.newDocument();

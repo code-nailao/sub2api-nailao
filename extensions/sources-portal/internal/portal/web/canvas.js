@@ -90,7 +90,6 @@ function begin(phase, state, text) {
   attempt = operation;
   clearInterval(sendTimer);
   sendTimer = undefined;
-  restoreRounds.clear();
   rounds.deadline(operation.round, 20000, () => {
     fail(operation, "连接用时较长。可以重试连接。已有画布和任务会保留。");
   });
@@ -242,10 +241,10 @@ function requireResave(connectionId) {
 }
 async function restoreConnection(connectionId, requestId, target) {
   const started = rounds.capture(), restoreRound = ++nextRestoreRound;
-  const activePayload = connection.payload;
   restoreRounds.set(connectionId, restoreRound);
-  const current = () => isCurrent(started) && target === frame.contentWindow &&
-    connection?.payload === activePayload && restoreRounds.get(connectionId) === restoreRound;
+  // The child can restore grants for its tasks independently of group selection.
+  const current = () => !locked && rounds.sameDocument(started) && target === frame.contentWindow &&
+    restoreRounds.get(connectionId) === restoreRound;
   let config;
   try {
     config = await api("/api/canvas/connection", current, { group_id: Number(connectionId.slice(6)), restore_only: true });
@@ -267,7 +266,7 @@ async function restoreConnection(connectionId, requestId, target) {
   target.postMessage({ type: "sub2api:media-studio-config", payload: { ...config, requestId, selectActive: false } }, studioURL.origin);
   if (needsCustomResave) {
     needsCustomResave = false;
-    if (connection.invalid && connection.grant.selectedConnectionId === connectionId) {
+    if (connection?.invalid && connection.grant.selectedConnectionId === connectionId) {
       repeatConfirmation();
       return;
     }
@@ -324,7 +323,6 @@ async function authorize(operation, groupId) {
     const config = await api("/api/canvas/connection", waiting, { group_id: groupId });
     if (!waiting()) return;
     needsCustomResave = false;
-    restoreRounds.clear();
     granted.set(config.selectedConnectionId, config);
     confirm(operation, config);
     watchSession();
@@ -430,6 +428,7 @@ function openCustomConnectionSettings() {
     if (locked) return;
     // A changed or removed connection must not be resent from the earlier grant.
     const customId = `group-${custom.groupId}`;
+    restoreRounds.delete(customId);
     granted.delete(customId);
     if (connection?.payload.selectedConnectionId === customId) {
       connection = undefined;

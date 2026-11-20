@@ -59,5 +59,5 @@ export function connectionRounds() {
   };
   // Call only where the parent navigates or replaces the iframe.
   const newDocument = () => { docEpoch++; };
-  return Object.assign(rounds, { capture, sameConnection, isCurrent, captureConnection, newDocument });
+  return Object.assign(rounds, { capture, sameDocument, sameConnection, isCurrent, captureConnection, newDocument });
 }

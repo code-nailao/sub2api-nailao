@@ -229,6 +229,36 @@ test('Canvas load after ready preserves the pending grant and in-flight restore'
   assert.equal(connections(f).length, 2);
 });
 
+test('a Canvas restore conflict in the same document still needs a resave after the active group ACK', async () => {
+  const restore = Promise.withResolvers();
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only
+    ? restore.promise : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.host();
+  f.loaded();
+  const connectionId = `group-${CUSTOM_ID}`;
+  const requestId = '00000000-0000-4000-8000-000000000025';
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId, requestId });
+  await flush();
+  assert.equal(connections(f).at(-1).options.body.restore_only, true);
+
+  await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  restore.resolve({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } });
+  await flush();
+
+  const error = f.last('sub2api:canvas-restore-error');
+  assert.equal(error?.requestId, requestId);
+  assert.equal(error.connectionId, connectionId);
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.match(f.elements['#message'].textContent, /重新保存自定义连接/);
+  assert.equal(f.frame.hidden, false);
+  const retry = f.elements['#canvas-retry'];
+  assert.equal(retry.textContent, '打开自定义连接');
+  assert.equal(retry.disabled, false);
+  retry.onclick();
+  assert.equal(f.settings.at(-1)?.kind, 'custom');
+});
+
 test('Canvas ignores a late restore conflict after a newer restore of the same grant succeeds', async () => {
   const first = Promise.withResolvers(), second = Promise.withResolvers();
   const restores = [first, second];
