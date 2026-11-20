@@ -105,7 +105,6 @@ func withoutDeepSeekWebTools(body []byte, protocol string, match func(typ string
 	}
 	items := tools.Array()
 	removedNames := map[string]bool{}
-	clientNames := map[string]bool{}
 	var removed []int
 	for i, item := range items {
 		if typ := item.Get("type").String(); match(typ) {
@@ -114,8 +113,6 @@ func withoutDeepSeekWebTools(body []byte, protocol string, match func(typ string
 			if name := item.Get("name").String(); name != "" {
 				removedNames[name] = true
 			}
-		} else if protocol == "chat" && item.Get("type").String() == "function" {
-			clientNames[item.Get("function.name").String()] = true
 		}
 	}
 	if len(removed) == 0 {
@@ -133,11 +130,6 @@ func withoutDeepSeekWebTools(body []byte, protocol string, match func(typ string
 		choice := gjson.GetBytes(out, "tool_choice")
 		typ, name := choice.Get("type").String(), choice.Get("name").String()
 		forced := choice.IsObject() && (removedNames[typ] || match(typ) || (typ == "tool" && (removedNames[name] || match(name))))
-		if protocol == "chat" && typ == "function" {
-			name = choice.Get("function.name").String()
-			// A client function may legitimately share a removed tool's name.
-			forced = (removedNames[name] || match(name)) && !clientNames[name]
-		}
 		if err == nil && forced {
 			auto := `"auto"`
 			if protocol == "messages" {

@@ -53,55 +53,24 @@ func deepSeekWantsTools(body []byte, auto bool) bool {
 	return false
 }
 
-// Keep family prefixes, hosted operations and native ownership in one place.
-// Chat and hosted matching include the base type and any underscore-delimited
-// suffix. Only tool types are classified; a client function's name does not
-// make it a hosted tool.
-var deepSeekWebToolFamilies = [...]struct {
-	prefix, operation string
-	provider          bool
-}{
-	{"web_search", "search", false},
-	{"web_fetch", "fetch", false},
-	{"deepseek_web_search", "search", true},
-	{"deepseek_read_url", "fetch", true},
-}
-
+// deepSeekExplicitTool maps the web tool types the gateway executes itself:
+// the OpenAI/Anthropic style (web_search*, web_fetch*) and the provider's own
+// (deepseek_web_search, deepseek_read_url).
 func deepSeekExplicitTool(typ string) string {
-	for _, family := range deepSeekWebToolFamilies {
-		if typ == family.prefix || strings.HasPrefix(typ, family.prefix+"_") {
-			return family.operation
-		}
+	if typ == "web_search" || typ == "web_search_preview" || strings.HasPrefix(typ, "web_search_20") || typ == "deepseek_web_search" {
+		return "search"
+	}
+	if typ == "web_fetch" || strings.HasPrefix(typ, "web_fetch_20") || typ == "deepseek_read_url" {
+		return "fetch"
 	}
 	return ""
 }
 
-// deepSeekProviderTool reports the provider's own web tool types. Nothing on
-// the ordinary path handles them in any protocol: forwarded as they are, the
-// provider would run paid tool calls the gateway never bills.
+// deepSeekProviderTool reports the provider's own web tool types. Unlike
+// web_search*, nothing on the ordinary path handles them: forwarded as they
+// are, the provider would run paid tool calls the gateway never bills.
 func deepSeekProviderTool(typ string) bool {
-	// Preserve the existing Responses/Messages byte contract: those ordinary
-	// paths strip only the native base types. Chat uses full family matching.
-	for _, family := range deepSeekWebToolFamilies {
-		if family.provider && typ == family.prefix {
-			return true
-		}
-	}
-	return false
-}
-
-// deepSeekOrdinaryPathDrops selects the web tool entries the ordinary path
-// must not carry for protocol. The provider's own types never pass. A Chat
-// Completions request is forwarded without conversion, so web_search* and
-// web_fetch* entries would reach the provider as well, which rejects the
-// request or answers with a call to a function the client never defined.
-// Responses and Messages lowering drops those entries, and Messages search
-// emulation has to see them, so there only the provider's own types go.
-func deepSeekOrdinaryPathDrops(protocol string) func(typ string) bool {
-	if protocol == "chat" {
-		return func(typ string) bool { return deepSeekExplicitTool(typ) != "" }
-	}
-	return deepSeekProviderTool
+	return typ == "deepseek_web_search" || typ == "deepseek_read_url"
 }
 
 func prepareDeepSeekHosted(body []byte, protocol string, auto bool) (*deepSeekHostedRequest, bool, error) {
@@ -518,9 +487,20 @@ func (s *OpenAIGatewayService) deepSeekBodyWithout(body []byte, protocol string,
 }
 
 func rejectDeepSeekChatFilter(c *gin.Context, err error) error {
-	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
 	}
+	const errType = "invalid_request_error"
+	if gatewaySSEStarted(c) {
+		// A queue heartbeat may have already committed the HTTP status.
+		MarkResponseCommitted(c)
+		MarkOpsStreamError(c, errType, err.Error(), http.StatusBadRequest)
+		if _, writeErr := c.Writer.WriteString(buildChatStreamErrorSSE(errType, err.Error())); writeErr == nil {
+			c.Writer.Flush()
+		}
+		return err
+	}
+	writeChatCompletionsError(c, http.StatusBadRequest, errType, err.Error())
 	return err
 }
 
@@ -538,9 +518,6 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 		return nil, body, false, nil
 	}
 	if protocol == "chat" {
-		if err := ctx.Err(); err != nil {
-			return nil, body, true, err
-		}
 		if !key.Group.DeepSeekTools.Enabled {
 			top, err := scanDeepSeekChatEnvelope(ctx, body)
 			if err != nil {
@@ -558,10 +535,12 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 			protocol = "responses"
 		}
 	}
-	// Enabled groups and other protocols keep their existing hosted loop and
-	// ordinary fallback behavior, including provider-specific tool removal.
+	// Without the hosted loop (tools off for the group, or tool_choice none)
+	// the provider's own web tool types are removed: the provider would run
+	// them as paid tool calls the gateway never bills. web_search* and
+	// web_fetch* keep their existing handling on the ordinary path.
 	if !key.Group.DeepSeekTools.Enabled || !deepSeekWantsTools(body, key.DeepSeekToolsAutoInject()) {
-		return nil, s.deepSeekBodyWithout(body, protocol, deepSeekOrdinaryPathDrops(protocol), deepSeekWantsTools(body, true), key, account), false, nil
+		return nil, s.deepSeekBodyWithout(body, protocol, deepSeekProviderTool, deepSeekWantsTools(body, true), key, account), false, nil
 	}
 	// The tools are optional. When they cannot be set up, nothing has been sent
 	// or reserved yet, so the request is answered on the ordinary path instead of

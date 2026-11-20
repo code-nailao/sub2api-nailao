@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 )
 
 const (
@@ -382,6 +383,17 @@ func (p deepSeekChatToolParser) parseArray(depth int, element func(json.Token, i
 	return nil
 }
 
+// This family match is only for filtering a disabled group's Chat request.
+// Hosted tool eligibility continues to use the existing provider rules.
+func deepSeekChatWebToolFamily(typ string) string {
+	for _, family := range [...]string{"web_search", "web_fetch", "deepseek_web_search", "deepseek_read_url"} {
+		if typ == family || strings.HasPrefix(typ, family+"_") {
+			return family
+		}
+	}
+	return ""
+}
+
 // filterDeepSeekChatWebTools only runs for a Chat request whose group has tools
 // turned off. Copy raw slices for the surviving tools and unrelated fields.
 func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekChatEnvelope) ([]byte, error) {
@@ -422,9 +434,9 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 		if err != nil {
 			return err
 		}
-		if deepSeekExplicitTool(tool.typ) != "" {
+		if family := deepSeekChatWebToolFamily(tool.typ); family != "" {
 			removed = true
-			removedType = removedType || tool.typ == choice.typ
+			removedType = removedType || choice.typ == tool.typ || choice.typ == family
 			return nil
 		}
 		keptFunction = keptFunction || (tool.typ == "function" && tool.named && tool.name == choice.name)
@@ -460,7 +472,7 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 	var edits []deepSeekChatEdit
 	removedFields := 0
 	if len(kept) == 0 {
-		edits, removedFields = removeDeepSeekChatToolFields(top, choiceTargetsRemovedTool)
+		edits, removedFields = removeDeepSeekChatToolFields(top)
 	} else {
 		edits = append(edits, deepSeekChatEdit{span: top.tools.value, tools: kept})
 		if choiceTargetsRemovedTool {
@@ -479,9 +491,9 @@ type deepSeekChatEdit struct {
 	tools       []deepSeekChatSpan
 }
 
-func removeDeepSeekChatToolFields(top deepSeekChatEnvelope, removeChoice bool) ([]deepSeekChatEdit, int) {
+func removeDeepSeekChatToolFields(top deepSeekChatEnvelope) ([]deepSeekChatEdit, int) {
 	first, second := top.tools, top.choice
-	if !removeChoice {
+	if second == nil {
 		return []deepSeekChatEdit{removeDeepSeekChatFields(first, first)}, 1
 	}
 	if second.index < first.index {

@@ -113,12 +113,12 @@ GPT-6.2 价卡的 Ultrafast 倍率留空时，按本仓库既有售价固定为 
 
 可选工具不拖垮普通请求（`deepseek_tools_hosted.go` 入口；`tryForwardDeepSeekTools` 不接手时把要走普通路径的请求体交还 `openai_gateway_forward.go`、`openai_gateway_chat_completions.go`、`openai_gateway_messages.go` 的调用点）：
 
-- 联网工具家族前缀集中在 `deepseek_tools_hosted.go` 的 `deepSeekWebToolFamilies`：`web_search` / `deepseek_web_search` 对应搜索，`web_fetch` / `deepseek_read_url` 对应网页抓取。Chat 与托管循环匹配基名或基名后以下划线分隔的任意后缀，包含官方 preview 版本和未来版本；只匹配工具的 `type`，客户端自己的 `function` 不因名称相同而变成托管工具。托管执行与计费在三种协议中复用；Responses / Messages 普通路径继续仅移除原生工具基名，保持原先请求字节处理策略。
-- 托管循环不接手（分组未开启工具，或 `tool_choice` 为 `none`）时，转发前移除供应商风格的条目：普通路径会把它们原样发给供应商，由供应商执行按次收费的工具，而这类请求只按 token 计费。`tool_choice` 不是 `none` 时附上联网不可用提示。Chat Completions 请求不经协议转换原样转发，`web_search*` / `web_fetch*` 也会到达供应商，被当作未知类型拒绝整个请求，或被当作函数声明而回复调用客户端从未定义的函数，所以在 Chat 路径上这两族条目一并移除；Responses 和 Messages 的协议降级本就会丢弃它们，Messages 路径之后还有原版的搜索模拟需要看到它们，因此这两种协议只移除供应商风格的条目。移除是对请求体的就地编辑，其余字节保持客户端原样。
-- 准备阶段失败（后台请求、没有可用的工具账号、价格未配置、请求形态不支持、用量日志不可写）时，只有网关自动附加的工具则原样转发。客户端自己声明了联网工具时，移除这些条目和 `max_tool_calls`，附上不可用提示，按普通请求转发和计费。
-- 分组未开启工具时，Chat 专用过滤器（`deepseek_request_json.go`）单遍定位顶层字段的字节范围。`messages` 等无关字段只跳过内容。顶层 `tools` 和 `tool_choice` 不得重复。如果 `tools` 缺失或并非数组，请求原样返回。其余情况只严格解析这两个字段，检查各层重复键（包括转义同名）、最多 128 层容器嵌套（含根对象）和每个数组最多 32768 个元素，违反时返回 `400 invalid_request_error`，不请求上游、不计费。扫描、工具解码和拼接均检查上下文取消。Responses、Messages 和已开启工具的分组沿用原有处理。发到 Chat 地址的 Responses 形状只用顶层扫描识别，之后进入 Responses 原路径。
-- 专用过滤器在移除联网条目时只拼接一次。工具列表为空就省略 `tools`。按类型选中了已移除的条目，或通过 `function.name` 选择了保留下来的列表中没有的函数时，有剩余工具就改为 `auto`，否则省略 `tool_choice`。其他选择保留。`tool_choice` 为 `none` 时不附加提示。客户端函数的名称可以与联网工具同名。无联网条目时返回原始字节。流式和非流式测试均检查模拟上游收到的请求、转发次数，以及与普通请求一致的扣费和 Key 配额记录。
-- 请求体大小沿用原入口限制：`backend/internal/server/routes/gateway.go` 为 Chat 路由挂接 `gateway.max_body_size`，`middleware/request_body_limit.go` 用 `http.MaxBytesReader` 执行；Chat handler 的 `readLenientJSONRequestBodyWithPrealloc` 在 `internal/pkg/httputil/body.go` 中按同一上限检查规范化后的字节数，压缩输入另受 `maxDecompressedBodySize` 限制。`backend/internal/server/http.go` 外层还用 `http.MaxBytesHandler` 执行 `server.max_request_body_size`（配置为 0 时回退到网关上限）。这些字节上限不能代替深度限制与取消检查。
+- 识别两族联网工具类型：`web_search`、`web_search_preview`、`web_search_20*`、`web_fetch`、`web_fetch_20*`，以及供应商风格的 `deepseek_web_search`（等同搜索）和 `deepseek_read_url`（等同抓取）。工具可用时两族都由托管循环执行并计费，三种协议一致；强制选择供应商风格工具与强制 `web_search` 相同。
+- 托管循环不接手（分组未开启工具，或 `tool_choice` 为 `none`）时，转发前移除供应商风格的条目：普通路径会把它们原样发给供应商，由供应商执行按次收费的工具，而这类请求只按 token 计费。`tool_choice` 不是 `none` 时附上联网不可用提示。除关闭工具分组的 Chat 请求外，`web_search*` / `web_fetch*` 沿用现有处理（Messages 路径之后还有原版的搜索模拟）。移除是对请求体的就地编辑，其余字节保持客户端原样。
+- 准备阶段失败（后台请求、没有可用的工具账号、价格未配置、请求形态不支持、用量日志不可写）时尚未向上游发送或预留任何内容，并记一条警告：只有网关自动附加的工具时，请求按客户端原样转发；客户端自己声明了联网工具时，移除两族的全部条目和 `max_tool_calls`，附上不可用提示，按普通请求转发和计费，不再返回错误。
+- 移除工具后，`tool_choice` 若强制的正是被移除的工具，改为不强制；`tools` 为空时连同 `tool_choice` 一起删除。提示文案与托管循环降级时使用的是同一条。
+- 关闭工具的分组收到 Chat 请求时，由 `deepseek_request_json.go` 一次定位顶层字段，仅严格解析 `tools` 和 `tool_choice`。分类依据是工具类型的基名或下划线后缀。客户端函数可以与联网工具同名。无联网条目时保留原请求字节。移除时一次拼接，保留无关字段和剩余工具的原始字节。工具移除后若没有剩余工具，则同时省略 `tools` 和 `tool_choice`。还有剩余工具时，将指向被移除工具的选择改为 `auto`。沿用联网不可用提示，选择为 `none` 时不附加提示。
+- 顶层的两个工具字段和这些字段内各层不允许有重复键，转义后同名也算重复。工具字段限制为最多 128 层容器嵌套（含根对象），每个数组最多 32768 项。重复或超限在转发和计费前返回 `400 invalid_request_error`。队列已发送心跳时，用现有 Chat SSE 错误帧报告同一原因。扫描、解码和拼接均检查上下文取消。Responses 形状按原规则分流。
 - 原生透传分支已删除：原来在账号开启 `deepseek_native_tools_enabled` 且使用原生 Responses 协议时把工具交给供应商执行并按其计数结算（原 `deepseek_tools_native.go`），并在共用的 `openai_gateway_response_handling.go` 中挂接了 SSE 观察。账号上已保存的 `deepseek_native_tools_enabled` 仍可通过校验，但不再有任何行为依赖它，账号表单上的开关也已移除。
 
 独立工具接口（`deepseek_tool_requests.go`、`deepseek_tool_endpoints.go`，路由在 `routes/gateway.go`，入口 `handler/openai_deepseek_tools.go`，标签 `deepseek_tool_endpoints`）：`POST /v1/tools/search|fetch|ocr|asr|tts` 按原版独立工具端点（`gateway_web_search.go`）的做法实现为单次转发，不进入网关工具循环。
