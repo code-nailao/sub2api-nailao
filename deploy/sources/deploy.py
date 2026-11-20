@@ -498,6 +498,18 @@ class Deployer:
     def log(self, msg: str) -> None:
         self.ops.log(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {msg}")
 
+    def _record_history(self, record: dict[str, Any]) -> None:
+        if self.ops.dry_run:
+            return
+        try:
+            append_history(self.cfg, record)
+        except (Exception, KeyboardInterrupt) as err:
+            # History is secondary to the saved state. The append may have
+            # reached disk, so do not retry or pass the error into recovery.
+            with contextlib.suppress(OSError):
+                print(f"deploy: warning: could not append release history ({type(err).__name__}). "
+                      "Check the history file. The saved release state still applies.", file=sys.stderr)
+
     @contextlib.contextmanager
     def step(self, name: str) -> Iterator[None]:
         start = self.ops.monotonic()
@@ -1101,9 +1113,7 @@ class Deployer:
         except DeployError as err:
             record.update(result="failed", error=str(err), steps=self.timings, finished_at=now())
             self._abort(state, target, err, created)
-            # A failed dry run changed nothing; a record would read like a failed release.
-            if not self.ops.dry_run:
-                append_history(self.cfg, record)
+            self._record_history(record)
             raise
         except (OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
             step = (state.get("in_progress") or {}).get("step")
@@ -1135,10 +1145,9 @@ class Deployer:
             self._finish_switch(state, current, target, record, create_background=False)
         except DeployError as err:
             record.update(result="failed", error=str(err), steps=self.timings, finished_at=now())
-            if not self.ops.dry_run:
-                if isinstance(err, FallbackFailed):
-                    self._record_unrestored(state, err)
-                append_history(self.cfg, record)
+            if not self.ops.dry_run and isinstance(err, FallbackFailed):
+                self._record_unrestored(state, err)
+            self._record_history(record)
             raise
         except (OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
             if not state.get("in_progress"):
@@ -1170,7 +1179,7 @@ class Deployer:
                     "allow_public_health_failure": allow_public_health_failure}
             self._save_progress(state, held)
             record.update(result="paused", steps=self.timings, finished_at=now())
-            append_history(self.cfg, record)
+            self._record_history(record)
         self.log("paused before background handoff; use 'resume' or 'abort'; no automatic expiry")
         for role in SERVING_ROLES:
             self.log(f"   {role}: http://127.0.0.1:{target.ports[role]}/ (access via your tunnel)")
@@ -1340,9 +1349,8 @@ class Deployer:
                                 held=held, networks=networks)
         except DeployError as err:
             self._abort(state, target, err, identities)
-            if not self.ops.dry_run:
-                record.update(result="failed", error=str(err), steps=self.timings, finished_at=now())
-                append_history(self.cfg, record)
+            record.update(result="failed", error=str(err), steps=self.timings, finished_at=now())
+            self._record_history(record)
             raise
         except (OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
             self._unexpected(err, record)
@@ -1370,11 +1378,11 @@ class Deployer:
         if not self.ops.dry_run:
             try:
                 self._save_progress(state, None)
-                record.update(result="ok", finished_at=now())
-                append_history(self.cfg, record)
             except OSError as err:
-                raise DeployError("held containers removed but metadata write failed; inspect status; "
-                                  "retry abort only if paused is still present") from err
+                raise DeployError("held containers removed but state write failed. Inspect 'status' and "
+                                  "retry 'abort' if the phase is still aborting") from err
+            record.update(result="ok", finished_at=now())
+            self._record_history(record)
         self.log("aborted held release; additive migrations and exported assets are kept")
 
     def _unexpected(self, err: BaseException, record: dict[str, Any]) -> None:
@@ -1388,7 +1396,7 @@ class Deployer:
             if phase == "deploying":
                 self._record_unrestored(persisted, failure)
             record.update(result="failed", error=str(failure), steps=self.timings, finished_at=now())
-            append_history(self.cfg, record)
+            self._record_history(record)
             if phase == "held":
                 raise DeployError("operation interrupted while recording a pause; pause retained; "
                                   "inspect status, then resume or abort") from err
@@ -1466,8 +1474,7 @@ class Deployer:
         if not self.ops.dry_run:
             save_state(self.cfg, state)
         record.update(result="ok", steps=self.timings, finished_at=now())
-        if not self.ops.dry_run:
-            append_history(self.cfg, record)
+        self._record_history(record)
         self.log(f"done: slot {target.slot} serving {target.image}")
 
     def _mark(self, state: dict[str, Any], target: Target, step: str) -> None:
@@ -1781,6 +1788,23 @@ def _adopt(cfg_path: str, ops: Ops, serving: str, standby: str, background: str,
 # CLI
 
 
+def main_recovery_hint(cfg: Config | None) -> str:
+    if cfg is None:
+        return "Check the Main configuration before retrying."
+    try:
+        progress = load_main_state(cfg).get("in_progress") or {}
+        phase = progress.get("phase")
+    except (Exception, KeyboardInterrupt):
+        return "Check access to the Main state file and run 'status' before retrying."
+    if phase == "held":
+        return "The release is paused. Run 'status', then 'resume' or 'abort'."
+    if phase == "aborting":
+        return "Cleanup is incomplete. Run 'status', then retry 'abort'."
+    if progress:
+        return "Run 'status' and verify routing and background ownership before clearing in_progress."
+    return "Run 'status' and verify the current release before retrying."
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", default=None,
@@ -1840,8 +1864,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"deploy: {err}", file=sys.stderr)
             return 1
     args.config = args.config or DEFAULT_CONFIG
-    ops = MainOps(dry_run=args.dry_run)
+    cfg = None
     try:
+        ops = MainOps(dry_run=args.dry_run)
         if args.command == "adopt":
             adopt(args.config, ops, args.serving, args.standby, args.background, args.work_dir,
                   args.public_health_url)
@@ -1872,6 +1897,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except DeployError as err:
         print(f"deploy: {err}", file=sys.stderr)
+        return 1
+    except (Exception, KeyboardInterrupt) as err:
+        print(f"deploy: {args.command} failed ({type(err).__name__}). {main_recovery_hint(cfg)}", file=sys.stderr)
         return 1
 
 

@@ -1,4 +1,6 @@
+import contextlib
 import http.client
+import io
 import json
 import os
 import socketserver
@@ -949,6 +951,95 @@ class DeployTest(unittest.TestCase):
             self.assertEqual(0, deploy.main(["main", "newer@sha256:3", "--hold-before-switch"]))
             self.assertEqual(0, deploy.main(["abort"]))
 
+    def test_cli_hold_succeeds_when_history_is_unwritable(self):
+        self.cfg.history_file = str(self.tmp)  # Opening a directory for append fails even as root.
+        stderr = io.StringIO()
+        with mock.patch.object(deploy.Config, "load", return_value=self.cfg), \
+                mock.patch.object(deploy, "MainOps", return_value=self.ops), \
+                mock.patch.object(deploy, "append_history", wraps=deploy.append_history) as history, \
+                contextlib.redirect_stderr(stderr):
+            self.assertEqual(0, deploy.main(["main", "fixture-image:held", "--hold-before-switch"]))
+        self.assertEqual("held", self.state()["in_progress"]["phase"])
+        self.assert_live_release(LEGACY)
+        history.assert_called_once()
+        self.assertEqual("paused", history.call_args.args[1]["result"])
+        self.assertEqual(1, len(stderr.getvalue().splitlines()))
+        self.assertIn("warning", stderr.getvalue())
+        output = "\n".join(self.ops.logs) + stderr.getvalue()
+        self.assertIn("'resume' or 'abort'", output)
+        self.assertNotIn("Traceback", output)
+
+    def test_cli_switch_keeps_committed_state_when_history_is_unwritable(self):
+        held = self.hold()
+        history = Path(self.cfg.history_file)
+        history.unlink()
+        history.mkdir()
+        stderr = io.StringIO()
+        with mock.patch.object(deploy.Config, "load", return_value=self.cfg), \
+                mock.patch.object(deploy, "MainOps", return_value=self.ops), \
+                mock.patch.object(deploy, "append_history", wraps=deploy.append_history) as append, \
+                contextlib.redirect_stderr(stderr):
+            self.assertEqual(0, deploy.main(["resume"]))
+        self.assert_live_release(held["target"])
+        self.assertEqual(held["target"]["slot"], self.state()["current"]["slot"])
+        self.assertIsNone(self.state()["in_progress"])
+        append.assert_called_once()
+        self.assertEqual("ok", append.call_args.args[1]["result"])
+        self.assertEqual(1, len(stderr.getvalue().splitlines()))
+        self.assertIn("warning", stderr.getvalue())
+
+    def test_cli_release_failure_keeps_original_error_when_history_is_unwritable(self):
+        self.cfg.history_file = str(self.tmp)
+        self.ops.nginx_test_rc = 1
+        stderr = io.StringIO()
+        with mock.patch.object(deploy.Config, "load", return_value=self.cfg), \
+                mock.patch.object(deploy, "MainOps", return_value=self.ops), \
+                mock.patch.object(deploy, "append_history", wraps=deploy.append_history) as history, \
+                contextlib.redirect_stderr(stderr):
+            self.assertEqual(1, deploy.main(["main", "fixture-image:nginx-fails"]))
+        self.assert_live_release(LEGACY)
+        self.assertIsNone(self.state()["in_progress"])
+        history.assert_called_once()
+        self.assertEqual("failed", history.call_args.args[1]["result"])
+        self.assertIn("warning", stderr.getvalue())
+        self.assertIn("nginx -t rejected", stderr.getvalue())
+
+    def test_cli_unexpected_error_reports_next_step_from_saved_state(self):
+        held = self.hold()
+        for phase, next_step in (
+            ("held", "'resume' or 'abort'"),
+            ("aborting", "retry 'abort'"),
+            ("failed", "verify routing and background ownership"),
+            ("deploying", "verify routing and background ownership"),
+        ):
+            with self.subTest(phase=phase):
+                deploy.save_state(self.cfg, {**self.state(), "in_progress": {**held, "phase": phase}})
+                before = self.state()
+                stderr = io.StringIO()
+                with mock.patch.object(deploy.Config, "load", return_value=self.cfg), \
+                        mock.patch.object(deploy, "MainOps", return_value=self.ops), \
+                        mock.patch.object(deploy.Deployer, "resume", side_effect=RuntimeError("fixture\nerror")), \
+                        contextlib.redirect_stderr(stderr):
+                    self.assertEqual(1, deploy.main(["resume"]))
+                self.assertEqual(before, self.state())
+                self.assertEqual(1, len(stderr.getvalue().splitlines()))
+                self.assertIn("RuntimeError", stderr.getvalue())
+                self.assertIn(next_step, stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_cli_unreadable_state_reports_recovery_hint_without_traceback(self):
+        path = Path(self.cfg.state_file)
+        path.write_text("invalid state")
+        stderr = io.StringIO()
+        with mock.patch.object(deploy.Config, "load", return_value=self.cfg), \
+                mock.patch.object(deploy, "MainOps", return_value=self.ops), \
+                contextlib.redirect_stderr(stderr):
+            self.assertEqual(1, deploy.main(["status"]))
+        self.assertEqual("invalid state", path.read_text())
+        self.assertEqual(1, len(stderr.getvalue().splitlines()))
+        self.assertIn("state file", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_cli_held_dry_run_does_not_create_a_lock_file_or_state(self):
         lock = self.tmp / "missing-lock-directory" / "release.lock"
         self.cfg.lock_file = str(lock)
@@ -1402,7 +1493,7 @@ class DeployTest(unittest.TestCase):
             return real(cfg, state)
 
         with mock.patch.object(deploy, "save_state", fail_clear):
-            with self.assertRaisesRegex(deploy.DeployError, "metadata write failed"):
+            with self.assertRaisesRegex(deploy.DeployError, "state write failed"):
                 deploy.Deployer(self.cfg, self.ops).abort()
         self.assertEqual("aborting", self.state()["in_progress"]["phase"])
         self.assertNotIn("sources-main-a-serving", self.ops.containers)
