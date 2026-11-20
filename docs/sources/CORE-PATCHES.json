@@ -711,8 +711,8 @@
       "features": [
         "deepseek_chat_transport_safety"
       ],
-      "sha256": "ed4194605848435633b913986fb632e94b291b3756708cfd8b696634d2b536e3",
-      "reason": "Exercises streaming and non-streaming DeepSeek Chat requests through two simulated accounts. A disconnect after reading the whole request stops failover, records the selected account failure and leaves usage and billing untouched. Dial, DNS and a full client cache before connection keep failover and ordinary billing."
+      "sha256": "17f0ce02ee54a598c069f56db56b720a84d2bf32ca0a852bc7fa3dff6c0f5f55",
+      "reason": "Exercises streaming and non-streaming DeepSeek Chat requests through two simulated accounts. A disconnect after reading the whole request stops failover, records the selected account failure and leaves usage and billing untouched. Dial, DNS and a full client cache before connection keep failover and ordinary billing. Verifies that HTTP/2 cannot replay an already-read POST after REFUSED_STREAM on the protected path. The ordinary Chat path still reuses the same connection."
     },
     {
       "path": "backend/internal/handler/dto/deepseek_tools_test.go",
@@ -2984,8 +2984,8 @@
         "deepseek_chat_transport_safety",
         "deepseek_tool_compat"
       ],
-      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point. For DeepSeek groups with tools off, a Chat transport error permits failover only when delivery tracking confirms the request did not obtain a connection or write request bytes.",
-      "sha256": "733d5d89e3a1b5e77963dc678e271a8bff5674ae749575b16406c2fe05bb638c"
+      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point. For DeepSeek groups with tools off, a Chat transport error permits failover only when delivery tracking confirms the request did not obtain a connection or write request bytes. Makes the protected POST body non-replayable by the underlying HTTP client, including HTTP/2 retries after REFUSED_STREAM.",
+      "sha256": "b80a7dc9a0dbfd99d1e47875c9001016475ac9560986778574725ae439d3c218"
     },
     {
       "path": "backend/internal/service/openai_gateway_chat_completions.go",

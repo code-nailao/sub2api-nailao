@@ -4,7 +4,9 @@ package handler
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +25,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 type deepSeekChatFailoverUpstream struct {
@@ -73,6 +77,11 @@ func TestDeepSeekChatTransportFailover(t *testing.T) {
 		t.Run(fmt.Sprintf("stream=%t/full_client_cache", stream), func(t *testing.T) {
 			testDeepSeekChatFailoverWithFullClientCache(t, stream)
 		})
+		for _, toolsEnabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/refused_stream/tools=%t", stream, toolsEnabled), func(t *testing.T) {
+				testDeepSeekChatHTTP2RefusedStream(t, stream, toolsEnabled)
+			})
+		}
 		for _, failure := range []string{"disconnect", "dial_timeout", "dns_validation"} {
 			t.Run(fmt.Sprintf("stream=%t/%s", stream, failure), func(t *testing.T) {
 				received := make(chan []byte, 1)
@@ -194,6 +203,141 @@ func testDeepSeekChatFailoverWithFullClientCache(t *testing.T, stream bool) {
 	require.Len(t, usage.created, 1)
 	require.Len(t, billing.commands, 1)
 	require.EqualValues(t, deepSeekChatBackupAccountID, billing.commands[0].AccountID)
+}
+
+func testDeepSeekChatHTTP2RefusedStream(t *testing.T, stream, toolsEnabled bool) {
+	t.Helper()
+	// Use the test listener directly so the peer can send raw HTTP/2 frames.
+	listener := httptest.NewUnstartedServer(nil).Listener
+	var completePosts, dials atomic.Int64
+	peerDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			peerDone <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		peerDone <- serveDeepSeekChatHTTP2Peer(conn, stream, &completePosts)
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		err := <-peerDone
+		if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			require.NoError(t, err)
+		}
+	})
+
+	protocols := new(http.Protocols)
+	protocols.SetUnencryptedHTTP2(true)
+	transport := &http.Transport{
+		Protocols: protocols,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			if dials.Add(1) != 1 {
+				return nil, errors.New("unexpected second connection to the test upstream")
+			}
+			return (&net.Dialer{}).DialContext(ctx, listener.Addr().Network(), listener.Addr().String())
+		},
+	}
+	t.Cleanup(transport.CloseIdleConnections)
+	client := &http.Client{Transport: transport, Timeout: 3 * time.Second}
+	upstream := &deepSeekChatFailoverUpstream{first: client.Do}
+	h, key, usage, billing := newDeepSeekChatFailoverHandler(t, upstream, "http://upstream.test")
+	key.Group.DeepSeekTools.Enabled = toolsEnabled
+	body := fmt.Sprintf(`{"model":"deepseek-flash","messages":[{"role":"user","content":"fixture"}],"stream":%t}`, stream)
+	rec := serveRejectionHTTPBody(t, h, key, "chat/completions", body)
+	require.EqualValues(t, 1, dials.Load())
+	require.Equal(t, []int64{deepSeekChatPreferredAccountID}, upstream.attempts)
+	require.Zero(t, h.gatewayService.SnapshotOpenAIAccountSchedulerMetrics().AccountSwitchTotal)
+	if toolsEnabled {
+		// The ordinary Chat path still retries the refused stream on the same connection.
+		require.EqualValues(t, 2, completePosts.Load())
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		require.Len(t, usage.created, 1)
+		require.Len(t, billing.commands, 1)
+		require.Positive(t, billing.commands[0].BalanceCost)
+		return
+	}
+	require.EqualValues(t, 1, completePosts.Load(), "HTTP/2 must not replay a POST with an unknown outcome")
+	require.Equal(t, http.StatusBadGateway, rec.Code, rec.Body.String())
+	require.Empty(t, usage.created)
+	require.Empty(t, billing.commands)
+}
+
+// Wait for the entire first POST before refusing it. A replay would succeed and
+// return usage, so the assertions catch retries hidden inside the HTTP client.
+func serveDeepSeekChatHTTP2Peer(conn net.Conn, stream bool, completePosts *atomic.Int64) error {
+	reader := bufio.NewReader(conn)
+	preface := make([]byte, len(http2.ClientPreface))
+	if _, err := io.ReadFull(reader, preface); err != nil {
+		return err
+	}
+	if string(preface) != http2.ClientPreface {
+		return errors.New("invalid HTTP/2 client preface")
+	}
+	framer := http2.NewFramer(conn, reader)
+	framer.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+	var body bytes.Buffer
+	for {
+		frame, err := framer.ReadFrame()
+		if err != nil {
+			return err
+		}
+		switch frame := frame.(type) {
+		case *http2.SettingsFrame:
+			if !frame.IsAck() {
+				if err := framer.WriteSettings(); err != nil {
+					return err
+				}
+				if err := framer.WriteSettingsAck(); err != nil {
+					return err
+				}
+			}
+		case *http2.MetaHeadersFrame:
+			if frame.PseudoValue("method") != http.MethodPost || frame.StreamEnded() {
+				return errors.New("expected a POST with a request body")
+			}
+			body.Reset()
+		case *http2.DataFrame:
+			body.Write(frame.Data())
+			if !frame.StreamEnded() {
+				continue
+			}
+			if !gjson.ValidBytes(body.Bytes()) || gjson.GetBytes(body.Bytes(), "stream").Bool() != stream {
+				return errors.New("invalid forwarded Chat request body")
+			}
+			if completePosts.Add(1) == 1 {
+				if err := framer.WriteRSTStream(frame.StreamID, http2.ErrCodeRefusedStream); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := writeDeepSeekChatHTTP2Success(framer, frame.StreamID, stream); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func writeDeepSeekChatHTTP2Success(framer *http2.Framer, streamID uint32, stream bool) error {
+	response := deepSeekChatFailoverResponse(stream)
+	defer func() { _ = response.Body.Close() }()
+	var block bytes.Buffer
+	encoder := hpack.NewEncoder(&block)
+	for _, field := range []hpack.HeaderField{{Name: ":status", Value: "200"}, {Name: "content-type", Value: response.Header.Get("Content-Type")}} {
+		if err := encoder.WriteField(field); err != nil {
+			return err
+		}
+	}
+	if err := framer.WriteHeaders(http2.HeadersFrameParam{StreamID: streamID, BlockFragment: block.Bytes(), EndHeaders: true}); err != nil {
+		return err
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return err
+	}
+	return framer.WriteData(streamID, true, body)
 }
 
 type deepSeekChatFailoverBalanceCache struct{ *handlerInflightCache }

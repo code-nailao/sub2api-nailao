@@ -274,6 +274,9 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 		group.Platform == PlatformDeepseek && !group.DeepSeekTools.Enabled
 	var delivery *httpUpstreamDelivery
 	if requireUnsent {
+		// HTTP/2 can retry REFUSED_STREAM before returning to the gateway.
+		// Without GetBody, the transport cannot replay this POST after writing it.
+		upstreamReq.GetBody = nil
 		upstreamReq, delivery = traceHTTPUpstreamDelivery(upstreamReq)
 	}
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
