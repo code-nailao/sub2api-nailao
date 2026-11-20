@@ -258,6 +258,63 @@ const connections = (f) => f.calls.filter((call) => call.path.endsWith('/connect
 // Messages are built in the page's realm; copy the IDs before comparing them.
 const ids = (groups) => Array.from(groups, (group) => group.id);
 
+test('a stale custom connection offers to open settings on startup', async () => {
+  const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID),
+    connection: () => ({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }) });
+  assert.match(f.message.textContent, /重新保存自定义连接/);
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackShell();
+  assert.equal(f.frame.hidden, true);
+  assert.equal(f.loadingPanel.hidden, false);
+  assert.match(f.message.textContent, /重新保存自定义连接/);
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  assert.equal(f.settings.length, 0);
+  f.retry.onclick();
+  assert.equal(f.settings.at(-1)?.kind, 'custom');
+  const before = connections(f);
+  f.settings.at(-1).onSaved(true);
+  assert.equal(f.values.get('sources:studio:last-group:9'), String(CUSTOM_ID));
+  assert.equal(f.state.reloads, 1);
+  assert.equal(connections(f), before);
+});
+
+test('an integrated Studio keeps the resave action visible after a failed switch and shell ACK', async () => {
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.group_id === CUSTOM_ID
+    ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  const shell = await f.integrate();
+  f.send(select(CUSTOM_ID, shell.revision, 'resave-connection-request'));
+  await flush();
+  const result = f.last('sub2api:image-studio-select-group-result');
+  assert.equal(result.status, 'error');
+  assert.match(result.message, /重新保存自定义连接/);
+  await f.ackShell();
+  assert.equal(f.loadingPanel.hidden, false);
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  assert.equal(f.settings.length, 0);
+  f.retry.onclick();
+  assert.equal(f.settings.at(-1)?.kind, 'custom');
+  assert.equal(f.document.body.dataset.integrated, 'true');
+  assert.equal(f.frame.hidden, false);
+});
+
+test('other Studio connection errors keep their existing hints and do not open settings', async () => {
+  const generic = '暂时无法连接此分组，请重试。已有作品和输入内容已保留。';
+  for (const [status, error, message] of [
+    [409, 'custom_connection_unavailable', generic],
+    [409, undefined, generic],
+    [503, 'custom_connection_needs_update', generic],
+    [403, 'custom_connection_needs_update', '此分组的授权已撤销或过期，请在主站 API 密钥页面核对。'],
+    [401, 'custom_connection_needs_update', '登录已失效，请重新登录主站后打开。'],
+  ]) {
+    const f = await fixture({ custom: 'configured', connection: () => ({ ok: false, status, data: { error } }) });
+    assert.equal(f.message.textContent, message);
+    assert.equal(f.retry.textContent, '重试连接');
+    assert.equal(f.settings.length, 0);
+  }
+});
+
 test('settings entries follow the groups and open a dialog instead of connecting', async () => {
   const f = await fixture({ custom: 'available', admin: true });
   const shell = await f.integrate();

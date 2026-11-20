@@ -17,6 +17,7 @@ const ownKeyButton = document.querySelector("#use-own-key");
 const manageRecoveryButton = document.querySelector("#manage-groups-recovery");
 const params = new URLSearchParams(location.search);
 const validRequestID = (value) => typeof value === "string" && /^[\w-]{16,80}$/.test(value);
+const CUSTOM_CONNECTION_NEEDS_UPDATE = "custom_connection_needs_update";
 let studioURL, mainOrigin, storageKey, hostConfig;
 let groups = [], viewer = { displayName: "", balance: null };
 // custom is the user's own-key connection, addressed like a group by a reserved
@@ -27,8 +28,9 @@ let generation = 0, shellRevision = 0, appliedShellRevision = 0;
 let shellReady = false, integrated = false, locked = false, selectionUncertain = false;
 let connectionPending, shellPending, connectionTimer, shellTimer, checkTimer;
 let connectionApplied = false, bootstrapPending = false, initialGroupId = null;
-let startupTimer;
-function showState(state, text) {
+let startupTimer, needsCustomResave = false;
+function showState(state, text, resave = false) {
+  needsCustomResave = resave;
   document.body.dataset.state = state;
   document.body.setAttribute("aria-busy", String(state === "loading"));
   loadingPanel.hidden = state === "ready";
@@ -37,12 +39,14 @@ function showState(state, text) {
   statusTitle.textContent = state === "loading" ? "正在打开图片工作台" : locked ? "请重新进入工作台" : "工作台连接需要处理";
   retry.hidden = locked;
   retry.disabled = Boolean(connectionPending) || bootstrapPending;
+  retry.textContent = resave ? "打开自定义连接" : "重试连接";
+  ownKeyButton.hidden = locked || resave || !custom.enabled;
   login.hidden = !locked;
   if (text) message.textContent = text;
 }
-function recoverView(text) {
+function recoverView(text, resave = false) {
   clearTimeout(startupTimer);
-  showState("recovery", text);
+  showState("recovery", text, resave);
   // Only a connection that was actually acknowledged may use an older peer.
   // This is a compatibility recovery, never a shortcut around authentication.
   if (connectionApplied && !locked) frame.hidden = false;
@@ -66,7 +70,8 @@ function notifyHost(ready) {
 }
 function setIntegrated(ready) {
   integrated = ready;
-  if (ready) { clearTimeout(startupTimer); showState("ready"); }
+  // A shell ACK does not fix a stale connection. Keep its recovery action visible.
+  if (ready && !needsCustomResave) { clearTimeout(startupTimer); showState("ready"); }
   document.body.dataset.integrated = String(ready);
   renderLegacyGroups();
   notifyHost(ready);
@@ -96,6 +101,9 @@ window.addEventListener("sources:locked", () => lock("主站已退出或切换�
 
 async function api(path, body) {
   const result = await authorizedJSON(path, { method: body ? "POST" : "GET", body });
+  if (path === "/api/studio/connection" && result.status === 409 && result.data?.error === CUSTOM_CONNECTION_NEEDS_UPDATE) {
+    throw Error("密钥所在的分组已变更，请重新保存自定义连接。", { cause: CUSTOM_CONNECTION_NEEDS_UPDATE });
+  }
   if (!result.ok) throw Error(result.status === 401
     ? "登录已失效，请重新登录主站后打开。"
     : result.status === 403 ? "此分组的授权已撤销或过期，请在主站 API 密钥页面核对。"
@@ -128,7 +136,8 @@ function renderLegacyGroups() {
   reconnect.hidden = locked || integrated || shellRevision === 0;
   reconnect.disabled = Boolean(connectionPending) || selectionUncertain || locked;
   retry.disabled = Boolean(connectionPending) || bootstrapPending;
-  customButton.hidden = ownKeyButton.hidden = locked || !custom.enabled;
+  customButton.hidden = locked || !custom.enabled;
+  ownKeyButton.hidden = customButton.hidden || needsCustomResave;
   manageButton.hidden = manageRecoveryButton.hidden = locked || !manageId;
 }
 function normalizeCustom(value) {
@@ -172,6 +181,7 @@ function recoverShell() {
 reconnect.onclick = recoverShell;
 retry.onclick = () => {
   if (locked || connectionPending || bootstrapPending) return;
+  if (needsCustomResave) { openSettings("custom"); return; }
   if (!studioURL) { void bootstrap(); return; }
   if (selectionUncertain || !connectionApplied) {
     const groupId = selectedGroupId ?? initialGroupId;
@@ -221,9 +231,8 @@ function publishShell() {
     if (++attempts > 30) {
       clearInterval(shellTimer);
       shellPending = null;
-      message.textContent = "连接暂未确认，请点击“恢复连接”重试。";
       setIntegrated(false);
-      recoverView(message.textContent);
+      if (!needsCustomResave) recoverView("连接暂未确认，请点击“恢复连接”重试。");
       return;
     }
     postStudio(pending);
@@ -249,7 +258,9 @@ async function connect(groupId, request) {
     requestId: request?.requestId, revision: request?.revision,
     restoreOnly: request?.restoreOnly === true, config: null };
   select.disabled = true;
-  message.textContent = "正在连接所选分组…";
+  const connectingText = "正在连接所选分组…";
+  if (needsCustomResave) recoverView(connectingText);
+  else message.textContent = connectingText;
   try {
     const config = await api("/api/studio/connection", { group_id: groupId, ...(pending.restoreOnly ? { restore_only: true } : {}) });
     if (locked || connectionPending !== pending) return;
@@ -277,8 +288,9 @@ async function connect(groupId, request) {
     if (locked || connectionPending !== pending) return;
     connectionPending = null;
     selectionResult(pending, "error", error.message);
-    message.textContent = error.message;
-    if (!integrated) recoverView(error.message);
+    const resave = error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE;
+    if (!integrated || resave) recoverView(error.message, resave);
+    else message.textContent = error.message;
     renderLegacyGroups();
     publishShell();
   }
@@ -319,8 +331,8 @@ window.addEventListener("message", async (event) => {
     shellPending = null;
     clearInterval(shellTimer);
     appliedShellRevision = pending.revision;
-    frame.hidden = false;
-    message.textContent = "";
+    if (!needsCustomResave || connectionApplied) frame.hidden = false;
+    if (!needsCustomResave) message.textContent = "";
     setIntegrated(true);
     return;
   }
@@ -385,7 +397,8 @@ async function refreshMetadata() {
   } catch (error) {
     if (locked) return;
     viewer = { displayName: viewer.displayName, balance: null };
-    message.textContent = error.message;
+    if (needsCustomResave) recoverView(error.message);
+    else message.textContent = error.message;
     publishShell();
   }
 }

@@ -2,6 +2,7 @@ import { authorizedJSON, clearSession, currentToken } from "./session.js";
 import { openCustomSettings, openGroupSettings } from "./studio-settings.js";
 
 const params = new URLSearchParams(location.search);
+const CUSTOM_CONNECTION_NEEDS_UPDATE = "custom_connection_needs_update";
 const frame = document.querySelector("#studio");
 const select = document.querySelector("#groups");
 const message = document.querySelector("#message");
@@ -19,13 +20,14 @@ const manageButton = document.querySelector("#canvas-manage");
 const ownKeyButton = document.querySelector("#canvas-own-key");
 let studioURL, configuration, hostConfig;
 let ack = false, generation = 0, locked = false, connecting = false, bootstrapping = false;
-let sendTimer, checkTimer, startupTimer;
+let sendTimer, checkTimer, startupTimer, needsCustomResave = false;
 const granted = new Map();
 // The user's own-key connection is addressed like a group, by a reserved ID.
 let custom = { groupId: 0, enabled: false, configured: false };
 const validRequestID = (value) => typeof value === "string" && /^[\w-]{16,80}$/.test(value);
 
-function showState(state, text) {
+function showState(state, text, resave = false) {
+  needsCustomResave = resave;
   document.body.dataset.state = state;
   document.body.setAttribute("aria-busy", String(state === "loading"));
   statusPanel.hidden = state === "ready";
@@ -34,6 +36,8 @@ function showState(state, text) {
   statusTitle.textContent = state === "loading" ? "正在打开无限画布" : locked ? "请重新进入画布" : "画布连接需要处理";
   retry.hidden = locked;
   retry.disabled = connecting || bootstrapping;
+  retry.textContent = resave ? "打开自定义连接" : "重试连接";
+  ownKeyButton.hidden = locked || resave || !custom.enabled;
   login.hidden = !locked;
   if (text) message.textContent = text;
 }
@@ -43,9 +47,9 @@ function notifyHost(ready) {
     requestId: hostConfig.requestId, revision: hostConfig.revision,
     shellMode: hostConfig.shellMode, integrated: ready }, location.origin);
 }
-function recover(text) {
+function recover(text, resave = false) {
   clearTimeout(startupTimer);
-  showState("recovery", text);
+  showState("recovery", text, resave);
 }
 function armStartupTimeout() {
   clearTimeout(startupTimer);
@@ -99,6 +103,9 @@ document.querySelector("#canvas-connection-menu").addEventListener("keydown", (e
 });
 async function api(path, body) {
   const result = await authorizedJSON(path, { method: body ? "POST" : "GET", body });
+  if (path === "/api/canvas/connection" && result.status === 409 && result.data?.error === CUSTOM_CONNECTION_NEEDS_UPDATE) {
+    throw Error("密钥所在的分组已变更，请重新保存自定义连接。", { cause: CUSTOM_CONNECTION_NEEDS_UPDATE });
+  }
   if (!result.ok) throw Error(result.status === 401
     ? "登录已失效，请重新登录主站后打开画布。"
     : result.status === 403 ? "画布授权已撤销或过期，请在主站 API 密钥页面核对。"
@@ -152,8 +159,10 @@ window.addEventListener("message", async (event) => {
       if (current !== generation || target !== frame.contentWindow || locked) return;
       granted.set(connectionId, config);
       target.postMessage({ type: "sub2api:media-studio-config", payload: { ...config, requestId, selectActive: false } }, studioURL.origin);
-    } catch {
-      if (current === generation && target === frame.contentWindow && !locked) target.postMessage({ type: "sub2api:canvas-restore-error", connectionId, requestId }, studioURL.origin);
+    } catch (error) {
+      if (current !== generation || target !== frame.contentWindow || locked) return;
+      target.postMessage({ type: "sub2api:canvas-restore-error", connectionId, requestId }, studioURL.origin);
+      if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) recover(error.message, true);
     }
     return;
   }
@@ -165,7 +174,7 @@ window.addEventListener("message", async (event) => {
   clearInterval(sendTimer);
   clearTimeout(startupTimer);
   frame.hidden = false;
-  showState("ready");
+  if (!needsCustomResave) showState("ready");
   applyAppearance();
   notifyHost(true);
 });
@@ -197,7 +206,7 @@ async function connect() {
     ack = previousAck;
     if (previous) select.value = previous.selectedConnectionId.slice(6);
     frame.hidden = !previousAck;
-    recover(error.message);
+    recover(error.message, error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE);
     return false;
   } finally {
     if (current === generation && !locked) {
@@ -209,6 +218,7 @@ async function connect() {
 }
 retry.onclick = () => {
   if (locked || connecting || bootstrapping) return;
+  if (needsCustomResave) { openCustomConnectionSettings(); return; }
   if (!studioURL) { void bootstrap(); return; }
   if (configuration && !ack) {
     // Resend the existing configuration, not a second authorization request.
@@ -245,7 +255,8 @@ function renderGroups(data, keep) {
     select.append(option);
   }
   if (keep && entries.some((group) => String(group.id) === keep)) select.value = keep;
-  customButton.hidden = ownKeyButton.hidden = !custom.enabled;
+  customButton.hidden = !custom.enabled;
+  ownKeyButton.hidden = customButton.hidden || needsCustomResave;
   manageButton.hidden = data.can_manage !== true;
   return entries.length;
 }
@@ -264,13 +275,17 @@ async function reloadGroups(selectId) {
       return;
     }
     select.onchange = connect;
-    if ((selectId || select.value !== previous || !configuration) && await connect()) watchSession();
+    if (selectId || select.value !== previous || !configuration) {
+      if (await connect()) watchSession();
+    } else if (needsCustomResave && !custom.configured && ack) {
+      showState("ready");
+    }
   } catch (error) {
     if (!locked) recover(error.message);
   }
 }
 const connectionMenu = document.querySelector("#canvas-connection-menu");
-customButton.onclick = ownKeyButton.onclick = () => {
+function openCustomConnectionSettings() {
   if (locked) return;
   connectionMenu.open = false;
   openCustomSettings({ onSaved: (configured) => {
@@ -278,7 +293,8 @@ customButton.onclick = ownKeyButton.onclick = () => {
     granted.delete(`group-${custom.groupId}`);
     void reloadGroups(configured ? String(custom.groupId) : "");
   } });
-};
+}
+customButton.onclick = ownKeyButton.onclick = openCustomConnectionSettings;
 manageButton.onclick = () => {
   if (locked) return;
   connectionMenu.open = false;

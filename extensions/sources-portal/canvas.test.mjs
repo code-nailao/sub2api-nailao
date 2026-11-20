@@ -129,6 +129,81 @@ test('Canvas layout is isolated, responsive and keeps native controls instead of
 
 const connections = (f) => f.calls.filter((call) => call.path.endsWith('/connection'));
 
+test('a stale custom Canvas connection offers settings and reconnects after saving', async () => {
+  let stale = true;
+  const f = await fixture({ groups: [], custom: 'configured', connection: (options, config) => stale
+    ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  assert.match(f.elements['#message'].textContent, /重新保存自定义连接/);
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+  assert.equal(f.settings.length, 0);
+  f.elements['#canvas-retry'].onclick();
+  assert.equal(f.settings.at(-1)?.kind, 'custom');
+  stale = false;
+  f.settings.at(-1).onSaved(true);
+  await flush(); await flush();
+  assert.equal(connections(f).at(-1).options.body.group_id, CUSTOM_ID);
+  f.loaded(); await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+});
+
+test('switching Canvas to a stale connection offers settings and preserves the acknowledged frame', async () => {
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.group_id === CUSTOM_ID
+    ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.loaded(); await f.ack();
+  const previous = f.select.value;
+  f.select.value = String(CUSTOM_ID);
+  await f.select.onchange();
+  assert.match(f.elements['#message'].textContent, /重新保存自定义连接/);
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+  f.elements['#canvas-retry'].onclick();
+  assert.equal(f.settings.at(-1)?.kind, 'custom');
+  assert.equal(f.select.value, previous);
+  assert.equal(f.frame.hidden, false);
+  f.state.custom = 'available';
+  f.settings.at(-1).onSaved(false);
+  await flush();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.select.value, previous);
+});
+
+test('restoring a stale Canvas connection reports the failure and offers settings without opening a dialog', async () => {
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only
+    ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.loaded(); await f.ack();
+  const connectionId = `group-${CUSTOM_ID}`;
+  const requestId = '00000000-0000-4000-8000-000000000000';
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId, requestId });
+  await flush();
+  assert.equal(f.last('sub2api:canvas-restore-error').requestId, requestId);
+  assert.match(f.elements['#message'].textContent, /重新保存自定义连接/);
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.settings.length, 0);
+  f.elements['#canvas-retry'].onclick();
+  assert.equal(f.settings.at(-1)?.kind, 'custom');
+});
+
+test('other Canvas connection errors keep their existing hints and do not open settings', async () => {
+  const generic = '授权暂不可用，请稍后重试；不会自动换组或创建新任务。';
+  for (const [status, error, message] of [
+    [409, 'custom_connection_unavailable', generic],
+    [409, undefined, generic],
+    [503, 'custom_connection_needs_update', generic],
+    [403, 'custom_connection_needs_update', '画布授权已撤销或过期，请在主站 API 密钥页面核对。'],
+    [401, 'custom_connection_needs_update', '登录已失效，请重新登录主站后打开画布。'],
+  ]) {
+    const f = await fixture({ custom: 'configured', connection: () => ({ ok: false, status, data: { error } }) });
+    assert.equal(f.elements['#message'].textContent, message);
+    assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
+    assert.equal(f.settings.length, 0);
+  }
+});
+
 test('a saved own-key connection is one more entry of the group menu', async () => {
   const f = await fixture({ custom: 'configured' }); f.host(); f.loaded(); await f.ack();
   assert.deepEqual(f.select.children.map((option) => option.value), [26, 27, CUSTOM_ID]);
