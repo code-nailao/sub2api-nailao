@@ -515,9 +515,6 @@ class Deployer:
                   initial_runtime: dict[str, Any] | None = None, allow_backup_wait: bool = True) -> int | None:
         """Return the exit code or None if Docker confirms that the owner was removed."""
         started = self.ops.monotonic()
-        # Confirmation and recovery share a hard deadline across their
-        # probes. The ordinary drain can extend its wait for a backup.
-        probe_deadline = None if allow_backup_wait else deadline
         next_note = started + first_note
         next_probe = next_note
         cutoff_probed = False
@@ -528,24 +525,35 @@ class Deployer:
         backup_until = None if remaining is None else started + remaining + BACKUP_FINISH_GRACE_SECONDS
         backup_running = remaining is not None
 
+        def exit_deadline() -> float:
+            wait_until = max(deadline, backup_until or deadline)
+            if cutoff_probed and runtime is None:
+                wait_until = max(wait_until, deadline + BACKUP_STATUS_RETRY_WINDOW_SECONDS)
+            return wait_until
+
         while True:
+            # Docker inspect and its list fallback draw from the same window.
+            # Only backup evidence or a failed cutoff status read can extend it.
+            probe_deadline = exit_deadline()
             info, removed = self.background_container(name, deadline=probe_deadline)
             seen_at = self.ops.monotonic()
-            if probe_deadline is not None and seen_at >= probe_deadline:
-                raise BackgroundExitTimeout(f"could not confirm exit of {name} before the deadline")
-            if removed:
-                return None
-            state = (info or {}).get("State") or {}
-            if state.get("Running") is False and not state.get("Restarting"):
-                return int(state.get("ExitCode", 0))
-            at_cutoff = seen_at >= deadline
-            if read_runtime and (seen_at >= next_probe or (at_cutoff and not cutoff_probed)):
-                cutoff_probed = cutoff_probed or at_cutoff
-                runtime_deadline = probe_deadline if probe_deadline is not None else seen_at + RUNTIME_STATUS_TIMEOUT_SECONDS
+            if seen_at < probe_deadline:
+                if removed:
+                    return None
+                state = (info or {}).get("State") or {}
+                if state.get("Running") is False and not state.get("Restarting"):
+                    return int(state.get("ExitCode", 0))
+
+            # Recheck at the ordinary cutoff in case a backup started after
+            # preflight. This read has a short budget even at the cutoff.
+            at_backup_cutoff = allow_backup_wait and seen_at >= deadline and not cutoff_probed
+            if read_runtime and (at_backup_cutoff or (seen_at < probe_deadline and seen_at >= next_probe)):
+                cutoff_probed = cutoff_probed or at_backup_cutoff
+                if at_backup_cutoff:
+                    probe_deadline = max(probe_deadline, deadline + RUNTIME_STATUS_TIMEOUT_SECONDS)
+                runtime_deadline = min(probe_deadline, seen_at + RUNTIME_STATUS_TIMEOUT_SECONDS)
                 runtime = read_runtime(runtime_deadline)
                 seen_at = self.ops.monotonic()
-                if probe_deadline is not None and seen_at >= probe_deadline:
-                    raise BackgroundExitTimeout(f"could not confirm exit of {name} before the deadline")
                 remaining = self.scheduled_backup_remaining(runtime)
                 if (allow_backup_wait and runtime is not None and remaining is None
                         and "scheduled_backup_remaining_seconds" in runtime):
@@ -566,23 +574,18 @@ class Deployer:
                     next_probe = seen_at + BACKUP_STATUS_POLL_SECONDS
                     retry_delay = 1
 
-            if seen_at >= deadline:
-                wait_until = max(deadline, backup_until or deadline)
-                if allow_backup_wait and read_runtime and runtime is None:
-                    wait_until = max(wait_until, deadline + BACKUP_STATUS_RETRY_WINDOW_SECONDS)
-                if seen_at >= wait_until:
-                    waited = int(seen_at - started)
-                    raise BackgroundExitTimeout(f"{name} is still draining after {waited}s")
-                if not logged_extension:
-                    detail = "backup status unavailable, retrying" if runtime is None else self.drain_progress(runtime)
-                    self.log(f"   {name} still draining past the ordinary timeout" + (f": {detail}" if detail else ""))
-                    logged_extension = True
+            wait_until = exit_deadline()
+            if seen_at >= wait_until:
+                raise BackgroundExitTimeout(f"could not confirm exit of {name} before the deadline")
+            if seen_at >= deadline and not logged_extension:
+                detail = "backup status unavailable, retrying" if runtime is None else self.drain_progress(runtime)
+                self.log(f"   {name} still draining past the ordinary timeout" + (f": {detail}" if detail else ""))
+                logged_extension = True
             if seen_at >= next_note:
                 detail = self.drain_progress(runtime)
                 self.log(f"   {name} still finishing in-flight work" + (f": {detail}" if detail else " ..."))
                 next_note += 60
-            delay = poll if probe_deadline is None else min(poll, max(0, probe_deadline - seen_at))
-            self.ops.sleep(delay)
+            self.ops.sleep(min(poll, wait_until - seen_at))
 
     def wait_recovery_exit(self, name: str) -> int | None:
         deadline = self.ops.monotonic() + HANDOFF_RECOVERY_SECONDS
@@ -806,19 +809,27 @@ class Deployer:
             parts.append("still stopping " + ", ".join(str(name) for name in stopping))
         return "; ".join(parts) or None
 
-    def start_background(self, view: dict[str, Any]) -> None:
+    @staticmethod
+    def background_restart_policy(info: dict[str, Any] | None) -> str:
+        policy = ((info or {}).get("HostConfig") or {}).get("RestartPolicy") or {}
+        restart = policy.get("Name") or "no"
+        if restart == "on-failure" and (limit := policy.get("MaximumRetryCount")):
+            restart += f":{limit}"
+        return restart
+
+    def start_background(self, view: dict[str, Any], *, restart: str = "unless-stopped") -> None:
         name = view["containers"]["background"]
-        self.ops.run(["docker", "update", "--restart=unless-stopped", name], mutate=True)
+        self.ops.run(["docker", "update", f"--restart={restart}", name], mutate=True)
         self.ops.run(["docker", "start", name], mutate=True)
         if not self.ops.dry_run:
             self.wait_ready(view["ports"]["background"], self.token_for(view, "background"),
                             "background", self.cfg.background_ready_timeout, container=name,
                             poll=HANDOFF_POLL_SECONDS)
 
-    def restore_background(self, current: dict[str, Any], failed: DeployError) -> None:
+    def restore_background(self, current: dict[str, Any], failed: DeployError, *, restart: str) -> None:
         old = current["containers"]["background"]
         try:
-            self.start_background(current)
+            self.start_background(current, restart=restart)
         except (DeployError, OSError, subprocess.SubprocessError) as restore_err:
             raise FallbackFailed(f"background handoff failed ({failed}); could not restart {old}: {restore_err}") from restore_err
         raise BackgroundRestored(f"background handoff failed ({failed}); previous background {old} is running again") from failed
@@ -861,24 +872,51 @@ class Deployer:
                                              f"Could not finish stopping it before restoring {old}: {stop_err}") from stop_err
                 elif not new_removed:
                     raise FallbackFailed(f"could not confirm the state of new background {new} before restoring {old}") from err
-                self.restore_background(current, DeployError(f"new background did not become ready: {err}"))
+                self.restore_background(current, DeployError(f"new background did not become ready: {err}"),
+                                        restart=self.background_restart_policy(old_info))
 
     def drain_background(self, current: dict[str, Any], old_info: dict[str, Any],
                          before: dict[str, Any] | None, successor: str, back: bool,
                          interrupted: Callable[[], bool]) -> None:
         old = current["containers"]["background"]
-        policy = (old_info.get("HostConfig") or {}).get("RestartPolicy") or {}
-        restart = policy.get("Name") or "no"
-        if restart == "on-failure" and (limit := policy.get("MaximumRetryCount")):
-            restart += f":{limit}"
+        restart = self.background_restart_policy(old_info)
+
+        follow_up = (f"Check container state and verify {old} has exited before starting "
+                     "the background for the active slot.")
+
+        def restore_restart_policy(reason: str) -> None:
+            try:
+                # A terminal Ctrl-C reaches the Docker CLI too. The child
+                # inherits SIG_IGN for this cleanup command.
+                with finish_handoff_cleanup(ignore=True):
+                    try:
+                        self.ops.run(["docker", "update", f"--restart={restart}", old], mutate=True,
+                                     timeout=DOCKER_STATUS_TIMEOUT_SECONDS)
+                    except KeyboardInterrupt:
+                        # Docker may already have applied the update.
+                        self.ops.run(["docker", "update", f"--restart={restart}", old], mutate=True,
+                                     timeout=DOCKER_STATUS_TIMEOUT_SECONDS)
+            except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
+                failure = FallbackFailed(f"{reason} Could not restore the restart policy of {old}: {err}. {follow_up}")
+                if not self.ops.dry_run:
+                    self._record_unrestored(load_state(self.cfg), failure)
+                raise failure from err
 
         try:
             self.ops.run(["docker", "update", "--restart=no", old], mutate=True)
-        except (DeployError, OSError, subprocess.SubprocessError):
-            if not self.ops.container_missing(old):
-                raise
-            self.log(f"   {old} was removed before SIGTERM. Starting the prepared background {successor}.")
-            return
+        except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                if self.ops.container_missing(old):
+                    self.log(f"   {old} was removed before SIGTERM. Starting the prepared background {successor}.")
+                    return
+            # The daemon can apply the update before the CLI is interrupted.
+            reason = f"could not disable automatic restart of {old}: {err}."
+            restore_restart_policy(reason)
+            raise DeployError(f"{reason} Its restart policy was restored.") from err
+        if not back and interrupted():
+            reason = f"handoff interrupted before SIGTERM to {old}."
+            restore_restart_policy(reason)
+            raise DeployError(f"{reason} Its restart policy was restored.")
         self.log(f"   TERM {old}. Waiting for it to finish in-flight work.")
         if (before or {}).get("admin_during_drain") == "read-only":
             self.log(f"   while {old} drains it answers admin reads and refuses admin writes with 503. "
@@ -899,24 +937,6 @@ class Deployer:
         # Give the owner a short window to report drain or exit.
         term_confirmed = not signal_failed
         check_term_after = self.ops.monotonic() + HANDOFF_FIRST_NOTE_SECONDS
-
-        follow_up = (f"Check container state and verify {old} has exited before starting "
-                     "the background for the active slot.")
-
-        def restore_restart_policy(reason: str) -> None:
-            try:
-                # A terminal Ctrl-C reaches the Docker CLI too. The child
-                # inherits SIG_IGN for this cleanup command.
-                with finish_handoff_cleanup(ignore=True):
-                    try:
-                        self.ops.run(["docker", "update", f"--restart={restart}", old], mutate=True,
-                                     timeout=DOCKER_STATUS_TIMEOUT_SECONDS)
-                    except KeyboardInterrupt:
-                        # Docker may already have applied the update.
-                        self.ops.run(["docker", "update", f"--restart={restart}", old], mutate=True,
-                                     timeout=DOCKER_STATUS_TIMEOUT_SECONDS)
-            except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
-                raise FallbackFailed(f"{reason} Could not restore the restart policy of {old}: {err}. {follow_up}") from err
 
         def fail_handoff(reason: str, err: BaseException) -> NoReturn:
             # Persist the recovery instructions even if restoring the policy fails.
@@ -974,7 +994,7 @@ class Deployer:
                 fail_handoff(f"could not confirm exit of {old} after the handoff and recovery waits.", recovery_err)
         if not back and code is not None and (failure is not None or interrupted()):
             try:
-                self.restore_background(current, failure or DeployError("handoff interrupted"))
+                self.restore_background(current, failure or DeployError("handoff interrupted"), restart=restart)
             except FallbackFailed:
                 _, removed = self.background_container(old)
                 if not removed:

@@ -620,6 +620,7 @@ class DeployTest(unittest.TestCase):
         old = self.state()["current"]["containers"]["background"]
         self.cfg.background_exit_timeout = 2
         self.ops.drain_seconds[old] = 8
+        self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"] = "always"
         starts = []
         original_run = self.ops.run
 
@@ -635,7 +636,7 @@ class DeployTest(unittest.TestCase):
         self.assertEqual([old], starts)
         self.assertFalse(self.ops.switched)
         self.assertTrue(self.ops.containers[old]["State"]["Running"])
-        self.assertEqual("unless-stopped", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertEqual("always", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
         self.assertIsNone(self.state()["in_progress"])
 
     def test_sigint_in_normal_drain_restores_old_background_after_exit(self):
@@ -702,6 +703,50 @@ class DeployTest(unittest.TestCase):
         self.assertEqual("always", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
         self.assertNotIn(["docker", "start", successor], self.ops.commands)
         self.assertFalse(self.ops.switched)
+
+    def test_slow_docker_queries_cannot_extend_the_ordinary_drain(self):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        successor = self.cfg.container("a", "background")
+        self.cfg.background_exit_timeout = 2
+        self.ops.drain_seconds[old] = float("inf")
+        original_run = self.ops.run
+        original_inspect = self.ops.inspect
+        term_at = None
+        slow_inspects = []
+        lists = []
+
+        def inspect(name, *, timeout=30):
+            if name == old and term_at is not None and self.ops.clock - term_at >= 1.5:
+                slow_inspects.append((self.ops.clock - term_at, timeout))
+                self.ops.clock += timeout
+                raise subprocess.TimeoutExpired("inspect", timeout)
+            return original_inspect(name, timeout=timeout)
+
+        def run(args, **kwargs):
+            nonlocal term_at
+            if args == ["docker", "kill", "--signal=TERM", old]:
+                term_at = self.ops.clock
+            if args[:3] == ["docker", "container", "ls"] and term_at is not None:
+                timeout = kwargs["timeout"]
+                lists.append(self.ops.clock - term_at)
+                self.ops.clock += timeout
+                raise subprocess.TimeoutExpired("list", timeout)
+            return original_run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "inspect", inspect), \
+                deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "could not confirm exit"):
+                self.deploy()
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertIn("could not confirm exit", self.state()["in_progress"]["failed"])
+        self.assertLess(self.ops.clock - term_at, 33)
+        start, timeout = slow_inspects[0]
+        self.assertLess(start, 2)
+        self.assertLess(start + timeout, 2.1)
+        self.assertEqual([], lists, "an inspect that consumes the budget leaves no time to list")
+        self.assertNotIn(["docker", "start", successor], self.ops.commands)
+        self.assertEqual("unless-stopped", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
 
     def test_ctrl_c_during_recovery_wait_still_restores_background(self):
         old = self.state()["current"]["containers"]["background"]
@@ -1217,6 +1262,33 @@ class DeployTest(unittest.TestCase):
                 self.assertTrue(ops.containers[successor]["State"]["Running"])
                 self.assertLess(ops.commands.index(["docker", "container", "ls", "--all", "--format", "{{.Names}}"]),
                                 ops.commands.index(["docker", "start", successor]))
+
+    def test_sigint_after_disabling_restart_restores_original_policy(self):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        successor = self.cfg.container("a", "background")
+        self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"] = "always"
+        original_run = self.ops.run
+
+        def run(args, **kwargs):
+            result = original_run(args, **kwargs)
+            if args == ["docker", "update", "--restart=no", old]:
+                # Docker has applied the update. Ctrl-C reaches both the
+                # deploy process and the client before the client returns.
+                child = "import os, signal; os.kill(os.getppid(), signal.SIGINT); signal.raise_signal(signal.SIGINT)"
+                return deploy.Ops.run(self.ops, [sys.executable, "-c", child], mutate=True, timeout=5)
+            return result
+
+        with mock.patch.object(self.ops, "run", run), deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaises(deploy.DeployError):
+                self.deploy()
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertEqual(current, self.state()["current"])
+            self.assertIsNone(self.state()["in_progress"])
+        self.assertTrue(self.ops.containers[old]["State"]["Running"])
+        self.assertEqual("always", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertNotIn(["docker", "kill", "--signal=TERM", old], self.ops.commands)
+        self.assertNotIn(["docker", "start", successor], self.ops.commands)
 
     def test_background_removed_before_restart_policy_change_allows_handoff(self):
         old = self.state()["current"]["containers"]["background"]

@@ -453,9 +453,10 @@ func (s *BackupService) UpdateS3Config(ctx context.Context, cfg BackupS3Config) 
 	return &cfg, nil
 }
 
-// sameBackupS3Endpoint allows the optional slash the SDK adds to a base
-// path. Comparing the rest verbatim keeps alternate destinations distinct.
-func sameBackupS3Endpoint(a, b string) bool {
+// sameBackupS3Endpoint allows an optional slash at the root or when the SDK
+// appends a bucket to the base path. Virtual-hosted HeadBucket keeps a
+// non-empty base path exactly as supplied.
+func sameBackupS3Endpoint(a, b string, forcePathStyle bool) bool {
 	if a == b {
 		return true
 	}
@@ -467,7 +468,8 @@ func sameBackupS3Endpoint(a, b string) bool {
 	}
 	endpoint, err := url.Parse(a)
 	return err == nil && (endpoint.Scheme == "http" || endpoint.Scheme == "https") &&
-		endpoint.Hostname() != "" && endpoint.User == nil && !strings.HasSuffix(endpoint.Path, "/")
+		endpoint.Hostname() != "" && endpoint.User == nil && !strings.HasSuffix(endpoint.Path, "/") &&
+		(forcePathStyle || endpoint.Path == "")
 }
 
 func (s *BackupService) TestS3Connection(ctx context.Context, cfg BackupS3Config) error {
@@ -475,7 +477,7 @@ func (s *BackupService) TestS3Connection(ctx context.Context, cfg BackupS3Config
 	// and access key. This lets admins test either addressing mode for it.
 	if cfg.SecretAccessKey == "" {
 		old, _ := s.loadS3Config(ctx)
-		if old != nil && sameBackupS3Endpoint(old.Endpoint, cfg.Endpoint) && old.Bucket == cfg.Bucket &&
+		if old != nil && sameBackupS3Endpoint(old.Endpoint, cfg.Endpoint, cfg.ForcePathStyle) && old.Bucket == cfg.Bucket &&
 			cmp.Or(old.Region, "auto") == cmp.Or(cfg.Region, "auto") &&
 			old.AccessKeyID == cfg.AccessKeyID {
 			cfg.SecretAccessKey = old.SecretAccessKey
