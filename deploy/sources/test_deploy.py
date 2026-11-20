@@ -261,6 +261,10 @@ class FakeOps(deploy.Ops):
             return
         self.files[path] = text
 
+    def remove_file(self, path):
+        if not self.dry_run:
+            self.files.pop(path, None)
+
     def port_free(self, port):
         return port not in self.busy_ports
 
@@ -1005,6 +1009,40 @@ class DeployTest(unittest.TestCase):
                               self.ops.inspect(current["containers"][role])["Id"]], self.ops.commands)
         self.assert_release_failure("failed", "route unconfirmed")
 
+    def test_degraded_rollback_allows_old_worker_to_finish_reloading_before_retirement(self):
+        for role in deploy.SERVING_ROLES:
+            for endpoint in self.ops.containers[LEGACY["containers"][role]]["NetworkSettings"]["Networks"].values():
+                endpoint["Aliases"] = [self.cfg.serving_alias]
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+        run, probe = self.ops.run, self.ops.probe_nginx_serving
+        old_route_proof = None
+        after_reload = 0
+
+        def change_route(args, **kw):
+            nonlocal old_route_proof
+            if args == ["docker", "start", LEGACY["containers"]["background"]]:
+                raise deploy.DeployError("fixture original background failed")
+            if args == [self.cfg.nginx_bin, "-s", "reload"] and self.ops.switched:
+                old_route_proof = probe("", 1)
+            return run(args, **kw)
+
+        def reply(path, timeout):
+            nonlocal after_reload
+            if old_route_proof is not None:
+                after_reload += 1
+                if after_reload == 2:
+                    return old_route_proof
+            return probe(path, timeout)
+
+        with mock.patch.object(self.ops, "run", change_route), mock.patch.object(self.ops, "probe_nginx_serving", reply):
+            with self.assertRaises(deploy.RollbackIncomplete):
+                self.deploy()
+        self.assertGreaterEqual(after_reload, 3)
+        self.assert_loaded_interfaces(LEGACY, target)
+        self.assert_no_shared_serving(target)
+        self.assert_release_failure("failed", "rollback background unavailable")
+
     def test_resume_keeps_both_serving_pairs_when_reload_is_ignored(self):
         target = self.hold()["target"]
         run = self.ops.run
@@ -1057,6 +1095,100 @@ class DeployTest(unittest.TestCase):
         for role in deploy.SERVING_ROLES:
             self.assertIsNone(self.ops.inspect(target["containers"][role]))
 
+    def test_main_failed_fingerprint_after_nginx_test_restores_loaded_admin(self):
+        self.deploy()
+        original = self.state()["current"]
+        run, read = self.ops.run, self.ops.read_bytes
+        injecting = False
+        failures = []
+
+        def test_nginx(args, **kw):
+            nonlocal injecting
+            result = run(args, **kw)
+            if args == [self.cfg.nginx_bin, "-t"]:
+                injecting = True
+            return result
+
+        def fail_fingerprint(path):
+            if path == self.cfg.upstream_file and injecting and not failures:
+                failures.append(path)
+                raise OSError("fixture fingerprint read failure")
+            return read(path)
+
+        self.ops.commands.clear()
+        with mock.patch.object(self.ops, "run", test_nginx), mock.patch.object(self.ops, "read_bytes", fail_fingerprint):
+            with self.assertRaisesRegex(deploy.DeployError, "fingerprint"):
+                self.deploy(image="fixture:second")
+        self.assertEqual([self.cfg.upstream_file], failures)
+        self.assert_live_release(original)
+        self.assertNotIn([self.cfg.nginx_bin, "-s", "reload"], self.ops.commands)
+        self.assertEqual("failed", self.history()[-1]["result"])
+
+    def test_main_rejected_candidate_file_is_removed_if_previous_file_disappears(self):
+        self.deploy()
+        original = self.state()["current"]
+        run = self.ops.run
+        new_background = self.cfg.slot_view("b")["containers"]["background"]
+
+        def remove_file_after_handoff(args, **kw):
+            result = run(args, **kw)
+            if args == ["docker", "start", new_background]:
+                self.ops.files.pop(self.cfg.upstream_file)
+            return result
+
+        self.ops.commands.clear()
+        self.ops.nginx_test_rc = 1
+        with mock.patch.object(self.ops, "run", remove_file_after_handoff):
+            with self.assertRaisesRegex(deploy.DeployError, "nginx -t rejected"):
+                self.deploy(image="fixture:second")
+        self.assertNotIn(self.cfg.upstream_file, self.ops.files)
+        self.assert_loaded_interfaces(original, original)
+        self.assertNotIn([self.cfg.nginx_bin, "-s", "reload"], self.ops.commands)
+        self.assert_release_failure("failed", "upstream file")
+
+    def test_main_can_install_a_probe_with_a_long_state_path(self):
+        original_state = self.state()
+        self.cfg.state_file = str(self.tmp / ("nested-" * 15) / "state.json")
+        deploy.save_state(self.cfg, original_state)
+        self.load_fixture_route(LEGACY, proof=False)
+        self.deploy()
+        self.assert_live_release(self.state()["current"])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertIn("X-Sources-Route", self.ops.loaded_upstreams)
+
+    def test_main_inspect_timeout_before_slot_changes_allows_retry(self):
+        self.deploy()
+        self.deploy(image="fixture:second")
+        before = self.state()
+        run, inspect = self.ops.run, self.ops.inspect
+        exported = False
+        seen = []
+
+        def export_then_inject(args, **kw):
+            nonlocal exported
+            result = run(args, **kw)
+            if args[:2] == ["cp", "-Rn"]:
+                exported = True
+            return result
+
+        def inspect_once(name):
+            if exported and not seen:
+                seen.append(name)
+                raise deploy.CommandTimedOut(subprocess.TimeoutExpired(["docker", "inspect", name], 1))
+            return inspect(name)
+
+        with mock.patch.object(self.ops, "run", export_then_inject), mock.patch.object(self.ops, "inspect", inspect_once):
+            with self.assertRaisesRegex(deploy.DeployError, "timed out"):
+                self.deploy(image="fixture:third")
+        self.assertEqual(1, len(seen))
+        self.assertEqual(before, self.state())
+        self.assert_live_release(before["current"])
+        for container in before["previous"]["containers"].values():
+            self.assertIsNotNone(self.ops.inspect(container))
+        self.assertEqual("failed", self.history()[-1]["result"])
+        self.deploy(image="fixture:retry")
+        self.assert_live_release(self.state()["current"])
+
     def test_main_reuses_switch_reload_to_install_probe_on_first_release(self):
         self.load_fixture_route(LEGACY, proof=False)
         self.deploy()
@@ -1064,6 +1196,33 @@ class DeployTest(unittest.TestCase):
                          + [[self.cfg.nginx_bin, "-s", "reload"]],
                          [args for args in self.ops.commands if args[0] == self.cfg.nginx_bin])
         self.assert_live_release(self.state()["current"])
+
+    def test_main_full_command_trace_does_not_repeat_docker_queries_within_a_check(self):
+        self.load_fixture_route(LEGACY, proof=False)
+        inspect = self.ops.inspect
+
+        def record_inspect(name):
+            self.ops.commands.append(["docker", "inspect", name])
+            return inspect(name)
+
+        with mock.patch.object(self.ops, "inspect", record_inspect):
+            for sequence, slot in enumerate(("a", "b")):
+                with self.subTest(release=sequence + 1):
+                    original = self.state()["current"]["containers"]
+                    target = self.cfg.slot_view(slot)["containers"]
+                    old_serving = [original[role] for role in deploy.SERVING_ROLES]
+                    new_serving = [target[role] for role in deploy.SERVING_ROLES]
+                    self.ops.commands.clear()
+                    self.deploy(image=f"fixture:release-{sequence}")
+                    inspected = [args[-1] for args in self.ops.commands if args[:2] == ["docker", "inspect"]]
+                    self.assertEqual(52, len(self.ops.commands) - len(inspected))
+                    expected = [target[role] for role in deploy.ROLES]  # preflight
+                    expected += old_serving + (new_serving if sequence else [])  # confirm before slot reuse
+                    expected += [original["background"], original["background"], target["background"]]
+                    expected += new_serving * 2  # check each port before and after reload
+                    expected += [target["serving"]] * 8  # guard polls
+                    expected += new_serving + old_serving * 2  # readiness, alias coverage and retirement
+                    self.assertEqual(expected, inspected)
 
     def test_main_second_release_publishes_alias_at_create_using_baseline_commands(self):
         self.deploy()
@@ -1190,6 +1349,77 @@ class DeployTest(unittest.TestCase):
         self.assertNotIn(["shared_alias_conflict"], [item["alert"] for item in deploy.watch_once(self.cfg, self.ops, {})])
         run(["docker", "start", previous_primary], mutate=True)
         self.assertIn(["shared_alias_conflict"], [item["alert"] for item in deploy.watch_once(self.cfg, self.ops, {})])
+
+    def test_watch_reports_an_instance_restarted_before_retirement_finishes(self):
+        self.deploy()
+        primary = self.state()["current"]["containers"]["serving"]
+        self.ops.drain_seconds[primary] = 10
+        pid = os.getpid()
+        self.ops.files["/proc/sys/kernel/random/boot_id"] = "fixture-boot\n"
+        self.ops.files[f"/proc/{pid}/stat"] = f"{pid} (release) R " + "0 " * 20
+        run = self.ops.run
+        samples = []
+
+        def monitor_retirement(args, **kw):
+            result = run(args, **kw)
+            if args == ["docker", "kill", "--signal=TERM", primary]:
+                self.assertEqual("deploying", self.state()["in_progress"]["phase"])
+                samples.append([alert["alert"] for alert in deploy.watch_once(self.cfg, self.ops, {})])
+                self.ops.sleep(11)
+                run(["docker", "start", primary], mutate=True)
+                samples.append([alert["alert"] for alert in deploy.watch_once(self.cfg, self.ops, {})])
+            return result
+
+        with mock.patch.object(self.ops, "run", monitor_retirement):
+            self.deploy(image="fixture:second")
+        self.assertNotIn(["shared_alias_conflict"], samples[0])
+        self.assertIn(["shared_alias_conflict"], samples[1])
+
+    def test_resume_failed_second_alias_network_with_existing_provider_returns_to_hold(self):
+        self.assert_resume_second_alias_network_failure(persistent=False)
+
+    def test_resume_persistent_second_network_failure_with_existing_provider_leaves_abortable_hold(self):
+        self.assert_resume_second_alias_network_failure(persistent=True)
+
+    def assert_resume_second_alias_network_failure(self, *, persistent):
+        self.deploy()
+        paused = self.hold()
+        original, target = paused["current"], paused["target"]
+        ids = {value["id"] for value in paused["containers"].values()}
+        run = self.ops.run
+        attempted = []
+
+        def fail_alias_network(args, **kw):
+            if (args[:3] == ["docker", "network", "connect"] and args[-1] in ids
+                    and self.ops.network_name(args[-2]) == self.cfg.networks[1]
+                    and (self.cfg.serving_alias in args or persistent)):
+                attempted.append(args)
+                raise deploy.DeployError("fixture second alias network unavailable")
+            return run(args, **kw)
+
+        runner = deploy.Deployer(self.cfg, self.ops)
+        with mock.patch.object(self.ops, "run", fail_alias_network):
+            with self.assertRaisesRegex(deploy.DeployError, "second alias network unavailable"):
+                runner.resume()
+        self.assertTrue(attempted)
+        self.assert_live_release(original)
+        self.assertEqual(original, self.state()["current"])
+        self.assert_release_failure("held")
+        self.assertEqual(paused["containers"], self.state()["in_progress"]["containers"])
+        self.assert_no_shared_serving(target)
+        self.assertIsNone(self.ops.inspect(target["containers"]["background"]))
+        for role in deploy.SERVING_ROLES:
+            endpoints = self.ops.inspect(original["containers"][role])["NetworkSettings"]["Networks"]
+            self.assertTrue(all(self.cfg.serving_alias in endpoints[net]["Aliases"] for net in self.cfg.networks))
+        if persistent:
+            self.assertIn("network restoration is incomplete", self.state()["in_progress"]["reason"])
+            deploy.Deployer(self.cfg, self.ops).abort()
+            self.assert_live_release(original)
+        else:
+            deploy.Deployer(self.cfg, self.ops).resume()
+            self.assert_live_release(self.state()["current"])
+            self.assertEqual(target["slot"], self.state()["current"]["slot"])
+        self.assertIsNone(self.state()["in_progress"])
 
     def test_resume_keeps_one_live_shared_alias_owner_during_second_release(self):
         self.deploy()
