@@ -63,6 +63,25 @@ func deepSeekCanFallbackWithoutTools(err error, httpStatus int) bool {
 // offered cannot be used, so it answers without claiming to have searched.
 const deepSeekToolsUnavailableNotice = "The gateway's optional web tools are unavailable for this request. Answer using the conversation and existing knowledge when appropriate. If live information is needed, tell the user it could not be verified. Do not claim to have searched, fetched, or verified sources."
 
+// Inspect every object, including tool definitions and forced choices. Reject
+// ambiguous Chat bodies before editing: GJSON reads the first duplicate field,
+// while the upstream decoder may use the last. Decoded keys also catch escaped
+// spellings without re-encoding otherwise untouched request bytes.
+func deepSeekHasDuplicateJSONFields(value gjson.Result) bool {
+	if !value.IsObject() && !value.IsArray() {
+		return false
+	}
+	if value.IsObject() && hasDuplicateJSONObjectKeys(value) {
+		return true
+	}
+	duplicate := false
+	value.ForEach(func(_, child gjson.Result) bool {
+		duplicate = deepSeekHasDuplicateJSONFields(child)
+		return !duplicate
+	})
+	return duplicate
+}
+
 // First-turn fallback has no tool-result slot, so explicitly disclose the
 // unavailable web capability in the model input without changing user history.
 func (r *deepSeekHostedRequest) addUnavailableNotice() {
@@ -105,6 +124,7 @@ func withoutDeepSeekWebTools(body []byte, protocol string, match func(typ string
 	}
 	items := tools.Array()
 	removedNames := map[string]bool{}
+	clientNames := map[string]bool{}
 	var removed []int
 	for i, item := range items {
 		if typ := item.Get("type").String(); match(typ) {
@@ -113,6 +133,8 @@ func withoutDeepSeekWebTools(body []byte, protocol string, match func(typ string
 			if name := item.Get("name").String(); name != "" {
 				removedNames[name] = true
 			}
+		} else if protocol == "chat" && item.Get("type").String() == "function" {
+			clientNames[item.Get("function.name").String()] = true
 		}
 	}
 	if len(removed) == 0 {
@@ -130,6 +152,11 @@ func withoutDeepSeekWebTools(body []byte, protocol string, match func(typ string
 		choice := gjson.GetBytes(out, "tool_choice")
 		typ, name := choice.Get("type").String(), choice.Get("name").String()
 		forced := choice.IsObject() && (removedNames[typ] || match(typ) || (typ == "tool" && (removedNames[name] || match(name))))
+		if protocol == "chat" && typ == "function" {
+			name = choice.Get("function.name").String()
+			// A client function may legitimately share a removed tool's name.
+			forced = removedNames[name] && !clientNames[name]
+		}
 		if err == nil && forced {
 			auto := `"auto"`
 			if protocol == "messages" {

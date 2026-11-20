@@ -516,6 +516,16 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 	if protocol == "chat" && !gjson.GetBytes(body, "messages").Exists() && gjson.GetBytes(body, "input").Exists() {
 		protocol = "responses"
 	}
+	// Only ordinary Chat processing needs this guard. The hosted loop decodes
+	// its request, and the other protocols keep their existing byte contract.
+	rejectAmbiguousChat := func() error {
+		if protocol != "chat" || !deepSeekHasDuplicateJSONFields(gjson.ParseBytes(body)) {
+			return nil
+		}
+		err := errors.New("duplicate JSON fields are not supported in Chat requests without web tools")
+		writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return err
+	}
 	// Without the hosted loop (tools off for the group, or tool_choice none)
 	// the web tool entries the ordinary path must not carry are removed, with
 	// the notice unless tool_choice is none: the provider's own types in every
@@ -523,6 +533,9 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 	// web_search* and web_fetch* as well. Responses and Messages keep those for
 	// their lowering and for Messages search emulation.
 	if !key.Group.DeepSeekTools.Enabled || !deepSeekWantsTools(body, key.DeepSeekToolsAutoInject()) {
+		if err := rejectAmbiguousChat(); err != nil {
+			return nil, body, true, err
+		}
 		return nil, s.deepSeekBodyWithout(body, protocol, deepSeekOrdinaryPathDrops(protocol), deepSeekWantsTools(body, true), key, account), false, nil
 	}
 	// The tools are optional. When they cannot be set up, nothing has been sent
@@ -531,6 +544,9 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 	// tools the client declared are removed with a notice that live information
 	// could not be checked.
 	unavailable := func(cause error) (*OpenAIForwardResult, []byte, bool, error) {
+		if err := rejectAmbiguousChat(); err != nil {
+			return nil, body, true, err
+		}
 		logger.L().Warn("deepseek tools: optional tools unavailable, forwarding without them",
 			zap.Int64("account_id", account.ID), zap.Int64("group_id", key.Group.ID), zap.Error(cause))
 		if !deepSeekWantsTools(body, false) {

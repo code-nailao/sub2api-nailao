@@ -381,3 +381,148 @@ func TestDeepSeekChatPathAnswersWhenDeclaredToolsCannotBeSetUp(t *testing.T) {
 	require.False(t, gjson.GetBytes(upstream.lastBody, "tool_choice").Exists())
 	require.Contains(t, string(upstream.lastBody), deepSeekToolsUnavailableNotice)
 }
+
+type deepSeekOrdinaryChatRun struct {
+	result   *OpenAIForwardResult
+	err      error
+	sent     []byte
+	calls    int
+	recorder *httptest.ResponseRecorder
+	billing  *openAIRecordUsageBillingRepoStub
+}
+
+// Exercise forwarding and the same usage recording the handler performs after
+// success. All upstream and persistence operations use in-memory test doubles.
+func runDeepSeekOrdinaryChat(t *testing.T, body []byte, enabled bool) deepSeekOrdinaryChatRun {
+	t.Helper()
+	run := deepSeekOrdinaryChatRun{recorder: httptest.NewRecorder(), billing: &openAIRecordUsageBillingRepoStub{}}
+	svc := newOpenAIRecordUsageServiceWithBillingRepoForTest(&openAIRecordUsageLogRepoStub{inserted: true}, run.billing, &openAIRecordUsageUserRepoStub{}, &openAIRecordUsageSubRepoStub{}, nil)
+	multiplier := svc.cfg.Default.RateMultiplier
+	svc.cfg = deepSeekChatFallbackTestConfig()
+	svc.cfg.Default.RateMultiplier = multiplier
+	account := deepSeekForcedToolChoiceAccount()
+	group := &Group{ID: account.ID, Platform: PlatformDeepseek, SubscriptionType: SubscriptionTypeStandard, RateMultiplier: multiplier, DeepSeekTools: DeepSeekToolsConfig{Enabled: enabled}}
+	user := &User{ID: account.ID}
+	key := &APIKey{ID: account.ID, UserID: user.ID, User: user, GroupID: &group.ID, Group: group}
+	account.GroupIDs = []int64{group.ID}
+	svc.accountRepo = deepSeekAccountFixture{account: account}
+	svc.httpUpstream = deepSeekHTTPFixture{fn: func(req *http.Request) (*http.Response, error) {
+		run.calls++
+		require.True(t, strings.HasSuffix(req.URL.Path, "/chat/completions"))
+		var err error
+		run.sent, err = io.ReadAll(req.Body)
+		require.NoError(t, err)
+		response := deepSeekFixtureModelResponse(t, gjson.GetBytes(body, "stream").Bool(), deepSeekChatFallbackOKBody)
+		response.Header.Set("X-Request-ID", t.Name())
+		return response, nil
+	}}
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(run.recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
+	c.Set("api_key", key)
+	run.result, run.err = svc.ForwardAsChatCompletions(c.Request.Context(), c, account, body, "", "")
+	if run.err == nil {
+		require.NoError(t, svc.RecordUsage(c.Request.Context(), &OpenAIRecordUsageInput{Result: run.result, APIKey: key, User: user, Account: account}))
+	}
+	return run
+}
+
+func TestDeepSeekChatReviewNestedForcedChoice(t *testing.T) {
+	const lookup = `{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}`
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprint(stream), func(t *testing.T) {
+			ordinary := runDeepSeekOrdinaryChat(t, []byte(fmt.Sprintf(`{"model":"deepseek-flash","messages":[],"stream":%t}`, stream)), false)
+			require.NoError(t, ordinary.err)
+			require.Equal(t, 1, ordinary.calls)
+			require.Equal(t, 1, ordinary.billing.calls)
+			require.Positive(t, ordinary.billing.lastCmd.BalanceCost)
+			for _, tc := range []struct {
+				name, web, client, choice, want string
+				enabled                         bool
+			}{
+				{"removed_web_search", `{"type":"web_search"}`, lookup, `{"type":"function","function":{"name":"web_search"}}`, `"auto"`, false},
+				{"removed_named_web_fetch", `{"type":"web_fetch","name":"fetch_page"}`, lookup, `{"type":"function","function":{"name":"fetch_page"}}`, `"auto"`, false},
+				{"client_function", `{"type":"web_search"}`, lookup, `{"type":"function", "function":{"name":"lookup"}}`, `{"type":"function", "function":{"name":"lookup"}}`, false},
+				{"client_function_with_web_name", `{"type":"web_search"}`, `{"type":"function","function":{"name":"web_search"}}`, `{"type":"function","function":{"name":"web_search"}}`, `{"type":"function","function":{"name":"web_search"}}`, false},
+				{"tool_choice_none", `{"type":"web_search"}`, lookup, `"none"`, `"none"`, true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","messages":[],"stream":%t,"tools":[%s,%s],"tool_choice":%s}`, stream, tc.web, tc.client, tc.choice))
+					run := runDeepSeekOrdinaryChat(t, body, tc.enabled)
+					require.NoError(t, run.err)
+					require.NotNil(t, run.result)
+					require.Equal(t, http.StatusOK, run.recorder.Code)
+					require.Equal(t, stream, run.result.Stream)
+					require.Equal(t, 1, run.calls, "degradation must not replay the request")
+					var sent struct {
+						Tools []json.RawMessage `json:"tools"`
+					}
+					require.NoError(t, json.Unmarshal(run.sent, &sent))
+					require.Len(t, sent.Tools, 1)
+					require.JSONEq(t, tc.client, string(sent.Tools[0]))
+					require.Equal(t, tc.want, gjson.GetBytes(run.sent, "tool_choice").Raw)
+					require.Nil(t, run.result.DeepSeekTools)
+					require.Equal(t, ordinary.result.Usage, run.result.Usage)
+					require.Equal(t, ordinary.billing.calls, run.billing.calls)
+					require.Equal(t, ordinary.billing.lastCmd.BalanceCost, run.billing.lastCmd.BalanceCost)
+					require.Equal(t, ordinary.billing.lastCmd.APIKeyQuotaCost, run.billing.lastCmd.APIKeyQuotaCost)
+					require.Empty(t, run.billing.lastCmd.DeepSeekToolFingerprint)
+					if stream {
+						require.Contains(t, run.recorder.Body.String(), "data: [DONE]")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestDeepSeekChatReviewDuplicateFieldsAreRejected(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, enabled := range []bool{false, true} {
+			for _, tc := range []struct{ name, fields string }{
+				{"tools", `"tools":[],"tools":[{"type":"web_search"}]`},
+				{"tool_type", `"tools":[{"type":"function","type":"web_search"}]`},
+				{"escaped_tools", `"tools":[],"\u0074ools":[{"type":"web_fetch"}]`},
+				{"tool_choice", `"tools":[{"type":"web_search"}],"tool_choice":"none","tool_choice":{"type":"function","function":{"name":"web_search"}}`},
+				{"nested_name", `"tools":[{"type":"web_search"},{"type":"function","function":{"name":"lookup"}}],"tool_choice":{"type":"function","function":{"name":"lookup","name":"web_search"}}`},
+			} {
+				t.Run(fmt.Sprintf("stream=%t/enabled=%t/%s", stream, enabled, tc.name), func(t *testing.T) {
+					body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","messages":[],"stream":%t,%s}`, stream, tc.fields))
+					run := runDeepSeekOrdinaryChat(t, body, enabled)
+					require.Error(t, run.err)
+					require.Nil(t, run.result)
+					require.Equal(t, http.StatusBadRequest, run.recorder.Code)
+					require.Equal(t, "invalid_request_error", gjson.Get(run.recorder.Body.String(), "error.type").String())
+					require.Zero(t, run.calls, "ambiguous requests must not reach the upstream")
+					require.Empty(t, run.sent)
+					require.Zero(t, run.billing.calls, "rejected requests must not be billed")
+					require.Nil(t, run.billing.lastCmd)
+				})
+			}
+		}
+	}
+}
+
+func TestDeepSeekChatReviewOtherProtocolsKeepDuplicateFields(t *testing.T) {
+	account := deepSeekForcedToolChoiceAccount()
+	key := &APIKey{Group: &Group{ID: account.ID, Platform: PlatformDeepseek}}
+	svc := &OpenAIGatewayService{cfg: deepSeekChatFallbackTestConfig()}
+	for _, stream := range []bool{false, true} {
+		for _, tc := range []struct{ name, protocol, input string }{
+			{"responses", "responses", `"input":[]`},
+			{"messages", "messages", `"messages":[]`},
+			{"responses_shape_on_chat", "chat", `"input":[]`},
+		} {
+			t.Run(fmt.Sprintf("%t/%s", stream, tc.name), func(t *testing.T) {
+				body := []byte(fmt.Sprintf(`{"model":"deepseek-flash", "stream":%t,"tools":[],"tools":[{"type":"web_search"}],"tool_choice":{"type":"function","function":{"name":"web_search"}},%s}`, stream, tc.input))
+				c := newDeepSeekForcedToolChoiceContext(t, "/v1/test", body)
+				c.Set("api_key", key)
+				result, forward, handled, err := svc.tryForwardDeepSeekTools(c.Request.Context(), c, account, body, tc.protocol, "")
+				require.NoError(t, err)
+				require.False(t, handled)
+				require.Nil(t, result)
+				require.Equal(t, body, forward)
+			})
+		}
+	}
+}

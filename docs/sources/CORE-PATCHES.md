@@ -116,7 +116,8 @@ GPT-6.2 价卡的 Ultrafast 倍率留空时，按本仓库既有售价固定为 
 - 识别两族联网工具类型：`web_search`、`web_search_preview`、`web_search_20*`、`web_fetch`、`web_fetch_20*`，以及供应商风格的 `deepseek_web_search`（等同搜索）和 `deepseek_read_url`（等同抓取）。工具可用时两族都由托管循环执行并计费，三种协议一致；强制选择供应商风格工具与强制 `web_search` 相同。
 - 托管循环不接手（分组未开启工具，或 `tool_choice` 为 `none`）时，转发前移除供应商风格的条目：普通路径会把它们原样发给供应商，由供应商执行按次收费的工具，而这类请求只按 token 计费。`tool_choice` 不是 `none` 时附上联网不可用提示。Chat Completions 请求不经协议转换原样转发，`web_search*` / `web_fetch*` 也会到达供应商，被当作未知类型拒绝整个请求，或被当作函数声明而回复调用客户端从未定义的函数，所以在 Chat 路径上这两族条目一并移除；Responses 和 Messages 的协议降级本就会丢弃它们，Messages 路径之后还有原版的搜索模拟需要看到它们，因此这两种协议只移除供应商风格的条目。移除是对请求体的就地编辑，其余字节保持客户端原样。
 - 准备阶段失败（后台请求、没有可用的工具账号、价格未配置、请求形态不支持、用量日志不可写）时尚未向上游发送或预留任何内容，并记一条警告：只有网关自动附加的工具时，请求按客户端原样转发；客户端自己声明了联网工具时，移除两族的全部条目和 `max_tool_calls`，附上不可用提示，按普通请求转发和计费，不再返回错误。
-- 移除工具后，`tool_choice` 若强制的正是被移除的工具，改为不强制；`tools` 为空时连同 `tool_choice` 一起删除。提示文案与托管循环降级时使用的是同一条。
+- 移除工具后，`tool_choice` 若强制的正是被移除的工具，改为不强制；Chat 同时识别嵌套的 `function.name`，仍存在的客户端函数（包括恰好与联网工具同名的函数）保持合法强制选择。`tools` 为空时连同 `tool_choice` 一起删除。提示文案与托管循环降级时使用的是同一条。
+- Chat 走普通或准备失败后的降级路径前，拒绝任意层级含重复 JSON 字段的请求，返回 `400 invalid_request_error`，不请求上游、不计费。原因是就地过滤读取首个字段，而后续解码器可能使用末个字段，不能可靠地选择其中一个；转义后相同的字段名也视为重复。已进入托管循环的请求、Responses 和 Messages（含发到 Chat 地址的 Responses 形状）沿用原路径，不增加这项拒绝规则。流式和非流式测试均检查模拟上游实际收到的请求体、转发次数，并通过内存计费替身与普通请求比较余额扣费及 Key 配额记录。
 - 原生透传分支已删除：原来在账号开启 `deepseek_native_tools_enabled` 且使用原生 Responses 协议时把工具交给供应商执行并按其计数结算（原 `deepseek_tools_native.go`），并在共用的 `openai_gateway_response_handling.go` 中挂接了 SSE 观察。账号上已保存的 `deepseek_native_tools_enabled` 仍可通过校验，但不再有任何行为依赖它，账号表单上的开关也已移除。
 
 独立工具接口（`deepseek_tool_requests.go`、`deepseek_tool_endpoints.go`，路由在 `routes/gateway.go`，入口 `handler/openai_deepseek_tools.go`，标签 `deepseek_tool_endpoints`）：`POST /v1/tools/search|fetch|ocr|asr|tts` 按原版独立工具端点（`gateway_web_search.go`）的做法实现为单次转发，不进入网关工具循环。
