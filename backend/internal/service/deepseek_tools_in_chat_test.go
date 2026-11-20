@@ -173,8 +173,9 @@ func TestDeepSeekNativeToolsSettingIsIgnored(t *testing.T) {
 	require.Contains(t, run.clientReply, "Final answer")
 }
 
-// Without the hosted loop the provider's own tool types are removed and every
-// other byte is forwarded as sent; web_search stays for the ordinary path.
+// The provider-only matcher, which the ordinary path uses for Responses and
+// Messages, removes the provider's own tool types and forwards every other
+// byte as sent; web_search stays for those protocols' lowering.
 func TestDeepSeekProviderStyleToolsAreRemovedWithoutTheHostedLoop(t *testing.T) {
 	sent := `{"model":"deepseek-flash",  "seed": 12345678901234567890, "temperature": 0.70,
  "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}},{"type":"deepseek_web_search"},{"type":"web_search"},{"type":"deepseek_read_url"}],
@@ -262,6 +263,101 @@ func TestDeepSeekChatPathDropsProviderToolsWhenToolsAreOff(t *testing.T) {
 			require.Equal(t, tc.notice, strings.Contains(string(upstream.lastBody), deepSeekToolsUnavailableNotice))
 		})
 	}
+}
+
+// End to end on the Chat Completions path, which forwards the request without
+// conversion: when the loop does not take it, web_search* and web_fetch*
+// entries are removed as well, and the client's own function stays as sent.
+func TestDeepSeekChatPathDropsWebToolsWhenTheLoopDoesNotTakeTheRequest(t *testing.T) {
+	const lookup = `{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}`
+	const webTools = `{"type":"web_search"},{"type":"web_search_preview"},{"type":"web_search_20250305","name":"web_search"},{"type":"web_fetch"},{"type":"web_fetch_20250910","name":"web_fetch"}`
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		tools   string
+		choice  string
+		notice  bool
+		check   func(t *testing.T, sent []byte)
+	}{
+		{"tools_off", false, webTools + "," + lookup, "", true, func(t *testing.T, sent []byte) {
+			require.Len(t, gjson.GetBytes(sent, "tools").Array(), 1)
+			require.Equal(t, lookup, gjson.GetBytes(sent, "tools.0").Raw)
+		}},
+		{"tool_choice_none", true, webTools + "," + lookup, `,"tool_choice":"none"`, false, func(t *testing.T, sent []byte) {
+			require.Len(t, gjson.GetBytes(sent, "tools").Array(), 1)
+			require.Equal(t, lookup, gjson.GetBytes(sent, "tools.0").Raw)
+			require.Equal(t, "none", gjson.GetBytes(sent, "tool_choice").String())
+		}},
+		{"only_web_tools", false, webTools, "", true, func(t *testing.T, sent []byte) {
+			require.False(t, gjson.GetBytes(sent, "tools").Exists(), "%s", sent)
+			require.False(t, gjson.GetBytes(sent, "tool_choice").Exists(), "%s", sent)
+		}},
+		{"forced_web_search", false, `{"type":"web_search"},` + lookup, `,"tool_choice":{"type":"web_search"}`, true, func(t *testing.T, sent []byte) {
+			require.Equal(t, `"auto"`, gjson.GetBytes(sent, "tool_choice").Raw)
+			require.Equal(t, lookup, gjson.GetBytes(sent, "tools.0").Raw)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			price, groupID := 6.0, int64(7)
+			key := &APIKey{ID: 2, UserID: 3, GroupID: &groupID, User: &User{ID: 3, Balance: 10}, Group: &Group{ID: groupID, Platform: PlatformDeepseek, SubscriptionType: SubscriptionTypeStandard, SearchPricePer1k: &price, DeepSeekTools: DeepSeekToolsConfig{Enabled: tc.enabled, FetchPricePer1K: &price}}}
+			account := deepSeekForcedToolChoiceAccount()
+			account.GroupIDs = []int64{groupID}
+			body := []byte(`{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}],"tools":[` + tc.tools + `]` + tc.choice + `}`)
+			c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
+			c.Set("api_key", key)
+			upstream := newOKChatCompletionsUpstream("rid_ds_chat_web_tools", deepSeekChatFallbackOKBody)
+			svc := &OpenAIGatewayService{cfg: deepSeekChatFallbackTestConfig(), httpUpstream: upstream, accountRepo: deepSeekAccountFixture{account: account}}
+			result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "")
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.Nil(t, result.DeepSeekTools, "billed as an ordinary request")
+			sent := upstream.lastBody
+			for _, typ := range []string{"web_search", "web_search_preview", "web_search_20250305", "web_fetch", "web_fetch_20250910"} {
+				require.NotContains(t, string(sent), `"type":"`+typ+`"`, "%s", sent)
+			}
+			require.Equal(t, tc.notice, strings.Contains(string(sent), deepSeekToolsUnavailableNotice))
+			tc.check(t, sent)
+		})
+	}
+}
+
+// When the loop does not take the request, Responses and Messages bodies, and
+// a Responses-shaped body sent to the chat URL, keep their web_search entries
+// byte for byte: protocol lowering drops them, and Messages search emulation
+// has to see them. The provider's own types are still removed there.
+func TestDeepSeekOtherProtocolsKeepWebToolsWhenTheLoopDoesNotTakeTheRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	price, groupID := 6.0, int64(7)
+	key := &APIKey{ID: 2, UserID: 3, GroupID: &groupID, User: &User{ID: 3, Balance: 10}, Group: &Group{ID: groupID, Platform: PlatformDeepseek, SubscriptionType: SubscriptionTypeStandard, SearchPricePer1k: &price, DeepSeekTools: DeepSeekToolsConfig{Enabled: false, FetchPricePer1K: &price}}}
+	account := deepSeekForcedToolChoiceAccount()
+	account.GroupIDs = []int64{groupID}
+	svc := &OpenAIGatewayService{cfg: deepSeekChatFallbackTestConfig(), accountRepo: deepSeekAccountFixture{account: account}}
+	call := func(t *testing.T, protocol, body string) []byte {
+		t.Helper()
+		c := newDeepSeekForcedToolChoiceContext(t, "/v1/test", []byte(body))
+		c.Set("api_key", key)
+		out, forward, handled, err := svc.tryForwardDeepSeekTools(context.Background(), c, account, []byte(body), protocol, "")
+		require.NoError(t, err)
+		require.False(t, handled)
+		require.Nil(t, out)
+		return forward
+	}
+	for _, tc := range []struct{ name, protocol, body string }{
+		{"messages", "messages", `{"model":"deepseek-flash", "max_tokens":128,"tools":[{"type":"web_search_20250305","name":"web_search"}],"messages":[{"role":"user","content":"hi"}]}`},
+		{"responses", "responses", `{"model":"deepseek-flash",  "tools":[{"type":"web_search"}],"input":"hi"}`},
+		{"responses_shape_on_chat_url", "chat", `{"model":"deepseek-flash", "tools":[{"type":"web_search"}],"input":"hi"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.body, string(call(t, tc.protocol, tc.body)))
+		})
+	}
+	t.Run("messages_provider_tool_still_removed", func(t *testing.T) {
+		body := `{"model":"deepseek-flash","max_tokens":128,"tools":[{"type":"web_search_20250305","name":"web_search"},{"type":"deepseek_web_search","name":"deepseek_web_search"}],"messages":[{"role":"user","content":"hi"}]}`
+		got := call(t, "messages", body)
+		require.NotContains(t, string(got), "deepseek_web_search")
+		require.Len(t, gjson.GetBytes(got, "tools").Array(), 1)
+		require.Equal(t, `{"type":"web_search_20250305","name":"web_search"}`, gjson.GetBytes(got, "tools.0").Raw)
+	})
 }
 
 // Case C end to end: a declared provider tool whose setup fails is answered as

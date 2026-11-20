@@ -109,7 +109,9 @@ func TestDeepSeekToolsDisabledGroupIsServedWithoutTheFeature(t *testing.T) {
 	for _, protocol := range []string{"chat", "responses", "messages"} {
 		t.Run(protocol, func(t *testing.T) {
 			// Not even a tool the client names itself turns the request into an
-			// error, and web_search* reaches the ordinary path unchanged.
+			// error. Responses and Messages reach the ordinary path unchanged;
+			// Chat Completions, forwarded without conversion, loses web_search*
+			// and carries the unavailable notice instead.
 			run := runDeepSeekFailOpen(t, deepSeekFailOpenSetup{
 				protocol: protocol,
 				body:     map[string]any{"tools": []any{deepSeekExplicitWebSearchTool(protocol)}},
@@ -118,7 +120,12 @@ func TestDeepSeekToolsDisabledGroupIsServedWithoutTheFeature(t *testing.T) {
 			})
 			require.NoError(t, run.err)
 			require.False(t, run.handled)
-			require.Equal(t, string(run.sent), string(run.forward))
+			if protocol != "chat" {
+				require.Equal(t, string(run.sent), string(run.forward))
+				return
+			}
+			require.False(t, gjson.GetBytes(run.forward, "tools").Exists(), "%s", run.forward)
+			require.Contains(t, string(run.forward), deepSeekToolsUnavailableNotice)
 		})
 	}
 }

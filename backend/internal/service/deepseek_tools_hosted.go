@@ -66,11 +66,25 @@ func deepSeekExplicitTool(typ string) string {
 	return ""
 }
 
-// deepSeekProviderTool reports the provider's own web tool types. Unlike
-// web_search*, nothing on the ordinary path handles them: forwarded as they
-// are, the provider would run paid tool calls the gateway never bills.
+// deepSeekProviderTool reports the provider's own web tool types. Nothing on
+// the ordinary path handles them in any protocol: forwarded as they are, the
+// provider would run paid tool calls the gateway never bills.
 func deepSeekProviderTool(typ string) bool {
 	return typ == "deepseek_web_search" || typ == "deepseek_read_url"
+}
+
+// deepSeekOrdinaryPathDrops selects the web tool entries the ordinary path
+// must not carry for protocol. The provider's own types never pass. A Chat
+// Completions request is forwarded without conversion, so web_search* and
+// web_fetch* entries would reach the provider as well, which rejects the
+// request or answers with a call to a function the client never defined.
+// Responses and Messages lowering drops those entries, and Messages search
+// emulation has to see them, so there only the provider's own types go.
+func deepSeekOrdinaryPathDrops(protocol string) func(typ string) bool {
+	if protocol == "chat" {
+		return func(typ string) bool { return deepSeekExplicitTool(typ) != "" }
+	}
+	return deepSeekProviderTool
 }
 
 func prepareDeepSeekHosted(body []byte, protocol string, auto bool) (*deepSeekHostedRequest, bool, error) {
@@ -503,11 +517,13 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 		protocol = "responses"
 	}
 	// Without the hosted loop (tools off for the group, or tool_choice none)
-	// the provider's own web tool types are removed: the provider would run
-	// them as paid tool calls the gateway never bills. web_search* and
-	// web_fetch* keep their existing handling on the ordinary path.
+	// the web tool entries the ordinary path must not carry are removed, with
+	// the notice unless tool_choice is none: the provider's own types in every
+	// protocol, and on Chat Completions, which is forwarded without conversion,
+	// web_search* and web_fetch* as well. Responses and Messages keep those for
+	// their lowering and for Messages search emulation.
 	if !key.Group.DeepSeekTools.Enabled || !deepSeekWantsTools(body, key.DeepSeekToolsAutoInject()) {
-		return nil, s.deepSeekBodyWithout(body, protocol, deepSeekProviderTool, deepSeekWantsTools(body, true), key, account), false, nil
+		return nil, s.deepSeekBodyWithout(body, protocol, deepSeekOrdinaryPathDrops(protocol), deepSeekWantsTools(body, true), key, account), false, nil
 	}
 	// The tools are optional. When they cannot be set up, nothing has been sent
 	// or reserved yet, so the request is answered on the ordinary path instead of
