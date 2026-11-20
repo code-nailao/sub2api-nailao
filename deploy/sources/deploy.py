@@ -65,12 +65,13 @@ HANDOFF_POLL_SECONDS = 0.5
 HANDOFF_FIRST_NOTE_SECONDS = 5
 HANDOFF_TERM_CONFIRM_SECONDS = 30
 HANDOFF_RECOVERY_SECONDS = 30
+# Reserve part of recovery for restoring the policy even if exit stays unknown.
+HANDOFF_RECOVERY_CLEANUP_SECONDS = 5
 DOCKER_STATUS_TIMEOUT_SECONDS = 30
 RUNTIME_STATUS_TIMEOUT_SECONDS = 5
 # A backup can still be cleaning up an interrupted upload at its own deadline.
 BACKUP_FINISH_GRACE_SECONDS = 180
 BACKUP_STATUS_POLL_SECONDS = 10
-BACKUP_STATUS_RETRY_WINDOW_SECONDS = 30
 
 
 class DeployError(Exception):
@@ -86,7 +87,15 @@ class BackgroundRestored(DeployError):
 
 
 class BackgroundExitTimeout(DeployError):
-    """The normal handoff budget ended before Docker confirmed exit."""
+    def __init__(self, name: str, deadline: float):
+        super().__init__(f"could not confirm exit of {name} before the deadline")
+        self.deadline = deadline
+
+
+@dataclass(frozen=True)
+class BackgroundExit:
+    code: int | None  # None only when Docker confirmed container removal
+    timed_out_at: float | None = None
 
 
 # --------------------------------------------------------------------------
@@ -470,26 +479,41 @@ class Deployer:
         status, body = self.ops.http_json(f"http://127.0.0.1:{port}/internal/sources/runtime", token=token, timeout=timeout)
         return body if status == 200 and isinstance(body, dict) else None
 
+    def recovery_timeout(self, deadline: float | None, maximum: float) -> float:
+        if deadline is None:
+            return maximum
+        remaining = deadline - self.ops.monotonic()
+        if remaining <= 0:
+            raise DeployError("background recovery deadline reached")
+        return min(maximum, remaining)
+
     def wait_ready(self, port: int, token: str, role: str, timeout: int,
-                   container: str | None = None, poll: float = 2) -> dict[str, Any]:
-        """Wait for a role to report ready. When the container is given, a
-        container that exited or is crash-restarting fails at once instead of
-        holding the background gap for the whole timeout."""
-        deadline = self.ops.monotonic() + timeout
+                   container: str | None = None, poll: float = 2, *, deadline: float | None = None) -> dict[str, Any]:
+        """Wait for a role to report ready. During recovery, share its deadline."""
+        ready_until = self.ops.monotonic() + timeout
+        if deadline is not None:
+            ready_until = min(ready_until, deadline)
         last: dict[str, Any] | None = None
-        while self.ops.monotonic() < deadline:
+        while self.ops.monotonic() < ready_until:
             if container and not self.ops.dry_run:
-                info = self.ops.inspect(container) or {}
+                inspect_timeout = self.recovery_timeout(ready_until if deadline is not None else None,
+                                                        DOCKER_STATUS_TIMEOUT_SECONDS)
+                info = self.ops.inspect(container, timeout=inspect_timeout) or {}
                 state = info.get("State", {})
                 if not state.get("Running") or state.get("Restarting"):
                     raise DeployError(f"{container} exited or is restarting before becoming ready "
                                       f"(exit {state.get('ExitCode')}); see its logs")
-            last = self.runtime(port, token)
+            if deadline is not None:
+                last = self.read_runtime_before(lambda limit: self.runtime(port, token, timeout=limit), ready_until)
+            else:
+                last = self.runtime(port, token)
             if last and last.get("ready") and last.get("role") == role:
                 if role != "background" or last.get("owns_background"):
                     return last
-            self.ops.sleep(poll)
-        raise DeployError(f"port {port} not ready as {role} within {timeout}s (last runtime: {json.dumps(last)[:300]})")
+            delay = poll if deadline is None else min(poll, max(0, ready_until - self.ops.monotonic()))
+            self.ops.sleep(delay)
+        limit = f"within {timeout}s" if deadline is None else "before the recovery deadline"
+        raise DeployError(f"port {port} not ready as {role} {limit} (last runtime: {json.dumps(last)[:300]})")
 
     def background_container(self, name: str, *, deadline: float | None = None) -> tuple[dict[str, Any] | None, bool]:
         """Return Docker's inspection and whether Docker confirmed removal."""
@@ -512,8 +536,8 @@ class Deployer:
 
     def wait_exit(self, name: str, deadline: float, poll: float = 2, first_note: float = 60,
                   read_runtime: Callable[[float], dict[str, Any] | None] | None = None,
-                  initial_runtime: dict[str, Any] | None = None, allow_backup_wait: bool = True) -> int | None:
-        """Return the exit code or None if Docker confirms that the owner was removed."""
+                  initial_runtime: dict[str, Any] | None = None, allow_backup_wait: bool = True) -> BackgroundExit:
+        """Wait for a verified exit, distinguishing a timely handoff from recovery."""
         started = self.ops.monotonic()
         next_note = started + first_note
         next_probe = next_note
@@ -525,24 +549,29 @@ class Deployer:
         backup_until = None if remaining is None else started + remaining + BACKUP_FINISH_GRACE_SECONDS
         backup_running = remaining is not None
 
-        def exit_deadline() -> float:
-            wait_until = max(deadline, backup_until or deadline)
+        def forward_deadline() -> float:
+            return max(deadline, backup_until or deadline)
+
+        def probe_until() -> float:
             if cutoff_probed and runtime is None:
-                wait_until = max(wait_until, deadline + BACKUP_STATUS_RETRY_WINDOW_SECONDS)
-            return wait_until
+                # Retry an unknown backup status in the existing recovery
+                # window. An exit during this retry is not a timely handoff.
+                retry_until = deadline + HANDOFF_RECOVERY_SECONDS - HANDOFF_RECOVERY_CLEANUP_SECONDS
+                return max(forward_deadline(), retry_until)
+            return forward_deadline()
 
         while True:
-            # Docker inspect and its list fallback draw from the same window.
-            # Only backup evidence or a failed cutoff status read can extend it.
-            probe_deadline = exit_deadline()
+            probe_deadline = probe_until()
             info, removed = self.background_container(name, deadline=probe_deadline)
             seen_at = self.ops.monotonic()
             if seen_at < probe_deadline:
+                cutoff = forward_deadline()
+                timed_out_at = cutoff if seen_at >= cutoff else None
                 if removed:
-                    return None
+                    return BackgroundExit(None, timed_out_at)
                 state = (info or {}).get("State") or {}
                 if state.get("Running") is False and not state.get("Restarting"):
-                    return int(state.get("ExitCode", 0))
+                    return BackgroundExit(int(state.get("ExitCode", 0)), timed_out_at)
 
             # Recheck at the ordinary cutoff in case a backup started after
             # preflight. This read has a short budget even at the cutoff.
@@ -574,9 +603,9 @@ class Deployer:
                     next_probe = seen_at + BACKUP_STATUS_POLL_SECONDS
                     retry_delay = 1
 
-            wait_until = exit_deadline()
+            wait_until = probe_until()
             if seen_at >= wait_until:
-                raise BackgroundExitTimeout(f"could not confirm exit of {name} before the deadline")
+                raise BackgroundExitTimeout(name, forward_deadline())
             if seen_at >= deadline and not logged_extension:
                 detail = "backup status unavailable, retrying" if runtime is None else self.drain_progress(runtime)
                 self.log(f"   {name} still draining past the ordinary timeout" + (f": {detail}" if detail else ""))
@@ -587,14 +616,13 @@ class Deployer:
                 next_note += 60
             self.ops.sleep(min(poll, wait_until - seen_at))
 
-    def wait_recovery_exit(self, name: str) -> int | None:
-        deadline = self.ops.monotonic() + HANDOFF_RECOVERY_SECONDS
+    def wait_recovery_exit(self, name: str, deadline: float) -> BackgroundExit:
         while self.ops.monotonic() < deadline:
             try:
                 return self.wait_exit(name, deadline, poll=HANDOFF_POLL_SECONDS, allow_backup_wait=False)
             except KeyboardInterrupt:
                 self.log(f"   Ctrl-C received while recovering the background. Waiting for {name} to exit.")
-        raise BackgroundExitTimeout(f"could not confirm exit of {name} before the recovery deadline")
+        raise BackgroundExitTimeout(name, deadline)
 
     def mounts_for(self, role: str, name: str) -> list[Mount]:
         group = "background" if role == "background" else "serving"
@@ -758,19 +786,25 @@ class Deployer:
         self.ops.run(["cp", "-Rn", staging + "/.", self.cfg.assets_dir + "/"], mutate=True)
 
     def owner_runtime(self, view: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any] | None:
-        """Read the owner status and discard replies completed after the deadline."""
+        return self.read_runtime_before(
+            lambda timeout: self.runtime(view["ports"]["background"], self.token_for(view, "background"), timeout=timeout),
+            deadline,
+        )
+
+    def read_runtime_before(self, read: Callable[[float], dict[str, Any] | None],
+                            deadline: float | None) -> dict[str, Any] | None:
+        """Read runtime status and discard replies completed after the deadline."""
         result = None
 
         def probe() -> None:
             nonlocal result
             try:
-                token = self.token_for(view, "background")
                 timeout = RUNTIME_STATUS_TIMEOUT_SECONDS
                 if deadline is not None:
                     timeout = min(timeout, deadline - self.ops.monotonic())
                     if timeout <= 0:
                         return
-                result = self.runtime(view["ports"]["background"], token, timeout=timeout)
+                result = read(timeout)
             except Exception:  # noqa: BLE001 - read failures do not prove shutdown
                 return
 
@@ -817,20 +851,26 @@ class Deployer:
             restart += f":{limit}"
         return restart
 
-    def start_background(self, view: dict[str, Any], *, restart: str = "unless-stopped") -> None:
+    def start_background(self, view: dict[str, Any], *, restart: str = "unless-stopped",
+                         deadline: float | None = None) -> None:
         name = view["containers"]["background"]
-        self.ops.run(["docker", "update", f"--restart={restart}", name], mutate=True)
-        self.ops.run(["docker", "start", name], mutate=True)
-        if not self.ops.dry_run:
-            self.wait_ready(view["ports"]["background"], self.token_for(view, "background"),
-                            "background", self.cfg.background_ready_timeout, container=name,
-                            poll=HANDOFF_POLL_SECONDS)
+        # Once ownership is vacant, Ctrl-C must not stop the Docker clients
+        # that put an owner back in service. They inherit the ignored signal.
+        with finish_handoff_cleanup(ignore=True):
+            self.ops.run(["docker", "update", f"--restart={restart}", name], mutate=True,
+                         timeout=self.recovery_timeout(deadline, 600))
+            self.ops.run(["docker", "start", name], mutate=True, timeout=self.recovery_timeout(deadline, 600))
+            if not self.ops.dry_run:
+                self.wait_ready(view["ports"]["background"], self.token_for(view, "background"),
+                                "background", self.cfg.background_ready_timeout, container=name,
+                                poll=HANDOFF_POLL_SECONDS, deadline=deadline)
 
-    def restore_background(self, current: dict[str, Any], failed: DeployError, *, restart: str) -> None:
+    def restore_background(self, current: dict[str, Any], failed: DeployError, *, restart: str,
+                           deadline: float | None = None) -> NoReturn:
         old = current["containers"]["background"]
         try:
-            self.start_background(current, restart=restart)
-        except (DeployError, OSError, subprocess.SubprocessError) as restore_err:
+            self.start_background(current, restart=restart, deadline=deadline)
+        except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as restore_err:
             raise FallbackFailed(f"background handoff failed ({failed}); could not restart {old}: {restore_err}") from restore_err
         raise BackgroundRestored(f"background handoff failed ({failed}); previous background {old} is running again") from failed
 
@@ -854,48 +894,52 @@ class Deployer:
         # Protect the transition before changing the restart policy or sending
         # TERM. Installing the handler after a timeout leaves a signal gap.
         with finish_handoff_cleanup() as interrupted:
+            recovery_deadline = None
             if old_info is not None:
-                self.drain_background(current, old_info, before, successor=new, back=back, interrupted=interrupted)
+                recovery_deadline = self.drain_background(current, old_info, before, successor=new, back=back,
+                                                          interrupted=interrupted)
             else:
                 self.log(f"   {old} is absent. Starting the prepared background {new}.")
             try:
-                self.start_background(view)
+                self.start_background(view, deadline=recovery_deadline)
             except (DeployError, OSError, subprocess.SubprocessError) as err:
+                if recovery_deadline is not None:
+                    raise FallbackFailed(f"could not make {new} ready during background recovery: {err}") from err
                 self.log(f"   new background failed: {err}. Restoring {old} once {new} exits.")
                 new_info, new_removed = self.background_container(new)
                 if new_info is not None:
                     try:
-                        self.drain_background(view, new_info, self.owner_runtime(view), successor=old, back=True,
-                                              interrupted=interrupted)
+                        recovery_deadline = self.drain_background(view, new_info, self.owner_runtime(view), successor=old,
+                                                                  back=True, interrupted=interrupted)
                     except (DeployError, OSError, subprocess.SubprocessError) as stop_err:
                         raise FallbackFailed(f"new background {new} did not become ready ({err}). "
                                              f"Could not finish stopping it before restoring {old}: {stop_err}") from stop_err
                 elif not new_removed:
                     raise FallbackFailed(f"could not confirm the state of new background {new} before restoring {old}") from err
                 self.restore_background(current, DeployError(f"new background did not become ready: {err}"),
-                                        restart=self.background_restart_policy(old_info))
+                                        restart=self.background_restart_policy(old_info), deadline=recovery_deadline)
 
     def drain_background(self, current: dict[str, Any], old_info: dict[str, Any],
                          before: dict[str, Any] | None, successor: str, back: bool,
-                         interrupted: Callable[[], bool]) -> None:
+                         interrupted: Callable[[], bool]) -> float | None:
         old = current["containers"]["background"]
         restart = self.background_restart_policy(old_info)
 
         follow_up = (f"Check container state and verify {old} has exited before starting "
                      "the background for the active slot.")
 
-        def restore_restart_policy(reason: str) -> None:
+        def restore_restart_policy(reason: str, deadline: float | None = None) -> None:
             try:
                 # A terminal Ctrl-C reaches the Docker CLI too. The child
                 # inherits SIG_IGN for this cleanup command.
                 with finish_handoff_cleanup(ignore=True):
                     try:
                         self.ops.run(["docker", "update", f"--restart={restart}", old], mutate=True,
-                                     timeout=DOCKER_STATUS_TIMEOUT_SECONDS)
+                                     timeout=self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS))
                     except KeyboardInterrupt:
                         # Docker may already have applied the update.
                         self.ops.run(["docker", "update", f"--restart={restart}", old], mutate=True,
-                                     timeout=DOCKER_STATUS_TIMEOUT_SECONDS)
+                                     timeout=self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS))
             except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
                 failure = FallbackFailed(f"{reason} Could not restore the restart policy of {old}: {err}. {follow_up}")
                 if not self.ops.dry_run:
@@ -938,12 +982,12 @@ class Deployer:
         term_confirmed = not signal_failed
         check_term_after = self.ops.monotonic() + HANDOFF_FIRST_NOTE_SECONDS
 
-        def fail_handoff(reason: str, err: BaseException) -> NoReturn:
+        def restore_policy_after_timeout(reason: str, deadline: float | None = None) -> FallbackFailed:
             # Persist the recovery instructions even if restoring the policy fails.
             self._record_unrestored(load_state(self.cfg), FallbackFailed(
                 f"{reason} Its restart policy may still need to be restored. {follow_up}"))
-            restore_restart_policy(reason)
-            raise FallbackFailed(f"{reason} Its restart policy was restored. {follow_up}") from err
+            restore_restart_policy(reason, deadline)
+            return FallbackFailed(f"{reason} Its restart policy was restored. {follow_up}")
 
         def read_runtime(deadline: float) -> dict[str, Any] | None:
             nonlocal term_confirmed, before
@@ -962,41 +1006,62 @@ class Deployer:
                 raise BackgroundRestored(f"SIGTERM to {old} failed. The background is still ready and its restart policy was restored.")
             return runtime
 
+        normal_deadline = None
+
+        def wait_for_drain() -> BackgroundExit:
+            nonlocal normal_deadline
+            normal_deadline = self.ops.monotonic() + self.cfg.background_exit_timeout
+            return self.wait_exit(old, normal_deadline, poll=HANDOFF_POLL_SECONDS,
+                                  first_note=HANDOFF_FIRST_NOTE_SECONDS, read_runtime=read_runtime, initial_runtime=before)
+
         failure = None
+        recovery_deadline = None
         try:
             if term_confirmed:
-                code = self.wait_exit(old, self.ops.monotonic() + self.cfg.background_exit_timeout,
-                                      poll=HANDOFF_POLL_SECONDS,
-                                      first_note=HANDOFF_FIRST_NOTE_SECONDS, read_runtime=read_runtime,
-                                      initial_runtime=before)
+                exited = wait_for_drain()
             else:
                 self.log(f"   could not confirm SIGTERM to {old}. Checking whether the owner starts draining.")
                 try:
-                    code = self.wait_exit(old, self.ops.monotonic() + HANDOFF_TERM_CONFIRM_SECONDS,
-                                          poll=HANDOFF_POLL_SECONDS,
-                                          first_note=HANDOFF_FIRST_NOTE_SECONDS, read_runtime=read_runtime,
-                                          allow_backup_wait=False)
+                    exited = self.wait_exit(old, self.ops.monotonic() + HANDOFF_TERM_CONFIRM_SECONDS,
+                                            poll=HANDOFF_POLL_SECONDS, first_note=HANDOFF_FIRST_NOTE_SECONDS,
+                                            read_runtime=read_runtime, allow_backup_wait=False)
                 except BackgroundExitTimeout:
                     if not term_confirmed:
                         raise
-                    code = self.wait_exit(old, self.ops.monotonic() + self.cfg.background_exit_timeout,
-                                          poll=HANDOFF_POLL_SECONDS,
-                                          first_note=HANDOFF_FIRST_NOTE_SECONDS, read_runtime=read_runtime,
-                                          initial_runtime=before)
+                    exited = wait_for_drain()
         except (BackgroundExitTimeout, KeyboardInterrupt) as err:
             if not term_confirmed:
-                fail_handoff(f"could not confirm SIGTERM or exit of {old}.", err)
-            failure = err if isinstance(err, BackgroundExitTimeout) else DeployError("handoff interrupted")
-            self.log(f"   {failure}. Waiting up to {HANDOFF_RECOVERY_SECONDS}s to restore the background.")
+                raise restore_policy_after_timeout(f"could not confirm SIGTERM or exit of {old}.") from err
+            if isinstance(err, BackgroundExitTimeout):
+                failure = err
+                cutoff = err.deadline
+            else:
+                failure = DeployError("handoff interrupted")
+                interrupted_at = self.ops.monotonic()
+                cutoff = min(normal_deadline, interrupted_at) if normal_deadline is not None else interrupted_at
+            recovery_deadline = cutoff + HANDOFF_RECOVERY_SECONDS
+            self.log(f"   {failure}. Trying to restore the background within the recovery window.")
             try:
-                code = self.wait_recovery_exit(old)
-            except BackgroundExitTimeout as recovery_err:
-                fail_handoff(f"could not confirm exit of {old} after the handoff and recovery waits.", recovery_err)
+                exited = self.wait_recovery_exit(old, recovery_deadline - HANDOFF_RECOVERY_CLEANUP_SECONDS)
+            except BackgroundExitTimeout:
+                unresolved = restore_policy_after_timeout(f"could not confirm exit of {old} after the handoff and recovery waits.",
+                                                          deadline=recovery_deadline)
+                # A fast policy update leaves time to catch an exit near the
+                # end of recovery. The update and final poll share the deadline.
+                try:
+                    exited = self.wait_recovery_exit(old, recovery_deadline)
+                except BackgroundExitTimeout as cleanup_err:
+                    raise unresolved from cleanup_err
+        if exited.timed_out_at is not None:
+            failure = BackgroundExitTimeout(old, exited.timed_out_at)
+            recovery_deadline = exited.timed_out_at + HANDOFF_RECOVERY_SECONDS
+        code = exited.code
         if not back and code is not None and (failure is not None or interrupted()):
             try:
-                self.restore_background(current, failure or DeployError("handoff interrupted"), restart=restart)
+                self.restore_background(current, failure or DeployError("handoff interrupted"), restart=restart,
+                                        deadline=recovery_deadline)
             except FallbackFailed:
-                _, removed = self.background_container(old)
+                _, removed = self.background_container(old, deadline=recovery_deadline)
                 if not removed:
                     raise
                 code = None
@@ -1004,6 +1069,7 @@ class Deployer:
             self.log(f"   {old} was removed. Starting the prepared background {successor}.")
         else:
             self.log(f"   {old} exited with code {code}")
+        return recovery_deadline
 
     def guard(self, target: Target, previous: dict[str, Any]) -> None:
         name = target.containers["serving"]

@@ -748,6 +748,154 @@ class DeployTest(unittest.TestCase):
         self.assertNotIn(["docker", "start", successor], self.ops.commands)
         self.assertEqual("unless-stopped", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
 
+    def run_handoff_without_backup_evidence(self, *, status_available, status_delay=0, exit_after=float("inf")):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        successor = self.cfg.container("a", "background")
+        self.cfg.background_exit_timeout = 2
+        self.ops.drain_seconds[old] = exit_after
+        self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"] = "always"
+        original_run = self.ops.run
+        original_http = self.ops.http_json
+        term_at = None
+        runtime_reads = []
+
+        def run(args, **kwargs):
+            nonlocal term_at
+            if args == ["docker", "kill", "--signal=TERM", old]:
+                term_at = self.ops.clock
+            return original_run(args, **kwargs)
+
+        def http_json(url, **kwargs):
+            if term_at is not None and url.endswith("/internal/sources/runtime"):
+                status, body = original_http(url, **kwargs)
+                if body and body.get("draining"):
+                    runtime_reads.append(self.ops.clock - term_at)
+                    self.ops.clock += status_delay
+                    return (status, body) if status_available else (0, None)
+                return status, body
+            return original_http(url, **kwargs)
+
+        error = deploy.FallbackFailed if exit_after == float("inf") else deploy.BackgroundRestored
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "http_json", http_json), \
+                deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaises(error):
+                self.deploy()
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertEqual(current, self.state()["current"])
+            progress = self.state()["in_progress"]
+            if error is deploy.FallbackFailed:
+                self.assertIn("could not confirm exit", progress["failed"])
+            else:
+                self.assertIsNone(progress)
+                self.assertIn(["docker", "start", old], self.ops.commands)
+        self.assertTrue(self.ops.containers[old]["State"]["Running"])
+        self.assertEqual("always", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertNotIn(["docker", "start", successor], self.ops.commands)
+        self.assertFalse(self.ops.switched)
+        self.assertLess(self.ops.clock - term_at, 33)
+        return runtime_reads
+
+    def test_delayed_cutoff_status_counts_towards_recovery(self):
+        self.assertTrue(self.run_handoff_without_backup_evidence(status_available=True, status_delay=2))
+
+    def test_unavailable_cutoff_status_retries_within_recovery_budget(self):
+        reads = self.run_handoff_without_backup_evidence(status_available=False)
+        self.assertGreater(len(reads), 1)
+        self.assertLess(reads[-1], 32)
+
+    def test_old_owner_exiting_after_unavailable_cutoff_status_is_restored(self):
+        self.run_handoff_without_backup_evidence(status_available=False, exit_after=8)
+
+    def test_old_owner_exiting_near_recovery_deadline_is_restored(self):
+        self.run_handoff_without_backup_evidence(status_available=True, exit_after=28)
+
+    def test_expired_handoff_limits_restart_policy_update_to_remaining_budget(self):
+        old = self.state()["current"]["containers"]["background"]
+        self.cfg.background_exit_timeout = 2
+        self.ops.drain_seconds[old] = float("inf")
+        original_run = self.ops.run
+        term_at = None
+        update_timeouts = []
+
+        def run(args, **kwargs):
+            nonlocal term_at
+            if args == ["docker", "kill", "--signal=TERM", old]:
+                term_at = self.ops.clock
+            if args == ["docker", "update", "--restart=unless-stopped", old]:
+                self.assertIn("could not confirm exit", self.state()["in_progress"]["failed"])
+                timeout = kwargs["timeout"]
+                update_timeouts.append(timeout)
+                self.ops.clock += timeout
+                raise subprocess.TimeoutExpired("update", timeout)
+            return original_run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "run", run), deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "Could not restore the restart policy"):
+                self.deploy()
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertIn("Could not restore the restart policy", self.state()["in_progress"]["failed"])
+        self.assertLess(self.ops.clock - term_at, 33)
+        self.assertEqual(1, len(update_timeouts))
+        self.assertGreater(update_timeouts[0], 0)
+
+    def test_recovered_owner_readiness_uses_remaining_recovery_time(self):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        self.cfg.background_exit_timeout = 2
+        self.cfg.background_ready_timeout = 120
+        self.ops.drain_seconds[old] = 8
+        self.ops.unready_ports.add(current["ports"]["background"])
+        original_run = self.ops.run
+        term_at = None
+
+        def run(args, **kwargs):
+            nonlocal term_at
+            if args == ["docker", "kill", "--signal=TERM", old]:
+                term_at = self.ops.clock
+            return original_run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "run", run), deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "could not restart"):
+                self.deploy()
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertEqual(current, self.state()["current"])
+            self.assertIn("recovery deadline", self.state()["in_progress"]["failed"])
+        self.assertIn(["docker", "start", old], self.ops.commands)
+        self.assertFalse(self.ops.switched)
+        self.assertLess(self.ops.clock - term_at, 33)
+
+    def test_sigint_to_restart_clients_does_not_abandon_old_background(self):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        successor = self.cfg.container("a", "background")
+        self.cfg.background_exit_timeout = 2
+        self.ops.drain_seconds[old] = 8
+        self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"] = "always"
+        original_run = self.ops.run
+        restart_commands = [["docker", "update", "--restart=always", old], ["docker", "start", old]]
+        attempted = []
+
+        def run(args, **kwargs):
+            if args in restart_commands:
+                self.assertFalse(self.ops.inspect(old)["State"]["Running"])
+                attempted.append(args)
+                child = "import os, signal; os.kill(os.getppid(), signal.SIGINT); signal.raise_signal(signal.SIGINT)"
+                deploy.Ops.run(self.ops, [sys.executable, "-c", child], mutate=True, timeout=5)
+            return original_run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "run", run), deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaises(deploy.BackgroundRestored):
+                self.deploy()
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertEqual(current, self.state()["current"])
+            self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual(restart_commands, attempted)
+        self.assertTrue(self.ops.containers[old]["State"]["Running"])
+        self.assertEqual("always", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertNotIn(["docker", "start", successor], self.ops.commands)
+        self.assertFalse(self.ops.switched)
+
     def test_ctrl_c_during_recovery_wait_still_restores_background(self):
         old = self.state()["current"]["containers"]["background"]
         self.cfg.background_exit_timeout = 2
