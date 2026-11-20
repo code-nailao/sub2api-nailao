@@ -328,6 +328,168 @@ class DeployTest(unittest.TestCase):
         self.assertEqual([view["containers"]["background"]], [n for n, r in roles if r.get("owns_background")])
         self.assertTrue(dict(roles)[view["containers"]["background"]]["ready"])
 
+    def assert_rollback_waits_for_background(self, *, manual):
+        target = self.cfg.slot_view("a")
+        if manual:
+            self.deploy()
+        else:
+            self.ops.memory_after_switch = 20 * GIB
+        old_background = LEGACY["containers"]["background"]
+        old_port = LEGACY["ports"]["background"]
+        old_route = self.upstreams_for(LEGACY)
+        live_route = self.upstreams_for(target)
+        run, http_json, write = self.ops.run, self.ops.http_json, self.ops.write_file_atomic
+        started = None
+        health_confirmed = False
+        probes_while_starting = []
+
+        def start(args, **kw):
+            nonlocal started
+            if args == ["docker", "kill", "--signal=TERM", target["containers"]["serving"]]:
+                self.assertEqual(old_route, self.ops.loaded_upstreams, "serving retires after the rollback reload")
+            result = run(args, **kw)
+            if args == ["docker", "start", old_background]:
+                started = self.ops.clock
+            return result
+
+        def probe(url, **kw):
+            nonlocal health_confirmed
+            if started is not None and f":{old_port}/" in url and url.endswith("/health"):
+                if self.ops.clock - started < 3:
+                    self.assertEqual(live_route, self.ops.loaded_upstreams)
+                    self.assertEqual(live_route, self.ops.files[self.cfg.upstream_file])
+                    probes_while_starting.append(url)
+                    return 0, None
+                health_confirmed = True
+            return http_json(url, **kw)
+
+        def check_write(path, text, **kw):
+            if path == self.cfg.upstream_file and text == old_route:
+                self.assertIsNotNone(started, "upstream was changed before the rollback background was started")
+                self.assertGreaterEqual(self.ops.clock - started, 3)
+                self.assertTrue(health_confirmed, "reload requires a successful health probe")
+            return write(path, text, **kw)
+
+        with mock.patch.object(self.ops, "run", start), mock.patch.object(self.ops, "http_json", probe), \
+                mock.patch.object(self.ops, "write_file_atomic", check_write):
+            if manual:
+                deploy.Deployer(self.cfg, self.ops).rollback()
+            else:
+                with self.assertRaisesRegex(deploy.DeployError, "guard failed"):
+                    self.deploy()
+        self.assertTrue(probes_while_starting)
+        self.assert_live_release(LEGACY)
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual("ok" if manual else "failed", self.history()[-1]["result"])
+
+    def test_guard_rollback_waits_for_healthy_background_before_writing_upstream(self):
+        self.assert_rollback_waits_for_background(manual=False)
+
+    def test_manual_rollback_waits_for_healthy_background_before_writing_upstream(self):
+        self.assert_rollback_waits_for_background(manual=True)
+
+    def test_guard_rollback_keeps_live_admin_route_if_old_background_cannot_start(self):
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+        run = self.ops.run
+
+        def fail_old_background(args, **kw):
+            if args == ["docker", "start", LEGACY["containers"]["background"]]:
+                raise deploy.DeployError("fixture: old background failed to start")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", fail_old_background):
+            with self.assertRaises(deploy.FallbackFailed):
+                self.deploy()
+        route = deploy.render_upstreams(*(LEGACY["ports"][role] for role in deploy.SERVING_ROLES),
+                                        target["ports"]["background"])
+        self.assertEqual(route, self.ops.loaded_upstreams)
+        self.assertEqual(route, self.ops.files[self.cfg.upstream_file])
+        self.assertTrue(deploy.Deployer(self.cfg, self.ops).owner_runtime(target)["owns_background"])
+        self.assertFalse(self.ops.inspect(target["containers"]["serving"])["State"]["Running"])
+        progress = self.state()["in_progress"]
+        self.assertEqual("failed", progress["phase"])
+        self.assertIn("old background failed to start", progress["reason"])
+        self.assertEqual(progress, deploy.status(self.cfg, self.ops)["in_progress"])
+        self.assertTrue(any(alert.get("in_progress") == progress for alert in deploy.watch_once(self.cfg, self.ops, {})))
+        self.assertIn("ROLLBACK INCOMPLETE", "\n".join(self.ops.logs))
+
+    def test_guard_rollback_does_not_reload_when_neither_background_is_available(self):
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+        run = self.ops.run
+        starts = []
+
+        def fail_backgrounds(args, **kw):
+            if args[:2] == ["docker", "start"] and args[-1] in (
+                    LEGACY["containers"]["background"], target["containers"]["background"]):
+                starts.append(args[-1])
+                if starts != [target["containers"]["background"]]:
+                    raise deploy.DeployError("fixture: background failed to start")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", fail_backgrounds):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "verify.*before clearing in_progress"):
+                self.deploy()
+        self.assertEqual([target["containers"]["background"], LEGACY["containers"]["background"],
+                          target["containers"]["background"]], starts)
+        self.assertEqual(self.upstreams_for(target), self.ops.loaded_upstreams)
+        self.assertEqual(self.upstreams_for(target), self.ops.files[self.cfg.upstream_file])
+        self.assertEqual("failed", self.state()["in_progress"]["phase"])
+        log = "\n".join(self.ops.logs)
+        self.assertIn("FAILED AND NOT RESTORED", log)
+        self.assertIn("restore one background", log)
+
+    def test_guard_rollback_precheck_preserves_running_background(self):
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+        self.ops.busy_ports.add(LEGACY["ports"]["background"])
+        with self.assertRaisesRegex(deploy.RollbackIncomplete, "port is already in use"):
+            self.deploy()
+        self.assertNotIn(["docker", "kill", "--signal=TERM", target["containers"]["background"]], self.ops.commands)
+        self.assertEqual("failed", self.state()["in_progress"]["phase"])
+        expected = {**LEGACY["ports"], "background": target["ports"]["background"]}
+        self.assertEqual(self.upstreams_for({"ports": expected}), self.ops.loaded_upstreams)
+
+    def test_manual_rollback_can_recover_a_stopped_background(self):
+        self.deploy()
+        current = self.state()["current"]
+        name = current["containers"]["background"]
+        self.ops.containers[name]["State"].update(Running=False, Status="exited")
+        deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertNotIn(["docker", "kill", "--signal=TERM", name], self.ops.commands)
+        self.assert_live_release(LEGACY)
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_guard_rollback_refuses_a_serving_port_that_stops_answering_during_switch(self):
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+        run, http_json = self.ops.run, self.ops.http_json
+        failed_port = LEGACY["ports"]["standby"]
+        reloads = []
+        offline = False
+
+        def observe_switch(args, **kw):
+            nonlocal offline
+            if args == [self.cfg.nginx_bin, "-t"] and self.ops.switched:
+                offline = True
+            if args == [self.cfg.nginx_bin, "-s", "reload"]:
+                reloads.append(self.ops.files[self.cfg.upstream_file])
+            return run(args, **kw)
+
+        def probe(url, **kw):
+            if offline and url.endswith(f":{failed_port}/health"):
+                return 0, None
+            return http_json(url, **kw)
+
+        with mock.patch.object(self.ops, "run", observe_switch), mock.patch.object(self.ops, "http_json", probe):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "rollback standby.*not answering"):
+                self.deploy()
+        self.assertTrue(offline)
+        self.assertEqual([self.upstreams_for(target)], reloads)
+        self.assert_live_release(target)
+        self.assertEqual("failed", self.state()["in_progress"]["phase"])
+
     def test_main_guard_docker_query_failure_restores_live_release(self):
         target = self.cfg.slot_view("a")
         inspect = self.ops.inspect
@@ -1306,6 +1468,9 @@ class DeployTest(unittest.TestCase):
 
                 def fail_reload(args, **kw):
                     nonlocal failed
+                    if args == [self.cfg.nginx_bin, "-s", "reload"] and failed:
+                        owner = deploy.Deployer(self.cfg, self.ops).owner_runtime(LEGACY) or {}
+                        self.assertTrue(owner.get("ready") and owner.get("owns_background"))
                     result = run(args, **kw)
                     if args == [self.cfg.nginx_bin, "-s", "reload"] and not failed:
                         failed = True
@@ -1397,8 +1562,8 @@ class DeployTest(unittest.TestCase):
         self.assertIn("restoring previous routing failed", progress["reason"])
         self.assertEqual(self.upstreams_for(progress["target"]), self.ops.loaded_upstreams)
         self.assertEqual(LEGACY, self.state()["current"])
-        self.assertTrue(self.ops.inspect(progress["target"]["containers"]["background"])["State"]["Running"])
-        self.assertFalse(self.ops.inspect(LEGACY["containers"]["background"])["State"]["Running"])
+        self.assertFalse(self.ops.inspect(progress["target"]["containers"]["background"])["State"]["Running"])
+        self.assertTrue(self.ops.inspect(LEGACY["containers"]["background"])["State"]["Running"])
 
     def test_main_nginx_test_without_backup_keeps_fault(self):
         del self.ops.files[self.cfg.upstream_file]
@@ -1822,40 +1987,34 @@ class DeployTest(unittest.TestCase):
         self.assertIn("Do not deploy again", str(again.exception))
         self.assertEqual(commands, len(self.ops.commands))
 
-    def test_rollback_with_an_owner_that_never_exits_keeps_in_progress(self):
+    def test_rollback_drain_timeout_preserves_read_only_admin_and_keeps_in_progress(self):
         self.deploy()
-        self.ops.drain_seconds["sources-main-a-background"] = float("inf")
-        with self.assertRaises(deploy.FallbackFailed):
+        current = self.state()["current"]
+        owner = current["containers"]["background"]
+        self.ops.drain_seconds[owner] = float("inf")
+        self.ops.runtime_extra[owner] = {"admin_during_drain": "read-only"}
+        with self.assertRaises(deploy.RollbackIncomplete):
             deploy.Deployer(self.cfg, self.ops).rollback()
         in_progress = self.state()["in_progress"]
+        self.assertEqual("failed", in_progress["phase"])
         self.assertEqual("background handoff", in_progress["failed_step"])
-        # Traffic is still on slot a while its background drains; the restarted
-        # previous serving containers have none.
-        for part in ("sources-main-a-background is still draining", "Traffic is on slot a.",
-                     "Serving containers left outside the Nginx route: old-serving, old-spare",
-                     "'docker start sources-main-a-background'"):
-            self.assertIn(part, in_progress["reason"])
+        self.assertIn("still draining", in_progress["reason"])
+        expected = {**LEGACY["ports"], "background": current["ports"]["background"]}
+        self.assertEqual(self.upstreams_for({"ports": expected}), self.ops.loaded_upstreams)
+        self.assertTrue(self.ops.inspect(owner)["State"]["Running"])
 
-    def test_handing_back_to_an_owner_that_never_exits_names_the_previous_background(self):
-        # Guard fails, traffic goes back to the previous slot, and the new
-        # background never exits: the person must start the previous release's
-        # background, not restart the newer one.
+    def test_guard_rollback_drain_timeout_does_not_select_unavailable_admin(self):
         self.ops.memory_after_switch = 20 * GIB
-        self.ops.drain_seconds["sources-main-a-background"] = float("inf")
-        with self.assertRaises(deploy.FallbackFailed) as ctx:
+        target = self.cfg.slot_view("a")
+        owner = target["containers"]["background"]
+        self.ops.drain_seconds[owner] = float("inf")
+        with self.assertRaisesRegex(deploy.FallbackFailed, "still draining.*'status'") as ctx:
             self.deploy()
-        message = str(ctx.exception)
-        slot = self.cfg.slot_view("a")
-        serving = ", ".join(slot["containers"][role] for role in deploy.SERVING_ROLES)
-        for part in ("sources-main-a-background is still draining", "old-bg was not started",
-                     "Traffic is on slot legacy",
-                     f"Serving containers left outside the Nginx route: {serving}",
-                     "start the background of slot legacy (not sources-main-a-background): "
-                     "'docker update --restart=unless-stopped old-bg' and 'docker start old-bg'"):
-            self.assertIn(part, message)
-        self.assertNotIn("docker start sources-main-a-background", message)
-        self.assertIn("127.0.0.1:9426 max_fails", self.ops.files[self.cfg.upstream_file], "traffic is back")
-        self.assertEqual(message, self.state()["in_progress"]["reason"])
+        self.assertEqual(self.upstreams_for(target), self.ops.loaded_upstreams)
+        self.assertEqual(self.upstreams_for(target), self.ops.files[self.cfg.upstream_file])
+        self.assertTrue(self.ops.inspect(owner)["State"]["Running"])
+        self.assertFalse(self.ops.inspect(LEGACY["containers"]["background"])["State"]["Running"])
+        self.assertEqual(str(ctx.exception), self.state()["in_progress"]["reason"])
 
     def test_a_reply_cut_off_mid_way_never_ends_the_handoff(self):
         # The old owner exits while answering a runtime read: the progress note

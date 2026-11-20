@@ -149,7 +149,7 @@ Main 的状态集中在 `in_progress`。空闲时该字段为 `null`。其它阶
 | `resume` 的身份、镜像、网络、健康、旧后台或目标端口验证不通过 | `in_progress.phase=held` 保留，没有交接或切流；恢复健康/原配置后重试，容器丢失或被替换则放弃并重新发布。同名替换容器需先人工确认归属，不能让工具误删 |
 | 配置共享别名、启动新 serving 或交接前再次检查端口失败 | 对可能已开始接流的目标容器先排空，再撤回已配置的别名，补回缺少的原网络连接。确认原容器以暂停配置重启并就绪后恢复 `in_progress.phase=held`，可继续或放弃。恢复不完整时保留 `in_progress.phase=failed` |
 | 后台交接或切流失败 | 目标后台启动失败时，工具尝试确认它已退出、恢复旧后台的重启策略并启动旧后台。能确认旧后台持锁且就绪、路由和磁盘配置已恢复时，先排空再移除本次新 serving。若配置未能还原但尚未 reload，仍尝试交还后台，并保留 `failed` 供人工修复。无法确认所有权、仍在排空或恢复失败时也保留 `failed` |
-| 守护失败，包括 Docker 查询异常 | 尝试恢复旧流量和后台，再对新 serving 发 SIGTERM 并保留容器供排查。回退或发出退役命令失败时保留故障状态 |
+| 守护失败，包括 Docker 查询异常 | 先恢复并确认旧后台可用，再回退路由并排空新 serving。旧后台无法恢复时保留可用的管理入口，故障结果记录在 `in_progress` |
 | 退役旧 serving 失败 | 新版本已在服务，保留步骤为退役的 `in_progress.phase=failed`；`current` 仍是提交完成前的旧记录。核实实际 upstream 和后台，完成旧 serving 排空，再以 `in_progress.target` 更新 current、原 current 记为 previous，最后清除标记；不要直接清空后再发布 |
 | 继续的变更阶段遇到命令超时、无法执行或 Ctrl-C | 命令可能已生效。工具按当前阶段尝试恢复，确认恢复结果后才更新状态。结果仍不明时保留 `in_progress.phase=failed`，按下文人工恢复。进程被强制终止时，以最后一次保存的 `in_progress` 为准 |
 | `abort` 中途失败或被中断 | `in_progress.phase=aborting` 保留；捕获到的失败写入 `reason`。后续只能重试 `abort`，不能 `resume`。修复 Docker 或权限后可重试。若进程仍在运行，重试会再次发送 SIGTERM。已移除的容器不会阻碍重试。Docker 查询失败时会保留状态 |
@@ -177,9 +177,11 @@ Main 命令遇到未处理的异常时会以非零状态退出，并输出一行
 
 上游供应商返回的 502、503、429 不算失败：它们在切流前后都可能出现，守护只看 Nginx 能不能连上应用。
 
-守护判断失败或查询抛出异常时，脚本尝试把 upstream 切回上一槽位并 reload，把后台交还旧版本，然后对新 serving 发 SIGTERM 并保留这些容器供排查。无法完成路由、后台恢复或退役命令时保留 `in_progress.phase=failed`。
+守护失败或查询抛出异常时，自动回退与 `deploy.py rollback` 共用同一套切换流程。手动回滚会先启动上一槽位已有的 serving。两条路径都先确认回退槽位的 serving 健康，再准备回退后台的重启策略，让当前后台排空退出。回退后台启动后，工具在 `background_ready_timeout` 内等待 `/health` 返回 200，并确认它就绪且持有后台锁。确认候选端口可用后写入 upstream，执行 `nginx -t`，在 reload 前再次核对端口。随后一次 reload 切换管理入口和用户入口，再排空并停止退役的 serving，记录状态与历史。自动回退保留故障槽位的容器供排查。
 
-守护期过后的回滚使用 `deploy.py rollback`：它复用上一槽位已停止的容器（不重新创建），按同样的顺序执行启动、后台交接、切流、守护和退役。
+回退后台无法启动或就绪时，工具先检查原管理入口的后台是否仍在应答，必要时会尝试恢复它。若它可用且回退槽位的 serving 健康，只回退用户流量，管理入口保留在原后台。此时报告 `ROLLBACK INCOMPLETE`，`status` 和 `watch` 显示 `in_progress.phase=failed` 及原因。若两个后台都无法确认可用，则保留已加载的路由并报告 `FAILED AND NOT RESTORED`。按下文恢复后台后再改管理 upstream。
+
+文件锁允许同时最多一个持有者。当前后台退出到回退后台就绪并切流之间仍有交接空档。整个等待期间保留已加载的 upstream，目标后台就绪后才切换。
 
 守护只能发现切流后几分钟内的问题。常驻监测由 `deploy.py watch`（systemd 单元 `sources-main-watch.service`）负责：每 10 秒对当前版本采样健康状态、重启、OOM、内存和活跃请求数，超过阈值时向 journal 写一条预警。
 
@@ -188,8 +190,8 @@ Main 命令遇到未处理的异常时会以非零状态退出，并输出一行
 恢复失败时，`in_progress` 的 `phase` 为 `failed`，`failed_step` 和 `reason` 保留失败位置和原因，`main` 与 `rollback` 会拒绝继续。`current` 是最后一次完成发布时写入的记录，切流或退役失败后可能与线上路由不同。旧后台排空超过 `background_exit_timeout` 时，工具保留进程继续排空。它的重启策略已关闭，如果它随后退出，须人工恢复后台。
 
 1. 暂停其他发布操作。运行 `deploy.py --config <MAIN_CONFIG> status`、`docker ps -a` 和 `docker logs <CONTAINER>`，核对 `current`、`in_progress.target`、两槽位后台状态和 upstream 配置。若 reload 结果不明，从实际入口核对路由，单看磁盘上的配置不足以判定生效结果。
-2. 选择要服务的槽位。正向发布或 `rollback` 在切流前超时时，恢复交接前的后台。切流已回退时，恢复旧路由对应的后台。必要时先把非目标后台设为不自动重启（`docker update --restart=no <OTHER_BACKGROUND>`），如果后台仍在运行且尚未收到停止信号，发送 `docker kill --signal=TERM <OTHER_BACKGROUND>`。单独调用排空接口不会令进程退出。用 `docker inspect <OTHER_BACKGROUND>` 等它退出。排空中的目标后台也要等其退出后再启动。
-3. 对选定的后台运行 `docker update --restart=unless-stopped <BACKGROUND>` 和 `docker start <BACKGROUND>`。通过 `/internal/sources/runtime` 确认 `role=background`、`ready=true` 和 `owns_background=true`。如果路由需要修复，按选定槽位的端口恢复 upstream，执行 `nginx -t` 成功后再 reload，并检查用户入口和管理入口。
+2. 选择要服务的槽位。正向发布或 `rollback` 在切流前超时时，恢复交接前的后台。若状态提示用户与管理流量分处两槽，先核对仍在应答的后台，再决定完成回退或恢复到同一槽位。必要时先把非目标后台设为不自动重启（`docker update --restart=no <OTHER_BACKGROUND>`），如果后台仍在运行且尚未收到停止信号，发送 `docker kill --signal=TERM <OTHER_BACKGROUND>`。单独调用排空接口不会令进程退出。用 `docker inspect <OTHER_BACKGROUND>` 等它退出。排空中的目标后台也要等其退出后再启动。
+3. 对选定的后台运行 `docker update --restart=unless-stopped <BACKGROUND>` 和 `docker start <BACKGROUND>`。确认 `/health` 返回 200，并通过 `/internal/sources/runtime` 核对 `role=background`、`ready=true` 和 `owns_background=true`。如果路由需要修复，先核对两个 serving 端口也在应答，再更新 upstream，执行 `nginx -t` 成功后 reload，检查用户入口和管理入口。
 4. 排空未选中槽位的 serving，等待退出后再做必要的移除。这些实例即使不在 Nginx 路由中，也可能通过共享别名接过请求。确认实际路由与持锁后台一致后备份状态文件。若决定保留已切流的新版本，完成旧 serving 退役，把 `in_progress.target` 记为 `current`，原 `current` 记为 `previous`。恢复到原版本时保留原 `current`、`previous`。最后将 `in_progress` 改为 `null`，复查 `status`。
 
 ## 已知取舍

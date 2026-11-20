@@ -75,12 +75,20 @@ class FallbackFailed(DeployError):
     """Restoring the previous release failed too; needs a person."""
 
 
+class RollbackIncomplete(FallbackFailed):
+    """Serving rolled back, but admin still uses the background we rolled back from."""
+
+
 class DrainTimeout(DeployError):
     """A container still runs after its drain deadline."""
 
 
 class RoutingFileNotRestored(FallbackFailed):
     """The file needs repair, but this attempt never reloaded live routing."""
+
+
+class RoutingRestored(DeployError):
+    """A failed reload was recovered along with the previous background."""
 
 
 # --------------------------------------------------------------------------
@@ -527,8 +535,11 @@ class Deployer:
         status, body = self.ops.http_json(f"http://127.0.0.1:{port}/internal/sources/runtime", token=token)
         return body if status == 200 and isinstance(body, dict) else None
 
+    def health(self, port: int) -> bool:
+        return self.ops.http_json(f"http://127.0.0.1:{port}/health")[0] == 200
+
     def wait_ready(self, port: int, token: str, role: str, timeout: int,
-                   container: str | None = None, poll: float = 2) -> dict[str, Any]:
+                   container: str | None = None, poll: float = 2, *, check_health: bool = False) -> dict[str, Any]:
         """Wait for a role to report ready. When the container is given, a
         container that exited or is crash-restarting fails at once instead of
         holding the background gap for the whole timeout."""
@@ -543,7 +554,7 @@ class Deployer:
                                       f"(exit {state.get('ExitCode')}); see its logs")
             last = self.runtime(port, token)
             if last and last.get("ready") and last.get("role") == role:
-                if role != "background" or last.get("owns_background"):
+                if (role != "background" or last.get("owns_background")) and (not check_health or self.health(port)):
                     return last
             self.ops.sleep(poll)
         raise DeployError(f"port {port} not ready as {role} within {timeout}s (last runtime: {json.dumps(last)[:300]})")
@@ -674,7 +685,8 @@ class Deployer:
                 return line[len(prefix):].strip()
         raise DeployError(f"no '{prefix}' line in command output")
 
-    def install_upstreams(self, text: str) -> None:
+    def install_upstreams(self, text: str, *, before_reload: Callable[[], None] | None = None,
+                          restore_on_reload_error: Callable[[], None] | None = None) -> None:
         try:
             previous = self.ops.read_text(self.cfg.upstream_file)
         except FileNotFoundError:
@@ -686,6 +698,8 @@ class Deployer:
             test = self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False)
             if test.returncode != 0:
                 raise DeployError("nginx -t rejected the upstream file")
+            if before_reload is not None and not self.ops.dry_run:
+                before_reload()
         except (Exception, KeyboardInterrupt) as err:
             if previous is None:
                 raise RoutingFileNotRestored(f"upstream update failed before reload ({err}) and no previous upstream file is available") from err
@@ -697,19 +711,27 @@ class Deployer:
         try:
             self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
         except (Exception, KeyboardInterrupt) as err:
+            if restore_on_reload_error is None:
+                raise FallbackFailed(f"reload outcome is unknown ({err}). Verify live routing with 'status' "
+                                     "and Nginx before changing background ownership") from err
             if previous is None:
                 raise FallbackFailed("reload failed and no previous upstream file is available") from err
             try:
+                restore_on_reload_error()
                 self.ops.write_file_atomic(self.cfg.upstream_file, previous)
                 self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True)
                 self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
             except (Exception, KeyboardInterrupt) as restore_err:
                 raise FallbackFailed("reload failed; restoring previous routing failed too; inspect status") from restore_err
-            raise DeployError("reload failed; previous routing restored") from err
+            raise RoutingRestored("reload failed; previous routing restored") from err
 
-    def switch_to(self, view: dict[str, Any]) -> None:
+    def switch_to(self, view: dict[str, Any], *, admin: dict[str, Any] | None = None,
+                  before_reload: Callable[[], None] | None = None,
+                  restore_on_reload_error: Callable[[], None] | None = None) -> None:
         ports = view["ports"]
-        self.install_upstreams(render_upstreams(ports["serving"], ports["standby"], ports["background"]))
+        admin_port = (view if admin is None else admin)["ports"]["background"]
+        self.install_upstreams(render_upstreams(ports["serving"], ports["standby"], admin_port),
+                               before_reload=before_reload, restore_on_reload_error=restore_on_reload_error)
 
     # steps ------------------------------------------------------------------
     def nginx_preflight(self) -> list[str]:
@@ -795,62 +817,63 @@ class Deployer:
         except Exception:  # noqa: BLE001 - a progress note must never end the wait
             return None
 
-    def stuck_owner(self, current: dict[str, Any], target: Target, back: bool, timeout: int) -> FallbackFailed:
+    def stuck_owner(self, current: dict[str, Any], target: Target, timeout: int) -> FallbackFailed:
         """The old owner did not exit in time. Say which slot serves traffic,
         what is left running and which background a person has to start."""
         old = current["containers"]["background"]
         new = target.containers["background"]
-        if back:
-            # Traffic already went back to target's slot; old is the newer
-            # release's background and must not be restarted.
-            traffic, start = target.slot, new
-            idle = [current["containers"][r] for r in SERVING_ROLES if current["containers"].get(r)]
-        else:
-            traffic, start = current["slot"], old
-            idle = [target.containers[r] for r in SERVING_ROLES]
-        not_this = f" (not {old})" if start != old else ""
+        traffic = current["slot"]
+        idle = [target.containers[r] for r in SERVING_ROLES]
         return FallbackFailed(
             f"{old} is still draining after {timeout}s; nothing was killed and {new} was not started. "
             f"Traffic is on slot {traffic}. {old} is set not to restart, so once it exits no background owner runs. "
             f"Serving containers left outside the Nginx route: {', '.join(idle) or 'none'}. "
-            f"Wait for {old} to exit (docker ps -a), then start the background of slot {traffic}{not_this}: "
-            f"'docker update --restart=unless-stopped {start}' and 'docker start {start}'; check 'status', "
+            f"Wait for {old} to exit (docker ps -a), then start the background of slot {traffic}: "
+            f"'docker update --restart=unless-stopped {old}' and 'docker start {old}'; check 'status', "
             "then clear in_progress. Do not deploy again before that")
 
     def handoff_background(self, current: dict[str, Any], target: Target, create: bool,
-                           back: bool = False) -> None:
+                           *, check_health: bool = False) -> None:
         """Move background ownership from current to target. The old owner gets
         one SIGTERM and finishes in-flight work; the kernel lock passes when it
         exits. If the new owner does not become ready, the old one restarts.
         An old owner that reports admin_during_drain keeps answering admin
-        reads until it closes its listener, just before it exits. back: the
-        handoff returns ownership to target after traffic already moved there."""
+        reads until it closes its listener, just before it exits."""
         old = current["containers"]["background"]
         new = target.containers["background"]
         before = self.owner_runtime(current)  # read-only, also in a dry run
-        self.ops.run(["docker", "update", "--restart=no", old], mutate=True)
+        source = self.ops.inspect(old) if check_health and not self.ops.dry_run else None
+        old_running = not check_health or self.ops.dry_run or bool((source or {}).get("State", {}).get("Running"))
+        if not create:
+            # Prepare the stopped rollback container before changing the active owner.
+            self.ops.run(["docker", "update", "--restart=unless-stopped", new], mutate=True)
+        if old_running or source:
+            self.ops.run(["docker", "update", "--restart=no", old], mutate=True)
         if create:
             self.create(target, "background")
-        else:
-            self.ops.run(["docker", "update", "--restart=unless-stopped", new], mutate=True)
-        self.log(f"   TERM {old}; waiting for it to finish in-flight work (no SIGKILL)")
-        if (before or {}).get("admin_during_drain") == "read-only":
-            self.log(f"   while {old} drains it answers admin reads and refuses admin writes with 503; "
-                     "the admin API is down only from its exit until the new background is ready")
-        else:
-            self.log(f"   the admin API is unavailable until the new background is ready "
-                     f"({old} does not report read-only draining)")
-        old_exited = False
+        if old_running:
+            self.log(f"   TERM {old}; waiting for it to finish in-flight work (no SIGKILL)")
+            if (before or {}).get("admin_during_drain") == "read-only":
+                self.log(f"   while {old} drains it answers admin reads and refuses admin writes with 503; "
+                         "the admin API is down only from its exit until the new background is ready")
+            else:
+                self.log(f"   the admin API is unavailable until the new background is ready "
+                         f"({old} does not report read-only draining)")
+        old_exited = not old_running
         try:
-            self.ops.run(["docker", "kill", "--signal=TERM", old], mutate=True)
-            if not self.ops.dry_run:
+            if old_running:
+                self.ops.run(["docker", "kill", "--signal=TERM", old], mutate=True)
+            if old_running and not self.ops.dry_run:
                 timeout = self.cfg.background_exit_timeout
                 try:
                     code = self.wait_exit(old, timeout, poll=HANDOFF_POLL_SECONDS,
                                           first_note=HANDOFF_FIRST_NOTE_SECONDS,
                                           progress=lambda: self.drain_progress(current))
                 except DrainTimeout as err:
-                    raise self.stuck_owner(current, target, back, timeout) from err
+                    if check_health:
+                        raise FallbackFailed(f"{old} is still draining; {new} was not started. "
+                                             "Wait for the current owner to exit before restoring a background") from err
+                    raise self.stuck_owner(current, target, timeout) from err
                 old_exited = True
                 self.log(f"   {old} exited with code {code}")
             self.ops.run(["docker", "start", new], mutate=True)
@@ -858,7 +881,7 @@ class Deployer:
                 return
             self.wait_ready(target.ports["background"], self.token_for(target.view(), "background"),
                             "background", self.cfg.background_ready_timeout, container=new,
-                            poll=HANDOFF_POLL_SECONDS)
+                            poll=HANDOFF_POLL_SECONDS, check_health=check_health)
         except FallbackFailed:
             raise
         except (Exception, KeyboardInterrupt) as err:
@@ -880,7 +903,8 @@ class Deployer:
                 self.ops.run(["docker", "update", "--restart=unless-stopped", old], mutate=True)
                 self.ops.run(["docker", "start", old], mutate=True)
                 self.wait_ready(current["ports"]["background"], self.token_for(current, "background"), "background",
-                                self.cfg.background_ready_timeout, container=old, poll=HANDOFF_POLL_SECONDS)
+                                self.cfg.background_ready_timeout, container=old, poll=HANDOFF_POLL_SECONDS,
+                                check_health=check_health)
             except (Exception, KeyboardInterrupt) as restore_err:
                 raise FallbackFailed(f"background handoff failed ({err}); restoring {old} failed too "
                                      f"({restore_err}); verify and restore background ownership") from restore_err
@@ -935,14 +959,81 @@ class Deployer:
                 return
             self.ops.sleep(self.cfg.guard_interval)
 
+    def check_rollback_serving(self, view: dict[str, Any]) -> None:
+        for role in SERVING_ROLES:
+            info = self.ops.inspect(view["containers"][role]) or {}
+            if not info.get("State", {}).get("Running") or not self.health(view["ports"][role]):
+                raise DeployError(f"rollback {role} on slot {view['slot']} is not answering health checks")
+
+    def background_answering(self, view: dict[str, Any], *, allow_draining: bool = False) -> bool:
+        runtime = self.owner_runtime(view) or {}
+        responding = runtime.get("ready") or (allow_draining and runtime.get("draining")
+                                               and runtime.get("admin_during_drain") == "read-only")
+        return bool(runtime.get("role") == "background" and runtime.get("owns_background") and responding
+                    and self.health(view["ports"]["background"]))
+
+    def check_rollback_route(self, serving: dict[str, Any], admin: dict[str, Any], *, allow_draining: bool = False) -> None:
+        self.check_rollback_serving(serving)
+        if not self.background_answering(admin, allow_draining=allow_draining):
+            raise DeployError(f"rollback background on slot {admin['slot']} is not answering health checks as owner")
+
+    def rollback_to(self, current: dict[str, Any], target: Target, state: dict[str, Any] | None = None) -> None:
+        """Switch a rollback to an answering background, or keep admin on the current owner."""
+        view = target.view()
+        if not self.ops.dry_run:
+            self.check_rollback_serving(view)
+        if state is not None:
+            self._mark(state, target, "background handoff")
+        with self.step("background handoff"):
+            try:
+                if not self.ops.dry_run:
+                    name = target.containers["background"]
+                    info = self.ops.inspect(name)
+                    if not info:
+                        raise DeployError("rollback background container is missing")
+                    if not info.get("State", {}).get("Running") and not self.ops.port_free(target.ports["background"]):
+                        raise DeployError("rollback background port is already in use")
+                self.handoff_background(current, target, create=False, check_health=True)
+            except (Exception, KeyboardInterrupt) as err:
+                if self.ops.dry_run:
+                    raise
+                self.route_rollback_serving_only(current, view, err)
+        if state is not None:
+            self._mark(state, target, "switch")
+        with self.step("switch"):
+            self.switch_after_handoff(current, target, rollback=True)
+
+    def route_rollback_serving_only(self, current: dict[str, Any], view: dict[str, Any], err: BaseException) -> None:
+        try:
+            admin_available = self.background_answering(current, allow_draining=True)
+        except (Exception, KeyboardInterrupt):
+            admin_available = False
+        if not admin_available:
+            raise FallbackFailed(f"rollback background unavailable ({err}). Run 'status' and 'docker ps -a'. "
+                                 "Wait for any draining owner to exit, then restore one background and verify "
+                                 "its health, ownership and live routing before clearing in_progress") from err
+        try:
+            self.check_rollback_serving(view)
+            self.switch_to(view, admin=current,
+                           before_reload=lambda: self.check_rollback_route(view, current, allow_draining=True))
+        except (Exception, KeyboardInterrupt) as route_err:
+            raise FallbackFailed(f"rollback background unavailable ({err}); switching serving alone failed "
+                                 f"({route_err}). Verify routing and background ownership before clearing in_progress") from route_err
+        try:
+            self.retire_serving(current)
+        except (Exception, KeyboardInterrupt) as retire_err:
+            err = DeployError(f"{err}. Retirement of the unselected serving containers is incomplete ({retire_err})")
+        raise RollbackIncomplete(f"rollback background unavailable ({err}). Serving uses slot {view['slot']} and admin "
+                                 f"uses slot {current['slot']}. Check 'status' before completing the rollback") from err
+
     def restore_after_guard(self, target: Target, previous: dict[str, Any], reason: str) -> None:
         self.log(f"   guard failed: {reason}; switching traffic back to slot {previous['slot']}")
         try:
-            self.switch_to(previous)
+            self.rollback_to(target.view(), Target.from_view(previous, self.cfg.runtime_token_file))
+        except RollbackIncomplete as err:
+            raise RollbackIncomplete(f"guard failed ({reason}); {err}") from err
         except (Exception, KeyboardInterrupt) as err:
             raise FallbackFailed(f"guard failed ({reason}) and switching back failed ({err})") from err
-        self.log("   handing the background back to the previous release")
-        self.hand_back(target, previous)
         try:
             self.retire_serving(target.view())
         except (Exception, KeyboardInterrupt) as err:
@@ -950,15 +1041,42 @@ class Deployer:
                                  "is incomplete; inspect status before clearing in_progress") from err
 
     def hand_back(self, target: Target, previous: dict[str, Any]) -> None:
-        """Return background ownership to the previous release after traffic
-        is already back on it."""
+        """Restore the background that was serving before a failed switch."""
         try:
             self.handoff_background(target.view(), Target.from_view(previous, self.cfg.runtime_token_file),
-                                    create=False, back=True)
+                                    create=False, check_health=True)
         except FallbackFailed:
             raise
         except (Exception, KeyboardInterrupt) as err:
             raise FallbackFailed(f"handing the background back failed: {err}") from err
+
+    def switch_after_handoff(self, current: dict[str, Any], target: Target, *, rollback: bool = False) -> None:
+        view = target.view()
+
+        def restore_before_reloading_old_route() -> None:
+            self.check_rollback_serving(current)
+            self.hand_back(target, current)
+            self.check_rollback_route(current, current)
+
+        try:
+            before_reload = None
+            if rollback and not self.ops.dry_run:
+                self.check_rollback_route(view, view)
+                before_reload = lambda: self.check_rollback_route(view, view)
+            self.switch_to(view, before_reload=before_reload,
+                           restore_on_reload_error=restore_before_reloading_old_route)
+        except RoutingFileNotRestored as err:
+            try:
+                self.hand_back(target, current)
+            except FallbackFailed as handoff_err:
+                raise FallbackFailed(f"{err}; {handoff_err}") from handoff_err
+            raise
+        except (FallbackFailed, RoutingRestored):
+            raise
+        except DeployError as err:
+            self.log("   switch failed; handing the background back")
+            self.hand_back(target, current)
+            raise DeployError(f"{err}; the previous release owns the background again") from err
 
     def container_memory(self, info: dict[str, Any]) -> int | None:
         cid = info.get("Id")
@@ -1128,7 +1246,7 @@ class Deployer:
         current, previous = state.get("current"), state.get("previous")
         if not current or not previous:
             raise DeployError("no previous release recorded; nothing to roll back to")
-        for role in ROLES:
+        for role in SERVING_ROLES:
             if not self.ops.inspect(previous["containers"][role]):
                 raise DeployError(f"previous container {previous['containers'][role]} no longer exists")
         target = Target.from_view(previous, self.cfg.runtime_token_file)
@@ -1145,8 +1263,11 @@ class Deployer:
             self._finish_switch(state, current, target, record, create_background=False)
         except DeployError as err:
             record.update(result="failed", error=str(err), steps=self.timings, finished_at=now())
-            if not self.ops.dry_run and isinstance(err, FallbackFailed):
-                self._record_unrestored(state, err)
+            if not self.ops.dry_run:
+                if isinstance(err, FallbackFailed):
+                    self._report_unrestored(state, err)
+                elif state.get("in_progress"):
+                    self._save_progress(state, None)
             self._record_history(record)
             raise
         except (OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
@@ -1413,43 +1534,15 @@ class Deployer:
                 assert networks is not None  # Supplied by resume's read-only validation.
                 self.activate_hold(state, held, target, identities, networks)
         view = target.view()
-        self._mark(state, target, "background handoff")
-        with self.step("background handoff"):
-            try:
-                self.handoff_background(current, target, create=create_background)
-            except FallbackFailed:
-                raise
-            except (Exception, KeyboardInterrupt) as err:
-                if self.ops.dry_run:
-                    raise
-                try:
-                    owner = self.owner_runtime(current) or {}
-                    new = self.owner_runtime(view) or {}
-                    if not owner.get("ready") or not owner.get("owns_background") or new.get("owns_background"):
-                        raise DeployError("previous background ownership is unconfirmed")
-                    self.ops.run(["docker", "update", "--restart=unless-stopped", current["containers"]["background"]],
-                                 mutate=True)
-                except (Exception, KeyboardInterrupt) as restore_err:
-                    raise FallbackFailed(f"background handoff failed ({err}); recovery is unconfirmed ({restore_err}); "
-                                         "inspect status and restore the previous background") from restore_err
-                raise DeployError(str(err) or "background handoff interrupted; previous background is ready") from err
-        self._mark(state, target, "switch")
-        with self.step("switch"):
-            try:
-                self.switch_to(view)
-            except RoutingFileNotRestored as err:
-                # Reload was never attempted. The old route still needs its background.
-                try:
-                    self.hand_back(target, current)
-                except FallbackFailed as handoff_err:
-                    raise FallbackFailed(f"{err}; {handoff_err}") from handoff_err
-                raise
-            except FallbackFailed:
-                raise
-            except DeployError as err:
-                self.log("   switch failed; handing the background back")
-                self.hand_back(target, current)
-                raise DeployError(f"{err}; the previous release owns the background again") from err
+        if create_background:
+            self._mark(state, target, "background handoff")
+            with self.step("background handoff"):
+                self.handoff_for_deploy(current, target)
+            self._mark(state, target, "switch")
+            with self.step("switch"):
+                self.switch_after_handoff(current, target)
+        else:
+            self.rollback_to(current, target, state)
         if not self.ops.dry_run:
             self._mark(state, target, "guard")
             with self.step("guard"):
@@ -1476,6 +1569,26 @@ class Deployer:
         record.update(result="ok", steps=self.timings, finished_at=now())
         self._record_history(record)
         self.log(f"done: slot {target.slot} serving {target.image}")
+
+    def handoff_for_deploy(self, current: dict[str, Any], target: Target) -> None:
+        try:
+            self.handoff_background(current, target, create=True)
+        except FallbackFailed:
+            raise
+        except (Exception, KeyboardInterrupt) as err:
+            if self.ops.dry_run:
+                raise
+            try:
+                owner = self.owner_runtime(current) or {}
+                new = self.owner_runtime(target.view()) or {}
+                if not owner.get("ready") or not owner.get("owns_background") or new.get("owns_background"):
+                    raise DeployError("previous background ownership is unconfirmed")
+                self.ops.run(["docker", "update", "--restart=unless-stopped", current["containers"]["background"]],
+                             mutate=True)
+            except (Exception, KeyboardInterrupt) as restore_err:
+                raise FallbackFailed(f"background handoff failed ({err}); recovery is unconfirmed ({restore_err}); "
+                                     "inspect status and restore the previous background") from restore_err
+            raise DeployError(str(err) or "background handoff interrupted; previous background is ready") from err
 
     def _mark(self, state: dict[str, Any], target: Target, step: str) -> None:
         progress = {"phase": "deploying", "target": target.view(), "step": step, "since": now()}
@@ -1504,6 +1617,11 @@ class Deployer:
                           reason=str(err) or type(err).__name__, failed_at=now())
             self._save_progress(state, failed)
 
+    def _report_unrestored(self, state: dict[str, Any], err: DeployError) -> None:
+        self._record_unrestored(state, err)
+        label = "ROLLBACK INCOMPLETE" if isinstance(err, RollbackIncomplete) else "FAILED AND NOT RESTORED"
+        self.log(f"{label}: {err}")
+
     def _abort(self, state: dict[str, Any], target: Target, err: DeployError, owned: dict[str, str]) -> None:
         """Clear a failure only when the old release still serves or recovery has finished."""
         progress = state.get("in_progress") or {}
@@ -1517,8 +1635,7 @@ class Deployer:
         if isinstance(err, FallbackFailed) or step not in (None, "migrate", "start serving", "background handoff", "switch"):
             # Keep in_progress so the next run refuses until a person resolves
             # it, and keep why, so 'status' shows what needs doing.
-            self._record_unrestored(state, err)
-            self.log(f"FAILED AND NOT RESTORED: {err}")
+            self._report_unrestored(state, err)
             return
         if step in ("start serving", "background handoff", "switch"):
             try:
