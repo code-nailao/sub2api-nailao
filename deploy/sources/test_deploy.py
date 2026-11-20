@@ -693,6 +693,88 @@ class DeployTest(unittest.TestCase):
         self.assertFalse(self.ops.switched)
         self.assertIsNone(self.state()["in_progress"])
 
+    def test_failed_term_with_unreadable_old_runtime_releases_publish_lock(self):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        successor = self.cfg.container("a", "background")
+        self.cfg.background_exit_timeout = 2
+        self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"] = "always"
+        original_run = self.ops.run
+        original_http = self.ops.http_json
+        original_sleep = self.ops.sleep
+        term_at = None
+
+        def run(args, **kwargs):
+            nonlocal term_at
+            if args == ["docker", "kill", "--signal=TERM", old]:
+                self.ops.commands.append(list(args))
+                term_at = self.ops.clock
+                return subprocess.CompletedProcess(args, 1, "", "signal rejected")
+            return original_run(args, **kwargs)
+
+        def http_json(*args, **kwargs):
+            status, body = original_http(*args, **kwargs)
+            if isinstance(body, dict) and body.get("instance_id") == self.ops.containers[old]["Id"]:
+                return 0, None
+            return status, body
+
+        def sleep(seconds):
+            if term_at is not None:
+                self.assertLess(self.ops.clock - term_at, 4 * 60 * 60, "unconfirmed SIGTERM kept the release lock")
+            original_sleep(seconds)
+
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "http_json", http_json), \
+                mock.patch.object(self.ops, "sleep", sleep), deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "SIGTERM"):
+                self.deploy()
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertEqual(current, self.state()["current"])
+        self.assertTrue(self.state()["in_progress"]["failed"])
+        self.assertIsNotNone(term_at)
+        self.assertLess(self.ops.clock - term_at, 60)
+        self.assertTrue(self.ops.containers[old]["State"]["Running"])
+        self.assertEqual("always", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertNotIn(["docker", "start", successor], self.ops.commands)
+        self.assertFalse(self.ops.switched)
+
+    def test_failed_term_to_unready_candidate_releases_publish_lock(self):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        successor = self.cfg.container("a", "background")
+        self.ops.unready_ports = {self.cfg.slots["a"]["background"]}
+        self.cfg.background_ready_timeout = 2
+        self.cfg.background_exit_timeout = 2
+        original_run = self.ops.run
+        original_sleep = self.ops.sleep
+        term_at = None
+
+        def run(args, **kwargs):
+            nonlocal term_at
+            if args == ["docker", "kill", "--signal=TERM", successor]:
+                self.ops.commands.append(list(args))
+                term_at = self.ops.clock
+                return subprocess.CompletedProcess(args, 1, "", "signal rejected")
+            return original_run(args, **kwargs)
+
+        def sleep(seconds):
+            if term_at is not None:
+                self.assertLess(self.ops.clock - term_at, 4 * 60 * 60, "failed candidate stop kept the release lock")
+            original_sleep(seconds)
+
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "sleep", sleep), \
+                deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "SIGTERM"):
+                self.deploy()
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertEqual(current, self.state()["current"])
+        self.assertIsNotNone(term_at)
+        self.assertLess(self.ops.clock - term_at, 60)
+        self.assertTrue(self.state()["in_progress"]["failed"])
+        self.assertTrue(self.ops.containers[successor]["State"]["Running"])
+        self.assertEqual("unless-stopped", self.ops.containers[successor]["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertNotIn(["docker", "start", old], self.ops.commands)
+        self.assertFalse(self.ops.switched)
+
     def test_failed_term_response_can_still_be_followed_by_drain(self):
         old = self.state()["current"]["containers"]["background"]
         self.ops.drain_seconds[old] = 6
@@ -759,6 +841,48 @@ class DeployTest(unittest.TestCase):
             self.deploy()
         self.assertNotIn(old, self.ops.containers)
         self.assertTrue(self.ops.containers[successor]["State"]["Running"])
+
+    def test_inspect_timeout_after_container_removal_still_confirms_absence(self):
+        for removed_before_handoff in (True, False):
+            with self.subTest(removed_before_handoff=removed_before_handoff), tempfile.TemporaryDirectory() as tmp:
+                cfg = make_config(Path(tmp))
+                ops = FakeOps(Path(tmp))
+                for role, name in LEGACY["containers"].items():
+                    ops.add(name, LEGACY["ports"][role])
+                    ops.containers[name]["role"] = "background" if role == "background" else "serving"
+                deploy.save_state(cfg, {"current": LEGACY, "previous": None, "in_progress": None})
+                old = LEGACY["containers"]["background"]
+                successor = cfg.container("a", "background")
+                ops.drain_seconds[old] = 2
+                removed_at = None
+                if removed_before_handoff:
+                    del ops.containers[old]
+                    removed_at = ops.clock
+                original_inspect = ops.inspect
+                original_sleep = ops.sleep
+
+                def inspect(name):
+                    nonlocal removed_at
+                    info = original_inspect(name)
+                    if name == old:
+                        if info and not info["State"]["Running"]:
+                            del ops.containers[old]
+                            removed_at = ops.clock
+                        if removed_at is not None:
+                            raise subprocess.TimeoutExpired(["docker", "inspect", name], 30)
+                    return info
+
+                def sleep(seconds):
+                    if removed_at is not None and not (ops.containers.get(successor) or {}).get("State", {}).get("Running"):
+                        self.assertLess(ops.clock - removed_at, 12, "confirmed removal must allow the successor to start")
+                    original_sleep(seconds)
+
+                with mock.patch.object(ops, "inspect", inspect), mock.patch.object(ops, "sleep", sleep):
+                    deploy.Deployer(cfg, ops).deploy("fixture-image")
+                self.assertNotIn(old, ops.containers)
+                self.assertTrue(ops.containers[successor]["State"]["Running"])
+                self.assertLess(ops.commands.index(["docker", "container", "ls", "--all", "--format", "{{.Names}}"]),
+                                ops.commands.index(["docker", "start", successor]))
 
     def test_background_removed_before_restart_policy_change_allows_handoff(self):
         old = self.state()["current"]["containers"]["background"]

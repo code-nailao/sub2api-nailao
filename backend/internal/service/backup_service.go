@@ -453,14 +453,13 @@ func (s *BackupService) UpdateS3Config(ctx context.Context, cfg BackupS3Config) 
 }
 
 func (s *BackupService) TestS3Connection(ctx context.Context, cfg BackupS3Config) error {
-	// A connection test may only reuse the saved secret for the saved target
-	// and access key. The bucket, region and addressing mode can change the
-	// effective address, even with the same endpoint field.
+	// Reuse the saved secret for the same configured endpoint, bucket, region
+	// and access key. This lets admins test either addressing mode for it.
 	if cfg.SecretAccessKey == "" {
 		old, _ := s.loadS3Config(ctx)
 		if old != nil && old.Endpoint == cfg.Endpoint && old.Bucket == cfg.Bucket &&
 			cmp.Or(old.Region, "auto") == cmp.Or(cfg.Region, "auto") &&
-			old.ForcePathStyle == cfg.ForcePathStyle && old.AccessKeyID == cfg.AccessKeyID {
+			old.AccessKeyID == cfg.AccessKeyID {
 			cfg.SecretAccessKey = old.SecretAccessKey
 		}
 	}

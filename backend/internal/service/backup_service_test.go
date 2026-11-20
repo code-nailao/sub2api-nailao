@@ -1138,7 +1138,9 @@ func TestBackupService_TestS3ConnectionReusesSecretOnlyForSavedTarget(t *testing
 		{name: "removed endpoint", change: func(c *BackupS3Config) { c.Endpoint = "" }},
 		{name: "different region", change: func(c *BackupS3Config) { c.Region = "other" }},
 		{name: "different bucket", change: func(c *BackupS3Config) { c.Bucket = "other" }},
-		{name: "different addressing mode", change: func(c *BackupS3Config) { c.ForcePathStyle = false }},
+		{name: "same target with different addressing mode", wantSecret: saved.SecretAccessKey, change: func(c *BackupS3Config) {
+			c.ForcePathStyle = false
+		}},
 		{name: "different access key", change: func(c *BackupS3Config) { c.AccessKeyID = "other" }},
 		{name: "new target with explicit secret", wantSecret: "replacement", change: func(c *BackupS3Config) {
 			c.Endpoint = "NEW_ENDPOINT"
@@ -1153,9 +1155,10 @@ func TestBackupService_TestS3ConnectionReusesSecretOnlyForSavedTarget(t *testing
 			}
 			var usedSecret string
 			called := false
-			svc.storeFactory = func(_ context.Context, cfg *BackupS3Config) (BackupObjectStore, error) {
+			svc.storeFactory = func(_ context.Context, testCfg *BackupS3Config) (BackupObjectStore, error) {
 				called = true
-				usedSecret = cfg.SecretAccessKey
+				require.Equal(t, cfg.ForcePathStyle, testCfg.ForcePathStyle)
+				usedSecret = testCfg.SecretAccessKey
 				return newMockObjectStore(), nil
 			}
 			err := svc.TestS3Connection(ctx, cfg)
