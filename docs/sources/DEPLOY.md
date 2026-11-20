@@ -31,7 +31,7 @@
 - **serving**：处理用户和 API 请求，不运行后台任务。主、备两个实例同时就绪，主实例故障时 Nginx 自动转到备实例。
 - **background**：运行全部后台服务（定时任务、渠道监控、OAuth 刷新、媒体引擎等）并处理需要它们的管理接口。
 
-同一时刻只能有一个后台。这由操作系统文件锁保证：background 在构造任何依赖之前对锁目录中的 `native-background.lock` 加 `flock`，媒体引擎存储在打开时再取一把自己的锁。进程退出时内核自动释放锁，所以新后台只有在旧后台真正退出后才能拿到锁。发布脚本只负责安排顺序，不需要证明“没有两个后台”，也从不发送 SIGKILL。
+操作系统文件锁保证同一时刻**最多一个后台持有者**。background 在构造依赖前对 `native-background.lock` 加 `flock`，媒体引擎打开存储时再取得自己的锁。旧进程退出后内核释放锁，新后台启动并取得锁前会有交接空档。排空超时或恢复失败时，空档可能持续到人工恢复。
 
 每个实例通过内部接口 `/internal/sources/runtime` 报告角色、`ready` 和 `owns_background`；`/internal/sources/drain` 让 serving 实例进入排空状态。两个接口都需要运行令牌。background 还报告 `admin_during_drain`（值为 `read-only`，表示排空期间管理接口只读，见下节）、`active_admin_writes`（排空期间会被拒绝、仍在处理的管理请求数）和 `stopping`（尚未停完的后台服务）。对 background 调用 `/internal/sources/drain` 同样会让它进入只读排空，直到进程退出；发布工具只对 serving 调用这个接口。
 
@@ -124,28 +124,30 @@ python3 deploy/sources/deploy.py --config <MAIN_CONFIG> abort
 
 ### 继续、放弃与失败恢复
 
-`resume` 先只读核对：仍为 `paused.phase=ready`；当前版本、配置和 upstream 文件未变；新容器存在且 ID、镜像 ID 一致，网络仍保持隔离；没有意外的目标后台；新主、新备均就绪且不持有后台，旧后台仍就绪且持锁。验证失败保留暂停，修复后可重试，或放弃；不会自动重建容器或启动停止的容器。配置指纹也覆盖配置里的环境配置项，但不校验 env 文件、挂载文件的内容；暂停期间不要变更这些输入，发生变更应放弃后重新发布。
+`resume` 先只读核对：仍为 `paused.phase=ready`；当前版本、配置和 upstream 文件未变；新容器存在且 ID、镜像 ID 一致，网络仍保持隔离；没有意外的目标后台；新主、新备均就绪且不持有后台，旧后台仍就绪且持锁。还会按普通预检的规则检查目标后台端口是否空闲，以及落在临时端口范围内时是否已保留。验证失败保留暂停，修复后可重试，或放弃；不会自动重建容器或启动停止的容器。配置指纹也覆盖配置里的环境配置项，但不校验 env 文件、挂载文件的内容；暂停期间不要变更这些输入，发生变更应放弃后重新发布。
 
-验证通过后，先原子地把 `paused` 换成 `in_progress`，再断开/重连暂停实例的配置网络以加入共享别名，重新确认就绪。这会短暂中断对新实例的验证连接；继续前结束手工验证请求。随后直接调用普通发布和回滚也使用的 `_finish_switch`，依次后台交接、切流、守护、退役，没有另一份切换实现。新后台用暂停时记录的镜像 ID 创建，镜像 tag 后来改变也不会混入另一个版本。接入共享别名后内部调用可能在 Nginx 切流前进入新 serving，与普通发布相同，此时已进入负责人主动继续的阶段。
+验证通过后，工具原子地把 `paused` 换成 `in_progress`。配置了共享别名时，先关闭新主、新备的自动重启，用 SIGTERM 等两台实例排空退出，再给停止的容器配置所有网络及别名。确认网络存在且配置齐全后才启动容器，复查网络和就绪状态。Docker 在启动容器时建立网络端点，应用进程就绪前，经别名连接到新端点的请求可能需要重试。继续前请结束手工验证请求。
+
+工具在交接前再次核对目标后台端口，然后调用普通发布和回滚共用的 `_finish_switch`，完成后台交接、切流、守护和退役。新后台使用暂停时记录的镜像 ID。新 serving 启动后，经共享别名的内部请求就可能进入它，此时 Nginx 仍可能指向旧 serving。
 
 `abort` 先写入 `paused.phase=aborting`，只处理这次记录的新 serving 和 standby：核对容器 ID，关闭自动重启，发送 SIGTERM，等待退出后移除，不发送 SIGKILL。已不存在的容器视为清理完成；同名替换容器不会被删除，当前版本与目标重叠、或出现意外目标后台时也拒绝继续。只有清理完成才清除暂停；只扩展的迁移、已追加的资源和验证请求产生的业务数据保留。
 
 | 失败或中断位置 | 明确状态与恢复方式 |
 | --- | --- |
 | 新 serving 尚未就绪 | 不产生暂停；清理新 serving，旧版继续工作。清理失败保留带失败原因的 `in_progress`，核查后人工清理 |
-| `resume` 的身份、镜像、网络、健康或旧后台验证不通过 | `paused.phase=ready` 保留，没有交接或切流；恢复健康/原配置后重试，容器丢失或被替换则放弃并重新发布。同名替换容器需先人工确认归属，不能让工具误删 |
-| 继续时接入共享别名失败 | 在交接前清理目标 serving，成功后清除 `in_progress`；清理失败保留故障状态，人工处理目标容器后再清除标记 |
-| 后台交接或切流失败 | 共用普通发布的恢复代码。能确认旧后台持锁且就绪、旧路由恢复时清理目标 serving 并结束；不能确认所有权、旧后台未退出、或恢复本身失败则保留 `in_progress.failed`，不能再当作暂停继续 |
-| 守护失败 | 共用普通发布的回滚：恢复旧流量与后台，停止新 serving 并保留排查；恢复或停止失败则保留故障状态 |
+| `resume` 的身份、镜像、网络、健康、旧后台或目标端口验证不通过 | `paused.phase=ready` 保留，没有交接或切流；恢复健康/原配置后重试，容器丢失或被替换则放弃并重新发布。同名替换容器需先人工确认归属，不能让工具误删 |
+| 配置共享别名、启动新 serving 或交接前再次检查端口失败 | 对可能已开始接流的目标容器先排空，再撤回已配置的别名，补回缺少的原网络连接。确认原容器以暂停配置重启并就绪后恢复 `paused.phase=ready`，可继续或放弃。恢复不完整时保留 `in_progress.failed` |
+| 后台交接或切流失败 | 目标后台启动失败时，工具尝试确认它已退出、恢复旧后台的重启策略并启动旧后台。能确认旧后台持锁且就绪、旧路由恢复时，先排空再移除本次新 serving。无法确认所有权、仍在排空或恢复失败时保留 `in_progress.failed` |
+| 守护失败，包括 Docker 查询异常 | 尝试恢复旧流量和后台，再对新 serving 发 SIGTERM 并保留容器供排查。回退或发出退役命令失败时保留故障状态 |
 | 退役旧 serving 失败 | 新版本已在服务，保留步骤为退役的 `in_progress.failed`；`current` 仍是提交完成前的旧记录。核实实际 upstream 和后台，完成旧 serving 排空，再以 `in_progress.target` 更新 current、原 current 记为 previous，最后清除标记；不要直接清空后再发布 |
-| 继续的变更阶段遇到命令超时、无法执行或 Ctrl-C | 命令结果可能未知，不猜测已恢复。保留 `in_progress.failed`，根据 `status`、实际容器与 upstream 确认流量和后台归属，恢复后人工修正状态；不可直接重跑 `resume`。进程被强制终止时至少保留最后一次写入的 `in_progress`，同样需要人工核查 |
+| 继续的变更阶段遇到命令超时、无法执行或 Ctrl-C | 命令可能已生效。工具按当前阶段尝试恢复，确认恢复结果后才更新状态。结果仍不明时保留 `in_progress.failed`，按下文人工恢复。进程被强制终止时，以最后一次保存的 `in_progress` 为准 |
 | `abort` 中途失败或被中断 | `paused.phase=aborting` 保留；捕获到的失败写入 `failed`。后续只能重试 `abort`，不能 `resume`。修复 Docker/权限或等待排空结束后重试，已移除的容器不会阻碍重试。Docker 不可访问不等于容器不存在，不能据此清除暂停 |
 | 暂停期间宿主重启 | 状态文件及容器必须位于持久存储；容器沿用自动重启策略。恢复后先看 `status`，ID 和镜像不变且健康时可继续；未启动的容器先由负责人检查并启动原容器，容器丢失则放弃重发。重启不自动确认发布，也不自动清除暂停。放弃中的容器已关闭自动重启，恢复后重试放弃 |
 | 容器操作结束但状态或历史写入失败 | 以磁盘上原子保存的状态为准；`status` 仍有暂停就继续核查或重试放弃，已有 `in_progress` 就人工恢复；状态已清除则不要重复容器操作。先修复存储问题，历史写入失败不代表流量一定回退 |
 
-`status` 分开展示 `paused` 和 `in_progress`。`watch` 继续监测当前正式版本，不因健康的暂停实例存在而报故障；`in_progress.failed` 会报 `release_incomplete`，放弃留下的失败会报 `abort_incomplete`。强制终止留下但尚未写入 `failed` 的状态需要通过 `status` 人工识别；watch 不把它伪装成主动暂停。
+`status` 分开展示 `paused` 和 `in_progress`。`watch` 继续监测当前正式版本，不因健康的暂停实例存在而报故障；`in_progress.failed` 会报 `release_incomplete`，放弃留下的失败会报 `abort_incomplete`。Docker 查询出错时，`status` 显示 `unknown`，`watch` 报 `docker_inspect_failed`。强制终止留下但尚未写入 `failed` 的状态需要通过 `status` 人工识别；watch 不把它伪装成主动暂停。
 
-`--dry-run` 是全局参数，可分别用于 `main <IMAGE_DIGEST> --hold-before-switch`、`resume`、`abort`。暂停演练到暂停点即结束；继续演练会真实进行上述只读校验，再打印接网、交接和切流计划；放弃演练检查归属、打印停止与移除计划。它们均不保存状态、不写历史、不改变容器或 Nginx；未通过验证的演练同样保留现场。
+`--dry-run` 是全局参数，可分别用于 `main <IMAGE_DIGEST> --hold-before-switch`、`resume`、`abort`。暂停演练会在本地缺少镜像时真实拉取镜像，并真实创建、运行、删除一次性检查容器来列出待迁移项。没有待迁移项时还会用一次性容器检查 serving 和后台的启动配置。有待迁移项时只打印迁移计划，跳过启动检查。迁移、资源导出、发布槽位容器操作和 Nginx 修改只打印计划。`resume` 和 `abort` 演练执行只读校验并打印后续命令。三个演练都不写状态或历史。
 
 本节对应的本地测试使用模拟 Docker/Nginx 和应用运行时，不能代替隔离环境实测。隔离验收仍按 #31 执行，结果记录到 #39；实测通过前不用于生产。
 
@@ -161,7 +163,7 @@ python3 deploy/sources/deploy.py --config <MAIN_CONFIG> abort
 
 上游供应商返回的 502、503、429 不算失败：它们在切流前后都可能出现，守护只看 Nginx 能不能连上应用。
 
-守护失败时，脚本立即把 upstream 文件切回上一槽位并 reload，把后台交还旧版本，然后停止新 serving 并**保留**这些容器供排查。
+守护判断失败或查询抛出异常时，脚本尝试把 upstream 切回上一槽位并 reload，把后台交还旧版本，然后对新 serving 发 SIGTERM 并保留这些容器供排查。无法完成路由、后台恢复或退役命令时保留 `in_progress.failed`。
 
 守护期过后的回滚使用 `deploy.py rollback`：它复用上一槽位已停止的容器（不重新创建），按同样的顺序执行启动、后台交接、切流、守护和退役。
 
@@ -169,18 +171,16 @@ python3 deploy/sources/deploy.py --config <MAIN_CONFIG> abort
 
 ## 无法自动恢复的情况
 
-如果恢复步骤本身也失败（例如切回旧槽位时 `nginx -t` 失败，或新后台失败后旧后台也无法重新就绪），脚本报告 `FAILED AND NOT RESTORED` 并保留 `in_progress`，原因写在 `in_progress.failed`。此时下一次发布会被拒绝，需要人工用 `deploy.py status` 和 `docker ps` 查看现场、恢复服务后再清除该标记。
+恢复失败时，`in_progress.failed` 保留失败步骤和原因，`main` 与 `rollback` 会拒绝继续。`current` 是最后一次完成发布时写入的记录，切流或退役失败后可能与线上路由不同。旧后台排空超过 `background_exit_timeout` 时，工具保留进程继续排空。它的重启策略已关闭，如果它随后退出，须人工恢复后台。
 
-正在排空的后台在 `background_exit_timeout` 内没有退出也属于这种情况。工具没有杀任何进程，接手的后台已创建（或已停止）但没有启动；排空中的后台已设为不自动重启，Docker 也不会重启被 `docker kill` 停下的容器，所以它退出后就没有后台进程了，直到有人手动启动一个。它在排空期间仍应答管理读请求。`deploy.py status` 里它的 `status` 为 `running`、`restart_policy` 为 `no`，原因和处理步骤写在 `in_progress.failed`。错误信息写明当前哪个槽位在服务流量、哪些 serving 容器留着运行但没有流量、应该启动哪一个后台：
-
-- 正向发布或 `rollback` 时（切流之前）：流量仍在当前槽位；排空中的是当前槽位的后台；目标槽位的主、备 serving 留着运行、没有流量，可在恢复后手动停止。等它退出后启动的就是它本身：`docker update --restart=unless-stopped <当前槽位后台>`、`docker start <当前槽位后台>`。
-- 交还时（切流失败或守护失败、流量已经回到上一槽位之后）：排空中的是新版本的后台，不要重启它；新版本的主、备 serving 留着运行、没有流量，可在恢复后手动停止。等它退出后启动上一槽位（正在服务流量的那个）的后台：`docker update --restart=unless-stopped <上一槽位后台>`、`docker start <上一槽位后台>`。
-
-然后用 `status` 确认后台在运行，再清除 `in_progress`。在此之前不要再次发布。
+1. 暂停其他发布操作。运行 `deploy.py --config <MAIN_CONFIG> status`、`docker ps -a` 和 `docker logs <CONTAINER>`，核对 `current`、`in_progress.target`、两槽位后台状态和 upstream 配置。若 reload 结果不明，从实际入口核对路由，单看磁盘上的配置不足以判定生效结果。
+2. 选择要服务的槽位。正向发布或 `rollback` 在切流前超时时，恢复交接前的后台。切流已回退时，恢复旧路由对应的后台。必要时先把非目标后台设为不自动重启（`docker update --restart=no <OTHER_BACKGROUND>`），只对仍在运行且尚未排空的进程发送 `docker kill --signal=TERM <OTHER_BACKGROUND>`。用 `docker inspect <OTHER_BACKGROUND>` 等它退出。排空中的目标后台也要等其退出后再启动。
+3. 对选定的后台运行 `docker update --restart=unless-stopped <BACKGROUND>` 和 `docker start <BACKGROUND>`。通过 `/internal/sources/runtime` 确认 `role=background`、`ready=true` 和 `owns_background=true`。如果路由需要修复，按选定槽位的端口恢复 upstream，执行 `nginx -t` 成功后再 reload，并检查用户入口和管理入口。
+4. 排空未选中槽位的 serving，等待退出后再做必要的移除。这些实例即使不在 Nginx 路由中，也可能通过共享别名接过请求。确认实际路由与持锁后台一致后备份状态文件。若决定保留已切流的新版本，完成旧 serving 退役，把 `in_progress.target` 记为 `current`，原 `current` 记为 `previous`。恢复到原版本时保留原 `current`、`previous`。最后将 `in_progress` 改为 `null`，复查 `status`。
 
 ## 已知取舍
 
-- 后台交接期间，后台任务暂停到新后台就绪；用户请求不受影响，新的图片任务照常受理并在新后台起来后执行。管理读接口在旧后台排空期间照常可用，只在“旧后台关闭监听到新后台就绪并切流”这几秒不可用；管理写操作和 MCP 要等新后台就绪，期间返回 503。旧后台上正在进行的长任务（例如定时备份）只延长写操作的等待。
+- 后台交接期间，后台任务暂停到新后台就绪；用户请求不受影响，新的图片任务照常受理并在新后台起来后执行。管理读接口在旧后台排空期间照常可用，从旧后台关闭监听到新后台就绪并切流期间不可用；管理写操作和 MCP 要等新后台就绪，期间返回 503。旧后台上正在进行的长任务（例如定时备份）只延长写操作的等待。
 - 守护只覆盖切流后的短时间窗口，较晚出现的问题依赖常驻监测和 serving 的主备结构。
 - 只在后台持锁时才执行的分支（应用迁移、以引擎方式打开媒体引擎）无法被 `-check-startup` 覆盖，由后台交接的自动回退兜底。
 - 本方案针对单台主机。若以后扩展到多台主机，可以把文件锁换成 PostgreSQL 会话级 advisory lock（连接断开时同样自动释放），其余设计不变。
