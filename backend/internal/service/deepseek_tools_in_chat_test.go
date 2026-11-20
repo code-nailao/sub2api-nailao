@@ -285,3 +285,592 @@ func TestDeepSeekChatPathAnswersWhenDeclaredToolsCannotBeSetUp(t *testing.T) {
 	require.False(t, gjson.GetBytes(upstream.lastBody, "tool_choice").Exists())
 	require.Contains(t, string(upstream.lastBody), deepSeekToolsUnavailableNotice)
 }
+
+type deepSeekOrdinaryChatRun struct {
+	result   *OpenAIForwardResult
+	err      error
+	sent     []byte
+	calls    int
+	recorder *httptest.ResponseRecorder
+	billing  *openAIRecordUsageBillingRepoStub
+}
+
+// Exercise forwarding and the same usage recording the handler performs after
+// success. All upstream and persistence operations use in-memory test doubles.
+func runDeepSeekOrdinaryChat(t *testing.T, body []byte, enabled bool) deepSeekOrdinaryChatRun {
+	t.Helper()
+	run := deepSeekOrdinaryChatRun{recorder: httptest.NewRecorder(), billing: &openAIRecordUsageBillingRepoStub{}}
+	svc := newOpenAIRecordUsageServiceWithBillingRepoForTest(&openAIRecordUsageLogRepoStub{inserted: true}, run.billing, &openAIRecordUsageUserRepoStub{}, &openAIRecordUsageSubRepoStub{}, nil)
+	multiplier := svc.cfg.Default.RateMultiplier
+	svc.cfg = deepSeekChatFallbackTestConfig()
+	svc.cfg.Default.RateMultiplier = multiplier
+	account := deepSeekForcedToolChoiceAccount()
+	group := &Group{ID: account.ID, Platform: PlatformDeepseek, SubscriptionType: SubscriptionTypeStandard, RateMultiplier: multiplier, DeepSeekTools: DeepSeekToolsConfig{Enabled: enabled}}
+	user := &User{ID: account.ID}
+	key := &APIKey{ID: account.ID, UserID: user.ID, User: user, GroupID: &group.ID, Group: group}
+	account.GroupIDs = []int64{group.ID}
+	svc.accountRepo = deepSeekAccountFixture{account: account}
+	svc.httpUpstream = deepSeekHTTPFixture{fn: func(req *http.Request) (*http.Response, error) {
+		run.calls++
+		require.True(t, strings.HasSuffix(req.URL.Path, "/chat/completions"))
+		var err error
+		run.sent, err = io.ReadAll(req.Body)
+		require.NoError(t, err)
+		response := deepSeekFixtureModelResponse(t, gjson.GetBytes(body, "stream").Bool(), deepSeekChatFallbackOKBody)
+		response.Header.Set("X-Request-ID", t.Name())
+		return response, nil
+	}}
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(run.recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
+	c.Set("api_key", key)
+	run.result, run.err = svc.ForwardAsChatCompletions(c.Request.Context(), c, account, body, "", "")
+	if run.err == nil {
+		require.NoError(t, svc.RecordUsage(c.Request.Context(), &OpenAIRecordUsageInput{Result: run.result, APIKey: key, User: user, Account: account}))
+	}
+	return run
+}
+
+func TestDeepSeekChatFiltersDisabledGroup(t *testing.T) {
+	const lookup = `{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}`
+	const namedSearch = `{"type":"function","function":{"name":"deepseek_web_search"}}`
+	const legacySearchChoice = `{"type":"tool", "name":"deepseek_web_search"}`
+	const aliasedSearch = `{"type":"deepseek_web_search","name":"search_alias"}`
+	const aliasFunction = `{"type":"function","function":{"name":"search_alias"}}`
+	const directAliasChoice = `{"type":"search_alias"}`
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			ordinary := runDeepSeekOrdinaryChat(t, []byte(fmt.Sprintf(`{"model":"deepseek-flash","messages":[],"stream":%t}`, stream)), false)
+			require.NoError(t, ordinary.err)
+			require.Equal(t, 1, ordinary.calls)
+			require.Equal(t, 1, ordinary.billing.calls)
+			require.Positive(t, ordinary.billing.lastCmd.BalanceCost)
+			for _, tc := range []struct {
+				name, tools, choice, wantTools, wantChoice string
+			}{
+				{"future_types", `{"type":"web_search_future"},{"type":"web_fetch_preview_future"},{"type":"deepseek_web_search_future"},{"type":"deepseek_read_url_preview_future"},` + lookup, `"auto"`, `[` + lookup + `]`, `"auto"`},
+				{"hyphen_suffix", `{"type":"web_search-v2099"},` + lookup, `"auto"`, `[` + lookup + `]`, `"auto"`},
+				{"dot_suffix", `{"type":"web_fetch.preview"},` + lookup, `"auto"`, `[` + lookup + `]`, `"auto"`},
+				{"prefix_without_separator", `{"type":"web_search2099"},{"type":"web_fetch2099"},` + lookup, `"auto"`, `[` + lookup + `]`, `"auto"`},
+				{"underscore_suffix", `{"type":"web_search_preview_2025_03_11"},` + lookup, `"auto"`, `[` + lookup + `]`, `"auto"`},
+				{"legacy_named_choice", `{"type":"deepseek_web_search"},` + lookup, `{"type":"tool","name":"deepseek_web_search"}`, `[` + lookup + `]`, `"auto"`},
+				{"legacy_named_alias", aliasedSearch + `,` + lookup, `{"type":"tool","name":"search_alias"}`, `[` + lookup + `]`, `"auto"`},
+				{"direct_alias_choice", aliasedSearch + `,` + lookup, directAliasChoice, `[` + lookup + `]`, `"auto"`},
+				{"type_only_removed_alias_shared_with_function", aliasedSearch + `,` + aliasFunction, directAliasChoice, `[` + aliasFunction + `]`, `"auto"`},
+				{"direct_alias_without_survivors", aliasedSearch, directAliasChoice, "", ""},
+				{"function_choice_of_removed_alias", aliasedSearch + `,` + lookup, `{"type":"function","function":{"name":"search_alias"}}`, `[` + lookup + `]`, `"auto"`},
+				{"required_mode_matching_alias", `{"type":"deepseek_web_search","name":"required"},` + lookup, `"required"`, `[` + lookup + `]`, `"required"`},
+				{"type_only_none_alias", `{"type":"deepseek_web_search","name":"none"},` + lookup, `{"type":"none"}`, `[` + lookup + `]`, `"auto"`},
+				{"type_only_tool_alias", `{"type":"deepseek_web_search","name":"tool"},` + lookup, `{"type":"tool"}`, `[` + lookup + `]`, `"auto"`},
+				{"legacy_choice_of_retained_tool", `{"type":"deepseek_web_search"},` + lookup, `{"type":"tool","name":"lookup"}`, `[` + lookup + `]`, `{"type":"tool","name":"lookup"}`},
+				{"legacy_kept_function_named_after_provider_tool", `{"type":"web_fetch"},` + namedSearch, legacySearchChoice, `[` + namedSearch + `]`, legacySearchChoice},
+				{"legacy_kept_function_named_after_removed_alias", `{"type":"web_fetch","name":"lookup"},` + lookup, `{"type":"tool","name":"lookup"}`, `[` + lookup + `]`, `{"type":"tool","name":"lookup"}`},
+				{"choice_by_family", `{"type":"web_search_preview_future"},` + lookup, `{"type":"web_search"}`, `[` + lookup + `]`, `"auto"`},
+				{"unmatched_function_choice", `{"type":"web_fetch"},` + lookup, `{"type":"function","function":{"name":"missing"}}`, `[` + lookup + `]`, `{"type":"function","function":{"name":"missing"}}`},
+				{"retained_function_choice", `{"type":"web_search"},{"type":"function","function":{"name":"web_search"}}`, `{"type":"function", "function":{"name":"web_search"}}`, `[{"type":"function","function":{"name":"web_search"}}]`, `{"type":"function", "function":{"name":"web_search"}}`},
+				{"required_without_survivors", `{"type":"deepseek_web_search"}`, `"required"`, "", ""},
+				{"no_notice_when_none", `{"type":"web_search"}`, `"none"`, "", `"none"`},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","messages":[],"stream":%t,"tools":[%s],"tool_choice":%s}`, stream, tc.tools, tc.choice))
+					run := runDeepSeekOrdinaryChat(t, body, false)
+					require.NoError(t, run.err)
+					require.NotNil(t, run.result)
+					require.Nil(t, run.result.DeepSeekTools)
+					require.Equal(t, http.StatusOK, run.recorder.Code)
+					require.Equal(t, stream, run.result.Stream)
+					require.Equal(t, 1, run.calls)
+					require.Equal(t, tc.wantTools, gjson.GetBytes(run.sent, "tools").Raw)
+					require.Equal(t, tc.wantChoice, gjson.GetBytes(run.sent, "tool_choice").Raw)
+					wantNotice := tc.choice != `"none"` && gjson.Get(tc.choice, "type").String() != "none"
+					require.Equal(t, wantNotice, strings.Contains(string(run.sent), deepSeekToolsUnavailableNotice))
+					require.Equal(t, ordinary.billing.calls, run.billing.calls)
+					require.Equal(t, ordinary.billing.lastCmd.BalanceCost, run.billing.lastCmd.BalanceCost)
+					require.Equal(t, ordinary.billing.lastCmd.APIKeyQuotaCost, run.billing.lastCmd.APIKeyQuotaCost)
+					if stream {
+						require.Contains(t, run.recorder.Body.String(), "data: [DONE]")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestDeepSeekChatFilterNormalizesToolChoice(t *testing.T) {
+	const removed = `{"type":"web_search_future","name":"search_alias"}`
+	const kept = `[{"type":"function","function":{"name":"lookup"}},{"type":"custom","name":"inspect"}]`
+	const unchanged = "unchanged"
+	const auto = `"auto"`
+	cases := []struct {
+		name, choice       string
+		withTools, noTools string
+	}{
+		{"auto", `"auto"`, unchanged, unchanged},
+		{"none", `"none"`, unchanged, unchanged},
+		{"required", `"required"`, unchanged, ""},
+		{"tool_kept_name", `{"type":"tool", "name":"lookup"}`, unchanged, unchanged},
+		{"tool_removed_name", `{"type":"tool","name":"search_alias"}`, auto, ""},
+		{"tool_no_name", `{"type":"tool","name":""}`, auto, ""},
+		{"nested_function_kept_name", `{"type":"function","function":{"name":"lookup"}}`, unchanged, unchanged},
+		{"nested_function_removed_type", `{"type":"function","function":{"name":"web_search_future"}}`, auto, ""},
+		{"nested_function_no_name", `{"type":"function","function":{}}`, auto, ""},
+		{"flat_function_kept_name", `{"type":"function","name":"lookup"}`, unchanged, unchanged},
+		{"flat_function_removed_name", `{"type":"function","name":"search_alias"}`, auto, ""},
+		{"flat_function_no_name", `{"type":"function","name":""}`, auto, ""},
+		{"top_name_precedes_nested_name", `{"type":"function","function":{"name":"search_alias"},"name":"lookup"}`, unchanged, unchanged},
+		{"type_only_kept_type", `{"type":"custom"}`, unchanged, unchanged},
+		{"type_only_removed_type", `{"type":"web_search_future"}`, auto, ""},
+		{"type_only_removed_alias", `{"type":"search_alias"}`, auto, ""},
+		{"type_only_unknown_type", `{"type":"other"}`, unchanged, unchanged},
+		{"type_only_tool", `{"type":"tool"}`, auto, ""},
+		{"type_only_function", `{"type":"function"}`, auto, ""},
+		{"alias_with_kept_name", `{"type":"search_alias","name":"inspect"}`, unchanged, unchanged},
+		{"type_with_kept_type_as_name", `{"type":"tool","name":"custom"}`, unchanged, unchanged},
+		{"type_with_removed_name", `{"type":"custom","name":"search_alias"}`, auto, ""},
+		{"alias_with_no_name", `{"type":"search_alias","name":""}`, auto, ""},
+		{"other_type_with_no_name", `{"type":"other","name":""}`, unchanged, unchanged},
+	}
+	for _, stream := range []bool{false, true} {
+		for _, withSurvivors := range []bool{false, true} {
+			for _, tc := range cases {
+				t.Run(fmt.Sprintf("stream=%t/survivors=%t/%s", stream, withSurvivors, tc.name), func(t *testing.T) {
+					tools := `[` + removed + `]`
+					wantTools, wantChoice := "", tc.noTools
+					if withSurvivors {
+						tools = `[` + removed + `,` + kept[1:]
+						wantTools, wantChoice = kept, tc.withTools
+					}
+					if wantChoice == unchanged {
+						wantChoice = tc.choice
+					}
+					body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","stream":%t,"messages":[],"tools":%s,"tool_choice":%s}`, stream, tools, tc.choice))
+					run := runDeepSeekOrdinaryChat(t, body, false)
+					require.NoError(t, run.err)
+					require.Equal(t, 1, run.calls)
+					require.True(t, json.Valid(run.sent), "%s", run.sent)
+					require.Equal(t, wantTools, gjson.GetBytes(run.sent, "tools").Raw)
+					require.Equal(t, wantChoice, gjson.GetBytes(run.sent, "tool_choice").Raw)
+				})
+			}
+		}
+	}
+}
+
+func TestDeepSeekChatFilterKeepsFlatFunctionOnFixedChat(t *testing.T) {
+	const function = `{"type":"function","name":"lookup","parameters":{"type":"object"}}`
+	const choice = `{"type":"tool", "name":"lookup"}`
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","stream":%t,"input":"test","tools":[{"type":"web_search_future","name":"lookup"},%s],"tool_choice":%s}`, stream, function, choice))
+			run := runDeepSeekOrdinaryChat(t, body, false)
+			require.NoError(t, run.err)
+			require.Equal(t, 1, run.calls)
+			require.Equal(t, `[`+function+`]`, gjson.GetBytes(run.sent, "tools").Raw)
+			require.Equal(t, choice, gjson.GetBytes(run.sent, "tool_choice").Raw)
+		})
+	}
+}
+
+func TestDeepSeekChatFilterHandlesInputShapeOnFixedChat(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, tc := range []struct{ name, input, wantInput string }{
+			{"string", `"hello\u0020world"`, `[{"content":"hello\u0020world","role":"user"},` + deepSeekChatNoticeMessage + `]`},
+			{"array", `[{ "role":"user", "content":"hello" }]`, `[{ "role":"user", "content":"hello" },` + deepSeekChatNoticeMessage + `]`},
+		} {
+			t.Run(fmt.Sprintf("stream=%t/%s", stream, tc.name), func(t *testing.T) {
+				body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","stream":%t,"input":%s,"tools":[{"type":"web_search"}],"tool_choice":"required"}`, stream, tc.input))
+				run := runDeepSeekOrdinaryChat(t, body, false)
+				require.NoError(t, run.err)
+				require.Equal(t, 1, run.calls)
+				require.Equal(t, 1, run.billing.calls)
+				require.Nil(t, run.result.DeepSeekTools)
+				require.False(t, gjson.GetBytes(run.sent, "tools").Exists())
+				require.False(t, gjson.GetBytes(run.sent, "tool_choice").Exists())
+				require.False(t, gjson.GetBytes(run.sent, "messages").Exists())
+				require.Equal(t, tc.wantInput, gjson.GetBytes(run.sent, "input").Raw)
+			})
+		}
+	}
+}
+
+func TestDeepSeekChatFilterRejectsDuplicateToolKeys(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, tc := range []struct{ name, fields string }{
+			{"tools", `"tools":[],"tools":[{"type":"web_search"}]`},
+			{"escaped_tools", `"tools":[],"\u0074ools":[{"type":"web_fetch"}]`},
+			{"tool_type", `"tools":[{"type":"function","type":"web_search"}]`},
+			{"schema_property", `"tools":[{"type":"function","function":{"parameters":{"properties":{"term":{},"\u0074erm":{}}}}}]`},
+			{"tool_choice", `"tools":[{"type":"web_search"}],"tool_choice":"none","tool_choice":{"type":"function","function":{"name":"web_search"}}`},
+			{"tool_choice_without_tools", `"tool_choice":"none","tool_choic\u0065":"auto"`},
+			{"nested_name", `"tools":[{"type":"web_search"},{"type":"function","function":{"name":"lookup"}}],"tool_choice":{"type":"function","function":{"name":"lookup","name":"web_search"}}`},
+		} {
+			t.Run(fmt.Sprintf("stream=%t/%s", stream, tc.name), func(t *testing.T) {
+				body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","messages":[],"stream":%t,%s}`, stream, tc.fields))
+				started := time.Now()
+				run := runDeepSeekOrdinaryChat(t, body, false)
+				require.Less(t, time.Since(started), 2*time.Second)
+				require.ErrorContains(t, run.err, "duplicate")
+				requireDeepSeekChatFilterRejected(t, run, "duplicate")
+			})
+		}
+	}
+}
+
+func TestDeepSeekChatFilterAddsNoticeToLastMessages(t *testing.T) {
+	const firstMessages = `"messages":[]`
+	const userMessage = `{"role":"user","content":"hello"}`
+	for _, stream := range []bool{false, true} {
+		for _, key := range []string{`"messages"`, `"\u006dessages"`} {
+			t.Run(fmt.Sprintf("stream=%t/key=%s", stream, key), func(t *testing.T) {
+				prefix := fmt.Sprintf(`{"model":"deepseek-flash","stream":%t,"stream_options":{"include_usage":true},`, stream)
+				last := key + `:[` + userMessage
+				body := []byte(prefix + firstMessages + `,"tools":[{"type":"web_search"}],` + last + `]}`)
+				run := runDeepSeekOrdinaryChat(t, body, false)
+				require.NoError(t, run.err)
+				require.Equal(t, 1, run.calls)
+				require.Equal(t, 1, run.billing.calls)
+				require.Equal(t, prefix+firstMessages+`,`+last+`,`+deepSeekChatNoticeMessage+`]}`, string(run.sent))
+				var upstream struct {
+					Messages []json.RawMessage `json:"messages"`
+				}
+				require.NoError(t, json.Unmarshal(run.sent, &upstream))
+				require.Len(t, upstream.Messages, 2)
+				require.JSONEq(t, userMessage, string(upstream.Messages[0]))
+				require.JSONEq(t, deepSeekChatNoticeMessage, string(upstream.Messages[1]))
+			})
+		}
+	}
+}
+
+func TestDeepSeekChatFilterAllowsDuplicateMessagesWithoutNotice(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			const prefix = `{"model":"deepseek-flash","stream":%t,"stream_options":{"include_usage":true},"messages":[],`
+			const lastMessages = `"messages":[{"role":"user","content":"hello"}]}`
+			unchanged := []byte(fmt.Sprintf(prefix+`"tools":[{"type":"function","function":{"name":"lookup"}}],`+lastMessages, stream))
+			withoutWeb := runDeepSeekOrdinaryChat(t, unchanged, false)
+			require.NoError(t, withoutWeb.err)
+			require.Equal(t, 1, withoutWeb.calls)
+			require.Equal(t, unchanged, withoutWeb.sent)
+
+			declined := []byte(fmt.Sprintf(prefix+`"tools":[{"type":"web_search"}],"tool_choice":"none",`+lastMessages, stream))
+			withoutNotice := runDeepSeekOrdinaryChat(t, declined, false)
+			require.NoError(t, withoutNotice.err)
+			require.Equal(t, 1, withoutNotice.calls)
+			require.Equal(t, fmt.Sprintf(prefix+`"tool_choice":"none",`+lastMessages, stream), string(withoutNotice.sent))
+		})
+	}
+}
+
+func requireDeepSeekChatFilterRejected(t *testing.T, run deepSeekOrdinaryChatRun, reason string) {
+	t.Helper()
+	require.Nil(t, run.result)
+	require.Equal(t, http.StatusBadRequest, run.recorder.Code)
+	response := run.recorder.Body.String()
+	require.Equal(t, "invalid_request_error", gjson.Get(response, "error.type").String())
+	require.Contains(t, gjson.Get(response, "error.message").String(), reason)
+	require.Zero(t, run.calls, "rejected requests must not reach the upstream")
+	require.Empty(t, run.sent)
+	require.Zero(t, run.billing.calls, "rejected requests must not be billed")
+	require.Nil(t, run.billing.lastCmd)
+}
+
+func TestDeepSeekChatEnabledGroupBypassesStrictFilter(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprint(stream), func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","messages":[],"stream":%t,"stream_options":{"include_usage":true},"tool_choice":"none","tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","type":"object"}}}]}`, stream))
+			run := runDeepSeekOrdinaryChat(t, body, true)
+			require.NoError(t, run.err)
+			require.Equal(t, 1, run.calls)
+			require.Equal(t, 1, run.billing.calls)
+			require.Equal(t, body, run.sent)
+		})
+	}
+}
+
+func TestDeepSeekChatWithNoWebToolsKeepsBytes(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, fields := range []string{
+			`"metadata":{"labels":{"x":1,"x":2},"large":123456789012345678901234567890}`,
+			`"tools": null, "tool_choice":{"type":"auto","data":{"x":1,"x":2}}`,
+			`"tools":{"type":"web_search"}, "meta": "{\"tools\":[{}]}"`,
+			`"tools": [ {"type":"function", "function":{"name":"web_search_preview_future"}}, {"type":"client_tool"} ]`,
+		} {
+			body := []byte(fmt.Sprintf(`{ "model":"deepseek-flash", "messages":[], "stream":%t,"stream_options":{"include_usage":true}, %s }`, stream, fields))
+			run := runDeepSeekOrdinaryChat(t, body, false)
+			require.NoError(t, run.err)
+			require.Equal(t, 1, run.calls)
+			require.Equal(t, 1, run.billing.calls)
+			require.Equal(t, body, run.sent)
+		}
+	}
+}
+
+func TestDeepSeekChatFilterBypassesOtherProtocols(t *testing.T) {
+	account := deepSeekForcedToolChoiceAccount()
+	key := &APIKey{Group: &Group{ID: account.ID, Platform: PlatformDeepseek}}
+	svc := &OpenAIGatewayService{cfg: deepSeekChatFallbackTestConfig()}
+	for _, stream := range []bool{false, true} {
+		for _, tc := range []struct{ name, protocol, input, accountProtocol string }{
+			{"responses", "responses", `"input":[]`, APIProtocolChatCompletions},
+			{"messages", "messages", `"messages":[]`, APIProtocolChatCompletions},
+			{"responses_shape_fixed_responses", "chat", `"input":[]`, APIProtocolResponses},
+			{"responses_shape_adaptive", "chat", `"input":[]`, APIProtocolAdaptive},
+		} {
+			t.Run(fmt.Sprintf("%t/%s", stream, tc.name), func(t *testing.T) {
+				account.Credentials["api_protocol"] = tc.accountProtocol
+				body := []byte(fmt.Sprintf(`{"model":"deepseek-flash", "stream":%t,"tools":[],"tools":[{"type":"web_search"}],"tool_choice":{"type":"function","function":{"name":"web_search"}},%s}`, stream, tc.input))
+				c := newDeepSeekForcedToolChoiceContext(t, "/v1/test", body)
+				c.Set("api_key", key)
+				result, forward, handled, err := svc.tryForwardDeepSeekTools(c.Request.Context(), c, account, body, tc.protocol, "")
+				require.NoError(t, err)
+				require.False(t, handled)
+				require.Nil(t, result)
+				require.Equal(t, body, forward)
+			})
+		}
+	}
+}
+
+// A versioned type recognized by the disabled-group filter must not become
+// eligible for hosted execution in an enabled group with auto tools off.
+func TestDeepSeekChatFilterLeavesHostedEligibilityAlone(t *testing.T) {
+	for _, protocol := range []string{"chat", "responses", "messages"} {
+		t.Run(protocol, func(t *testing.T) {
+			const typ = "web_search_preview_2025_03_11"
+			run := runDeepSeekInChat(t, protocol, map[string]any{"tools": []any{map[string]any{"type": typ}}}, nil)
+			require.NoError(t, run.err)
+			require.False(t, run.handled)
+			require.Nil(t, run.result)
+			require.Zero(t, run.toolCalls)
+			require.Empty(t, run.journal.checkpoints)
+			require.Equal(t, typ, gjson.GetBytes(run.forward, "tools.0.type").String())
+		})
+	}
+}
+
+func TestDeepSeekChatFilterToolListBounds(t *testing.T) {
+	const client = `{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}`
+	const web = `{"type":"web_search"}`
+	const deadline = 2 * time.Second
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			t.Run("many_removals", func(t *testing.T) {
+				body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","messages":[],"stream":%t,"tools":[%s%s]}`, stream, strings.Repeat(web+",", 20_000), client))
+				started := time.Now()
+				run := runDeepSeekOrdinaryChat(t, body, false)
+				require.Less(t, time.Since(started), deadline, "tool filtering must fit the time bound")
+				require.NoError(t, run.err)
+				require.Equal(t, 1, run.calls)
+				require.Equal(t, 1, run.billing.calls)
+				require.Equal(t, "["+client+"]", gjson.GetBytes(run.sent, "tools").Raw)
+			})
+			entries := strings.Repeat(`null,`, deepSeekMaxRequestTools) + `null`
+			for _, tc := range []struct{ name, fields string }{
+				{"tools", `"tools":[` + entries + `]`},
+				{"choice_array", `"tools":[` + web + `],"tool_choice":{"options":[` + entries + `]}`},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","messages":[],"stream":%t,%s}`, stream, tc.fields))
+					started := time.Now()
+					run := runDeepSeekOrdinaryChat(t, body, false)
+					require.Less(t, time.Since(started), deadline, "tool-count validation must fit the time bound")
+					require.ErrorContains(t, run.err, "tool count")
+					requireDeepSeekChatFilterRejected(t, run, "tool count")
+				})
+			}
+		})
+	}
+}
+
+func TestDeepSeekChatFilterScanBounds(t *testing.T) {
+	const deadline = 2 * time.Second
+	for _, tc := range []struct {
+		name, metadata string
+		cancel         bool
+	}{
+		{"already_canceled", strings.Repeat(`{"next":`, 8000) + `"` + strings.Repeat("x", 8<<20) + `"` + strings.Repeat("}", 8000), true},
+		{"depth_limit", strings.Repeat(`{"next":`, 256) + `null` + strings.Repeat("}", 256), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"tools":[{"type":"web_search","metadata":` + tc.metadata + `}],"messages":[],"model":"deepseek-flash"}`)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancel {
+				cancel()
+			}
+			account := deepSeekForcedToolChoiceAccount()
+			c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
+			c.Request = c.Request.WithContext(ctx)
+			c.Set("api_key", &APIKey{Group: &Group{ID: account.ID, Platform: PlatformDeepseek}})
+			svc := &OpenAIGatewayService{}
+			type outcome struct {
+				result  *OpenAIForwardResult
+				handled bool
+				err     error
+			}
+			done := make(chan outcome, 1)
+			go func() {
+				result, _, handled, err := svc.tryForwardDeepSeekTools(ctx, c, account, body, "chat", "")
+				done <- outcome{result, handled, err}
+			}()
+			timer := time.NewTimer(deadline)
+			defer timer.Stop()
+			select {
+			case got := <-done:
+				require.Nil(t, got.result)
+				require.True(t, got.handled)
+				if tc.cancel {
+					require.ErrorIs(t, got.err, context.Canceled)
+				} else {
+					require.ErrorContains(t, got.err, "nesting")
+					require.Equal(t, http.StatusBadRequest, c.Writer.Status())
+				}
+			case <-timer.C:
+				t.Fatal("Chat JSON validation exceeded its time bound")
+			}
+		})
+	}
+}
+
+func TestDeepSeekChatFilterPreservesContextError(t *testing.T) {
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if cause == context.DeadlineExceeded {
+				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			} else {
+				ctx, cancel = context.WithCancel(context.Background())
+				cancel()
+			}
+			defer cancel()
+
+			body := []byte(`{"model":"deepseek-flash","messages":[],"tools":[{"type":"web_search"}]}`)
+			account := deepSeekForcedToolChoiceAccount()
+			c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
+			c.Request = c.Request.WithContext(ctx)
+			c.Set("api_key", &APIKey{Group: &Group{Platform: PlatformDeepseek}})
+			svc := &OpenAIGatewayService{}
+			result, err := svc.ForwardAsChatCompletions(ctx, c, account, body, "", "")
+			require.Nil(t, result)
+			require.ErrorIs(t, err, cause)
+			require.EqualError(t, err, cause.Error())
+			require.False(t, c.Writer.Written())
+			require.ErrorIs(t, err, ErrDeepSeekChatToolValidation)
+		})
+	}
+}
+
+type deepSeekCancelDuringScan struct {
+	context.Context
+	cancel        context.CancelFunc
+	checks, after int
+}
+
+func (c *deepSeekCancelDuringScan) Err() error {
+	c.checks++
+	if c.checks == c.after {
+		c.cancel()
+	}
+	return c.Context.Err()
+}
+
+func runDeepSeekChatFilter(ctx context.Context, body []byte) ([]byte, error) {
+	top, err := scanDeepSeekChatEnvelope(ctx, body)
+	if err != nil {
+		return nil, err
+	}
+	return filterDeepSeekChatWebTools(ctx, body, top)
+}
+
+func TestDeepSeekChatJSONCancellationDuringScan(t *testing.T) {
+	for _, tc := range []struct {
+		name, fields string
+		duringTools  bool
+	}{
+		{"opaque_string", `"metadata":"` + strings.Repeat("x", 8<<20) + `","tools":[]`, false},
+		{"tool_string", `"tools":[{"type":"web_search","description":"` + strings.Repeat("x", 8<<20) + `"}]`, true},
+		{"tool_array", `"tools":[` + strings.Repeat(`{"type":"web_search"},`, 20_000) + `null]`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			body := []byte(`{` + tc.fields + `}`)
+			probe := &deepSeekCancelDuringScan{Context: ctx, cancel: cancel, after: 16}
+			if tc.duringTools {
+				// Let the envelope scan finish, then cancel during the
+				// strict decoder's refills or token reads.
+				probe.after += len(body) / deepSeekJSONChunk
+			}
+			started := time.Now()
+			out, err := runDeepSeekChatFilter(probe, body)
+			require.Less(t, time.Since(started), 2*time.Second)
+			require.ErrorIs(t, err, context.Canceled)
+			require.Nil(t, out)
+		})
+	}
+}
+
+func TestDeepSeekChatJSONDepthBoundary(t *testing.T) {
+	for _, array := range []bool{false, true} {
+		for _, depth := range []int{deepSeekChatJSONMaxDepth, deepSeekChatJSONMaxDepth + 1} {
+			t.Run(fmt.Sprintf("array=%t/depth=%d", array, depth), func(t *testing.T) {
+				open, close := `{"next":`, `}`
+				if array {
+					open, close = `[`, `]`
+				}
+				body := []byte(`{"tools":[],"tool_choice":` + strings.Repeat(open, depth-1) + `null` + strings.Repeat(close, depth-1) + `}`)
+				started := time.Now()
+				out, err := runDeepSeekChatFilter(context.Background(), body)
+				require.Less(t, time.Since(started), 2*time.Second)
+				if depth == deepSeekChatJSONMaxDepth {
+					require.NoError(t, err)
+					require.Equal(t, body, out)
+				} else {
+					require.ErrorContains(t, err, "nesting")
+				}
+			})
+		}
+	}
+}
+
+func TestDeepSeekChatJSONKeepsObjectScopesAndDecodedKeys(t *testing.T) {
+	for _, tc := range []struct{ name, body, failure string }{
+		{"siblings", `{"tools":[{"type":"function","function":{"name":"lookup"},"other":[{"name":"lookup"},{"name":"lookup"}]}],"seed":123456789012345678901234567890}`, ""},
+		{"nested_scope", `{"tools":[{"nested":{"name":"lookup"},"name":"lookup","empty":{}}],"array":[[],{},true,false,null]}`, ""},
+		{"opaque_duplicates", `{"metadata":[{"\u006eame":"first","name":"second"}],"metadata":{},"tools":[{"type":"function"}]}`, ""},
+		{"escaped_duplicate", `{"tools":[{"metadata":[{"\u006eame":"lookup","name":"lookup"}]}]}`, "duplicate"},
+		{"escaped_quotes", `{"tools":[],"tool_choice":{"a\"b":null,"a\u0022b":null}}`, "duplicate"},
+		{"trailing_document", `{"metadata":null}{}`, "invalid"},
+		{"unfinished_object", `{"metadata":`, "invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(tc.body)
+			out, err := runDeepSeekChatFilter(context.Background(), body)
+			if tc.failure == "" {
+				require.NoError(t, err)
+				require.Equal(t, body, out)
+			} else {
+				require.ErrorContains(t, err, tc.failure)
+			}
+		})
+	}
+}
+
+func TestDeepSeekChatFilterEditsOnlySelectedSpans(t *testing.T) {
+	for _, tc := range []struct{ name, body, want string }{
+		{"leading_fields_removed", ` {"tool_choice":{"type":"web_search"}, "\u0074ools":[{"type":"web_search"}], "meta":{"key":1,"key":2}} `, ` { "meta":{"key":1,"key":2},"messages":[` + deepSeekChatNoticeMessage + `]} `},
+		{"nonadjacent_fields_removed", `{"tools":[{"type":"web_fetch"}], "metadata":{"literal":"[}\"","big":12345678901234567890}, "tool_choice":{"type":"function","function":{"name":"web_fetch"}}}`, `{ "metadata":{"literal":"[}\"","big":12345678901234567890},"messages":[` + deepSeekChatNoticeMessage + `]}`},
+		{"all_fields_removed", `{"tools":[{"type":"web_fetch"}], "tool_choice":"required" }`, `{ "messages":[` + deepSeekChatNoticeMessage + `]}`},
+		{"leading_tools_only_removed", `{"tools":[{"type":"web_fetch"}], "tool_choice":"auto" }`, `{ "tool_choice":"auto" ,"messages":[` + deepSeekChatNoticeMessage + `]}`},
+		{"retained_bytes", `{"tools" : [ 99e100 , {"type":"web_fetch_preview_future"}, {"type":"web_searchable"}, { "type": "function", "function":{"name":"web_search"}}], "messages":[{"role":"user","content":"literal \\ \" [ ]"}],"meta": {"z":1,"z":2}}`, `{"tools" : [99e100,{ "type": "function", "function":{"name":"web_search"}}], "messages":[{"role":"user","content":"literal \\ \" [ ]"},` + deepSeekChatNoticeMessage + `],"meta": {"z":1,"z":2}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runDeepSeekChatFilter(context.Background(), []byte(tc.body))
+			require.NoError(t, err)
+			require.True(t, gjson.ValidBytes(out), "%s", out)
+			require.Equal(t, tc.want, string(out))
+		})
+	}
+}
