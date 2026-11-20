@@ -5,7 +5,10 @@
 
 ## Unreleased
 
+### Bug 修复
+
 - 关闭联网工具的 DeepSeek 分组在转发前移除 `web_search`、`web_fetch`、`deepseek_web_search`、`deepseek_read_url` 家族的条目，包括带版本或 preview 后缀的写法，也覆盖发送到固定 Chat 账号的 Responses 形状请求。显式指定仍然存在的工具的选择保留；指向被移除工具的选择（含只写 `tool` 或 `function` 的写法）在还有工具时改为 `auto`，工具删空时连同 `tools` 一起移除，`required` 一并删除，`auto` 和 `none` 保持不变。需要提示时写进最后一个 `messages`，Responses 形状写进 `input`。不含这些工具的请求保持原字节；工具字段的重复键和超限在转发前拒绝。
+- 主站发布时，Nginx 拒绝的新配置会撤回，命令超时会报告失败并记录历史，后台交接失败后恢复旧实例原有的重启策略。
 
 ## Main / Portal 0.2.82 — 2026-11-20
 

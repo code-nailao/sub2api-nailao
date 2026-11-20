@@ -67,6 +67,10 @@ class DeployError(Exception):
     """A step failed; the previous release serves and owns the background."""
 
 
+class CommandTimedOut(DeployError):
+    """A command did not return. Its side effects may still have happened."""
+
+
 class FallbackFailed(DeployError):
     """Restoring the previous release failed too; needs a person."""
 
@@ -222,7 +226,10 @@ class Ops:
         if self.dry_run and mutate:
             self.log("DRY-RUN " + shlex.join(args))
             return subprocess.CompletedProcess(args, 0, "", "")
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise CommandTimedOut(f"command timed out after {timeout:g}s: {shlex.join(args[:4])} ...") from None
         if check and proc.returncode != 0:
             tail = (proc.stderr or proc.stdout).strip().splitlines()[-5:]
             raise DeployError(f"command failed ({proc.returncode}): {shlex.join(args[:4])} ...: " + " | ".join(tail))
@@ -271,6 +278,12 @@ class Ops:
             fh.write(text)
         os.chmod(tmp, mode)
         os.replace(tmp, target)
+
+    def remove_file(self, path: str) -> None:
+        if self.dry_run:
+            self.log(f"DRY-RUN remove {path}")
+        else:
+            Path(path).unlink(missing_ok=True)
 
     def meminfo_available(self) -> int:
         for line in Path("/proc/meminfo").read_text().splitlines():
@@ -564,13 +577,26 @@ class Deployer:
         raise DeployError(f"no '{prefix}' line in command output")
 
     def install_upstreams(self, text: str) -> None:
-        previous = self.ops.read_text(self.cfg.upstream_file) if Path(self.cfg.upstream_file).exists() else None
+        try:
+            previous = self.ops.read_text(self.cfg.upstream_file)
+        except FileNotFoundError:
+            previous = None
+        except OSError as err:
+            raise DeployError("cannot read the previous upstream file; routing unchanged") from err
         self.ops.write_file_atomic(self.cfg.upstream_file, text)
-        test = self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False)
-        if test.returncode != 0:
-            if previous is not None:
-                self.ops.write_file_atomic(self.cfg.upstream_file, previous)
-            raise DeployError("nginx -t rejected the upstream file; previous file restored, routing unchanged")
+        try:
+            test = self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False)
+            if test.returncode != 0:
+                raise DeployError("nginx -t rejected the upstream file")
+        except DeployError as err:
+            try:
+                if previous is None:
+                    self.ops.remove_file(self.cfg.upstream_file)
+                else:
+                    self.ops.write_file_atomic(self.cfg.upstream_file, previous)
+            except OSError as restore_err:
+                raise FallbackFailed(f"{err}; could not restore the upstream file state") from restore_err
+            raise DeployError(f"{err}; previous upstream file state restored, routing unchanged") from err
         self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
 
     def switch_to(self, view: dict[str, Any]) -> None:
@@ -683,6 +709,16 @@ class Deployer:
         handoff returns ownership to target after traffic already moved there."""
         old = current["containers"]["background"]
         new = target.containers["background"]
+        old_restart = "no"
+        if not self.ops.dry_run:
+            info = self.ops.inspect(old) or {}
+            policy = (info.get("HostConfig") or {}).get("RestartPolicy")
+            if policy is None:
+                raise DeployError(f"cannot read the restart policy of {old}")
+            old_restart = policy.get("Name") or "no"
+            retries = policy.get("MaximumRetryCount") or 0
+            if old_restart == "on-failure" and retries:
+                old_restart = f"{old_restart}:{retries}"
         before = self.owner_runtime(current)  # read-only, also in a dry run
         self.ops.run(["docker", "update", "--restart=no", old], mutate=True)
         if create:
@@ -724,7 +760,7 @@ class Deployer:
             with contextlib.suppress(DeployError):
                 self.wait_exit(new, 120, poll=HANDOFF_POLL_SECONDS)
             try:
-                self.ops.run(["docker", "update", "--restart=unless-stopped", old], mutate=True)
+                self.ops.run(["docker", "update", f"--restart={old_restart}", old], mutate=True)
                 self.ops.run(["docker", "start", old], mutate=True)
                 self.wait_ready(current["ports"]["background"], self.token_for(current, "background"), "background",
                                 self.cfg.background_ready_timeout, poll=HANDOFF_POLL_SECONDS)
@@ -947,6 +983,9 @@ class Deployer:
         with self.step("switch"):
             try:
                 self.switch_to(view)
+            except CommandTimedOut as err:
+                # A timed-out reload may already have switched live traffic.
+                raise FallbackFailed(f"{err}; routing is unconfirmed, inspect with 'status'") from err
             except FallbackFailed:
                 raise
             except DeployError as err:
@@ -973,7 +1012,7 @@ class Deployer:
         if not self.ops.dry_run:
             save_state(self.cfg, state)
 
-    def _record_unrestored(self, state: dict[str, Any], err: FallbackFailed) -> None:
+    def _record_unrestored(self, state: dict[str, Any], err: DeployError) -> None:
         """Keep in_progress, with why, so the next run refuses and 'status'
         shows what a person has to do."""
         if state.get("in_progress"):
@@ -989,7 +1028,9 @@ class Deployer:
         if self.ops.dry_run:
             self.log(f"FAILED: {err}")
             return
-        if isinstance(err, FallbackFailed):
+        # An unhandled timeout during handoff or after switching can leave live state unknown.
+        unconfirmed = isinstance(err, CommandTimedOut) and step in ("background handoff", "guard")
+        if isinstance(err, FallbackFailed) or unconfirmed:
             # Keep in_progress so the next run refuses until a person resolves
             # it, and keep why, so 'status' shows what needs doing.
             self._record_unrestored(state, err)
