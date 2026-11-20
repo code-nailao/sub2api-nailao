@@ -249,10 +249,12 @@ function updateMetadata(data) {
   }
   renderLegacyGroups();
 }
-function publishShell(force = false) {
-  // A new shell document gets its shell even while a connection is pending;
-  // periodic republishing still waits for that connection.
-  if (!shellReady || !studioURL || !mainOrigin || locked || (!force && isConnecting()) || selectionUncertain) return;
+function publishShell() {
+  // The page's own connection goes first. The released client keeps a startup
+  // listener until the first shell configuration arrives, and that listener
+  // rejects a connection configuration; the shell is published once the
+  // connection is confirmed (or there is none to confirm).
+  if (!shellReady || !studioURL || !mainOrigin || locked || isConnecting() || selectionUncertain) return;
   clearInterval(shellTimer);
   const config = {
     type: "sub2api:image-studio-shell-config", version: 1,
@@ -296,13 +298,17 @@ function selectionResult(pending, status, text = "", reconnectRequired = false) 
     ...(text === null ? { message: "" } : text ? { message: text } : {}), reconnectRequired });
 }
 function sendConnection(pending) {
-  if (!pending?.config || connectionPending !== pending || !isCurrent(pending.view) || !rounds.isWaiting(pending.attempt)) return;
+  if (!pending?.config || connectionPending !== pending || (pending.sent && !isCurrent(pending.sent)) || !rounds.isWaiting(pending.attempt)) return;
   pending.target = frame.contentWindow;
   if (!pending.target) return;
-  // Every configuration carries its own marker, so an acknowledgement from an
-  // earlier document never matches the one this document was sent.
-  postStudio({ type: "sub2api:image-studio-config", payload: pending.config, requestId: pending.requestId,
-    ...(pending.revision === undefined ? {} : { revision: pending.revision }) });
+  // The page records the delivery itself: which document, which attempt it
+  // belongs to. Its own request goes out in the shape released clients have
+  // always accepted (no request metadata), and the answer is matched against
+  // this record instead of an echo. A selection the child made asked for its
+  // metadata, so that echo is still required.
+  pending.sent = rounds.beginView();
+  postStudio({ type: "sub2api:image-studio-config", payload: pending.config,
+    ...(pending.fromChild ? { requestId: pending.requestId, revision: pending.revision } : {}) });
 }
 function bindFrameLoad(target) {
   target.addEventListener("load", () => {
@@ -319,19 +325,26 @@ function startDocument() {
   shellPending = null;
   clearInterval(shellTimer);
   if (connectionPending) {
-    if (connectionPending.fromChild) {
-      // A selection the old child made is not the new child's request. Its
-      // deadline stays armed but is inert: it no longer finds this attempt.
+    if (connectionPending.fromChild || connectionPending.sent) {
+      // A selection the old child made, or a configuration already handed to
+      // the old document: neither answer can belong to the new one. The page
+      // drops the request and its deadline together, so a late timeout cannot
+      // rewrite the document that replaced it either.
       clearInterval(connectionTimer);
+      rounds.retire();
       connectionPending = undefined;
     } else {
-      // The page's own request is still owed, but not to the document that saw
-      // the last attempt: a new marker and a new view make its answer void.
-      connectionPending.requestId = crypto.randomUUID();
-      connectionPending.view = rounds.beginView();
+      // The page's own request has not been delivered yet; it is still owed.
+      connectionPending.attempt = rounds.readdress(connectionPending.attempt);
       connectionPending.target = undefined;
     }
   }
+  // Confirmations, including one the page had to wait for, belong to the
+  // document that gave them.
+  connectionApplied = false;
+  selectionUncertain = false;
+  appliedShellRevision = 0;
+  if (integrated) setIntegrated(false);
   frame.hidden = true;
 }
 function replaceFrame() {
@@ -339,9 +352,7 @@ function replaceFrame() {
   frame = previous.cloneNode(false);
   startDocument();
   shellReady = false;
-  shellRevision = appliedShellRevision = 0;
-  connectionApplied = false;
-  if (integrated) setIntegrated(false);
+  shellRevision = 0;
   bindFrameLoad(frame);
   previous.replaceWith(frame);
 }
@@ -358,11 +369,11 @@ function connectionTimedOut(pending, text) {
 async function connect(groupId, request) {
   if (locked || isConnecting() || isBootstrapping() || !groups.some((group) => group.id === groupId)) return;
   // A selection the child made ends with that child's document; the page's own
-  // menu outlives it. The attempt follows the request; the view and the marker
-  // belong to the document the configuration is sent to.
+  // menu outlives it. The attempt follows the request and the delivery record
+  // is written when it is actually sent.
   const attempt = rounds.beginAttempt(request ? "view" : "page");
-  const pending = connectionPending = { groupId, attempt, view: rounds.beginView(),
-    fromChild: Boolean(request), requestId: request?.requestId ?? crypto.randomUUID(),
+  const pending = connectionPending = { groupId, attempt,
+    fromChild: Boolean(request), requestId: request?.requestId,
     revision: request?.revision, restoreOnly: request?.restoreOnly === true, config: null };
   clearInterval(shellTimer);
   shellPending = null;
@@ -388,8 +399,7 @@ async function connect(groupId, request) {
     // A peer that saw the shell may reject a legacy selection even if its ACK
     // never arrived. A new frame also isolates retries from old legacy ACKs.
     if (replacePeer) replaceFrame();
-    // A replaced frame is a new document: its configuration needs a new view.
-    pending.view = rounds.beginView();
+    if (pending.sent && !isCurrent(pending.sent)) pending.sent = undefined;
     if (needsCustomResave) {
       needsCustomResave = false;
       recoverView("已收到工作台连接配置，正在等待确认…");
@@ -398,7 +408,7 @@ async function connect(groupId, request) {
     sendConnection(pending);
     let attempts = 0;
     const timer = setInterval(() => {
-      if (!waiting(pending.attempt) || !isCurrent(pending.view) || timer !== connectionTimer) return;
+      if (!waiting(pending.attempt) || !isCurrent(pending.sent) || timer !== connectionTimer) return;
       if (++attempts > 30) {
         rounds.retire();
         connectionTimedOut(pending, "连接尚未确认，请重新选择分组。");
@@ -444,11 +454,13 @@ window.addEventListener("message", async (event) => {
     return;
   }
   if (data.type === "sub2api:image-studio-shell-ready" && data.version === 1) {
-    // A shell that boots is a new child document. It is always processed, and
-    // the page answers it instead of the document that came before.
-    startDocument();
+    // A child that announces itself after this page already gave it a shell is
+    // a new document: the page no longer treats the old one's confirmations as
+    // its own. The announcements a starting client sends before that are not
+    // restarts, and must not discard what this document is doing.
+    if (appliedShellRevision > 0) startDocument();
     shellReady = true;
-    publishShell(true);
+    publishShell();
     sendConnection(connectionPending);
     return;
   }
@@ -487,14 +499,18 @@ window.addEventListener("message", async (event) => {
   }
   if (data.type !== "sub2api:image-studio-config-applied" || data.payload?.status !== "applied") return;
   const pending = connectionPending;
-  if (!pending?.config || !isCurrent(pending.view) || !isConnecting() || pending.target !== event.source) return;
+  // Ownership lives on the page: the delivery record is current only in the
+  // document it was written in. A released client echoes nothing, so its
+  // answer needs no marker to match; a selection the child made still has to
+  // echo the request and revision it asked with.
+  if (!pending?.config || !pending.sent || !isCurrent(pending.sent) || !isConnecting() || pending.target !== event.source) return;
   if (!pending.restoreOnly && data.payload.profileId !== `sub2api-image-studio-group-${pending.groupId}`) return;
-  // The acknowledgement must be the one this document was sent: its marker,
-  // and the shell revision when a selection asked for it.
-  if (data.payload.requestId !== pending.requestId) return;
-  if (pending.revision !== undefined && data.payload.revision !== pending.revision) return;
+  if (pending.fromChild) {
+    if (data.payload.requestId !== pending.requestId) return;
+    if (data.payload.revision !== pending.revision) return;
+  }
   try { await currentToken(); } catch { return; }
-  if (!isCurrent(pending.view) || connectionPending !== pending || pending.target !== frame.contentWindow || !rounds.finish(pending.attempt)) return;
+  if (!isCurrent(pending.sent) || connectionPending !== pending || pending.target !== frame.contentWindow || !rounds.finish(pending.attempt)) return;
   clearInterval(connectionTimer);
   connectionPending = null;
   selectionUncertain = false;

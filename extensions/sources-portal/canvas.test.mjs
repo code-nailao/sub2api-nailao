@@ -279,37 +279,28 @@ test('Canvas ignores a late restore conflict after a newer restore of the same g
   assert.equal(f.frame.hidden, false);
 });
 
-test('a Canvas restore conflict from before the child restarted cannot block the new document', async () => {
-  const restore = Promise.withResolvers();
+test('a Canvas resave entry survives the child restarting', async () => {
   const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only
-    ? restore.promise.then((result) => result ?? { ok: true, status: 200, data: config(options.body.group_id) })
+    ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
     : { ok: true, status: 200, data: config(options.body.group_id) } });
   f.host(); f.loaded(); await f.ack();
   const connectionId = `group-${CUSTOM_ID}`;
-  const requestId = '00000000-0000-4000-8000-000000000026';
-  f.send({ type: 'sub2api:canvas-restore-connection', connectionId, requestId });
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId, requestId: '00000000-0000-4000-8000-000000000026' });
   await flush();
-
-  // An ordinary group becomes the accepted connection, then the child restarts.
-  const alternate = f.select.children.find(({ value }) => String(value) !== f.select.value && value !== CUSTOM_ID).value;
-  f.select.value = String(alternate);
-  await f.select.onchange();
-  await f.ack();
-  assert.equal(f.document.body.dataset.state, 'ready');
-
-  // The old document's answer arrives before the new document says it is ready.
-  restore.resolve({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } });
-  await flush();
-  assert.equal(f.last('sub2api:canvas-restore-error').requestId, requestId);
+  const retry = f.elements['#canvas-retry'];
+  assert.equal(retry.textContent, '打开自定义连接');
   assert.match(f.elements['#message'].textContent, /重新保存自定义连接/);
 
-  // The child's restart is always processed: it ends that verdict and asks again.
+  // A restarted child has nothing new to say about the stored connection: the
+  // entry the page shows is its own, and stays until a save or a new
+  // authorization replaces it.
+  const outbound = f.calls.length;
   f.send({ type: 'sub2api:canvas-ready' });
-  assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
-  assert.equal(f.last('sub2api:media-studio-config').payload.selectedConnectionId, `group-${alternate}`);
+  assert.equal(retry.textContent, '打开自定义连接');
   await f.ack();
-  assert.equal(f.document.body.dataset.state, 'ready');
-  assert.equal(f.frame.hidden, false);
+  assert.equal(f.calls.length, outbound, 'the restart neither re-polls nor re-authorizes');
+  assert.equal(retry.textContent, '打开自定义连接');
+  assert.equal(f.document.body.dataset.state, 'recovery');
 });
 
 test('a Canvas bare load neither starts a new document nor hides the acknowledged canvas', async () => {
@@ -343,12 +334,12 @@ test('a Canvas document that asks again gets its own resave verdict', async () =
   await flush();
   assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
 
-  // Reloading withdraws the verdict made for the previous document...
+  // Reloading does not withdraw the entry; the page still needs the save...
   f.loaded();
   f.send({ type: 'sub2api:canvas-ready' });
-  assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
   await f.ack();
-  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
 
   // ...and the same answer for the new document is applied to it.
   const nextRequestId = '00000000-0000-4000-8000-000000000028';

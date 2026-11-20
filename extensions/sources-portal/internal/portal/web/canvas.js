@@ -22,9 +22,9 @@ const manageButton = document.querySelector("#canvas-manage");
 const ownKeyButton = document.querySelector("#canvas-own-key");
 let studioURL, connection, attempt, hostConfig, savedGroupToReconnect;
 let locked = false, needsCustomResave = false;
-// Where the resave action came from: a token for a child document's answer, or
-// undefined for a decision the page made itself.
-let resaveConnectionId, resaveStarted;
+// The stored connection the resave entry is about. It is page state, so it is
+// not tied to the child document that happened to report the conflict.
+let resaveConnectionId;
 let sendTimer, checkTimer, acknowledgment;
 const rounds = connectionRounds();
 const granted = new Map();
@@ -48,14 +48,16 @@ function waitingFor(operation) {
 
 function clearResave() {
   needsCustomResave = false;
-  resaveConnectionId = resaveStarted = undefined;
+  resaveConnectionId = undefined;
 }
 // The one place a new child document begins: the page navigates or replaces
 // the frame, or the child says it restarted. A bare load is not a new document.
+// The resave entry is the page's own guidance about a stored connection; a
+// restarted child does not answer it, so it outlives the document until a save
+// or a successful connection supersedes it.
 function startDocument() {
   rounds.newDocument();
   acknowledgment = undefined;
-  if (resaveStarted !== undefined && !rounds.isCurrent(resaveStarted)) clearResave();
   if (connection) connection = { ...connection, started: rounds.readdress(connection.started) };
   frame.hidden = true;
 }
@@ -250,26 +252,17 @@ function rehandshake() {
 // document changed; only navigation or canvas-ready does.
 frame.addEventListener("load", () => startSending(attempt));
 
-function requireResave(connectionId, started) {
+function requireResave(connectionId) {
   needsCustomResave = true;
   resaveConnectionId = connectionId;
   const invalidate = (candidate) => candidate?.grant.selectedConnectionId === connectionId
     ? { ...candidate, invalid: true }
     : candidate;
-  let held = false;
-  if (attempt) {
-    const previous = invalidate(attempt.previous);
-    held = previous !== attempt.previous;
-    attempt.previous = previous;
-  }
-  const next = invalidate(connection);
-  held = held || next !== connection;
-  connection = next;
+  if (attempt) attempt.previous = invalidate(attempt.previous);
   // Losing the running connection is a page decision: it needs a resave, not
-  // an answer that ends with the document that happened to report it.
-  // A verdict reported by a restore ends with that document; one the page
-  // reached itself, or by invalidating the running connection, stays.
-  resaveStarted = held || !started ? undefined : rounds.beginVerdict();
+  // an answer that ends with whatever document happened to report it. The
+  // entry stays on the page until a save or a successful connection clears it.
+  connection = invalidate(connection);
   granted.delete(connectionId);
 }
 async function restoreConnection(connectionId, requestId, target) {
@@ -283,7 +276,7 @@ async function restoreConnection(connectionId, requestId, target) {
   } catch (error) {
     if (!current()) return;
     if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) {
-      requireResave(connectionId, started);
+      requireResave(connectionId);
       if (attempt?.phase === "confirm") finish(attempt);
       showState("recovery", error.message);
       if (!confirmed()) notifyHost(false);

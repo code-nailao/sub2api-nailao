@@ -156,20 +156,33 @@ test('lost shell ACK recovers through a new handshake before another group switc
   assert.equal(f.frameSets, 1);
 });
 
-test('initial connection timeout remains retryable after the shell restarted', async () => {
+test('a shell that announces itself during the first connection waits for it', async () => {
+  const f = await fixture();
+  assert.ok(f.last('sub2api:image-studio-config'));
+  // The released client asks for its shell from the listener it keeps until
+  // the first shell arrives. The page's own connection is not confirmed yet,
+  // so the shell waits, and the announcement is not a restart.
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  assert.equal(f.last('sub2api:image-studio-shell-config'), undefined);
+  await f.ackConnection();
+  assert.ok(f.last('sub2api:image-studio-shell-config'));
+  await f.ackShell();
+  assert.equal(f.document.body.dataset.integrated, 'true');
+  assert.equal(f.frame.hidden, false);
+});
+
+test('a first connection that never confirms keeps the retry after the shell announced itself', async () => {
   const f = await fixture();
   const timedOutFrame = f.frame;
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
-  // A new shell is published even while the connection is unconfirmed; the
-  // connection itself still needs a new attempt.
-  assert.ok(f.last('sub2api:image-studio-shell-config'));
-  const timer = [...f.timers.values()].find((entry) => entry.delay === 500);
-  for (let i = 0; i < 31; i++) timer.callback();
-  assert.notEqual(f.document.body.dataset.state, 'ready');
+  const retryTimer = [...f.timers.values()].find((entry) => entry.delay === 500);
+  for (let i = 0; i < 31; i++) retryTimer.callback();
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.retry.hidden, false);
   assert.equal(f.select.disabled, false);
-  assert.equal(f.reconnect.hidden, false);
-  f.select.value = '26';
-  f.select.onchange();
+  assert.equal(f.frame.hidden, true);
+
+  f.retry.onclick();
   await flush();
   await f.ackConnection();
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
@@ -582,7 +595,7 @@ test('an integrated Studio keeps the resave action visible after a failed switch
   assert.equal(f.frame.hidden, false);
 });
 
-test('a Studio deadline from before a restart is inert for the new shell', async () => {
+test('a Studio deadline from before a restart cannot answer for the new shell', async () => {
   const old = Promise.withResolvers();
   const f = await fixture({ connection: (options, config) => options.body.group_id === 27
     ? old.promise
@@ -596,14 +609,19 @@ test('a Studio deadline from before a restart is inert for the new shell', async
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   const restarted = await f.ackShell();
   assert.ok(restarted.revision > shell.revision);
-  assert.equal(f.document.body.dataset.integrated, 'true');
+  // A restarted child is a new document: the connection confirmed by the old
+  // one is not carried into it, and its recovery action stays visible.
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.retry.hidden, false);
 
-  [...f.timers.values()].find(({ delay }) => delay === 20000).callback();
+  // The old request's deadline ended with the document that owned it.
+  assert.equal([...f.timers.values()].find(({ delay }) => delay === 20000), undefined);
   old.resolve({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } });
   await flush();
   assert.equal(f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-select-group-result').length, resultsBefore);
   assert.equal(f.retry.textContent, '重试连接');
-  assert.equal(f.document.body.dataset.integrated, 'true');
+  assert.doesNotMatch(f.message.textContent, /重新保存自定义连接/);
+  assert.equal(f.document.body.dataset.integrated, 'false');
 });
 
 test('a Studio selection made by a shell that already restarted is not applied', async () => {
@@ -630,29 +648,63 @@ test('a Studio selection made by a shell that already restarted is not applied',
   await flush();
   assert.doesNotMatch(f.message.textContent, /重新保存自定义连接/);
   assert.equal(f.retry.textContent, '重试连接');
-  assert.equal(f.document.body.dataset.integrated, 'true');
+  // The restarted child has not confirmed anything, whatever the old one did.
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.retry.hidden, false);
 });
 
-test('a Studio shell restart voids the connection configured for the previous document', async () => {
+test('a page configuration keeps the released client shape, and a restart voids it', async () => {
   const f = await fixture();
-  // The first configuration went out, but the child had not acknowledged it.
   const initial = f.last('sub2api:image-studio-config');
   assert.ok(initial);
-  assert.ok(initial.requestId, 'a page configuration carries its own request marker');
+  // Released clients only accept a start-up configuration with no top-level
+  // request metadata; the page records the delivery itself.
+  assert.equal('requestId' in initial, false);
+  assert.equal('revision' in initial, false);
 
+  // The announcements a starting shell sends are not restarts: the page's own
+  // connection still belongs to this document and is confirmed by its answer.
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
-  await f.ackShell();
-  f.send({ type: 'sub2api:image-studio-config-applied', payload: { status: 'applied',
-    profileId: `sub2api-image-studio-${initial.payload.selectedConnectionId}`, requestId: initial.requestId } });
-  await flush();
+  await f.ackConnection();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  const shell = await f.ackShell();
+  assert.equal(f.document.body.dataset.integrated, 'true');
+  assert.equal(f.frame.hidden, false);
 
-  assert.notEqual(f.document.body.dataset.state, 'ready');
+  // After that shell, another announcement is a new document. Neither the old
+  // confirmation nor the old answer applies to it.
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  const restarted = await f.ackShell();
+  assert.ok(restarted.revision > shell.revision);
   assert.equal(f.document.body.dataset.integrated, 'false');
   assert.equal(f.frame.hidden, true);
-  // The new document was sent its own configuration with its own marker.
-  const resent = f.last('sub2api:image-studio-config');
-  assert.notEqual(resent.requestId, initial.requestId);
-  assert.equal(resent.payload.selectedConnectionId, initial.payload.selectedConnectionId);
+  f.send({ type: 'sub2api:image-studio-config-applied', payload: { status: 'applied',
+    profileId: `sub2api-image-studio-${initial.payload.selectedConnectionId}` } });
+  await flush();
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.frame.hidden, true);
+});
+
+test('a Studio shell restart after a failed switch asks the new document for its shell', async () => {
+  const f = await fixture({ connection: (options, config) => ({ ok: true, status: 200, data: config(options.body.group_id) }) });
+  const shell = await f.integrate();
+  f.send(select(27, shell.revision, 'switch-before-restart-1'));
+  await flush();
+  // The configuration went out; its acknowledgement never arrives.
+  [...f.timers.values()].find(({ delay }) => delay === 20000).callback();
+  // The acknowledged workspace stays; the failed switch leaves its recovery.
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.retry.hidden, false);
+
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  const restarted = f.last('sub2api:image-studio-shell-config');
+  assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
+  await f.ackShell();
+  assert.equal(f.retry.hidden, false);
+  assert.equal(f.select.disabled, false);
+  // The switch and the confirmation it never got ended with the old document.
+  assert.equal(f.document.body.dataset.integrated, 'false');
 });
 
 test('a Studio settings save from before the shell restarted cannot close the dialog', async () => {
