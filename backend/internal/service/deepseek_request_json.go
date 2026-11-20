@@ -412,6 +412,7 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 	}
 
 	var choice deepSeekChatToolSelection
+	var choiceIsObject bool
 	if top.choice != nil {
 		raw := body[top.choice.value.start:top.choice.value.end]
 		p := newDeepSeekChatToolParser(ctx, raw)
@@ -419,6 +420,7 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 		if err != nil {
 			return nil, err
 		}
+		choiceIsObject = first == json.Delim('{')
 		choice, err = p.parseValue(first, 2, deepSeekChatToolChoice)
 		if err != nil {
 			return nil, err
@@ -435,13 +437,17 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 	}
 	var kept []deepSeekChatSpan
 	var removed, removedChoice, keptFunction bool
-	legacyChoice := choice.typ == "tool"
 	functionChoice := choice.typ == "function" && choice.named
-	selectedType, selectedFunctionName := choice.typ, choice.name
-	if legacyChoice {
-		// The legacy named form can select a provider type or a tool's top-level name.
-		selectedType, selectedFunctionName = choice.legacyName, choice.legacyName
-		removedChoice = deepSeekProviderTool(selectedType)
+	choiceTarget := choice.typ
+	switch choice.typ {
+	case "tool":
+		choiceTarget = choice.legacyName
+		removedChoice = deepSeekProviderTool(choiceTarget)
+	case "function":
+		choiceTarget = choice.name
+	case "auto", "none", "required":
+		// Choice modes can share a spelling with a declared tool alias.
+		choiceTarget = ""
 	}
 	err := p.parseArray(2, func(first json.Token, depth, offset int) error {
 		tokenEnd := int(p.dec.InputOffset())
@@ -451,11 +457,11 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 		}
 		if family := deepSeekChatWebToolFamily(tool.typ); family != "" {
 			removed = true
-			removedChoice = removedChoice || selectedType == tool.typ || selectedType == family ||
-				(legacyChoice && selectedType != "" && selectedType == tool.legacyName)
+			matchesAlias := choiceIsObject && tool.legacyName != "" && choiceTarget == tool.legacyName
+			removedChoice = removedChoice || choiceTarget == tool.typ || choiceTarget == family || matchesAlias
 			return nil
 		}
-		if (legacyChoice || functionChoice) && tool.typ == "function" && tool.named && tool.name == selectedFunctionName {
+		if choiceIsObject && tool.typ == "function" && tool.named && tool.name == choiceTarget {
 			keptFunction = true
 		}
 		start := tokenEnd - 1

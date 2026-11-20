@@ -335,6 +335,9 @@ func TestDeepSeekChatFiltersDisabledGroup(t *testing.T) {
 	const lookup = `{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}`
 	const namedSearch = `{"type":"function","function":{"name":"deepseek_web_search"}}`
 	const legacySearchChoice = `{"type":"tool", "name":"deepseek_web_search"}`
+	const aliasedSearch = `{"type":"deepseek_web_search","name":"search_alias"}`
+	const aliasFunction = `{"type":"function","function":{"name":"search_alias"}}`
+	const directAliasChoice = `{"type":"search_alias"}`
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
 			ordinary := runDeepSeekOrdinaryChat(t, []byte(fmt.Sprintf(`{"model":"deepseek-flash","messages":[],"stream":%t}`, stream)), false)
@@ -351,7 +354,13 @@ func TestDeepSeekChatFiltersDisabledGroup(t *testing.T) {
 				{"prefix_without_separator", `{"type":"web_search2099"},{"type":"web_fetch2099"},` + lookup, `"auto"`, `[` + lookup + `]`, `"auto"`},
 				{"underscore_suffix", `{"type":"web_search_preview_2025_03_11"},` + lookup, `"auto"`, `[` + lookup + `]`, `"auto"`},
 				{"legacy_named_choice", `{"type":"deepseek_web_search"},` + lookup, `{"type":"tool","name":"deepseek_web_search"}`, `[` + lookup + `]`, `"auto"`},
-				{"legacy_named_alias", `{"type":"deepseek_web_search","name":"search_alias"},` + lookup, `{"type":"tool","name":"search_alias"}`, `[` + lookup + `]`, `"auto"`},
+				{"legacy_named_alias", aliasedSearch + `,` + lookup, `{"type":"tool","name":"search_alias"}`, `[` + lookup + `]`, `"auto"`},
+				{"direct_alias_choice", aliasedSearch + `,` + lookup, directAliasChoice, `[` + lookup + `]`, `"auto"`},
+				{"direct_alias_choice_of_retained_function", aliasedSearch + `,` + aliasFunction, directAliasChoice, `[` + aliasFunction + `]`, directAliasChoice},
+				{"direct_alias_without_survivors", aliasedSearch, directAliasChoice, "", ""},
+				{"function_choice_of_removed_alias", aliasedSearch + `,` + lookup, `{"type":"function","function":{"name":"search_alias"}}`, `[` + lookup + `]`, `"auto"`},
+				{"required_mode_matching_alias", `{"type":"deepseek_web_search","name":"required"},` + lookup, `"required"`, `[` + lookup + `]`, `"required"`},
+				{"none_mode_matching_alias", `{"type":"deepseek_web_search","name":"none"},` + lookup, `{"type":"none"}`, `[` + lookup + `]`, `{"type":"none"}`},
 				{"legacy_choice_of_retained_tool", `{"type":"deepseek_web_search"},` + lookup, `{"type":"tool","name":"lookup"}`, `[` + lookup + `]`, `{"type":"tool","name":"lookup"}`},
 				{"legacy_kept_function_named_after_provider_tool", `{"type":"web_fetch"},` + namedSearch, legacySearchChoice, `[` + namedSearch + `]`, legacySearchChoice},
 				{"legacy_kept_function_named_after_removed_alias", `{"type":"web_fetch","name":"lookup"},` + lookup, `{"type":"tool","name":"lookup"}`, `[` + lookup + `]`, `{"type":"tool","name":"lookup"}`},
@@ -372,7 +381,8 @@ func TestDeepSeekChatFiltersDisabledGroup(t *testing.T) {
 					require.Equal(t, 1, run.calls)
 					require.Equal(t, tc.wantTools, gjson.GetBytes(run.sent, "tools").Raw)
 					require.Equal(t, tc.wantChoice, gjson.GetBytes(run.sent, "tool_choice").Raw)
-					require.Equal(t, tc.choice != `"none"`, strings.Contains(string(run.sent), deepSeekToolsUnavailableNotice))
+					wantNotice := tc.choice != `"none"` && gjson.Get(tc.choice, "type").String() != "none"
+					require.Equal(t, wantNotice, strings.Contains(string(run.sent), deepSeekToolsUnavailableNotice))
 					require.Equal(t, ordinary.billing.calls, run.billing.calls)
 					require.Equal(t, ordinary.billing.lastCmd.BalanceCost, run.billing.lastCmd.BalanceCost)
 					require.Equal(t, ordinary.billing.lastCmd.APIKeyQuotaCost, run.billing.lastCmd.APIKeyQuotaCost)

@@ -2536,8 +2536,8 @@
       "features": [
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "053e71388b54da4d59e7c5aadf170e7ef36cbf34e7b48c2f12640ed9ff0093bf",
-      "reason": "Scans the Chat request envelope once for groups with tools turned off. Filters web tools by type prefix and rejects duplicates only in the tool fields. Adds the unavailable notice to the last messages field or to input for raw Responses-shaped requests. Preserves untouched bytes and adjusts forced choices while prioritizing retained client functions for choices by name."
+      "sha256": "5fd397ab42e206a965f78e82e4118df960d3d290df5a34a912757ac4317cdc82",
+      "reason": "Scans the Chat request envelope once for groups with tools turned off. Filters web tools by type prefix and rejects duplicates only in the tool fields. Adds the unavailable notice to the last messages field or to input for raw Responses-shaped requests. Preserves untouched bytes and resolves forced choices by type, declared alias, or function name. Retained client functions take priority and mode values retain their meaning."
     },
     {
       "path": "backend/internal/service/deepseek_stream_timing_test.go",
@@ -2666,8 +2666,8 @@
       "features": [
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "6eee373248b85c189ca0e7e52633022a5ae5c94f71128f321a2b6cfcde007354",
-      "reason": "Tests stream and non-stream forwarding, prefix matching without separators, Responses-shaped requests on fixed Chat accounts, notice placement in the last messages field, retained client choices, billing parity, bypassed protocols, bounded validation and preservation of context errors."
+      "sha256": "795f98081b2cd1ebc3de229b63161991f072851992179a41ec175de43fc168b3",
+      "reason": "Tests stream and non-stream forwarding, prefix matching without separators, Responses-shaped requests on fixed Chat accounts, notice placement in the last messages field, direct and named alias choices, retained client functions, billing parity, bypassed protocols, bounded validation and preservation of context errors."
     },
     {
       "path": "backend/internal/service/deepseek_tools_incremental.go",
