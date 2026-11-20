@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -25,6 +26,8 @@ const (
 	checkConfigOK   = "SOURCES_PORTAL_CONFIG_OK"
 	usageLine       = "usage: sources-portal [-check-config]"
 )
+
+const workbenchURLRequirement = " requires a fixed HTTPS page without credentials or a nonempty query or fragment, with a canonical ASCII host and unpadded port (no trailing dot)"
 
 // Start-up failure messages. The normal start and -check-config report the
 // same message for the same problem; none contains a secret or an env value.
@@ -53,10 +56,11 @@ const (
 	errStudioConfig       = "invalid studio config"
 	errStudio             = "studio bindings initialization failed"
 	errStudioAPILabels    = "STUDIO_CUSTOM_API_LABELS must contain at most 16 unique lowercase DNS labels"
-	errStudioURL          = "STUDIO_URL requires a fixed HTTPS page with a canonical ASCII host and port (no Unicode, trailing dot or port padding)"
+	errStudioURL          = "STUDIO_URL" + workbenchURLRequirement
 	errStudioOrigin       = "STUDIO_URL must use a separate origin so the workbench cannot read Main login storage"
-	errCanvasURL          = "CANVAS_URL requires a fixed HTTPS page on a separate origin with a canonical ASCII host and port (no Unicode, trailing dot or port padding)"
-	errListenAddress      = "PORTAL_LISTEN requires a valid host:port address"
+	errCanvasURL          = "CANVAS_URL" + workbenchURLRequirement
+	errCanvasOrigin       = "CANVAS_URL must use a separate origin so the canvas cannot read Main login storage"
+	errListenAddress      = "PORTAL_LISTEN requires host:port with an empty host, IP or valid hostname and a numeric port from 0 to 65535"
 	errListener           = "extension HTTP listener unavailable"
 	errServer             = "extension HTTP server failed"
 )
@@ -258,28 +262,15 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 		if err := portal.CheckStudioCapabilities(caps, mediaEngineLegacyName); err != nil {
 			return fail(errStudio)
 		}
-		studio, e := url.Parse(getenv("STUDIO_URL"))
-		if e != nil || studio.Scheme != "https" || studio.Host == "" || studio.User != nil || studio.RawQuery != "" || studio.Fragment != "" {
-			return fail(errStudioURL)
+		server.StudioURL, err = validateWorkbenchURL(getenv("STUDIO_URL"), sub, errStudioURL, errStudioOrigin)
+		if err != nil {
+			return nil, err
 		}
-		studioOrigin, e := canonicalBrowserOrigin(studio.Scheme + "://" + studio.Host)
-		if e != nil {
-			return fail(errStudioURL)
-		}
-		if studioOrigin == sub {
-			return fail(errStudioOrigin)
-		}
-		server.StudioURL = studio.String()
 		if raw := getenv("CANVAS_URL"); raw != "" {
-			canvas, e := url.Parse(raw)
-			if e != nil || canvas.Scheme != "https" || canvas.Host == "" || canvas.User != nil || canvas.RawQuery != "" || canvas.Fragment != "" {
-				return fail(errCanvasURL)
+			server.CanvasURL, err = validateWorkbenchURL(raw, sub, errCanvasURL, errCanvasOrigin)
+			if err != nil {
+				return nil, err
 			}
-			canvasOrigin, e := canonicalBrowserOrigin(canvas.Scheme + "://" + canvas.Host)
-			if e != nil || canvasOrigin == sub {
-				return fail(errCanvasURL)
-			}
-			server.CanvasURL = canvas.String()
 		}
 	}
 	addr := getenv("PORTAL_LISTEN")
@@ -292,7 +283,7 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 	if err != nil || !validListenHost(host) {
 		return fail(errListenAddress)
 	}
-	if _, err := net.LookupPort("tcp", port); err != nil {
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
 		return fail(errListenAddress)
 	}
 	if open.check {
@@ -335,6 +326,22 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 		}
 	}
 	return &portalSetup{store: store, svc: svc, server: server, addr: addr}, nil
+}
+
+// The authorized client runs in an iframe of the HTTPS main site.
+func validateWorkbenchURL(raw, mainOrigin string, formatError, sameOriginError startupError) (string, error) {
+	page, err := url.Parse(raw)
+	if err != nil || page.Scheme != "https" || page.RawQuery != "" || page.Fragment != "" {
+		return "", formatError
+	}
+	origin, err := canonicalBrowserOrigin(page)
+	if err != nil {
+		return "", formatError
+	}
+	if origin == mainOrigin {
+		return "", sameOriginError
+	}
+	return page.String(), nil
 }
 
 func validListenHost(host string) bool {

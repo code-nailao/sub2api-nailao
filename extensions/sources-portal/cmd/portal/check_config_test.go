@@ -354,7 +354,7 @@ func TestCheckConfigFailsLikeStart(t *testing.T) {
 		{"studio custom corrupt", state("studio-custom.json", `{"x":{}}`), errStudio},
 		{"studio url missing", set("STUDIO_URL", ""), errStudioURL},
 		{"studio url same origin", set("STUDIO_URL", "https://main.example/studio"), errStudioOrigin},
-		{"canvas url same origin", set("CANVAS_URL", "https://main.example/canvas"), errCanvasURL},
+		{"canvas url same origin", set("CANVAS_URL", "https://main.example/canvas"), errCanvasOrigin},
 		{"canvas url http", set("CANVAS_URL", "http://canvas.example/"), errCanvasURL},
 	}
 	for _, tc := range cases {

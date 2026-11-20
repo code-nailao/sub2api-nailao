@@ -10,31 +10,34 @@ import (
 	"sources.local/portal/internal/portal"
 )
 
-var errBrowserOrigin = errors.New("canonical HTTPS origin required")
+var errBrowserOrigin = errors.New("canonical HTTP or HTTPS origin required")
 
 // The main-site origin also serves outbound Portal requests, so it keeps the
 // existing public address policy after browser syntax validation.
 func canonicalMainSiteOrigin(raw string) (string, error) {
-	origin, err := canonicalBrowserOrigin(raw)
+	u, err := url.Parse(raw)
+	if err != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", errBrowserOrigin
+	}
+	origin, err := canonicalBrowserOrigin(u)
 	if err != nil {
 		return "", err
 	}
 	return portal.CanonicalOrigin(origin)
 }
 
-// canonicalBrowserOrigin compares browser page origins without applying the
-// outbound public address policy. Ambiguous DNS and legacy IPv4 forms are
-// rejected, while equivalent IPv6 spellings are normalized.
-func canonicalBrowserOrigin(raw string) (string, error) {
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+// canonicalBrowserOrigin serializes (scheme, host, port), omitting the
+// default port for the scheme. It does not resolve the host or require it
+// to be public. Page and outbound URL policies belong to its callers.
+func canonicalBrowserOrigin(u *url.URL) (string, error) {
+	if (u.Scheme != "http" && u.Scheme != "https") || u.User != nil {
 		return "", errBrowserOrigin
 	}
 	authority, ok := canonicalBrowserAuthority(u)
 	if !ok {
 		return "", errBrowserOrigin
 	}
-	return "https://" + authority, nil
+	return u.Scheme + "://" + authority, nil
 }
 
 func canonicalBrowserAuthority(u *url.URL) (string, bool) {
@@ -64,7 +67,7 @@ func canonicalBrowserAuthority(u *url.URL) (string, bool) {
 			return "", false
 		}
 		authority += ":" + port
-		if port != "443" {
+		if !(u.Scheme == "https" && port == "443" || u.Scheme == "http" && port == "80") {
 			normalized += ":" + port
 		}
 	}

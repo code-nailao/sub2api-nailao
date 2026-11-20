@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -25,7 +26,7 @@ func TestWorkbenchURLsRejectCanonicalMainOrigin(t *testing.T) {
 				f.env[variable] = tc.page
 				want := errStudioOrigin
 				if variable == "CANVAS_URL" {
-					want = errCanvasURL
+					want = errCanvasOrigin
 				}
 				if code, stdout, stderr := runCheck(f); code != 1 || stdout != "" || stderr != want+"\n" {
 					t.Errorf("check: code=%d stdout=%q stderr=%q", code, stdout, stderr)
@@ -39,6 +40,28 @@ func TestWorkbenchURLsRejectCanonicalMainOrigin(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestBrowserOriginKeepsSchemeAndNormalizesItsDefaultPort(t *testing.T) {
+	parse := func(raw string) string {
+		t.Helper()
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		origin, err := canonicalBrowserOrigin(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return origin
+	}
+	http := parse("http://main.example")
+	if got := parse("HTTP://MAIN.EXAMPLE:80/workbench"); got != http {
+		t.Fatalf("HTTP default port made a separate origin: %s vs %s", got, http)
+	}
+	if got := parse("https://main.example:80"); got == http {
+		t.Fatal("HTTP and HTTPS on the same host and port were treated as the same origin")
 	}
 }
 
@@ -78,6 +101,10 @@ func TestWorkbenchURLsRejectAmbiguousBrowserAuthorities(t *testing.T) {
 		{"separate empty port", "separate.example:"},
 		{"numeric hostname suffix", "separate.1"},
 		{"hex hostname suffix", "separate.0x1"},
+		{"IPv4 padded octet", "127.000.0.1"},
+		{"IPv4 octal octet", "0177.0.0.1"},
+		{"IPv4 hex octet", "0x7f.0.0.1"},
+		{"IPv4 omitted octets", "127.1"},
 	}
 	for _, variable := range []string{"STUDIO_URL", "CANVAS_URL"} {
 		for _, tc := range cases {
@@ -235,11 +262,14 @@ func TestInvalidStartupConfigDoesNotModifyState(t *testing.T) {
 		{"studio engine", file("STUDIO_CONFIG_FILE", `[{"group_id":1,"engine":"other","models":["model"]}]`, 0600), errStudio},
 		{"legacy media engine", set("SOURCES_MEDIA_ENGINE_LEGACY_NAME", "sub2api"), errStudio},
 		{"studio URL", set("STUDIO_URL", ""), errStudioURL},
+		{"studio URL http", set("STUDIO_URL", "http://studio.example/workbench"), errStudioURL},
 		{"studio main origin", set("STUDIO_URL", "https://MAIN.EXAMPLE:443/studio"), errStudioOrigin},
 		{"canvas URL", set("CANVAS_URL", "http://canvas.example/canvas"), errCanvasURL},
-		{"canvas main origin", set("CANVAS_URL", "https://MAIN.EXAMPLE:443/canvas"), errCanvasURL},
+		{"canvas main origin", set("CANVAS_URL", "https://MAIN.EXAMPLE:443/canvas"), errCanvasOrigin},
 		{"listener", set("PORTAL_LISTEN", "invalid-listener"), errListenAddress},
 		{"listener service", set("PORTAL_LISTEN", ":invalid-service"), errListenAddress},
+		{"listener named port", set("PORTAL_LISTEN", ":http"), errListenAddress},
+		{"listener empty port", set("PORTAL_LISTEN", ":"), errListenAddress},
 		{"listener host", set("PORTAL_LISTEN", "bad host:0"), errListenAddress},
 	}
 	for _, tc := range cases {
@@ -255,6 +285,12 @@ func TestInvalidStartupConfigDoesNotModifyState(t *testing.T) {
 				}
 				tc.mutate(t, f)
 				before := treeSnapshot(t, f.root)
+				if code, stdout, stderr := runCheck(f); code != 1 || stdout != "" || stderr != tc.want+"\n" {
+					t.Errorf("check: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+				}
+				if !sameTree(before, treeSnapshot(t, f.root)) {
+					t.Error("check with invalid configuration changed the state tree")
+				}
 				setup, err := prepare(f.getenv, startState)
 				if setup != nil {
 					setup.store.Close()
@@ -263,10 +299,7 @@ func TestInvalidStartupConfigDoesNotModifyState(t *testing.T) {
 					t.Errorf("start: got %v, want %q", err, tc.want)
 				}
 				if !sameTree(before, treeSnapshot(t, f.root)) {
-					t.Error("invalid configuration changed the state tree")
-				}
-				if code, stdout, stderr := runCheck(f); code != 1 || stdout != "" || stderr != tc.want+"\n" {
-					t.Errorf("check: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+					t.Error("start with invalid configuration changed the state tree")
 				}
 			})
 		}

@@ -34,7 +34,7 @@
 
 只把上述固定路径送到Portal，**`/api/v1/*`、`/v1/*`、登录及其它路由仍给原版 Sub**。不要把主站根路由或全部 `/api` 交给Portal。主站原自定义菜单照常创建；管理员可见只是入口控制，API检查不可省略。
 
-工作台静态客户端由 `STUDIO_URL` 指向固定 HTTPS 页面，必须与 Main 使用独立源，防止读取 Main 登录存储。同一 Nginx 可以同时提供这两处静态文件。比较工作台和 Canvas 的源时，Portal 会先规范化 ASCII 大小写、标准默认端口和 IPv6 的等价写法。每轮使用新 iframe，校验窗口、源、组 ID 和 applied ACK。旧页面迟到的消息不确认新授权。
+工作台静态客户端由 `STUDIO_URL` 指向固定 HTTPS 页面，必须与 Main 使用独立源，防止读取 Main 登录存储。同一 Nginx 可以同时提供这两处静态文件。Portal 先规范化协议、主机和端口，再比较工作台和 Canvas 是否与 Main 同源。ASCII 大小写、标准默认端口和 IPv6 的等价写法统一处理。工作台和 Canvas 的配置仍要求 HTTPS，便于在主站页面内嵌并传递授权。每轮使用新 iframe，校验窗口、源、组 ID 和 applied ACK。旧页面迟到的消息不确认新授权。
 
 `SUB_ORIGIN`、`PORTAL_ORIGIN`、`STUDIO_URL` 和 `CANVAS_URL` 参与这条同源边界时遵守相同规则：
 
@@ -131,7 +131,7 @@ Portal 的状态目录由进程锁保证单写者，新进程要等旧进程退�
 - 与正常启动共用配置校验，失败信息一致：先校验各环境变量、master.key 与钱包桥密钥文件的权限和格式、`PORTAL_HOME_DIR/index.html`、`STUDIO_CONFIG_FILE`，再读取状态。正常启动也只在这些配置全部通过后才获取状态锁、创建目录或执行迁移，配置错误不会改写中断任务或旧版状态。
 - 状态校验包含正常启动会读取的文件——`sources.json`（含用当前密钥解密每条来源）、`account-bindings.json`、`intelligence/state.json`（含解密监测 Key）、设置 `PORTAL_HOME_DIR` 时的 `home.json`、设置 `STUDIO_CONFIG_FILE` 时的 `studio-bindings.json`、`studio-registry.json`、`studio-custom.json`。不存在的状态文件按正常启动的方式视为空状态。
 - `PORTAL_DATA_DIR` 必须是已存在的目录（空目录可以）；不存在说明挂载错了，正常启动会在那里静默建一份空状态。
-- 两种启动模式都在打开状态前检查 `PORTAL_LISTEN` 的 `host:port` 格式。主机部分可以留空，也可以填写 IP 或合法主机名。实际绑定由正常启动在打开状态后执行，绑定失败时可能已经发生状态写入。
+- 两种启动模式都在打开状态前检查 `PORTAL_LISTEN` 的 `host:port` 格式。主机部分可以留空，也可以填写 IP 或合法主机名。端口必须填写十进制数字，范围为 0 至 65535。实际绑定由正常启动在打开状态后执行，绑定失败时可能已经发生状态写入。
 - 刻意不做：不取也不等待进程锁，不建目录，不写、改名、改权限或删除任何文件（启动迁移和中断任务的改写只校验输入、不落盘），不监听端口，不启动 worker，不访问网络。状态目录和密钥文件只读挂载时也能运行。旧进程运行中原子替换文件，检查期间读取是安全的。
 - 检查成功时 stdout 只输出一行 `SOURCES_PORTAL_CONFIG_OK`，退出码 0。检查失败时 stderr 输出一行错误信息，退出码 1。两种启动模式的配置错误使用相同消息，且不输出密钥或变量值。其他参数输出用法，退出码 2。
 
