@@ -24,7 +24,7 @@
 | 共享钱包与提醒 | 管理员把多个账号关联到同一钱包、指定代表账号；低余额与恢复提醒按事件去重投递 | `wallet*`、Portal |
 | V1 渠道监控 | 默认黄色 20 秒、总超时 60 秒且可热更新；管理员手动排序；覆盖请求为 stream 时按 SSE 终态判断；管理员列表附带探测 Key 当前所属计费分组 | `channel_monitor*` |
 | V2 渠道卡片 | 按品牌分区的卡片，显示倍率、缓存率、可用率、首 Token 延迟和状态条；管理员可两级排序、覆盖分类、选择生图分组方式，配置与版本号同事务保存；普通用户只看授权展示的数据；V1 保留 | `features/sources/monitor-v2-cards`、`channel_monitor_v2_display_order*`；本地预览见 [extensions/sources-monitor-local](extensions/sources-monitor-local/README.md) |
-| 渠道状态设计预览 | 主站导航从本地配置读取地址，未配置时入口禁用并提示原因 | [渠道状态设计预览](extensions/sources-monitor-design/README.md) |
+| 渠道状态设计预览 | 主站导航默认使用同源路径，有效的本地配置可指定主站源 | [渠道状态设计预览](extensions/sources-monitor-design/README.md) |
 | 用量缓存列 | 管理员用量表的“性能”列改为缓存比例；缺失或零分母显示为未知；原生 TPS 保留 | `features/sources/usage` |
 | Fast / Ultrafast 档位 | 分组档位策略、自定义价卡、倍率预设和不可变账单快照；显式开启的分组可按 Key 档位选择固定供应商账号，普通分组行为不变；覆盖 HTTP、SSE、WebSocket | `request_speed*`、`openai_group_service_tier*`、`features/sources/pricing` |
 | Grok 内容拒绝费 | 可选的固定拒绝费：请求前预留余额和 Key 额度，每个请求只结算一次；已发送的同步请求结果未知时，超过持久化截止时间（30 分钟生命周期+10 分钟宽限，未知时缩短为 10 分钟）由后台释放固定费预留；从未知释放的迟到结果只记录不扣费，从已发送释放（进程推定已停止）后迟到的普通用量仍按普通路径扣一次，迟到拒绝不扣费；绑定任务的请求与升级前已在等待的历史冻结仍待人工核对；结果未知或免费释放的预留记录上游响应的状态码和请求标识（`X-Client-Request-ID`、`X-Request-ID`、`CF-Ray` 及账号指定的请求号头），超时释放后保留，只用于对账、不参与扣费；设置项 `upstream_rejection_deadline_release_paused` 可暂停后台超时释放；一次预留只覆盖一个上游请求，因此开启该策略的分组里 composer 模型不接受图片输入（原版会先为每张图另发一次描述请求），直接返回 400，不发出上游请求、预留立即释放，未开启的分组照常桥接；规范化 Grok 模型名 | `grok_media_rejection*`、`group_upstream_rejection_billing*`、`upstream_rejection_trace*`、`handler/upstream_rejection_*` |

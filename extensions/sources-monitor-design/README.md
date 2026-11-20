@@ -14,9 +14,9 @@ node extensions/sources-monitor-design/preview.mjs
 
 ## 主站导航
 
-在 `extensions/sources-monitor-design/.env.local` 中为 `VITE_MONITOR_PREVIEW_MAIN_ORIGIN` 填入主站源。地址需包含 `http://` 或 `https://`，可以带端口和末尾斜杠。路径、查询参数、片段和凭据会使导航保持禁用。该文件已被 Git 忽略。
+主站入口默认在新标签页打开当前站点的同源路径。需要链接到独立的主站时，在 Git 忽略的 `extensions/sources-monitor-design/.env.local` 中设置 `VITE_MONITOR_PREVIEW_MAIN_ORIGIN`。地址需包含 `http://` 或 `https://`，可以带端口和末尾斜杠。
 
-Vite 在启动预览或静态构建时校验原始地址。只有通过校验的主站源才会出现在浏览器脚本里。修改后重启预览或重新构建。配置为空或无效时，导航入口保留并显示「未配置主站地址」。配置有效时，链接会在新标签页打开对应的主站页面。填入真实地址的构建产物仅供本机使用。
+Vite 在启动预览或静态构建时校验原始地址。带路径、查询参数、片段或凭据的地址会被拒绝，导航回退到同源路径。只有通过校验的主站源才会出现在浏览器脚本里，并用于生成绝对链接。修改后重启预览或重新构建。填入真实地址的构建产物仅供本机使用。
 
 在仓库根目录运行导航回归测试：
 

@@ -39,46 +39,35 @@ function findLink(document, label) {
 }
 
 afterEach(() => {
-  vi.restoreAllMocks()
   vi.unstubAllEnvs()
   dom?.window.close()
   dom = undefined
 })
 
-it('keeps every main-site link disabled and inert without a configured origin', async () => {
-  const window = mountPreview(await buildPreview(''))
-  const { document } = window
-  const startURL = window.location.href
-  const open = vi.spyOn(window, 'open')
-  expect(document.body.textContent).toContain('未配置主站地址')
-
-  for (const [label] of mainLinks) {
-    const link = findLink(document, label)
-    expect(link.hasAttribute('href')).toBe(false)
-    expect(link.hasAttribute('target')).toBe(false)
-    expect(link.getAttribute('role')).toBe('link')
-    expect(link.getAttribute('aria-disabled')).toBe('true')
-    const hint = document.getElementById(link.getAttribute('aria-describedby'))
-    expect(hint?.textContent).toContain('未配置主站地址')
-    link.click()
-  }
-
-  expect(open).not.toHaveBeenCalled()
-  expect(window.location.href).toBe(startURL)
-})
-
-it('joins the configured origin to the original paths and enables navigation', async () => {
-  const origin = 'https://preview-main.example'
-  const { document } = mountPreview(await buildPreview(`${origin}/`))
-  expect(document.body.textContent).not.toContain('未配置主站地址')
-
+function expectMainLinks(document, origin = '') {
   for (const [label, path] of mainLinks) {
     const link = findLink(document, label)
-    expect(link.getAttribute('href')).toBe(`${origin}${path}`)
+    expect(link.getAttribute('href'), label).toBe(`${origin}${path}`)
+    expect(link.href).toBe(`${origin || document.location.origin}${path}`)
     expect(link.getAttribute('target')).toBe('_blank')
     expect(link.relList.contains('noopener')).toBe(true)
     expect(link.hasAttribute('aria-disabled')).toBe(false)
+    expect(link.tabIndex).toBe(0)
+    const click = new document.defaultView.MouseEvent('click', { bubbles: true, cancelable: true })
+    expect(link.dispatchEvent(click)).toBe(true)
   }
+}
+
+it('builds active same-origin links without a configured origin', async () => {
+  // An empty override keeps the test independent of any local .env files.
+  const { document } = mountPreview(await buildPreview(''))
+  expectMainLinks(document)
+})
+
+it('uses the configured origin with the original paths', async () => {
+  const origin = 'https://preview-main.example'
+  const { document } = mountPreview(await buildPreview(`${origin}/`))
+  expectMainLinks(document, origin)
 })
 
 it.each([
@@ -86,10 +75,9 @@ it.each([
   'javascript:alert(1)',
   'https://preview-main.example/base',
   'https://preview-main.example/app/..',
-])('leaves navigation disabled for an invalid origin (%s)', async value => {
+])('falls back to same-origin links for an invalid origin (%s)', async value => {
   const { document } = mountPreview(await buildPreview(value))
-  expect(findLink(document, '仪表盘').getAttribute('aria-disabled')).toBe('true')
-  expect(findLink(document, '模型广场').hasAttribute('href')).toBe(false)
+  expectMainLinks(document)
 })
 
 it('keeps the username and password of a rejected URL out of the built scripts', async () => {
@@ -98,5 +86,5 @@ it('keeps the username and password of a rejected URL out of the built scripts',
   const scripts = await buildPreview(`https://${user}:${password}@preview-main.example/`)
   expect(scripts.some(script => script.includes(user) || script.includes(password))).toBe(false)
   const { document } = mountPreview(scripts)
-  expect(findLink(document, '仪表盘').getAttribute('aria-disabled')).toBe('true')
+  expectMainLinks(document)
 }, 15_000)
