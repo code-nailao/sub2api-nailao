@@ -302,7 +302,7 @@ func (s *OpenAIGatewayService) deepSeekModelTurn(ctx context.Context, c *gin.Con
 	if value, ok := child.Get(OpsUpstreamErrorsKey); ok {
 		if events, ok := value.([]*OpsUpstreamErrorEvent); ok && len(events) > len(prior) {
 			last := events[len(events)-1]
-			if last != nil && (last.Kind == "failover" || last.UpstreamStatusCode == http.StatusRequestTimeout) {
+			if last != nil && last.Kind == "failover" {
 				capture.rejectedHTTPStatus = last.UpstreamStatusCode
 			}
 		}
@@ -486,6 +486,37 @@ func (s *OpenAIGatewayService) deepSeekBodyWithout(body []byte, protocol string,
 	return next
 }
 
+// ErrDeepSeekChatToolValidation marks a local filter rejection or interruption
+// before the request reached the selected account.
+var ErrDeepSeekChatToolValidation = errors.New("invalid DeepSeek Chat tool fields")
+
+type deepSeekChatToolValidationError struct{ error }
+
+func (e deepSeekChatToolValidationError) Unwrap() error { return e.error }
+
+func (deepSeekChatToolValidationError) Is(target error) bool {
+	return target == ErrDeepSeekChatToolValidation
+}
+
+func rejectDeepSeekChatFilter(c *gin.Context, err error) error {
+	marked := deepSeekChatToolValidationError{err}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return marked
+	}
+	const errType = "invalid_request_error"
+	if gatewaySSEStarted(c) {
+		// A queue heartbeat may have already committed the HTTP status.
+		MarkResponseCommitted(c)
+		MarkOpsStreamError(c, errType, err.Error(), http.StatusBadRequest)
+		if _, writeErr := c.Writer.WriteString(buildChatStreamErrorSSE(errType, err.Error())); writeErr == nil {
+			c.Writer.Flush()
+		}
+	} else {
+		writeChatCompletionsError(c, http.StatusBadRequest, errType, err.Error())
+	}
+	return marked
+}
+
 // tryForwardDeepSeekTools runs the hosted web tool loop when the request is
 // its to serve (handled). Otherwise it returns the body to forward on the
 // ordinary path, which may differ from the one passed in: web tool entries the
@@ -499,8 +530,26 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 	if key == nil || key.Group == nil {
 		return nil, body, false, nil
 	}
-	if protocol == "chat" && !gjson.GetBytes(body, "messages").Exists() && gjson.GetBytes(body, "input").Exists() {
-		protocol = "responses"
+	if protocol == "chat" {
+		if !key.Group.DeepSeekTools.Enabled {
+			top, err := scanDeepSeekChatEnvelope(ctx, body)
+			if err != nil {
+				return nil, body, true, rejectDeepSeekChatFilter(c, err)
+			}
+			// Fixed Chat accounts also forward Responses-shaped requests as raw
+			// Chat. Adaptive accounts keep their Responses handling for that shape.
+			fixedChat := !account.IsAdaptiveAPIProtocol() && shouldForwardOpenAIResponsesViaRawChatCompletions(account)
+			if top.messages != nil || top.input == nil || fixedChat {
+				next, err := filterDeepSeekChatWebTools(ctx, body, top)
+				if err != nil {
+					return nil, body, true, rejectDeepSeekChatFilter(c, err)
+				}
+				return nil, next, false, nil
+			}
+			protocol = "responses"
+		} else if !gjson.GetBytes(body, "messages").Exists() && gjson.GetBytes(body, "input").Exists() {
+			protocol = "responses"
+		}
 	}
 	// Without the hosted loop (tools off for the group, or tool_choice none)
 	// the provider's own web tool types are removed: the provider would run
@@ -614,12 +663,6 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 			}
 		}
 		if turnErr != nil {
-			if capture.rejectedHTTPStatus == http.StatusRequestTimeout && len(result.DeepSeekModelTurns) == 0 && snapshot.Cost() == 0 {
-				// A timeout leaves the model submission's outcome unknown. Do
-				// not return a failover signal to the outer account scheduler.
-				c.Header("x-should-retry", "false")
-				return nil, nil, true, fmt.Errorf("DeepSeek tool turn timed out: %v", turnErr)
-			}
 			// One fresh attempt without our optional tools is allowed only for a
 			// definitive HTTP rejection before any model/tool work or public output.
 			if !req.ToolsUnavailable && turn == nil && len(result.DeepSeekModelTurns) == 0 &&

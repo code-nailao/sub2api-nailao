@@ -51,7 +51,7 @@ func deepSeekHostedProtocolFixture(t *testing.T, protocol string, body map[strin
 	for _, setup := range configure {
 		setup(c)
 	}
-	result, _, handled, err := svc.tryForwardDeepSeekTools(c.Request.Context(), c, account, wire, protocol, "")
+	result, _, handled, err := svc.forwardWithDeepSeekTools(c.Request.Context(), c, account, wire, protocol, "")
 	require.True(t, handled)
 	return result, journal, recorder.Body.String(), err
 }
