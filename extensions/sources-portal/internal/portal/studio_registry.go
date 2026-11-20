@@ -42,11 +42,13 @@ type StudioManagedGroup struct {
 }
 
 type studioRegistryState struct {
-	Revision       int64                `json:"revision"`
-	UpdatedAt      time.Time            `json:"updated_at"`
-	UpdatedBy      int64                `json:"updated_by"`
-	CustomDisabled bool                 `json:"custom_disabled"`
-	Groups         []StudioManagedGroup `json:"groups"`
+	Revision         int64                `json:"revision"`
+	UpdatedAt        time.Time            `json:"updated_at"`
+	UpdatedBy        int64                `json:"updated_by"`
+	CustomAPILabels  []string             `json:"custom_api_labels,omitempty"`
+	CustomAPIDefault string               `json:"custom_api_default,omitempty"`
+	CustomDisabled   bool                 `json:"custom_disabled"`
+	Groups           []StudioManagedGroup `json:"groups"`
 }
 
 // studioModels trims and de-duplicates a model list; ok is false when a model
@@ -128,6 +130,9 @@ func (s *StudioService) loadRegistry() error {
 	if state.Groups, e = studioManagedGroups(state.Groups); e != nil {
 		return e
 	}
+	if e = validateStudioAPILabels(state.CustomAPILabels, state.CustomAPIDefault); e != nil {
+		return e
+	}
 	s.registry = state
 	s.effective = mergeStudioCapabilities(s.Capabilities, state.Groups)
 	return nil
@@ -155,7 +160,11 @@ func (s *StudioService) customAllowed() bool {
 
 // saveRegistry replaces the managed groups if revision is still the current
 // one. The change takes effect for the next request; nothing restarts.
-func (s *StudioService) saveRegistry(revision int64, customDisabled bool, groups []StudioManagedGroup, admin int64) error {
+func (s *StudioService) saveRegistry(revision int64, customDisabled bool, groups []StudioManagedGroup, admin int64, labels []string, defaultLabel string) error {
+	if e := validateStudioAPILabels(labels, defaultLabel); e != nil {
+		return e
+	}
+	labels = append([]string(nil), labels...)
 	groups, e := studioManagedGroups(groups)
 	if e != nil {
 		return e
@@ -175,7 +184,7 @@ func (s *StudioService) saveRegistry(revision int64, customDisabled bool, groups
 	if revision != s.registry.Revision {
 		return ErrConflict
 	}
-	next := studioRegistryState{Revision: revision + 1, UpdatedAt: time.Now().UTC(), UpdatedBy: admin, CustomDisabled: customDisabled, Groups: groups}
+	next := studioRegistryState{Revision: revision + 1, UpdatedAt: time.Now().UTC(), UpdatedBy: admin, CustomDisabled: customDisabled, Groups: groups, CustomAPILabels: labels, CustomAPIDefault: defaultLabel}
 	e = writeJSONAtomic(s.registryPath, next)
 	if e != nil && !writeCommitted(e) {
 		return e
@@ -285,7 +294,15 @@ func (s *Server) studioRegistryView(r *http.Request) (map[string]any, error) {
 	for _, group := range state.Groups {
 		missing(group.GroupID)
 	}
-	return map[string]any{"revision": state.Revision, "writable": writable, "custom_disabled": state.CustomDisabled, "groups": rows}, nil
+	_, _, source := s.Studio.customAPISettings()
+	return map[string]any{
+		"revision": state.Revision, "writable": writable, "groups": rows,
+		"custom_disabled": state.CustomDisabled, "api_host": s.Studio.customAPIHost(),
+		"custom_api_labels": state.CustomAPILabels, "custom_api_default": state.CustomAPIDefault,
+		"deployment_api_labels":  s.Studio.deploymentLabels,
+		"deployment_api_default": firstStudioAPILabel(s.Studio.deploymentLabels),
+		"custom_api_source":      source,
+	}, nil
 }
 
 func studioAdmin(w http.ResponseWriter, r *http.Request) (Identity, bool) {
@@ -323,15 +340,17 @@ func (s *Server) studioRegistryRoutes(mux *http.ServeMux) {
 			return
 		}
 		var in struct {
-			Revision       int64                `json:"revision"`
-			CustomDisabled bool                 `json:"custom_disabled"`
-			Groups         []StudioManagedGroup `json:"groups"`
+			Revision         int64                `json:"revision"`
+			CustomAPILabels  []string             `json:"custom_api_labels,omitempty"`
+			CustomAPIDefault string               `json:"custom_api_default,omitempty"`
+			CustomDisabled   bool                 `json:"custom_disabled"`
+			Groups           []StudioManagedGroup `json:"groups"`
 		}
 		if decode(w, r, &in) != nil {
 			jsonResponse(w, 400, map[string]string{"error": "invalid_json"})
 			return
 		}
-		switch e := s.Studio.saveRegistry(in.Revision, in.CustomDisabled, in.Groups, admin.ID); {
+		switch e := s.Studio.saveRegistry(in.Revision, in.CustomDisabled, in.Groups, admin.ID, in.CustomAPILabels, in.CustomAPIDefault); {
 		case e == nil:
 			view(w, r)
 		case errors.Is(e, ErrStudioRegistry):

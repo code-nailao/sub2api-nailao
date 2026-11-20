@@ -32,9 +32,11 @@
 | 媒体引擎持久图片任务 | 专用分组的异步图片任务：冻结价格快照、唯一执行者、提交结果未知不重发、结算与释放互斥 | `extensions/sources-media-engine`、`sources_media_engine*.go`、`sources_image_ledger.go`；[媒体引擎实施](docs/sources/MEDIA-ENGINE.md) |
 | 图片任务自动收尾 | 可选的恢复策略：有上游任务号只查询；超期且无成功证据时按原冻结释放客户余额，供应结果仍标为未知；不重新生成 | 媒体引擎恢复器、`features/sources/ImageTaskReview.vue` |
 | USDT 支付保护 | 原生 BEpusdt provider、主动查单、唯一付款凭证、旧订单配置版本、迟到与重复回调、跨实例读取配置 | 原支付服务与 provider；[支付实施](docs/sources/PAYMENT-IMPLEMENTATION.md) |
-| 工作台 / Canvas 授权 | 内嵌会话恢复；为用户发放普通、可见、可撤销的 Key；原生“使用密钥”与“导入到 CCS”保留；登记的原生 Gemini 分组可用于工作台；管理员可在页面内在线登记原生分组；用户可用自己的 Key 建立域名固定为本站的自定义连接 | 前端挂接、Portal；[Portal 说明](extensions/sources-portal/README.md) |
+| 工作台 / Canvas 授权 | 内嵌会话恢复；为用户发放普通、可见、可撤销的 Key；原生“使用密钥”与“导入到 CCS”保留；登记的原生 Gemini 分组可用于工作台；管理员可在页面内在线登记原生分组；用户可用自己的 Key 建立自定义连接，选择管理员允许的本站 API 子域名；路径由系统推导，Antigravity 固定走主站，兼容旧连接 | 前端挂接、Portal；[Portal 说明](extensions/sources-portal/README.md) |
+| Portal 启动校验 | 正常启动与只读检查共用配置校验；全部环境变量校验先于状态写入；主站、Portal、工作台与画布统一规范化 ASCII 大小写及标准默认端口，拒绝前导零/空端口、非 ASCII 主机、末尾点号及非规范 IP 写法后再比较源，工作台与画布必须独立源；登记文件拒绝 `null`，保留空数组 `[]` | `extensions/sources-portal/cmd/portal`；[Portal 说明](extensions/sources-portal/README.md) |
 | 智商检测计划 | Portal 内的定时模型检测：管理员写、用户只读，可见性、排序、删除；兼容不限期、不限总额的 Key；Key 失效时可暂停计划 | `extensions/sources-portal` |
 | serving / 唯一后台 | 进程分为接流（serving）和后台（background）两种角色，文件锁保证最多一个后台持有者；正常排空；`-migrate-only` 迁移入口；管理 MCP 与 OAuth 回调归后台；后台退出时等待在途 OAuth 刷新保存；后台交接期间旧后台只读排空，停后台服务时仍应答管理读请求（写、MCP、WebSocket 升级返回 503），最后才关闭监听；探测类任务快速取消且不记假失败；启动致命错误直接写 stderr；发布用一次性命令 `-list-pending-migrations`、`-check-startup`、`-export-web-assets`；发布可在新 serving 就绪后暂停验证，`resume` 核对目标后台端口并在暂停实例排空退出后配置共享别名，再复用交接切流流程。接网失败可恢复暂停，`abort` 可重试地排空并清理 | `internal/processrole`、`cmd/server/sources_*.go`、`deploy/sources/deploy.py`；[发布与部署](docs/sources/DEPLOY.md) |
+| Portal 退出交接 | 关闭时取消只读余额查询，包括同步刷新；退出取消不写假失败，余额记录、检查计划和告警状态保持原样；日志显示在途 HTTP 请求、后台等待、检测当前轮次与排空耗时；已接受的写入和已开始的检测提交或轮询保存完成后才释放状态目录文件锁，不强杀、不重放结果未知的付费请求 | `extensions/sources-portal/cmd/portal/lifecycle.go`、Portal Service；[Portal 说明](extensions/sources-portal/README.md) |
 | 日志保留归属 | 外部日志保留归属开关（默认关闭）；开启后拒绝原生用量清理；管理员统计在明细删除后仍保留汇总 | `external_log_cleanup.go`、retention 统计；开关只表示归属，不会触发删除 |
 | 备份时限与磁盘 | 备份总时限两小时，租约与截止时间隔离；完整 gzip 只生成一次，各分片按偏移直接从该文件上传，不再另存分片临时文件，避免两倍磁盘占用 | 原备份服务 |
 | 依赖安全与协议兼容 | 已登记的安全依赖升级、图片解码修复和上游兼容修复 | 核心清单中的 `dependency_security`、`image_decoder_security`、`upstream_compatibility` 标签 |
