@@ -260,7 +260,7 @@ function modelPicker({ selected, load, isOpen, onChange = () => {}, preselect = 
 }
 
 /** Administrator: which groups the workbench and the canvas offer. */
-export function openGroupSettings({ onSaved = () => {} } = {}) {
+export function openGroupSettings({ captureConnection = () => () => true, onSaved = () => {} } = {}) {
   const view = openDialog("工作台分组设置", "勾选的分组会出现在图片工作台和无限画布里，仍然只有对该分组有权限的用户能看到它。保存后立即生效，不需要重启。");
   const messages = {
     source_changed_refresh_page: "其他管理员刚修改过设置，已载入最新内容，请重新调整后保存。",
@@ -295,6 +295,8 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
     if (error) { say(view, error, "error"); return; }
     const addresses = customAPILabelRequest(addressRows.map((row) => row.input.value.trim()), addressRows.find((row) => row.radio.checked)?.input.value.trim() || "");
     if (addresses.error) { say(view, addresses.error, "error"); return; }
+    // A save answers the document and connection it started in.
+    const stillConnected = captureConnection();
     void busy(view, "正在保存…", async (current) => {
       const result = await authorizedJSON("/api/studio/admin/registry", {
         method: "PUT", body: { revision, custom_disabled: !allowCustom.checked, groups, ...addresses }, isCurrent: current,
@@ -312,7 +314,7 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
         show(data);
       }
       throw Error(messages[result.data?.error] || "暂时无法保存，请稍后重试。");
-    });
+    }, stillConnected);
   };
   const saveButton = button("保存", save, "portal-primary");
   function row(group) {
@@ -320,7 +322,11 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
     const touched = () => { dirty = true; reset = false; note.textContent = ""; };
     const check = el("input", { type: "checkbox", checked: group.enabled, disabled: group.locked });
     const picker = group.locked ? null : modelPicker({ selected: group.models, isOpen: view.isOpen, onChange: touched, preselect: true,
-      load: async (isCurrent) => (await request(`/api/studio/admin/groups/${group.group_id}/models`, { isCurrent }, messages)).models });
+      load: async (isCurrent) => {
+        const stillConnected = captureConnection();
+        return (await request(`/api/studio/admin/groups/${group.group_id}/models`,
+          { isCurrent: () => stillConnected() && isCurrent() }, messages)).models;
+      } });
     const note = el("span", { class: "portal-note" });
     const tags = [
       group.locked ? "媒体引擎 · 服务器登记，只读" : { file: "服务器登记", override: "已在此修改", managed: "已在此加入" }[group.source],
@@ -375,12 +381,13 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
       button("添加", () => addAddress("", addressRows.length === 0), "portal-link", "添加 API 子域名"), addressSource, addressDeployment,
       el("p", { class: "portal-note", text: "留空则使用部署配置的初始值；都没有时使用主站地址。" })), list);
   view.actions.append(button("关闭", view.close), saveButton);
+  const openedFor = captureConnection();
   void busy(view, "正在读取分组…", async (current) => {
     const data = await request("/api/studio/admin/registry", { isCurrent: current }, messages);
     if (!current()) return;
     say(view, "");
     show(data);
-  });
+  }, openedFor);
 }
 
 /** Any user: connect with one of their own API keys. */
@@ -425,8 +432,10 @@ export function openCustomSettings({ captureConnection = () => () => true, onSav
     const legacy = Boolean(saved && !saved.api_label && (data.api_labels || []).length);
     notice.textContent = choice.removed ? "之前选的地址已停用，已改用默认地址。" : legacy ? "现在的连接仍使用主站地址，保存后改用上面选择的地址。" : "";
     const picker = modelPicker({ selected: saved ? saved.models : [], isOpen: view.isOpen, preselect: true, load: async (isCurrent) => {
+      const stillConnected = captureConnection();
       return (await request("/api/studio/custom/models", {
-        method: "POST", body: { key_id: Number(keySelect.value), protocol: protocolSelect.value }, isCurrent,
+        method: "POST", body: { key_id: Number(keySelect.value), protocol: protocolSelect.value },
+        isCurrent: () => stillConnected() && isCurrent(),
       }, messages)).models;
     } });
     const describe = () => {
@@ -474,10 +483,11 @@ export function openCustomSettings({ captureConnection = () => () => true, onSav
     // The list is fetched as soon as the dialog opens.
     void picker.refresh();
   }
+  const openedFor = captureConnection();
   void busy(view, "正在读取你的密钥…", async (current) => {
     const data = await request("/api/studio/custom", { isCurrent: current }, messages);
     if (!current()) return;
     show(data);
     say(view, "");
-  });
+  }, openedFor);
 }

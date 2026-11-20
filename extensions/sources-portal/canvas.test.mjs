@@ -1102,3 +1102,129 @@ test('group settings refresh the menu without reconnecting the selected group', 
   user.elements['#canvas-manage'].onclick();
   assert.equal(user.settings.length, 0);
 });
+
+const deadlineAt = (f, delay) => [...f.timers.values()].find((timer) => timer.delay === delay);
+const canvasActionable = (f) => !f.elements['#canvas-status'].hidden && !f.elements['#canvas-recovery'].hidden && !f.elements['#canvas-retry'].hidden;
+const sessionChecks = (f) => f.parentMessages.filter(({ type }) => type === 'sub2api:session-check').length;
+
+for (const oldStatus of [200, 401]) {
+  test(`a Canvas restore of ${oldStatus} from before a restart cannot reach the new child`, async () => {
+    const old = Promise.withResolvers(), groups = Promise.withResolvers();
+    let saved = false, grant;
+    const f = await fixture({ custom: 'configured', useSessionTransport: true,
+      groupsResponse: () => saved ? groups.promise : undefined,
+      connection: (options, config) => {
+        if (options.body.restore_only && options.body.group_id === 26) { grant = config(26); return old.promise; }
+        if (options.body.restore_only && options.body.group_id === CUSTOM_ID) return { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } };
+        return { ok: true, status: 200, data: config(options.body.group_id) };
+      } });
+    f.host(); f.loaded(); await f.ack();
+    f.select.value = String(CUSTOM_ID);
+    await f.select.onchange();
+    await f.ack();
+    const stale = { type: 'sub2api:canvas-restore-connection', connectionId: 'group-26', requestId: '00000000-0000-4000-8000-000000000031' };
+    f.send(stale);
+    await flush();
+    assert.ok(grant);
+    f.send({ type: 'sub2api:canvas-restore-connection', connectionId: `group-${CUSTOM_ID}`, requestId: '00000000-0000-4000-8000-000000000030' });
+    await flush();
+    assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+
+    // Saving leaves the group read hanging; its deadline leaves a retry.
+    f.elements['#canvas-retry'].onclick();
+    saved = true;
+    f.settings.at(-1).onSaved(true);
+    await flush();
+    deadlineAt(f, 20000).callback();
+    assert.equal(canvasActionable(f), true);
+    const restores = () => connections(f).filter((call) => call.options.body?.restore_only && call.options.body.group_id === 26).length;
+    const reads = restores();
+
+    f.send({ type: 'sub2api:canvas-ready' });
+    old.resolve(oldStatus === 401 ? { ok: false, status: 401, data: { error: 'admin_login_required' } } : { ok: true, status: 200, data: grant });
+    await flush();
+    groups.resolve({ ok: false, status: 503 });
+    await flush();
+
+    assert.equal(f.canvasMessages.some((item) => item.payload?.requestId === stale.requestId), false);
+    assert.equal(restores(), reads);
+    assert.equal(sessionChecks(f), 0);
+    assert.equal(f.locked, false);
+    assert.equal(canvasActionable(f), true);
+  });
+}
+
+test('a Canvas 409 verdict survives a same-document restore failure', async () => {
+  let restores = 0;
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only && options.body.group_id === CUSTOM_ID
+    ? (++restores === 1 ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } } : { ok: false, status: 503 })
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.loaded(); await f.ack();
+  f.select.value = String(CUSTOM_ID);
+  await f.select.onchange();
+  f.select.value = '26';
+  await f.select.onchange();
+  await f.ack();
+
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId: `group-${CUSTOM_ID}`, requestId: '00000000-0000-4000-8000-000000000032' });
+  await flush();
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+  assert.equal(f.frame.hidden, false);
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId: `group-${CUSTOM_ID}`, requestId: '00000000-0000-4000-8000-000000000033' });
+  await flush();
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+  f.elements['#canvas-retry'].onclick();
+  assert.equal(f.settings.at(-1)?.kind, 'custom');
+});
+
+test('a Canvas group settings save from before a restart cannot renew or replay', async () => {
+  const write = Promise.withResolvers();
+  const registry = { revision: 1, groups: [], custom_disabled: false };
+  let writes = 0;
+  const f = await fixture({ admin: true, settingsRequest: () => { throw Error('only the registry dialog is used'); },
+    connection: (options, config) => {
+      if (options.method === 'GET' && !options.body && options.body?.group_id === undefined) {
+        if (options.headers?.body === undefined && !('group_id' in (options.body || {}))) return { ok: true, status: 200, data: registry };
+      }
+      if (options.method === 'PUT' && options.body?.revision === 1) { writes++; return write.promise; }
+      return { ok: true, status: 200, data: config(options.body?.group_id) };
+    } });
+  f.host(); f.loaded(); await f.ack();
+  f.elements['#canvas-manage'].onclick();
+  await flush();
+  const [dialog] = f.document.body.querySelectorAll('dialog');
+  const save = dialog.querySelectorAll('button').find((button) => button.textContent === '保存');
+  save.click();
+  await flush();
+  assert.equal(writes, 1);
+
+  f.send({ type: 'sub2api:canvas-ready' });
+  await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  write.resolve({ ok: false, status: 401, data: { error: 'admin_login_required' } });
+  await flush();
+  assert.equal(writes, 1);
+  assert.equal(sessionChecks(f), 0);
+  assert.equal(f.locked, false);
+  assert.equal(f.frame.hidden, false);
+  dialog.close();
+});
+
+test('a Canvas selection during an authorization never disagrees with the confirmed connection', async () => {
+  const auth = Promise.withResolvers();
+  let held;
+  const f = await fixture({ connection: (options, config) => {
+    if (options.body.group_id === 27) { held = config(27); return auth.promise; }
+    return { ok: true, status: 200, data: config(options.body.group_id) };
+  } });
+  f.loaded(); await f.ack();
+  f.select.value = '27';
+  const first = f.select.onchange();
+  f.select.value = '26';
+  await f.select.onchange();
+  auth.resolve({ ok: true, status: 200, data: held });
+  await first;
+  await f.ack();
+  assert.equal(f.last('sub2api:media-studio-config').payload.selectedConnectionId, `group-${f.select.value}`);
+  assert.equal(f.select.value, '27');
+});

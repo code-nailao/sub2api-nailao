@@ -32,11 +32,13 @@ export function requestRounds() {
     stopWaiting();
     return true;
   }
-  function deadline(round, delay, onTimeout) {
+  function deadline(round, delay, onTimeout, stillCurrent = () => true) {
     if (!isWaiting(round)) return;
     clearTimeout(timer);
     const scheduled = setTimeout(() => {
-      if (timer !== scheduled || !isWaiting(round)) return;
+      // The guard is the caller's staleness test, applied before the timeout
+      // retires the attempt: an expired timer must not change anything.
+      if (timer !== scheduled || !isWaiting(round) || !stillCurrent()) return;
       advance();
       onTimeout();
     }, delay);
@@ -62,6 +64,10 @@ export function requestRounds() {
 //                        with a newer answer for the same connection, or with
 //                        an authorization the page accepted for it. A retry,
 //                        poll or acknowledgement elsewhere does not end it.
+//   beginVerdict()       a verdict a child answer established (this connection
+//                        needs a resave). It ends with its document only, so a
+//                        failure for the same connection does not take away its
+//                        guidance; a successful answer ends it where it is set.
 //   captureConnection()  a configuration the child accepted: ends with the
 //                        connection generation or the document showing it.
 //   beginView()          a request the page itself makes on the child's
@@ -98,6 +104,9 @@ export function connectionRounds() {
     keys.set(key, revision);
     return { scope: "child", document, key, revision };
   }
+  function beginVerdict() {
+    return { scope: "verdict", document };
+  }
   function renew(key) {
     keys.set(key, (keys.get(key) || 0) + 1);
   }
@@ -113,6 +122,7 @@ export function connectionRounds() {
     if (started.scope === "child") {
       return started.document === document && keys.get(started.key) === started.revision;
     }
+    if (started.scope === "verdict") return started.document === document;
     if (started.scope === "connection") {
       return started.generation === rounds.generation && started.document === document;
     }
@@ -129,7 +139,8 @@ export function connectionRounds() {
   }
   const isWaiting = (started) => Boolean(started) && rounds.isWaiting(started.round);
   const finish = (started) => rounds.finish(started.round);
-  const deadline = (started, delay, onTimeout) => rounds.deadline(started.round, delay, onTimeout);
+  const deadline = (started, delay, onTimeout) => rounds.deadline(started.round, delay, onTimeout,
+    () => isCurrent(started));
   const retire = () => rounds.advance();
   const accepted = () => rounds.markApplied();
   // The one place a child document begins. A bare load is not a document.
@@ -140,7 +151,7 @@ export function connectionRounds() {
   return {
     get current() { return rounds.current; }, get generation() { return rounds.generation; }, get document() { return document; },
     advance: rounds.advance, start: rounds.start, markApplied: rounds.markApplied,
-    isWaiting, finish, deadline, beginAttempt, beginView, beginRead, beginChild, renew,
+    isWaiting, finish, deadline, beginAttempt, beginView, beginRead, beginChild, beginVerdict, renew,
     captureConnection, beginView, guardConnection, isCurrent, readdress, retire, accepted, newDocument,
   };
 }

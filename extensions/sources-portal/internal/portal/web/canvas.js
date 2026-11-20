@@ -33,8 +33,9 @@ let custom = { groupId: 0, enabled: false, configured: false };
 const validRequestID = (value) => typeof value === "string" && /^[\w-]{16,80}$/.test(value);
 const connectionKey = (connectionId) => `connection:${connectionId}`;
 // Every staleness decision goes through the token the request started with.
-const resaveActive = () => !locked && needsCustomResave &&
-  (resaveStarted === undefined || rounds.isCurrent(resaveStarted));
+// startDocument() ends a verdict from an earlier document; a failure for the
+// same connection in this one leaves the 409 guidance in place.
+const resaveActive = () => !locked && needsCustomResave;
 const working = () => Boolean(attempt) && rounds.isWaiting(attempt.started);
 const isWaiting = (operation) => !locked && attempt === operation && rounds.isWaiting(operation.started);
 const readingOrAuthorizing = () => working() && ["bootstrap", "authorize"].includes(attempt.phase);
@@ -54,6 +55,7 @@ function clearResave() {
 function startDocument() {
   rounds.newDocument();
   acknowledgment = undefined;
+  if (resaveStarted !== undefined && !rounds.isCurrent(resaveStarted)) clearResave();
   if (connection) connection = { ...connection, started: rounds.readdress(connection.started) };
   frame.hidden = true;
 }
@@ -191,7 +193,7 @@ async function api(path, isCurrent, body) {
 }
 function isConfirming(operation, candidate) {
   return operation && candidate && isWaiting(operation) && operation.phase === "confirm" &&
-    connection === candidate && rounds.isCurrent(candidate.started) && !candidate.invalid && !resaveActive();
+    rounds.isCurrent(candidate.started) && !candidate.invalid && !resaveActive();
 }
 function startSending(operation, candidate = connection) {
   if (sendTimer !== undefined || !isConfirming(operation, candidate)) return;
@@ -265,7 +267,9 @@ function requireResave(connectionId, started) {
   connection = next;
   // Losing the running connection is a page decision: it needs a resave, not
   // an answer that ends with the document that happened to report it.
-  resaveStarted = held ? undefined : started;
+  // A verdict reported by a restore ends with that document; one the page
+  // reached itself, or by invalidating the running connection, stays.
+  resaveStarted = held || !started ? undefined : rounds.beginVerdict();
   granted.delete(connectionId);
 }
 async function restoreConnection(connectionId, requestId, target) {
@@ -316,11 +320,14 @@ window.addEventListener("message", async (event) => {
     if (confirmed() && !frame.hidden) notifyHost(true);
     return;
   }
-  if (locked || event.source !== frame.contentWindow || event.origin !== studioURL?.origin || !connection) return;
-  if (data?.type === "sub2api:canvas-ready") {
+  if (locked || event.source !== frame.contentWindow || event.origin !== studioURL?.origin || !data) return;
+  // A child that restarts is a new document even when the page holds no
+  // connection yet; it is always processed.
+  if (data.type === "sub2api:canvas-ready") {
     rehandshake();
     return;
   }
+  if (!connection) return;
   if (data?.type === "sub2api:canvas-restore-connection") {
     const { connectionId, requestId } = data;
     if (typeof connectionId !== "string" || !/^group-[1-9][0-9]*$/.test(connectionId) || typeof requestId !== "string" || !/^[a-f0-9-]{36}$/.test(requestId)) return;
@@ -337,6 +344,8 @@ window.addEventListener("message", async (event) => {
   finish(pending);
   rounds.accepted();
   acknowledgment = { payload: candidate.payload, started: rounds.captureConnection() };
+  // A selection made while this one was being authorized is not the connection.
+  select.value = candidate.payload.selectedConnectionId.slice(6);
   showReady();
 });
 
@@ -470,7 +479,7 @@ customButton.onclick = ownKeyButton.onclick = openCustomConnectionSettings;
 manageButton.onclick = () => {
   if (locked) return;
   connectionMenu.open = false;
-  openGroupSettings({ onSaved: () => void reloadGroups() });
+  openGroupSettings({ captureConnection: rounds.guardConnection, onSaved: () => void reloadGroups() });
 };
 async function bootstrap() {
   if (locked || readingOrAuthorizing()) return;

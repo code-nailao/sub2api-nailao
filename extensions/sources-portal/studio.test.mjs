@@ -579,6 +579,30 @@ test('an integrated Studio keeps the resave action visible after a failed switch
   assert.equal(f.frame.hidden, false);
 });
 
+test('a Studio deadline from before a restart is inert for the new shell', async () => {
+  const old = Promise.withResolvers();
+  const f = await fixture({ connection: (options, config) => options.body.group_id === 27
+    ? old.promise
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  const shell = await f.integrate();
+  f.send(select(27, shell.revision, 'selection-before-restart-1'));
+  await flush();
+  assert.equal(connections(f), 2);
+  const resultsBefore = f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-select-group-result').length;
+
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  const restarted = await f.ackShell();
+  assert.ok(restarted.revision > shell.revision);
+  assert.equal(f.document.body.dataset.integrated, 'true');
+
+  [...f.timers.values()].find(({ delay }) => delay === 20000).callback();
+  old.resolve({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } });
+  await flush();
+  assert.equal(f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-select-group-result').length, resultsBefore);
+  assert.equal(f.retry.textContent, '重试连接');
+  assert.equal(f.document.body.dataset.integrated, 'true');
+});
+
 test('a Studio selection made by a shell that already restarted is not applied', async () => {
   const answer = Promise.withResolvers();
   let hold = false;

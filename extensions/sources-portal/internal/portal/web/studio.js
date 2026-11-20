@@ -185,7 +185,7 @@ function openSettings(kind) {
   if (locked) return;
   document.querySelector("#connection-menu").open = false;
   if (kind === "manage") {
-    openGroupSettings({ onSaved: () => void refreshMetadata() });
+    openGroupSettings({ captureConnection: rounds.guardConnection, onSaved: () => void refreshMetadata() });
     return;
   }
   openCustomSettings({ captureConnection: rounds.guardConnection, onSaved: (configured) => {
@@ -313,7 +313,8 @@ function startDocument() {
   clearInterval(shellTimer);
   if (connectionPending) {
     if (connectionPending.requestId) {
-      // A selection the old child made is not the new child's request.
+      // A selection the old child made is not the new child's request. Its
+      // deadline stays armed but is inert: it no longer finds this attempt.
       clearInterval(connectionTimer);
       connectionPending = undefined;
     } else {
