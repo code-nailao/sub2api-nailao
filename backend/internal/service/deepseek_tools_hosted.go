@@ -536,7 +536,10 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 			if err != nil {
 				return nil, body, true, rejectDeepSeekChatFilter(c, err)
 			}
-			if top.messages != nil || !top.hasInput {
+			// Fixed Chat accounts also forward Responses-shaped requests as raw
+			// Chat. Adaptive accounts keep their Responses handling for that shape.
+			fixedChat := !account.IsAdaptiveAPIProtocol() && shouldForwardOpenAIResponsesViaRawChatCompletions(account)
+			if top.messages != nil || top.input == nil || fixedChat {
 				next, err := filterDeepSeekChatWebTools(ctx, body, top)
 				if err != nil {
 					return nil, body, true, rejectDeepSeekChatFilter(c, err)

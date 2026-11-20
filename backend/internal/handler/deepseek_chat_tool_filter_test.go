@@ -84,22 +84,24 @@ func TestDeepSeekChatFilterWritesSSEErrorAfterQueueHeartbeat(t *testing.T) {
 	c.Set(string(middleware2.ContextKeyUser), middleware2.AuthSubject{UserID: key.UserID, Concurrency: 1})
 	h.ChatCompletions(c)
 
-	require.Equal(t, http.StatusOK, rec.Code, "the heartbeat commits the response headers")
+	require.True(t, rec.Flushed)
 	require.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
 	require.True(t, strings.HasPrefix(rec.Body.String(), ":\n\n"))
-	var events []string
+	var errorFrames []gjson.Result
 	for _, frame := range strings.Split(strings.TrimSpace(rec.Body.String()), "\n\n") {
 		if strings.HasPrefix(frame, ":") {
 			continue
 		}
 		payload, ok := strings.CutPrefix(frame, "data: ")
-		require.True(t, ok, "every non-heartbeat frame must be SSE data")
+		require.True(t, ok, "the validation failure must be an SSE data frame")
 		require.True(t, gjson.Valid(payload))
-		events = append(events, payload)
+		event := gjson.Parse(payload)
+		require.Equal(t, "invalid_request_error", event.Get("error.type").String())
+		require.Equal(t, "duplicate top-level JSON key: tools", event.Get("error.message").String())
+		require.False(t, event.Get("choices").Exists())
+		errorFrames = append(errorFrames, event)
 	}
-	require.Len(t, events, 1)
-	require.Equal(t, "invalid_request_error", gjson.Get(events[0], "error.type").String())
-	require.Contains(t, gjson.Get(events[0], "error.message").String(), "duplicate top-level JSON key: tools")
+	require.Len(t, errorFrames, 1)
 	require.Zero(t, upstream.calls)
 }
 

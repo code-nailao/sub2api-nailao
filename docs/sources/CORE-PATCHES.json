@@ -703,8 +703,8 @@
       "features": [
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "b63aa026d52c22ee751d55233ea1901b76648ef818ffdbf71645f8fa9eb9356b",
-      "reason": "Tests disabled-group Chat SSE error framing after a queue heartbeat and verifies that local 400 responses, cancellations and deadlines at account slot acquisition create no advanced scheduler account samples."
+      "sha256": "68a9b0f5c681068d909522add9e8964754fc01ecb1af1843414f4c16b358e01a",
+      "reason": "Verifies a parseable Chat SSE validation error frame after a queue heartbeat and verifies that local 400 responses, cancellations and deadlines at account slot acquisition create no advanced scheduler account samples."
     },
     {
       "path": "backend/internal/handler/dto/deepseek_tools_test.go",
@@ -2536,8 +2536,8 @@
       "features": [
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "3fff588a43eaf8023e2c35dd9f9207c3aa14465d8fc0cfb7bf0df601911c026f",
-      "reason": "Scans the Chat request envelope once for groups with tools turned off. Filters web-tool families by base type and underscore, hyphen or dot suffix. Strictly checks the tool fields when tools is an array and checks for duplicate messages when adding a notice. Preserves untouched bytes and relaxes forced choices of removed tools while prioritizing retained client functions for choices by name."
+      "sha256": "053e71388b54da4d59e7c5aadf170e7ef36cbf34e7b48c2f12640ed9ff0093bf",
+      "reason": "Scans the Chat request envelope once for groups with tools turned off. Filters web tools by type prefix and rejects duplicates only in the tool fields. Adds the unavailable notice to the last messages field or to input for raw Responses-shaped requests. Preserves untouched bytes and adjusts forced choices while prioritizing retained client functions for choices by name."
     },
     {
       "path": "backend/internal/service/deepseek_stream_timing_test.go",
@@ -2658,16 +2658,16 @@
         "deepseek_tool_compat",
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "524b76fb70682a15de9b91875696b6c898d8879220fe5c3100e62b1ddadb97d4",
-      "reason": "Runs optional hosted search and fetch with existing eligibility, streaming and usage checkpoint rules. Routes Chat requests from groups with tools turned off through the bounded web-tool filter. Marks local validation rejections, cancellations and deadlines so the Chat handler does not report them as account failures. Preserves the underlying context errors. Optional setup failures continue through ordinary forwarding after removing unavailable declarations and adding a notice."
+      "sha256": "0ff94253dfef90d49fc63689469879aaf32ca0832d19564cc3c2affabf1af102",
+      "reason": "Runs optional hosted search and fetch with existing eligibility, streaming and usage checkpoint rules. Routes disabled-group Chat requests, including Responses-shaped bodies on fixed Chat accounts, through the bounded web-tool filter. Marks local validation rejections and interruptions so they do not count as account failures. Optional setup failures use ordinary forwarding after removing unavailable declarations and adding a notice."
     },
     {
       "path": "backend/internal/service/deepseek_tools_in_chat_test.go",
       "features": [
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "2196d00020fed9932e751df0ee2e25c085a225051d9e1e5c633981d6a3648c6b",
-      "reason": "Tests hosted tool types and the disabled-group Chat filter. Mock upstream and billing checks cover one ordinary forward on success, both streaming modes, suffix delimiters, legacy forced choices including retained functions with colliding names, duplicate messages, byte preservation, bypassed paths, bounded validation and preservation of context errors."
+      "sha256": "6eee373248b85c189ca0e7e52633022a5ae5c94f71128f321a2b6cfcde007354",
+      "reason": "Tests stream and non-stream forwarding, prefix matching without separators, Responses-shaped requests on fixed Chat accounts, notice placement in the last messages field, retained client choices, billing parity, bypassed protocols, bounded validation and preservation of context errors."
     },
     {
       "path": "backend/internal/service/deepseek_tools_incremental.go",

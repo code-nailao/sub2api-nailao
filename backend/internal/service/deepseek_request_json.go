@@ -28,11 +28,9 @@ type deepSeekChatField struct {
 }
 
 type deepSeekChatEnvelope struct {
-	tools, choice, messages *deepSeekChatField
-	hasInput                bool
-	duplicateMessages       bool
-	duplicate               string
-	end, fields             int
+	tools, choice, messages, input *deepSeekChatField
+	duplicate                      string
+	end, fields                    int
 }
 
 // deepSeekChatCursor locates top-level fields. The Chat ingress has already
@@ -198,19 +196,24 @@ func scanDeepSeekChatEnvelope(ctx context.Context, body []byte) (deepSeekChatEnv
 			case "tool_choice":
 				field = &top.choice
 			case "messages":
-				top.duplicateMessages = top.messages != nil
 				field = &top.messages
 			case "input":
-				top.hasInput = true
+				field = &top.input
 			}
 			var previous *deepSeekChatField
 			if field != nil {
-				if *field == nil {
-					previous = &deepSeekChatField{value: deepSeekChatSpan{start, s.pos}, keyStart: keyStart,
+				if *field != nil && (name == "tools" || name == "tool_choice") {
+					if top.duplicate == "" {
+						top.duplicate = name
+					}
+				} else {
+					// Keep the last messages/input span, as JSON decoding does.
+					if *field == nil {
+						*field = new(deepSeekChatField)
+					}
+					previous = *field
+					*previous = deepSeekChatField{value: deepSeekChatSpan{start, s.pos}, keyStart: keyStart,
 						comma: comma, nextComma: -1, index: top.fields, nonemptyArray: nonemptyArray}
-					*field = previous
-				} else if field != &top.messages && top.duplicate == "" {
-					top.duplicate = name
 				}
 			}
 			top.fields++
@@ -391,8 +394,7 @@ func (p deepSeekChatToolParser) parseArray(depth int, element func(json.Token, i
 // Hosted tool eligibility continues to use the existing provider rules.
 func deepSeekChatWebToolFamily(typ string) string {
 	for _, family := range [...]string{"web_search", "web_fetch", "deepseek_web_search", "deepseek_read_url"} {
-		suffix, ok := strings.CutPrefix(typ, family)
-		if ok && (suffix == "" || strings.ContainsRune("_-.", rune(suffix[0]))) {
+		if strings.HasPrefix(typ, family) {
 			return family
 		}
 	}
@@ -484,11 +486,6 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 		return body, ctx.Err()
 	}
 
-	needsNotice := choice.typ != "none"
-	if needsNotice && top.duplicateMessages {
-		return nil, errors.New("duplicate top-level JSON key: messages")
-	}
-
 	var edits []deepSeekChatEdit
 	removedFields := 0
 	if len(kept) == 0 {
@@ -500,7 +497,7 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 			edits = append(edits, deepSeekChatEdit{span: top.choice.value, replacement: `"auto"`})
 		}
 	}
-	if needsNotice {
+	if choice.typ != "none" {
 		edits = append(edits, deepSeekChatNoticeEdit(body, top, removedFields))
 	}
 	return applyDeepSeekChatEdits(ctx, body, edits)
@@ -510,6 +507,8 @@ type deepSeekChatEdit struct {
 	span        deepSeekChatSpan
 	replacement string
 	tools       []deepSeekChatSpan
+	// A prefix keeps the original span between prefix and replacement.
+	prefix string
 }
 
 func removeDeepSeekChatToolFields(top deepSeekChatEnvelope) ([]deepSeekChatEdit, int) {
@@ -540,14 +539,25 @@ func removeDeepSeekChatFields(first, last *deepSeekChatField) deepSeekChatEdit {
 var deepSeekChatNoticeMessage = `{"content":` + string(appendSJSONString(nil, deepSeekToolsUnavailableNotice)) + `,"role":"system"}`
 
 func deepSeekChatNoticeEdit(body []byte, top deepSeekChatEnvelope, removedFields int) deepSeekChatEdit {
-	if top.messages == nil {
+	field := top.messages
+	if field == nil && top.input != nil {
+		// A fixed Chat upstream can receive a raw Responses-shaped body.
+		// Keep its input shape and add the notice to the same history.
+		field = top.input
+		if body[field.value.start] == '"' {
+			return deepSeekChatEdit{
+				span: field.value, prefix: `[{"content":`,
+				replacement: `,"role":"user"},` + deepSeekChatNoticeMessage + "]",
+			}
+		}
+	}
+	if field == nil {
 		prefix := ""
 		if top.fields > removedFields {
 			prefix = ","
 		}
 		return deepSeekChatEdit{span: deepSeekChatSpan{top.end, top.end}, replacement: prefix + `"messages":[` + deepSeekChatNoticeMessage + "]"}
 	}
-	field := top.messages
 	if body[field.value.start] == '[' {
 		replacement := deepSeekChatNoticeMessage
 		if field.nonemptyArray {
@@ -565,7 +575,12 @@ func applyDeepSeekChatEdits(ctx context.Context, body []byte, edits []deepSeekCh
 	slices.SortFunc(edits, func(a, b deepSeekChatEdit) int { return a.span.start - b.span.start })
 	size := len(body)
 	for _, edit := range edits {
-		size += len(edit.replacement) - (edit.span.end - edit.span.start)
+		size += len(edit.replacement)
+		if edit.prefix == "" {
+			size -= edit.span.end - edit.span.start
+		} else {
+			size += len(edit.prefix)
+		}
 		if len(edit.tools) > 0 {
 			size += len(edit.tools) + 1 // brackets and separating commas
 			for _, tool := range edit.tools {
@@ -597,6 +612,13 @@ func applyDeepSeekChatEdits(ctx context.Context, body []byte, edits []deepSeekCh
 			}
 			out = append(out, ']')
 		} else {
+			if edit.prefix != "" {
+				out = append(out, edit.prefix...)
+				out, err = appendDeepSeekChatBytes(ctx, out, body[edit.span.start:edit.span.end])
+				if err != nil {
+					return nil, err
+				}
+			}
 			out = append(out, edit.replacement...)
 		}
 		last = edit.span.end
