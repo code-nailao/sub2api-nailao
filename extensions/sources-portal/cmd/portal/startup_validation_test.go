@@ -51,6 +51,110 @@ func TestWorkbenchURLsAllowSeparateCanonicalOrigins(t *testing.T) {
 	setup.store.Close()
 }
 
+func TestWorkbenchURLsRejectAmbiguousBrowserAuthorities(t *testing.T) {
+	cases := []struct {
+		name, authority string
+	}{
+		{"padded default port", "main.example:0443"},
+		{"long padded default port", "main.example:000443"},
+		{"fullwidth hostname", "ｍａｉｎ.example"},
+		{"ideographic dot", "main。example"},
+		{"fullwidth dot", "main．example"},
+		{"soft hyphen", "ma\u00adin.example"},
+		{"encoded unicode hostname", "%EF%BD%8D%EF%BD%81%EF%BD%89%EF%BD%8E.example"},
+		{"encoded ASCII hostname", "%6dain.example"},
+		{"backslash in authority", "main.example\\separate.example"},
+		{"trailing dot", "main.example."},
+		{"empty port", "main.example:"},
+		{"separate padded port", "separate.example:0443"},
+		{"separate unicode hostname", "ｓｅｐａｒａｔｅ.example"},
+		{"separate trailing dot", "separate.example."},
+		{"separate empty port", "separate.example:"},
+		{"numeric hostname suffix", "separate.1"},
+		{"hex hostname suffix", "separate.0x1"},
+	}
+	for _, variable := range []string{"STUDIO_URL", "CANVAS_URL"} {
+		for _, tc := range cases {
+			t.Run(variable+"/"+tc.name, func(t *testing.T) {
+				f := newCheckFixture(t)
+				writeFile(t, f.env["STUDIO_CONFIG_FILE"], "[]", 0600)
+				f.env[variable] = "https://" + tc.authority + "/workbench"
+				before := treeSnapshot(t, f.root)
+				want := errStudioURL
+				if variable == "CANVAS_URL" {
+					want = errCanvasURL
+				}
+				if code, stdout, stderr := runCheck(f); code != 1 || stdout != "" || stderr != want+"\n" {
+					t.Errorf("check: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+				}
+				setup, err := prepare(f.getenv, startState)
+				if setup != nil {
+					setup.store.Close()
+				}
+				if err == nil || err.Error() != want {
+					t.Errorf("start: got %v, want %q", err, want)
+				}
+				if !sameTree(before, treeSnapshot(t, f.root)) {
+					t.Error("rejected URL changed the state tree")
+				}
+			})
+		}
+	}
+}
+
+func TestWorkbenchURLsAllowCanonicalASCIIHosts(t *testing.T) {
+	for _, variable := range []string{"STUDIO_URL", "CANVAS_URL"} {
+		for _, authority := range []string{"SEPARATE.EXAMPLE:443", "main.example:444", "xn--bcher-kva.example"} {
+			t.Run(variable+"/"+authority, func(t *testing.T) {
+				f := newCheckFixture(t)
+				writeFile(t, f.env["STUDIO_CONFIG_FILE"], "[]", 0600)
+				f.env[variable] = "https://" + authority + "/workbench"
+				if code, _, stderr := runCheck(f); code != 0 {
+					t.Fatalf("check failed: %s", stderr)
+				}
+				setup, err := prepare(f.getenv, startState)
+				if err != nil {
+					t.Fatal(err)
+				}
+				setup.store.Close()
+			})
+		}
+	}
+}
+
+func TestMainOriginsRejectAmbiguousBrowserAuthorities(t *testing.T) {
+	for _, variable := range []string{"SUB_ORIGIN", "PORTAL_ORIGIN"} {
+		for _, authority := range []string{"main.example:0443", "main.example:000443", "ｍａｉｎ.example", "main.example."} {
+			t.Run(variable+"/"+authority, func(t *testing.T) {
+				f := newCheckFixture(t)
+				f.env[variable] = "https://" + authority
+				want := errPortalOrigin
+				if variable == "SUB_ORIGIN" {
+					// The main and Portal can otherwise agree on the same unsafe
+					// spelling and bypass a comparison with a canonical workbench URL.
+					f.env["PORTAL_ORIGIN"] = f.env[variable]
+					f.env["STUDIO_URL"] = "https://main.example/workbench"
+					want = errSubOrigin
+				}
+				before := treeSnapshot(t, f.root)
+				if code, stdout, stderr := runCheck(f); code != 1 || stdout != "" || stderr != want+"\n" {
+					t.Errorf("check: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+				}
+				setup, err := prepare(f.getenv, startState)
+				if setup != nil {
+					setup.store.Close()
+				}
+				if err == nil || err.Error() != want {
+					t.Errorf("start: got %v, want %q", err, want)
+				}
+				if !sameTree(before, treeSnapshot(t, f.root)) {
+					t.Error("rejected main origin changed the state tree")
+				}
+			})
+		}
+	}
+}
+
 func TestStudioConfigRequiresArray(t *testing.T) {
 	for _, content := range []string{"null", " \n null\t", "[]"} {
 		t.Run(content, func(t *testing.T) {

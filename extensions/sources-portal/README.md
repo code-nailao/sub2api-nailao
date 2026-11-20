@@ -34,7 +34,14 @@
 
 只把上述固定路径送到Portal，**`/api/v1/*`、`/v1/*`、登录及其它路由仍给原版 Sub**。不要把主站根路由或全部 `/api` 交给Portal。主站原自定义菜单照常创建；管理员可见只是入口控制，API检查不可省略。
 
-工作台静态客户端由 `STUDIO_URL` 指向固定HTTPS页面，必须独立origin（可以仍由同一Nginx提供静态文件，不增加业务服务），防止画布直接读取Main登录存储。工作台与 Canvas 的源均在规范化后与 Main 比较，大小写不同或显式写默认端口不构成独立源。每轮使用新iframe且校验窗口、origin、组ID、applied ACK；旧页面迟到消息不确认新授权。
+工作台静态客户端由 `STUDIO_URL` 指向固定HTTPS页面，必须独立origin（可以仍由同一Nginx提供静态文件，不增加业务服务），防止画布直接读取Main登录存储。工作台与 Canvas 的源统一采用保守校验：只对 ASCII 大小写和标准默认端口做规范化，再与 Main 比较；浏览器可能另作解释的主机或端口写法直接报配置错误。每轮使用新iframe且校验窗口、origin、组ID、applied ACK；旧页面迟到消息不确认新授权。
+
+`SUB_ORIGIN`、`PORTAL_ORIGIN`、`STUDIO_URL` 和 `CANVAS_URL` 参与这条同源边界时遵守相同规则：
+
+- 主机使用 ASCII DNS 名或规范的 IP 文本；域名标签只含字母、数字和连字符，标签首尾不能是连字符。不做 Unicode/IDNA 转换，非 ASCII、全角字符、Unicode 点号、末尾点号及其它含糊的 authority 写法直接拒绝；已用 ASCII 表达的 Punycode 域名可用。
+- 端口省略或使用不带前导零的十进制形式；显式空端口、前导零端口均拒绝。标准默认 HTTPS 端口与省略端口视为同源，规范的非默认端口仍可用。
+- 可能触发浏览器旧式 IPv4 解释的非规范地址、数值式域名尾标签，以及带 zone、映射地址或展开写法的非规范 IPv6 文本均拒绝。
+- 错误信息说明对应变量要求规范 ASCII 主机和端口，不回显配置值。正常启动与 `-check-config` 结果相同，这些地址配置校验失败时不写状态。
 
 无限画布通过可选 `CANVAS_URL` 指向真实 Canvas 静态客户端。例如 `https://YOUR_SEPARATE_CANVAS_ORIGIN/infinite/canvas`；构建必须设置 `VITE_BASE=/infinite/`，同一站点根路径保留 Studio。Canvas 必须与 Main 不同 origin。仅设置环境变量不会创建菜单或发布静态包；发布时还须固定 Canvas 制品、为 Main 增加 `/canvas` 用户菜单和上述 Portal 路由，并验证模型 API 的精确跨域白名单。原 `STUDIO_URL` 和工作台路由保持独立。
 

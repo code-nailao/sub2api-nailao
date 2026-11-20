@@ -29,8 +29,8 @@ const (
 // Start-up failure messages. The normal start and -check-config report the
 // same message for the same problem; none contains a secret or an env value.
 const (
-	errSubOrigin          = "SUB_ORIGIN must be a fixed HTTPS main-site origin"
-	errPortalOrigin       = "PORTAL_ORIGIN must be a fixed HTTPS extension origin"
+	errSubOrigin          = "SUB_ORIGIN must be a fixed HTTPS main-site origin with a canonical ASCII host and unpadded port"
+	errPortalOrigin       = "PORTAL_ORIGIN must be a fixed HTTPS extension origin with a canonical ASCII host and unpadded port"
 	errSameOrigin         = "Portal must use reviewed same-origin main-site routes"
 	errKeyFile            = "PORTAL_KEY_FILE must be an owner-only regular file"
 	errKeyRead            = "encryption key read failed"
@@ -52,9 +52,9 @@ const (
 	errStudioConfigRead   = "studio config unavailable"
 	errStudioConfig       = "invalid studio config"
 	errStudio             = "studio bindings initialization failed"
-	errStudioURL          = "fixed HTTPS STUDIO_URL required"
+	errStudioURL          = "STUDIO_URL requires a fixed HTTPS page with a canonical ASCII host and port (no Unicode, trailing dot or port padding)"
 	errStudioOrigin       = "STUDIO_URL must use a separate origin so the workbench cannot read Main login storage"
-	errCanvasURL          = "CANVAS_URL requires a fixed HTTPS page on a separate origin"
+	errCanvasURL          = "CANVAS_URL requires a fixed HTTPS page on a separate origin with a canonical ASCII host and port (no Unicode, trailing dot or port padding)"
 	errListener           = "extension HTTP listener unavailable"
 	errServer             = "extension HTTP server failed"
 )
@@ -145,11 +145,11 @@ func serve(getenv func(string) string, logger *log.Logger) int {
 // the server. On failure it releases the store it opened and returns the message.
 func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup, failure error) {
 	fail := func(message string) (*portalSetup, error) { return nil, startupError(message) }
-	sub, err := portal.CanonicalOrigin(getenv("SUB_ORIGIN"))
+	sub, err := canonicalBrowserOrigin(getenv("SUB_ORIGIN"))
 	if err != nil {
 		return fail(errSubOrigin)
 	}
-	public, err := portal.CanonicalOrigin(getenv("PORTAL_ORIGIN"))
+	public, err := canonicalBrowserOrigin(getenv("PORTAL_ORIGIN"))
 	if err != nil {
 		return fail(errPortalOrigin)
 	}
@@ -257,7 +257,7 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 		if e != nil || studio.Scheme != "https" || studio.Host == "" || studio.User != nil || studio.RawQuery != "" || studio.Fragment != "" {
 			return fail(errStudioURL)
 		}
-		studioOrigin, e := portal.CanonicalOrigin(studio.Scheme + "://" + studio.Host)
+		studioOrigin, e := canonicalBrowserOrigin(studio.Scheme + "://" + studio.Host)
 		if e != nil {
 			return fail(errStudioURL)
 		}
@@ -270,7 +270,7 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 			if e != nil || canvas.Scheme != "https" || canvas.Host == "" || canvas.User != nil || canvas.RawQuery != "" || canvas.Fragment != "" {
 				return fail(errCanvasURL)
 			}
-			canvasOrigin, e := portal.CanonicalOrigin(canvas.Scheme + "://" + canvas.Host)
+			canvasOrigin, e := canonicalBrowserOrigin(canvas.Scheme + "://" + canvas.Host)
 			if e != nil || canvasOrigin == sub {
 				return fail(errCanvasURL)
 			}
