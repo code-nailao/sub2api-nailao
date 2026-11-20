@@ -1,16 +1,32 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"sources.local/portal/internal/portal"
 )
+
+type shutdownLog struct {
+	bytes.Buffer
+	httpDrained chan struct{}
+}
+
+func (l *shutdownLog) Write(p []byte) (int, error) {
+	n, err := l.Buffer.Write(p)
+	if strings.HasPrefix(string(p), "Portal shutdown http_drained:") {
+		close(l.httpDrained)
+	}
+	return n, err
+}
 
 func TestShutdownKeepsStoreLockUntilAcceptedWriteAndWorkerComplete(t *testing.T) {
 	dir, key := t.TempDir(), make([]byte, 32)
@@ -30,9 +46,10 @@ func TestShutdownKeepsStoreLockUntilAcceptedWriteAndWorkerComplete(t *testing.T)
 	})}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	var logs bytes.Buffer
 	finished := make(chan error, 1)
 	go func() {
-		err := runPortal(ctx, server, listener, func(ctx context.Context) { <-ctx.Done(); close(workerStopped) })
+		err := runPortal(ctx, server, listener, func(ctx context.Context) { <-ctx.Done(); close(workerStopped) }, log.New(&logs, "", 0), nil)
 		_ = store.Close()
 		finished <- err
 	}()
@@ -85,6 +102,11 @@ func TestShutdownKeepsStoreLockUntilAcceptedWriteAndWorkerComplete(t *testing.T)
 	case <-time.After(3 * time.Second):
 		t.Fatal("shutdown did not finish")
 	}
+	for _, want := range []string{"Portal shutdown started: active_requests=1", "Portal shutdown background_stopped:", "Portal shutdown http_drained: active_requests=0", "Portal shutdown complete: active_requests=0 http_pending=false background_pending=false intelligence_round_active=false"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("missing shutdown state %q", want)
+		}
+	}
 	other, err := portal.OpenStore(dir, key)
 	if err != nil {
 		t.Fatal(err)
@@ -105,22 +127,31 @@ func TestShutdownKeepsStoreLockUntilBackgroundWorkerFinishes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	workerCancelled, release := make(chan struct{}), make(chan struct{})
+	logs := shutdownLog{httpDrained: make(chan struct{})}
+	var intelligenceBusy atomic.Bool
+	intelligenceBusy.Store(true)
 	finished := make(chan error, 1)
 	go func() {
 		err := runPortal(ctx, &http.Server{Handler: http.NotFoundHandler()}, listener, func(ctx context.Context) {
 			<-ctx.Done()
 			close(workerCancelled)
 			<-release
-		})
+			intelligenceBusy.Store(false)
+		}, log.New(&logs, "", 0), intelligenceBusy.Load)
 		_ = store.Close()
 		finished <- err
 	}()
 	cancel()
 	<-workerCancelled
 	select {
+	case <-logs.httpDrained:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP drain was not reported while the worker was active")
+	}
+	select {
 	case err := <-finished:
 		t.Fatalf("exited before background worker finished: %v", err)
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
 	if other, err := portal.OpenStore(dir, key); err == nil {
 		other.Close()
@@ -134,5 +165,10 @@ func TestShutdownKeepsStoreLockUntilBackgroundWorkerFinishes(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("shutdown did not finish")
+	}
+	for _, want := range []string{"Portal shutdown http_drained: active_requests=0 http_pending=false background_pending=true intelligence_round_active=true", "Portal shutdown complete: active_requests=0 http_pending=false background_pending=false intelligence_round_active=false"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("missing shutdown state %q", want)
+		}
 	}
 }

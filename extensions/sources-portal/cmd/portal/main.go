@@ -140,7 +140,7 @@ func serve(getenv func(string) string, logger *log.Logger) int {
 		return 1
 	}
 	logger.Print("Sources portal started; no main database connection")
-	if err := runPortal(ctx, httpServer, listener, setup.svc.Run); err != nil {
+	if err := runPortal(ctx, httpServer, listener, setup.svc.Run, logger, setup.svc.Intelligence.RoundActive); err != nil {
 		logger.Print(errServer)
 		return 1
 	}
