@@ -286,6 +286,9 @@ func (r *accountRepository) GetByID(ctx context.Context, id int64) (*service.Acc
 	if scoped := r.accountTransactionScope(ctx); scoped != r {
 		return scoped.GetByID(ctx, id)
 	}
+	if scoped := r.scopedOpenAIRefreshReader(ctx, id); scoped != r {
+		return scoped.GetByID(ctx, id)
+	}
 	m, err := r.client.Account.Query().Where(dbaccount.IDEQ(id)).Only(ctx)
 	if err != nil {
 		return nil, translatePersistenceError(err, service.ErrAccountNotFound, nil)
@@ -1731,6 +1734,13 @@ func (r *accountRepository) updateOAuthCredentialsIfUnchanged(
 	executor := r.sql
 	if tx := dbent.TxFromContext(ctx); tx != nil {
 		executor = tx.Client()
+	} else if session, _ := ctx.Value(scopedOpenAIRefreshSessionKey{}).(*scopedOpenAIRefreshSession); session != nil {
+		if session.accountID != id || platform != service.PlatformOpenAI {
+			return false, errors.New("credential write does not match the scoped OAuth refresh")
+		}
+		// The atomic update and outbox insert below are one autocommit
+		// transaction, under the persistence deadline rather than the lock wait.
+		executor = session.conn
 	}
 	result, err := executor.ExecContext(ctx, `
 		WITH updated AS (
@@ -4287,6 +4297,9 @@ func (r *accountRepository) RevertProxyFallback(ctx context.Context, accountID i
 // 软删除行由 SoftDeleteMixin 拦截器自动排除，无需手写 deleted_at IS NULL。
 func (r *accountRepository) ListShadowsByParent(ctx context.Context, parentID int64) ([]*service.Account, error) {
 	if scoped := r.accountTransactionScope(ctx); scoped != r {
+		return scoped.ListShadowsByParent(ctx, parentID)
+	}
+	if scoped := r.scopedOpenAIRefreshReader(ctx, parentID); scoped != r {
 		return scoped.ListShadowsByParent(ctx, parentID)
 	}
 	rows, err := r.client.Account.Query().

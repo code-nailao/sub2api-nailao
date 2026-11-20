@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 )
 
@@ -56,27 +55,9 @@ func (t *TavilyProvider) Search(ctx context.Context, req SearchRequest) (*Search
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	resp, err := t.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("tavily: request failed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode == http.StatusRequestTimeout {
-		return nil, searchSubmissionTimeout("tavily")
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
-	if err != nil {
-		return nil, fmt.Errorf("tavily: read body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("tavily: status %d: %s", resp.StatusCode, truncateBody(body))
-	}
-
 	var raw tavilyResponse
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("tavily: decode response: %w", err)
+	if err := searchJSON(t.httpClient, httpReq, tavilyProviderName, &raw); err != nil {
+		return nil, err
 	}
 
 	results := make([]SearchResult, 0, len(raw.Results))

@@ -87,9 +87,11 @@ func (r cancelAfterOAuthCAS) UpdateOpenAIOAuthCredentialsIfUnchanged(ctx context
 
 type scopedOAuthRotationClient struct {
 	service.OpenAIOAuthClient
+	checkExchange func(context.Context)
 }
 
-func (scopedOAuthRotationClient) RefreshTokenWithClientID(context.Context, string, string, string) (*openai.TokenResponse, error) {
+func (c scopedOAuthRotationClient) RefreshTokenWithClientID(ctx context.Context, _, _, _ string) (*openai.TokenResponse, error) {
+	c.checkExchange(ctx)
 	return &openai.TokenResponse{AccessToken: "fixture-next-access", RefreshToken: "fixture-next-refresh", ExpiresIn: 3600}, nil
 }
 
@@ -124,7 +126,9 @@ func TestScopedOAuthRotationPersistsAfterHTTPContextCancellation(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 
 	refreshAPI := service.NewOAuthRefreshAPI(cancelAfterOAuthCAS{accountRepository: repo, cancel: cancelRequest}, nil)
-	oauth := service.ProvideOpenAIOAuthService(nil, scopedOAuthRotationClient{}, nil, refreshAPI)
+	oauth := service.ProvideOpenAIOAuthService(nil, scopedOAuthRotationClient{checkExchange: func(ctx context.Context) {
+		require.Nil(t, dbent.TxFromContext(ctx), "the OAuth provider must run outside the credentials write transaction")
+	}}, nil, refreshAPI)
 	t.Cleanup(oauth.Stop)
 
 	updated, resErr := scoped.ScopedAdminWrite(requestCtx, account.ID, "accounts.refresh", nil, oauth.RefreshStoredAccount)
@@ -136,4 +140,9 @@ func TestScopedOAuthRotationPersistsAfterHTTPContextCancellation(t *testing.T) {
 	require.Equal(t, "fixture-next-access", durable.GetOpenAIAccessToken())
 	require.NoError(t, resErr)
 	require.Equal(t, durable.GetOpenAIRefreshToken(), updated.GetOpenAIRefreshToken())
+	var locks int
+	require.NoError(t, integrationDB.QueryRowContext(t.Context(), `
+		SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'
+		AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`).Scan(&locks))
+	require.Zero(t, locks, "no advisory lock may be left on a pooled session")
 }

@@ -410,6 +410,9 @@ func (m *Manager) getOrCreateHTTPClient(proxyURL string) (*http.Client, error) {
 // Returns error if proxyURL is invalid — never falls back to direct connection.
 func newHTTPClient(proxyURL string) (*http.Client, error) {
 	transport := &http.Transport{
+		// net/http may automatically replay a GET on a reused connection
+		// after the provider has already received it. Searches are paid.
+		DisableKeepAlives:     true,
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 		DialContext:           (&net.Dialer{Timeout: proxyDialTimeout}).DialContext,
 		TLSHandshakeTimeout:   proxyTLSTimeout,

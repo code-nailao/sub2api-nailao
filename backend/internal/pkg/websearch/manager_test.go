@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -100,6 +102,100 @@ func TestManagerDoesNotReplaySearchAfterHTTP408(t *testing.T) {
 			require.ErrorContains(t, err, "408")
 		})
 	}
+}
+
+func TestManagerOnlyFallsBackBeforeAnySearchCouldBeSent(t *testing.T) {
+	cases := []struct {
+		name       string
+		send       bool
+		status     int
+		body       string
+		writeError error
+	}{
+		{name: "confirmed-preconnect-timeout"},
+		{name: "timeout-after-write", send: true},
+		{name: "ambiguous-partial-write", send: true, writeError: io.ErrShortWrite},
+		{name: "provider-error-response", send: true, status: http.StatusServiceUnavailable, body: `{}`},
+		{name: "broken-response", send: true, status: http.StatusOK, body: `{`},
+	}
+	for _, first := range []string{"exa", "brave", "tavily"} {
+		for _, tc := range cases {
+			t.Run(first+"/"+tc.name, func(t *testing.T) {
+				backup := "tavily"
+				if first == backup {
+					backup = "exa"
+				}
+				manager := NewManager([]ProviderConfig{{Type: first, APIKey: "fixture-first"}, {Type: backup, APIKey: "fixture-backup"}}, nil)
+				calls := 0
+				manager.clientCache[""] = &http.Client{Transport: exaRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					calls++
+					trace := httptrace.ContextClientTrace(req.Context())
+					if trace != nil && trace.GetConn != nil {
+						trace.GetConn(req.URL.Host)
+					}
+					if calls == 1 {
+						if tc.send && trace != nil && trace.WroteRequest != nil {
+							trace.WroteRequest(httptrace.WroteRequestInfo{Err: tc.writeError})
+						}
+						if tc.status == 0 {
+							if tc.writeError != nil {
+								return nil, tc.writeError
+							}
+							return nil, context.DeadlineExceeded
+						}
+						return &http.Response{StatusCode: tc.status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+				})}
+
+				result, provider, err := manager.SearchWithBestProvider(t.Context(), SearchRequest{Query: "fixture"})
+
+				if tc.send {
+					require.Equal(t, 1, calls, "a possibly sent search must never reach the backup provider")
+					require.Nil(t, result)
+					require.ErrorIs(t, err, ErrSearchOutcomeUnknown)
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, 2, calls)
+					require.Equal(t, backup, provider)
+				}
+			})
+		}
+	}
+}
+
+func TestSearchTransportDoesNotReplayWrittenGET(t *testing.T) {
+	var received atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if received.Add(1) == 2 {
+			// The request reached the provider, but the connection fails
+			// before it returns the response headers.
+			conn, _, err := http.NewResponseController(w).Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+	client, err := newHTTPClient("")
+	require.NoError(t, err)
+	defer client.CloseIdleConnections()
+	search := func() error {
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, nil)
+		require.NoError(t, err)
+		var response map[string]any
+		return searchJSON(client, request, "fixture", &response)
+	}
+	require.NoError(t, search(), "warm a keep-alive connection if permitted")
+
+	err = search()
+
+	require.Equal(t, int32(2), received.Load(), "the HTTP transport must not reissue a search already received by the server")
+	require.ErrorIs(t, err, ErrSearchOutcomeUnknown)
 }
 
 func TestManager_SearchWithBestProvider_NilRedis(t *testing.T) {

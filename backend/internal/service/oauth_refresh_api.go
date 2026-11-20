@@ -326,13 +326,20 @@ func (api *OAuthRefreshAPI) refresh(
 		// validated an existing token also needs a conditional write.
 		durableAccount, applied, persistErr := persistOpenAIRefreshCredentials(ctx, api.accountRepo, attemptedAccount, newCredentials)
 		if applied && api.tokenCache != nil {
-			AfterAccountCommit(ctx, func(committed context.Context) {
+			clearTokenCache := func(committed context.Context) {
 				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(committed), defaultRefreshPostPersistCleanupTimeout)
 				defer cancel()
 				if err := api.tokenCache.DeleteAccessToken(cleanupCtx, cacheKey); err != nil {
 					slog.Warn("oauth_refresh_post_persist_cache_delete_failed", "account_id", account.ID, "error", err)
 				}
-			})
+			}
+			if dbent.TxFromContext(ctx) != nil {
+				AfterAccountCommit(ctx, clearTokenCache)
+			} else {
+				// The independent write has committed. Clear the cache before
+				// releasing the shared OAuth refresh lock.
+				clearTokenCache(ctx)
+			}
 		}
 		if persistErr != nil {
 			return nil, persistErr

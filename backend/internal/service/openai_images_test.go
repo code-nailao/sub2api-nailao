@@ -1010,6 +1010,9 @@ func TestPaidGatewaySubmission408IsTerminal(t *testing.T) {
 		{"openai-responses-search", PlatformOpenAI, "/v1/responses", `{"model":"gpt-5","input":"fixture","tools":[{"type":"web_search"}]}`, false},
 		{"openai-passthrough-search", PlatformOpenAI, "/v1/responses", `{"model":"gpt-5","input":"fixture","tools":[{"type":"web_search_preview"}]}`, true},
 		{"grok-responses-search", PlatformGrok, "/v1/responses", `{"model":"grok-4.6","input":"fixture","tools":[{"type":"web_search"}]}`, false},
+		{"openai-responses-files", PlatformOpenAI, "/v1/responses", `{"model":"gpt-5","input":"fixture","tools":[{"type":"file_search","vector_store_ids":["vs_fixture"]}]}`, false},
+		{"grok-responses-collections", PlatformGrok, "/v1/responses", `{"model":"grok-4.6","input":"fixture","tools":[{"type":"collections_search","collection_ids":["fixture"]}]}`, false},
+		{"grok-responses-mcp", PlatformGrok, "/v1/responses", `{"model":"grok-4.6","input":"fixture","tools":[{"type":"mcp","server_label":"fixture","server_url":"https://fixture.example/mcp"}]}`, false},
 		{"grok-images", PlatformGrok, "/v1/images/generations", `{"model":"grok-imagine-image","prompt":"fixture"}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

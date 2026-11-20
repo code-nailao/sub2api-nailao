@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 )
@@ -76,27 +75,9 @@ func (e *ExaProvider) Search(ctx context.Context, req SearchRequest) (*SearchRes
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-api-key", e.apiKey)
 
-	resp, err := e.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("exa: request failed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode == http.StatusRequestTimeout {
-		return nil, searchSubmissionTimeout("exa")
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
-	if err != nil {
-		return nil, fmt.Errorf("exa: read body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("exa: status %d: %s", resp.StatusCode, truncateBody(body))
-	}
-
 	var raw exaResponse
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("exa: decode response: %w", err)
+	if err := searchJSON(e.httpClient, httpReq, exaProviderName, &raw); err != nil {
+		return nil, err
 	}
 
 	results := make([]SearchResult, 0, len(raw.Results))

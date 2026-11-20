@@ -4,17 +4,23 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"maps"
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"entgo.io/ent/dialect"
 	entsql "entgo.io/ent/dialect/sql"
+	"github.com/DATA-DOG/go-sqlmock"
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/adminaccess"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/stretchr/testify/require"
 )
 
@@ -322,4 +328,90 @@ func TestScopedAdminCreateWithCredentialWriteDoesNotRequireRead(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT count(*) FROM accounts WHERE id=$1`, account.ID).Scan(&count))
 	require.Equal(t, 1, count)
 	require.False(t, p.Policy.AllowsAccount("accounts.read", scopedAccountResource(account)))
+}
+
+type slowScopedRefreshRepo struct {
+	AccountRepository
+	account       Account
+	persistBudget time.Duration
+	casErr        error
+}
+
+func (r *slowScopedRefreshRepo) GetByID(context.Context, int64) (*Account, error) {
+	copy := r.account
+	copy.Credentials = maps.Clone(copy.Credentials)
+	return &copy, nil
+}
+
+func (*slowScopedRefreshRepo) ListShadowsByParent(context.Context, int64) ([]*Account, error) {
+	return nil, nil
+}
+
+func (*slowScopedRefreshRepo) WithScopedOpenAIRefreshLocks(ctx context.Context, _ int64, run func(context.Context) error) error {
+	time.Sleep(55 * time.Second)
+	return run(ctx)
+}
+
+func (r *slowScopedRefreshRepo) UpdateOpenAIOAuthCredentialsIfUnchanged(ctx context.Context, _ int64, expected map[string]any, _ *int64, credentials map[string]any) (bool, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		r.persistBudget = time.Until(deadline)
+	}
+	if tx := dbent.TxFromContext(ctx); tx != nil {
+		// The old path still has the transaction opened before its lock wait.
+		_, r.casErr = tx.Client().ExecContext(ctx, "SELECT 1")
+		if r.casErr != nil {
+			return false, r.casErr
+		}
+	}
+	if !reflect.DeepEqual(expected, r.account.Credentials) {
+		return false, nil
+	}
+	r.account.Credentials = maps.Clone(credentials)
+	return true, nil
+}
+
+type slowScopedOAuthExchange struct{ OpenAIOAuthClient }
+
+func (slowScopedOAuthExchange) RefreshTokenWithClientID(context.Context, string, string, string) (*openai.TokenResponse, error) {
+	time.Sleep(6 * time.Second)
+	synctest.Wait() // Let database/sql expire the old transaction, if present.
+	return &openai.TokenResponse{AccessToken: "fixture-rotated-access", RefreshToken: "fixture-rotated-refresh", ExpiresIn: 3600}, nil
+}
+
+func TestScopedOpenAIRefreshSaveGetsFreshDeadlineAfterLockWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		require.NoError(t, err)
+		defer func() { _ = db.Close() }()
+		// The old implementation opens this transaction before it waits.
+		mock.ExpectBegin()
+		mock.ExpectExec("SELECT pg_advisory_xact_lock").WillDelayFor(55 * time.Second).WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectExec("SELECT id FROM accounts").WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec("SELECT account_id FROM account_groups").WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectRollback()
+		repo := &slowScopedRefreshRepo{account: Account{
+			ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive,
+			Credentials: map[string]any{"access_token": "fixture-before-access", "refresh_token": "fixture-before-refresh"},
+		}}
+		admin := &adminServiceImpl{entClient: dbent.NewClient(dbent.Driver(entsql.OpenDB(dialect.Postgres, db))), accountRepo: repo}
+		oauth := ProvideOpenAIOAuthService(nil, slowScopedOAuthExchange{}, nil, NewOAuthRefreshAPI(repo, nil))
+		defer oauth.Stop()
+		principal := &adminaccess.Principal{Policy: adminaccess.Policy{Rules: []adminaccess.Rule{{
+			AccountTypes: []string{AccountTypeOAuth}, Platforms: []string{PlatformOpenAI}, IncludeUngrouped: true,
+			Permissions: []string{"accounts.refresh"},
+		}}}}
+		ctx, cancel := context.WithTimeout(adminaccess.WithPrincipal(t.Context(), principal), 60*time.Second)
+		defer cancel()
+		started := time.Now()
+
+		result, err := admin.ScopedAdminWrite(ctx, repo.account.ID, "accounts.refresh", nil, oauth.RefreshStoredAccount)
+
+		require.Equal(t, "fixture-rotated-refresh", repo.account.GetOpenAIRefreshToken(), "durable after lock wait and independent exchange: %v (expired transaction: %v)", err, errors.Is(repo.casErr, sql.ErrTxDone))
+		require.NoError(t, err)
+		require.Equal(t, "fixture-rotated-access", result.GetOpenAIAccessToken())
+		require.Equal(t, 61*time.Second, time.Since(started))
+		require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+		require.Equal(t, defaultOpenAIRefreshPersistTimeout, repo.persistBudget)
+	})
 }

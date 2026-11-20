@@ -387,7 +387,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			// a failover so the handler switches to a healthy account.
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true)
 		}
-		if resp.StatusCode == http.StatusRequestTimeout && !imageIntent && responsesSubmissionHasSearchTool(body) {
+		if resp.StatusCode == http.StatusRequestTimeout && !imageIntent && responsesSubmissionMayRunHostedTools(body) {
 			_ = resp.Body.Close()
 			return stopPaidSubmissionAfterTimeout(c)
 		}

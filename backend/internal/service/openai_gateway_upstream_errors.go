@@ -19,30 +19,48 @@ import (
 	"go.uber.org/zap"
 )
 
-// responsesSubmissionHasSearchTool looks only at tool declarations that can
-// request a hosted search. Search items replayed as history are not submissions.
-func responsesSubmissionHasSearchTool(body []byte) bool {
+// responsesSubmissionMayRunHostedTools examines tool declarations, excluding
+// historical search results. An unrecognized tool is treated conservatively
+// because the gateway cannot tell whether the provider executes it.
+func responsesSubmissionMayRunHostedTools(body []byte) bool {
 	if gjson.GetBytes(body, "tool_choice").String() == "none" {
 		return false
 	}
-	containsSearch := func(tools gjson.Result) bool {
-		if !tools.IsArray() {
-			return false
-		}
-		for _, tool := range tools.Array() {
-			typ := tool.Get("type").String()
-			if isOpenAIWebSearchToolType(typ) || typ == "x_search" {
-				return true
-			}
-		}
-		return false
-	}
-	if containsSearch(gjson.GetBytes(body, "tools")) {
+	if responsesToolsMayRunOnProvider(gjson.GetBytes(body, "tools")) {
 		return true
 	}
 	for _, item := range gjson.GetBytes(body, "input").Array() {
-		if item.Get("type").String() == openAIAdditionalToolsItemType && containsSearch(item.Get("tools")) {
+		if item.Get("type").String() == openAIAdditionalToolsItemType && responsesToolsMayRunOnProvider(item.Get("tools")) {
 			return true
+		}
+	}
+	return false
+}
+
+func responsesToolsMayRunOnProvider(tools gjson.Result) bool {
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		switch strings.TrimSpace(tool.Get("type").String()) {
+		case "", "function", "custom", "local_shell", "computer", "computer_use_preview", "apply_patch":
+			// These tools return a call for the client to execute.
+		case "namespace":
+			if responsesToolsMayRunOnProvider(tool.Get("tools")) {
+				return true
+			}
+		case "web_search", "web_search_preview", "web_search_preview_2025_03_11", "web_search_2025_08_26", "x_search", "web_fetch", "google_search":
+			return true // Hosted public or social web retrieval.
+		case "file_search", "collections_search", "attachment_search":
+			return true // Hosted private data retrieval.
+		case "mcp":
+			return true // The provider may query a connector.
+		case "tool_search":
+			if tool.Get("execution").String() != "client" {
+				return true
+			}
+		default:
+			return true // Other hosted tools and provider extensions may already have run.
 		}
 	}
 	return false
