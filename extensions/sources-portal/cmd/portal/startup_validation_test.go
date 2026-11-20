@@ -1,25 +1,32 @@
 package main
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
 func TestWorkbenchURLsRejectCanonicalMainOrigin(t *testing.T) {
+	cases := []struct{ name, main, page string }{
+		{"uppercase domain", "https://main.example", "https://MAIN.EXAMPLE/workbench"},
+		{"uppercase scheme", "https://main.example", "HTTPS://main.example/workbench"},
+		{"explicit default port", "https://main.example", "https://main.example:443/workbench"},
+		{"mixed case with default port", "https://main.example", "HTTPS://MAIN.EXAMPLE:443/workbench"},
+		// Use the documentation prefix 3fff::/20 for a Main IP literal.
+		{"IPv6 case and default port", "https://[3fff::ab]", "HTTPS://[3FFF::AB]:443/workbench"},
+		{"expanded IPv6 page", "https://[3fff::ab]", "https://[3fff:0000:0:0:0:0:0:00ab]/workbench"},
+		{"expanded IPv6 main", "https://[3fff:0000:0:0:0:0:0:00ab]", "https://[3fff::ab]/workbench"},
+	}
 	for _, variable := range []string{"STUDIO_URL", "CANVAS_URL"} {
-		for _, value := range []string{
-			"https://MAIN.EXAMPLE/workbench",
-			"HTTPS://main.example/workbench",
-			"https://main.example:443/workbench",
-			"HTTPS://MAIN.EXAMPLE:443/workbench",
-		} {
-			t.Run(variable+"/"+value, func(t *testing.T) {
+		for _, tc := range cases {
+			t.Run(variable+"/"+tc.name, func(t *testing.T) {
 				f := newCheckFixture(t)
-				f.env[variable] = value
+				f.env["SUB_ORIGIN"], f.env["PORTAL_ORIGIN"] = tc.main, tc.main
+				f.env[variable] = tc.page
 				want := errStudioOrigin
 				if variable == "CANVAS_URL" {
-					want = errCanvasURL
+					want = errCanvasOrigin
 				}
 				if code, stdout, stderr := runCheck(f); code != 1 || stdout != "" || stderr != want+"\n" {
 					t.Errorf("check: code=%d stdout=%q stderr=%q", code, stdout, stderr)
@@ -33,6 +40,28 @@ func TestWorkbenchURLsRejectCanonicalMainOrigin(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestBrowserOriginKeepsSchemeAndNormalizesItsDefaultPort(t *testing.T) {
+	parse := func(raw string) string {
+		t.Helper()
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		origin, err := canonicalBrowserOrigin(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return origin
+	}
+	http := parse("http://main.example")
+	if got := parse("HTTP://MAIN.EXAMPLE:80/workbench"); got != http {
+		t.Fatalf("HTTP default port made a separate origin: %s vs %s", got, http)
+	}
+	if got := parse("https://main.example:80"); got == http {
+		t.Fatal("HTTP and HTTPS on the same host and port were treated as the same origin")
 	}
 }
 
@@ -72,6 +101,10 @@ func TestWorkbenchURLsRejectAmbiguousBrowserAuthorities(t *testing.T) {
 		{"separate empty port", "separate.example:"},
 		{"numeric hostname suffix", "separate.1"},
 		{"hex hostname suffix", "separate.0x1"},
+		{"IPv4 padded octet", "127.000.0.1"},
+		{"IPv4 octal octet", "0177.0.0.1"},
+		{"IPv4 hex octet", "0x7f.0.0.1"},
+		{"IPv4 omitted octets", "127.1"},
 	}
 	for _, variable := range []string{"STUDIO_URL", "CANVAS_URL"} {
 		for _, tc := range cases {
@@ -104,7 +137,10 @@ func TestWorkbenchURLsRejectAmbiguousBrowserAuthorities(t *testing.T) {
 
 func TestWorkbenchURLsAllowCanonicalASCIIHosts(t *testing.T) {
 	for _, variable := range []string{"STUDIO_URL", "CANVAS_URL"} {
-		for _, authority := range []string{"SEPARATE.EXAMPLE:443", "main.example:444", "xn--bcher-kva.example"} {
+		for _, authority := range []string{
+			"SEPARATE.EXAMPLE:443", "main.example:444", "xn--bcher-kva.example",
+			"192.168.0.0", "[fd00::1]", "127.0.0.1", "[::1]", "localhost",
+		} {
 			t.Run(variable+"/"+authority, func(t *testing.T) {
 				f := newCheckFixture(t)
 				writeFile(t, f.env["STUDIO_CONFIG_FILE"], "[]", 0600)
@@ -226,11 +262,15 @@ func TestInvalidStartupConfigDoesNotModifyState(t *testing.T) {
 		{"studio engine", file("STUDIO_CONFIG_FILE", `[{"group_id":1,"engine":"other","models":["model"]}]`, 0600), errStudio},
 		{"legacy media engine", set("SOURCES_MEDIA_ENGINE_LEGACY_NAME", "sub2api"), errStudio},
 		{"studio URL", set("STUDIO_URL", ""), errStudioURL},
+		{"studio URL http", set("STUDIO_URL", "http://studio.example/workbench"), errStudioURL},
 		{"studio main origin", set("STUDIO_URL", "https://MAIN.EXAMPLE:443/studio"), errStudioOrigin},
 		{"canvas URL", set("CANVAS_URL", "http://canvas.example/canvas"), errCanvasURL},
-		{"canvas main origin", set("CANVAS_URL", "https://MAIN.EXAMPLE:443/canvas"), errCanvasURL},
-		{"listener", set("PORTAL_LISTEN", "invalid-listener"), errListener},
-		{"listener service", set("PORTAL_LISTEN", ":invalid-service"), errListener},
+		{"canvas main origin", set("CANVAS_URL", "https://MAIN.EXAMPLE:443/canvas"), errCanvasOrigin},
+		{"listener", set("PORTAL_LISTEN", "invalid-listener"), errListenAddress},
+		{"listener service", set("PORTAL_LISTEN", ":invalid-service"), errListenAddress},
+		{"listener named port", set("PORTAL_LISTEN", ":http"), errListenAddress},
+		{"listener empty port", set("PORTAL_LISTEN", ":"), errListenAddress},
+		{"listener host", set("PORTAL_LISTEN", "bad host:0"), errListenAddress},
 	}
 	for _, tc := range cases {
 		for _, missing := range []bool{false, true} {
@@ -245,6 +285,12 @@ func TestInvalidStartupConfigDoesNotModifyState(t *testing.T) {
 				}
 				tc.mutate(t, f)
 				before := treeSnapshot(t, f.root)
+				if code, stdout, stderr := runCheck(f); code != 1 || stdout != "" || stderr != tc.want+"\n" {
+					t.Errorf("check: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+				}
+				if !sameTree(before, treeSnapshot(t, f.root)) {
+					t.Error("check with invalid configuration changed the state tree")
+				}
 				setup, err := prepare(f.getenv, startState)
 				if setup != nil {
 					setup.store.Close()
@@ -253,10 +299,7 @@ func TestInvalidStartupConfigDoesNotModifyState(t *testing.T) {
 					t.Errorf("start: got %v, want %q", err, tc.want)
 				}
 				if !sameTree(before, treeSnapshot(t, f.root)) {
-					t.Error("invalid configuration changed the state tree")
-				}
-				if code, stdout, stderr := runCheck(f); code != 1 || stdout != "" || stderr != tc.want+"\n" {
-					t.Errorf("check: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+					t.Error("start with invalid configuration changed the state tree")
 				}
 			})
 		}
