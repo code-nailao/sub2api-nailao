@@ -293,7 +293,7 @@ class DeployTest(unittest.TestCase):
 
     def hold(self):
         self.deploy(hold_before_switch=True)
-        return self.state()["paused"]
+        return self.state()["in_progress"]
 
     def upstreams_for(self, view):
         return deploy.render_upstreams(*(view["ports"][role] for role in deploy.ROLES))
@@ -349,8 +349,8 @@ class DeployTest(unittest.TestCase):
         self.assert_live_release(target)
         self.assertEqual(LEGACY, self.state()["current"])
         progress = self.state()["in_progress"]
-        self.assertEqual("guard", progress["step"])
-        self.assertIn("KeyboardInterrupt", progress["failed"])
+        self.assertEqual("guard", progress["failed_step"])
+        self.assertIn("KeyboardInterrupt", progress["reason"])
 
     def test_resume_busy_or_unreserved_background_port_keeps_pause(self):
         paused = self.hold()
@@ -366,8 +366,7 @@ class DeployTest(unittest.TestCase):
                     deploy.Deployer(self.cfg, self.ops).resume()
                 self.assertEqual([], self.ops.commands[before:])
                 self.assert_live_release(LEGACY)
-                self.assertEqual(paused, self.state()["paused"])
-                self.assertIsNone(self.state()["in_progress"])
+                self.assertEqual(paused, self.state()["in_progress"])
 
     def test_background_start_error_recovers_after_old_owner_exits(self):
         # The address can become busy after the preflight check. Test both
@@ -395,7 +394,6 @@ class DeployTest(unittest.TestCase):
                 self.assert_live_release(LEGACY)
                 self.assertEqual(LEGACY, self.state()["current"])
                 self.assertIsNone(self.state()["in_progress"])
-                self.assertIsNone(self.state().get("paused"))
                 info = self.ops.inspect(LEGACY["containers"]["background"])
                 self.assertEqual("unless-stopped", info["HostConfig"]["RestartPolicy"]["Name"])
 
@@ -438,7 +436,8 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(self.upstreams_for(LEGACY), self.ops.loaded_upstreams)
         self.assertTrue(all(not self.ops.inspect(name)["State"]["Running"] for name in attempted))
         self.assertEqual(LEGACY, self.state()["current"])
-        self.assertIn("failed", self.state()["in_progress"])
+        self.assertEqual("failed", self.state()["in_progress"]["phase"])
+        self.assertTrue(self.state()["in_progress"]["reason"])
 
     def test_main_cleanup_drains_and_verifies_removal(self):
         target = self.cfg.slot_view("a")
@@ -461,8 +460,8 @@ class DeployTest(unittest.TestCase):
                 self.deploy()
         self.assertTrue(removal_attempts)
         self.assert_live_release(LEGACY)
-        self.assertIn("cleanup incomplete", self.state()["in_progress"]["failed"])
-        self.assertIn("still exists", self.state()["in_progress"]["failed"])
+        self.assertIn("cleanup incomplete", self.state()["in_progress"]["reason"])
+        self.assertIn("still exists", self.state()["in_progress"]["reason"])
         self.assertFalse(self.ops.inspect(name)["State"]["Running"])
 
     def test_main_missing_create_identity_leaves_progress_for_manual_cleanup(self):
@@ -481,9 +480,10 @@ class DeployTest(unittest.TestCase):
                 self.deploy()
         self.assert_live_release(LEGACY)
         self.assertIsNotNone(self.ops.inspect(name))
-        self.assertIn("failed", self.state()["in_progress"])
+        self.assertEqual("failed", self.state()["in_progress"]["phase"])
+        self.assertTrue(self.state()["in_progress"]["reason"])
 
-    def test_main_records_timeout_and_interrupt_after_progress_is_written(self):
+    def test_hold_records_preparation_timeout_and_interrupt_after_progress_is_written(self):
         run = self.ops.run
         initial = self.state()
         for failure in (subprocess.TimeoutExpired([], 1), KeyboardInterrupt()):
@@ -497,21 +497,63 @@ class DeployTest(unittest.TestCase):
 
                 with mock.patch.object(self.ops, "run", fail):
                     with self.assertRaises(deploy.FallbackFailed):
-                        self.deploy()
+                        self.deploy(hold_before_switch=True)
                 self.assert_live_release(LEGACY)
                 self.assertEqual(LEGACY, self.state()["current"])
-                self.assertIn(type(failure).__name__, self.state()["in_progress"]["failed"])
+                self.assertIn(type(failure).__name__, self.state()["in_progress"]["reason"])
                 self.assertEqual("failed", self.history()[-1]["result"])
                 self.assertFalse(self.created())
+
+    def test_watch_detects_abandoned_deploy_and_rejects_reused_process_identity(self):
+        pid = os.getpid()
+        stat = f"/proc/{pid}/stat"
+        boot = "/proc/sys/kernel/random/boot_id"
+
+        def process_stat(start, state="R"):
+            return f"{pid} (release (fixture)) {state} " + "0 " * 18 + f"{start} 0\n"
+
+        self.ops.files[boot] = "fixture-boot\n"
+        self.ops.files[stat] = process_stat("first-start")
+        run = self.ops.run
+
+        def interrupt_after_mark(args, **kw):
+            if args[0] == "install":
+                self.assertEqual("deploying", self.state()["in_progress"]["phase"])
+                self.assertTrue(deploy.status(self.cfg, self.ops)["in_progress"]["process_running"])
+                self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
+                raise subprocess.TimeoutExpired(args, 1)
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", interrupt_after_mark):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.deploy()
+        progress = self.state()["in_progress"]
+        self.assertEqual("deploying", progress["phase"])
+        self.assertEqual("first-start", progress["process"]["started_at_tick"])
+        self.assertEqual([], self.history())
+        for process_status in (None, process_stat("later-start"), process_stat("first-start", "Z")):
+            with self.subTest(process_status=process_status):
+                if process_status is None:
+                    del self.ops.files[stat]
+                else:
+                    self.ops.files[stat] = process_status
+                result = deploy.watch_once(self.cfg, self.ops, {})
+                self.assertEqual(["release_incomplete"], result[0]["alert"])
+                self.assertFalse(deploy.status(self.cfg, self.ops)["in_progress"]["process_running"])
+        self.ops.files[stat] = process_stat("first-start")
+        self.ops.files[boot] = "another-boot\n"
+        self.assertEqual(["release_incomplete"], deploy.watch_once(self.cfg, self.ops, {})[0]["alert"])
+        self.assertEqual(progress, self.state()["in_progress"])
+        self.assert_live_release(LEGACY)
 
     def test_hold_keeps_traffic_background_and_internal_alias_on_previous_release(self):
         upstream = self.ops.files[self.cfg.upstream_file]
         paused = self.hold()
-        self.assertEqual("ready", paused["phase"])
+        self.assertEqual("held", paused["phase"])
         self.assertEqual("new@sha256:2", paused["target"]["image"])
-        self.assertIn("since", paused)
+        self.assertIn("held_at", paused)
+        self.assertNotIn("paused", self.state())
         self.assertEqual(set(deploy.SERVING_ROLES), set(paused["containers"]))
-        self.assertIsNone(self.state()["in_progress"])
         self.assertEqual(LEGACY, self.state()["current"])
         self.assertEqual(upstream, self.ops.files[self.cfg.upstream_file])
         self.assertFalse(self.ops.switched)
@@ -534,7 +576,6 @@ class DeployTest(unittest.TestCase):
                 self.ops.unready_ports = {self.cfg.slots["a"]["standby"]} if failure == "serving" else set()
                 with self.assertRaises(deploy.DeployError):
                     self.deploy(hold_before_switch=True)
-                self.assertFalse(self.state().get("paused"))
                 self.assertIsNone(self.state()["in_progress"])
                 self.assertTrue(self.ops.containers["old-bg"]["State"]["Running"])
                 self.assertNotIn("sources-main-a-serving", self.ops.containers)
@@ -554,7 +595,6 @@ class DeployTest(unittest.TestCase):
             self.assertEqual(1, finish.call_count, "hold stops before the shared switch pipeline")
             deploy.Deployer(self.cfg, self.ops).resume()
             self.assertEqual(2, finish.call_count)
-        self.assertFalse(self.state().get("paused"))
         self.assertIsNone(self.state()["in_progress"])
         self.assertEqual("b", self.state()["current"]["slot"])
         self.assertEqual("resume", self.history()[-1]["action"])
@@ -622,7 +662,7 @@ class DeployTest(unittest.TestCase):
                     with self.assertRaises(deploy.DeployError):
                         deploy.Deployer(self.cfg, self.ops).resume()
                 self.assertEqual([], self.ops.commands)
-                self.assertEqual(paused, self.state()["paused"])
+                self.assertEqual(paused, self.state()["in_progress"])
                 self.assertFalse(self.ops.switched)
         self.ops.containers[name] = original
         self.ops.unready_ports.clear()
@@ -643,7 +683,29 @@ class DeployTest(unittest.TestCase):
         self.ops.containers["old-bg"]["State"]["Running"] = False
         with self.assertRaises(deploy.DeployError):
             deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertEqual("ready", self.state()["paused"]["phase"])
+        self.assertEqual("held", self.state()["in_progress"]["phase"])
+
+    def test_resume_rechecks_nginx_memory_and_public_health_without_mutating(self):
+        held = self.hold()
+        for failure in ("fixed upstream names", "MemAvailable", "public health check"):
+            with self.subTest(failure=failure):
+                self.ops.public_status = 503 if failure == "public health check" else 200
+                self.ops.nginx_dump = "" if failure == "fixed upstream names" else FIXED_NGINX
+                before = len(self.ops.commands)
+                available = GIB if failure == "MemAvailable" else self.ops.meminfo_available()
+                with mock.patch.object(self.ops, "meminfo_available", return_value=available):
+                    with self.assertRaisesRegex(deploy.DeployError, failure):
+                        deploy.Deployer(self.cfg, self.ops).resume()
+                self.assertEqual([[self.cfg.nginx_bin, "-T"]], self.ops.commands[before:])
+                self.assertEqual(held, self.state()["in_progress"])
+                self.assert_live_release(LEGACY)
+
+    def test_resume_honors_public_health_override_recorded_at_hold(self):
+        self.deploy(hold_before_switch=True, allow_public_health_failure=True)
+        self.ops.public_status = 503
+        self.ops.public_status_after_reload = 200
+        deploy.Deployer(self.cfg, self.ops).resume()
+        self.assert_live_release(self.state()["current"])
         self.assertIsNone(self.state()["in_progress"])
 
     def test_resume_background_failure_restores_old_owner_and_clears_pause(self):
@@ -651,9 +713,8 @@ class DeployTest(unittest.TestCase):
         self.ops.unready_ports.add(self.cfg.slots["a"]["background"])
         with self.assertRaisesRegex(deploy.DeployError, "previous background .* running again"):
             deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertFalse(self.state().get("paused"))
         self.assertIsNone(self.state()["in_progress"])
-        self.assertTrue(self.ops.containers["old-bg"]["State"]["Running"])
+        self.assert_live_release(LEGACY)
         self.assertFalse(self.ops.switched)
 
     def test_resume_guard_failure_restores_traffic_and_background(self):
@@ -661,19 +722,18 @@ class DeployTest(unittest.TestCase):
         self.ops.memory_after_switch = 20 * GIB
         with self.assertRaisesRegex(deploy.DeployError, "guard failed"):
             deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertFalse(self.state().get("paused"))
         self.assertIsNone(self.state()["in_progress"])
         self.assertEqual(LEGACY, self.state()["current"])
         self.assertFalse(self.ops.containers["sources-main-a-serving"]["State"]["Running"])
-        self.assertTrue(self.ops.containers["old-bg"]["State"]["Running"])
+        self.assert_live_release(LEGACY)
 
     def test_resume_unrestored_failure_is_never_reported_as_a_pause(self):
         self.hold()
         self.ops.drain_seconds["old-bg"] = float("inf")
         with self.assertRaises(deploy.FallbackFailed):
             deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertFalse(self.state().get("paused"))
-        self.assertIn("failed", self.state()["in_progress"])
+        self.assertEqual("failed", self.state()["in_progress"]["phase"])
+        self.assertTrue(self.state()["in_progress"]["reason"])
         self.assertTrue(any("release_incomplete" in alert["alert"]
                             for alert in deploy.watch_once(self.cfg, self.ops, {})))
         for action in ("resume", "abort"):
@@ -684,7 +744,6 @@ class DeployTest(unittest.TestCase):
         self.hold()
         upstream = self.ops.files[self.cfg.upstream_file]
         deploy.Deployer(self.cfg, self.ops).abort()
-        self.assertFalse(self.state().get("paused"))
         self.assertIsNone(self.state()["in_progress"])
         self.assertEqual(set(LEGACY["containers"].values()), set(self.ops.containers))
         self.assertTrue(self.ops.migrated)
@@ -704,15 +763,16 @@ class DeployTest(unittest.TestCase):
         with mock.patch.object(self.ops, "run", fail_remove):
             with self.assertRaisesRegex(deploy.DeployError, "retry 'abort'"):
                 deploy.Deployer(self.cfg, self.ops).abort()
-        self.assertEqual("aborting", self.state()["paused"]["phase"])
-        self.assertIn("failed", self.state()["paused"])
+        self.assertEqual("aborting", self.state()["in_progress"]["phase"])
+        self.assertTrue(self.state()["in_progress"]["reason"])
+        self.assert_live_release(LEGACY)
         self.assertIn(["abort_incomplete"], [alert["alert"] for alert in deploy.watch_once(self.cfg, self.ops, {})])
         self.assertNotIn("sources-main-a-serving", self.ops.containers)
         self.assertIn("sources-main-a-standby", self.ops.containers)
         with self.assertRaisesRegex(deploy.DeployError, "cleanup has started"):
             deploy.Deployer(self.cfg, self.ops).resume()
         deploy.Deployer(self.cfg, self.ops).abort()
-        self.assertFalse(self.state().get("paused"))
+        self.assertIsNone(self.state()["in_progress"])
 
     def test_abort_refuses_a_replacement_container(self):
         paused = self.hold()
@@ -721,17 +781,17 @@ class DeployTest(unittest.TestCase):
         with self.assertRaisesRegex(deploy.DeployError, "unrelated container"):
             deploy.Deployer(self.cfg, self.ops).abort()
         self.assertTrue(self.ops.containers[name]["State"]["Running"])
-        self.assertEqual("aborting", self.state()["paused"]["phase"])
+        self.assertEqual("aborting", self.state()["in_progress"]["phase"])
 
     def test_abort_timeout_waits_without_killing_and_can_retry_after_exit(self):
         self.hold()
         self.ops.drain_seconds["sources-main-a-serving"] = float("inf")
         with self.assertRaisesRegex(deploy.DeployError, "nothing was killed"):
             deploy.Deployer(self.cfg, self.ops).abort()
-        self.assertEqual("aborting", self.state()["paused"]["phase"])
+        self.assertEqual("aborting", self.state()["in_progress"]["phase"])
         self.ops.containers["sources-main-a-serving"]["State"]["Running"] = False
         deploy.Deployer(self.cfg, self.ops).abort()
-        self.assertFalse(self.state().get("paused"))
+        self.assertIsNone(self.state()["in_progress"])
 
     def test_hold_blocks_main_and_rollback_and_commands_require_a_pause(self):
         for action in ("resume", "abort"):
@@ -747,13 +807,13 @@ class DeployTest(unittest.TestCase):
     def test_status_reports_age_and_warning_without_expiring_the_pause(self):
         self.hold()
         state = self.state()
-        state["paused"]["since"] = "2000-01-01T00:00:00+00:00"
+        state["in_progress"]["held_at"] = "2000-01-01T00:00:00+00:00"
         deploy.save_state(self.cfg, state)
         report = deploy.status(self.cfg, self.ops)
-        self.assertGreater(report["paused"]["age_seconds"], self.cfg.hold_warning_seconds)
-        self.assertTrue(report["paused"]["warning"])
-        self.assertEqual("ready", report["paused"]["phase"])
-        self.assertTrue(report["paused"]["live_containers"]["serving"]["image_matches"])
+        self.assertGreater(report["in_progress"]["age_seconds"], self.cfg.hold_warning_seconds)
+        self.assertTrue(report["in_progress"]["warning"])
+        self.assertEqual("held", report["in_progress"]["phase"])
+        self.assertTrue(report["in_progress"]["live_containers"]["serving"]["image_matches"])
         self.assertEqual(state, self.state())
 
     def test_host_reboot_retains_pause_until_original_containers_return(self):
@@ -768,7 +828,7 @@ class DeployTest(unittest.TestCase):
         for c in daemon.containers.values():
             c["State"].update(Running=False, Status="exited")
         self.ops = daemon
-        self.assertEqual("exited", deploy.status(self.cfg, daemon)["paused"]["live_containers"]["serving"]["status"])
+        self.assertEqual("exited", deploy.status(self.cfg, daemon)["in_progress"]["live_containers"]["serving"]["status"])
         with self.assertRaisesRegex(deploy.DeployError, "exited"):
             deploy.Deployer(self.cfg, daemon).resume()
         self.assertEqual([], daemon.commands)
@@ -780,7 +840,6 @@ class DeployTest(unittest.TestCase):
         self.assert_live_release(paused["target"])
         self.assertEqual(paused["target"]["slot"], self.state()["current"]["slot"])
         self.assertIsNone(self.state()["in_progress"])
-        self.assertIsNone(self.state()["paused"])
 
     def test_dry_run_hold_resume_and_abort_preserve_state_history_and_containers(self):
         self.ops.dry_run = True
@@ -816,13 +875,64 @@ class DeployTest(unittest.TestCase):
             self.assertEqual(0, deploy.main(["main", "newer@sha256:3", "--hold-before-switch"]))
             self.assertEqual(0, deploy.main(["abort"]))
 
+    def test_cli_held_dry_run_does_not_create_a_lock_file_or_state(self):
+        lock = self.tmp / "missing-lock-directory" / "release.lock"
+        self.cfg.lock_file = str(lock)
+        self.hold()
+        state_bytes = Path(self.cfg.state_file).read_bytes()
+        history = self.history()
+        self.ops.dry_run = True
+        with mock.patch.object(deploy.Config, "load", return_value=self.cfg), \
+                mock.patch.object(deploy, "MainOps", return_value=self.ops):
+            for command in ("resume", "abort"):
+                self.assertEqual(0, deploy.main(["--dry-run", command]))
+        self.assertFalse(lock.parent.exists())
+        self.assertEqual(state_bytes, Path(self.cfg.state_file).read_bytes())
+        self.assertEqual(history, self.history())
+        self.assertIn(["DRY", self.cfg.nginx_bin, "-T"], self.ops.commands)
+
+    def test_legacy_pause_is_read_without_migration_and_consumed_by_resume(self):
+        held = self.hold()
+        legacy = {key: value for key, value in held.items() if key not in ("held_at", "allow_public_health_failure")}
+        legacy.update(phase="ready", since=held["held_at"])
+        deploy.save_state(self.cfg, {**self.state(), "paused": legacy, "in_progress": None})
+        disk = Path(self.cfg.state_file).read_bytes()
+        report = deploy.status(self.cfg, self.ops)
+        self.assertEqual("held", report["in_progress"]["phase"])
+        self.assertEqual(held["held_at"], report["in_progress"]["held_at"])
+        self.assertEqual(disk, Path(self.cfg.state_file).read_bytes())
+        deploy.Deployer(self.cfg, self.ops).resume()
+        self.assert_live_release(self.state()["current"])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertNotIn("paused", self.state())
+
+    def test_resume_checks_all_networks_before_touching_held_containers(self):
+        held = self.hold()
+        containers = json.loads(json.dumps(self.ops.containers))
+        run = self.ops.run
+        network_checks = []
+
+        def missing_network(args, **kw):
+            if args[:3] == ["docker", "network", "inspect"]:
+                network_checks.append(args[3:])
+                raise deploy.DeployError("simulated network disappeared")
+            self.assertFalse(kw["mutate"], args)
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", missing_network):
+            with self.assertRaisesRegex(deploy.DeployError, "network disappeared.*pause restored"):
+                deploy.Deployer(self.cfg, self.ops).resume()
+        self.assertEqual([self.cfg.networks], network_checks)
+        self.assertEqual(containers, self.ops.containers)
+        self.assertEqual(held, self.state()["in_progress"])
+        self.assert_live_release(LEGACY)
+
     def test_resume_nginx_failure_hands_background_back(self):
         self.hold()
         self.ops.nginx_test_rc = 1
         with self.assertRaisesRegex(deploy.DeployError, "owns the background again"):
             deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertTrue(self.ops.containers["old-bg"]["State"]["Running"])
-        self.assertFalse(self.state().get("paused"))
+        self.assert_live_release(LEGACY)
         self.assertIsNone(self.state()["in_progress"])
 
     def test_resume_partial_alias_activation_drains_and_restores_pause(self):
@@ -858,12 +968,11 @@ class DeployTest(unittest.TestCase):
         self.assertNotIn(["docker", "rm", "-f"], [cmd[:3] for cmd in self.ops.commands[before:]
                                                  if cmd[-1] in names | ids])
         self.assert_live_release(LEGACY)
-        self.assertIsNone(self.state()["in_progress"])
         self.assertEqual(LEGACY, self.state()["current"])
-        self.assertEqual(paused, self.state()["paused"])
+        self.assertEqual(paused, self.state()["in_progress"])
         deploy.Deployer(self.cfg, self.ops).resume()
         self.assert_live_release(self.state()["current"])
-        self.assertIsNone(self.state()["paused"])
+        self.assertIsNone(self.state()["in_progress"])
 
     def test_resume_network_timeout_reconciles_unknown_effect_before_restoring_pause(self):
         paused = self.hold()
@@ -880,11 +989,10 @@ class DeployTest(unittest.TestCase):
         with mock.patch.object(self.ops, "run", fail):
             with self.assertRaisesRegex(deploy.DeployError, "pause restored"):
                 deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertEqual(paused, self.state()["paused"])
-        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual(paused, self.state()["in_progress"])
         self.assert_live_release(LEGACY)
         deploy.Deployer(self.cfg, self.ops).abort()
-        self.assertIsNone(self.state()["paused"])
+        self.assertIsNone(self.state()["in_progress"])
 
     def test_resume_drains_already_activated_serving_if_standby_start_fails(self):
         paused = self.hold()
@@ -911,8 +1019,7 @@ class DeployTest(unittest.TestCase):
                 deploy.Deployer(self.cfg, self.ops).resume()
         self.assertTrue(served)
         self.assert_live_release(LEGACY)
-        self.assertEqual(paused, self.state()["paused"])
-        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual(paused, self.state()["in_progress"])
 
     def test_resume_rechecks_background_port_after_activation(self):
         paused = self.hold()
@@ -928,8 +1035,7 @@ class DeployTest(unittest.TestCase):
             with self.assertRaisesRegex(deploy.DeployError, "already in use.*pause restored"):
                 deploy.Deployer(self.cfg, self.ops).resume()
         self.assert_live_release(LEGACY)
-        self.assertEqual(paused, self.state()["paused"])
-        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual(paused, self.state()["in_progress"])
 
     def test_abort_command_errors_and_interruptions_keep_retryable_cleanup(self):
         self.hold()
@@ -945,10 +1051,9 @@ class DeployTest(unittest.TestCase):
                 with mock.patch.object(self.ops, "run", fail):
                     with self.assertRaisesRegex(deploy.DeployError, "retry 'abort'"):
                         deploy.Deployer(self.cfg, self.ops).abort()
-                self.assertEqual("aborting", self.state()["paused"]["phase"])
-                self.assertIsNone(self.state()["in_progress"])
+                self.assertEqual("aborting", self.state()["in_progress"]["phase"])
         deploy.Deployer(self.cfg, self.ops).abort()
-        self.assertFalse(self.state().get("paused"))
+        self.assertIsNone(self.state()["in_progress"])
 
     def test_resume_rejects_network_alias_added_while_paused(self):
         self.hold()
@@ -956,7 +1061,7 @@ class DeployTest(unittest.TestCase):
         endpoint["Aliases"].append(self.cfg.serving_alias)
         with self.assertRaisesRegex(deploy.DeployError, "network isolation changed"):
             deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertEqual("ready", self.state()["paused"]["phase"])
+        self.assertEqual("held", self.state()["in_progress"]["phase"])
 
     def test_resume_refuses_a_changed_current_release_or_unexpected_background(self):
         self.hold()
@@ -971,7 +1076,7 @@ class DeployTest(unittest.TestCase):
         for action in ("resume", "abort"):
             with self.assertRaisesRegex(deploy.DeployError, "unexpected target background"):
                 getattr(deploy.Deployer(self.cfg, self.ops), action)()
-        self.assertEqual("ready", self.state()["paused"]["phase"])
+        self.assertEqual("held", self.state()["in_progress"]["phase"])
 
     def test_abort_does_not_remove_current_release_even_if_state_was_edited(self):
         paused = self.hold()
@@ -994,7 +1099,7 @@ class DeployTest(unittest.TestCase):
         with mock.patch.object(self.ops, "inspect", inspect):
             with self.assertRaisesRegex(deploy.DeployError, "retry 'abort'"):
                 deploy.Deployer(self.cfg, self.ops).abort()
-        self.assertEqual("aborting", self.state()["paused"]["phase"])
+        self.assertEqual("aborting", self.state()["in_progress"]["phase"])
         self.assertIn("sources-main-a-serving", self.ops.containers)
         deploy.Deployer(self.cfg, self.ops).abort()
 
@@ -1047,9 +1152,9 @@ class DeployTest(unittest.TestCase):
                 self.deploy()
         progress = self.state()["in_progress"]
         self.assert_live_release(progress["target"])
-        self.assertEqual("retire previous serving", progress["step"])
-        self.assertIn("failed", progress)
-        self.assertIsNone(self.state().get("paused"))
+        self.assertEqual("retire previous serving", progress["failed_step"])
+        self.assertEqual("failed", progress["phase"])
+        self.assertTrue(progress["reason"])
         self.assertEqual(LEGACY, self.state()["current"])
         before = len(self.ops.commands)
         with self.assertRaisesRegex(deploy.DeployError, "did not finish"):
@@ -1057,7 +1162,6 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(before, len(self.ops.commands))
         with mock.patch.object(self.ops, "inspect", side_effect=deploy.DeployError("Docker unavailable")):
             report = deploy.status(self.cfg, self.ops)
-            self.assertIsNone(report["paused"])
             self.assertEqual(progress, report["in_progress"])
             self.assertEqual("unknown", report["current"]["containers"]["background"]["status"])
             reasons = [alert["alert"] for alert in deploy.watch_once(self.cfg, self.ops, {})]
@@ -1086,8 +1190,8 @@ class DeployTest(unittest.TestCase):
         with mock.patch.object(self.ops, "run", fail):
             with self.assertRaises(deploy.FallbackFailed):
                 deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertIn("restoring the pause failed", self.state()["in_progress"]["failed"])
-        self.assertIsNone(self.state()["paused"])
+        self.assertIn("restoring the pause failed", self.state()["in_progress"]["reason"])
+        self.assertEqual("failed", self.state()["in_progress"]["phase"])
         self.assert_live_release(LEGACY)
         self.assertEqual("failed", self.history()[-1]["result"])
 
@@ -1108,11 +1212,10 @@ class DeployTest(unittest.TestCase):
             with self.assertRaises(deploy.FallbackFailed):
                 self.deploy()
         progress = self.state()["in_progress"]
-        self.assertEqual("switch", progress["step"])
-        self.assertIn("restoring previous routing failed", progress["failed"])
+        self.assertEqual("switch", progress["failed_step"])
+        self.assertIn("restoring previous routing failed", progress["reason"])
         self.assertEqual(self.upstreams_for(progress["target"]), self.ops.loaded_upstreams)
         self.assertEqual(LEGACY, self.state()["current"])
-        self.assertIsNone(self.state().get("paused"))
         self.assertTrue(self.ops.inspect(progress["target"]["containers"]["background"])["State"]["Running"])
         self.assertFalse(self.ops.inspect(LEGACY["containers"]["background"])["State"]["Running"])
 
@@ -1122,24 +1225,63 @@ class DeployTest(unittest.TestCase):
         with self.assertRaisesRegex(deploy.FallbackFailed, "no previous upstream file"):
             self.deploy()
         self.assertEqual(self.upstreams_for(LEGACY), self.ops.loaded_upstreams)
+        owner = deploy.Deployer(self.cfg, self.ops).owner_runtime(LEGACY) or {}
+        self.assertTrue(owner.get("owns_background"))
+        target = self.state()["in_progress"]["target"]
+        self.assertFalse(self.ops.inspect(target["containers"]["background"])["State"]["Running"])
         self.assertEqual(LEGACY, self.state()["current"])
-        self.assertEqual("switch", self.state()["in_progress"]["step"])
-        self.assertIn("failed", self.state()["in_progress"])
+        self.assertEqual("switch", self.state()["in_progress"]["failed_step"])
+        self.assertEqual("failed", self.state()["in_progress"]["phase"])
+        self.assertTrue(self.state()["in_progress"]["reason"])
+
+    def test_main_upstream_write_error_before_reload_restores_old_release(self):
+        write = self.ops.write_file_atomic
+        attempted = False
+
+        def interrupted_write(path, text, **kw):
+            nonlocal attempted
+            write(path, text, **kw)
+            if path == self.cfg.upstream_file and not attempted:
+                attempted = True
+                raise OSError("simulated failure after writing upstream")
+
+        with mock.patch.object(self.ops, "write_file_atomic", interrupted_write):
+            with self.assertRaisesRegex(deploy.DeployError, "previous file restored, routing unchanged"):
+                self.deploy()
+        self.assertTrue(attempted)
+        self.assertFalse(self.ops.switched)
+        self.assert_live_release(LEGACY)
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_main_unreadable_upstream_keeps_routing_and_returns_background(self):
+        read = self.ops.read_text
+
+        def unreadable(path):
+            if path == self.cfg.upstream_file:
+                raise PermissionError("simulated upstream read failure")
+            return read(path)
+
+        with mock.patch.object(self.ops, "read_text", unreadable):
+            with self.assertRaisesRegex(deploy.DeployError, "cannot read the previous upstream file"):
+                self.deploy()
+        self.assertFalse(self.ops.switched)
+        self.assert_live_release(LEGACY)
+        self.assertIsNone(self.state()["in_progress"])
 
     def test_pause_write_failure_preserves_failed_progress_and_running_target(self):
         real = deploy.save_state
 
         def fail_pause(cfg, state):
-            if state.get("paused"):
+            if (state.get("in_progress") or {}).get("phase") == "held":
                 raise OSError("simulated pause write failure")
             return real(cfg, state)
 
         with mock.patch.object(deploy, "save_state", fail_pause):
             with self.assertRaises(deploy.FallbackFailed):
                 self.hold()
-        self.assertFalse(self.state().get("paused"))
-        self.assertEqual("start serving", self.state()["in_progress"]["step"])
-        self.assertIn("failed", self.state()["in_progress"])
+        self.assertEqual("start serving", self.state()["in_progress"]["failed_step"])
+        self.assertEqual("failed", self.state()["in_progress"]["phase"])
+        self.assertTrue(self.state()["in_progress"]["reason"])
         self.assertTrue(self.ops.containers["sources-main-a-serving"]["State"]["Running"])
         self.assertFalse(self.ops.switched)
 
@@ -1156,26 +1298,25 @@ class DeployTest(unittest.TestCase):
         with mock.patch.object(deploy, "save_state", fail_consume):
             with self.assertRaisesRegex(deploy.DeployError, "pause retained"):
                 deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertEqual(paused, self.state()["paused"])
-        self.assertIsNone(self.state()["in_progress"])
-        self.assertEqual([], self.ops.commands)
+        self.assertEqual(paused, self.state()["in_progress"])
+        self.assertEqual([[self.cfg.nginx_bin, "-T"]], self.ops.commands)
 
     def test_abort_state_write_failure_after_removal_can_retry_without_containers(self):
         self.hold()
         real = deploy.save_state
 
         def fail_clear(cfg, state):
-            if not state.get("paused"):
+            if not state.get("in_progress"):
                 raise OSError("simulated state write failure")
             return real(cfg, state)
 
         with mock.patch.object(deploy, "save_state", fail_clear):
             with self.assertRaisesRegex(deploy.DeployError, "metadata write failed"):
                 deploy.Deployer(self.cfg, self.ops).abort()
-        self.assertEqual("aborting", self.state()["paused"]["phase"])
+        self.assertEqual("aborting", self.state()["in_progress"]["phase"])
         self.assertNotIn("sources-main-a-serving", self.ops.containers)
         deploy.Deployer(self.cfg, self.ops).abort()
-        self.assertFalse(self.state().get("paused"))
+        self.assertIsNone(self.state()["in_progress"])
 
     def test_main_handoff_create_failure_restores_old_background_restart_policy(self):
         real = self.ops.run
@@ -1483,12 +1624,12 @@ class DeployTest(unittest.TestCase):
         self.assertFalse(self.ops.containers["sources-main-a-background"]["State"]["Running"])
         self.assertFalse(self.ops.switched, "traffic never moved")
         in_progress = self.state()["in_progress"]
-        self.assertEqual("background handoff", in_progress["step"])
-        self.assertEqual(message, in_progress["failed"])
+        self.assertEqual("background handoff", in_progress["failed_step"])
+        self.assertEqual(message, in_progress["reason"])
         self.assertIn("failed_at", in_progress)
         # 'status' shows it, and the next deploy refuses until a person clears it.
         report = deploy.status(self.cfg, self.ops)
-        self.assertEqual(message, report["in_progress"]["failed"])
+        self.assertEqual(message, report["in_progress"]["reason"])
         self.assertEqual("running", report["current"]["containers"]["background"]["status"])
         self.assertEqual("no", report["current"]["containers"]["background"]["restart_policy"])
         self.assertIn("FAILED AND NOT RESTORED", "\n".join(self.ops.logs))
@@ -1505,13 +1646,13 @@ class DeployTest(unittest.TestCase):
         with self.assertRaises(deploy.FallbackFailed):
             deploy.Deployer(self.cfg, self.ops).rollback()
         in_progress = self.state()["in_progress"]
-        self.assertEqual("background handoff", in_progress["step"])
+        self.assertEqual("background handoff", in_progress["failed_step"])
         # Traffic is still on slot a while its background drains; the restarted
         # previous serving containers have none.
         for part in ("sources-main-a-background is still draining", "Traffic is on slot a.",
                      "Serving containers left outside the Nginx route: old-serving, old-spare",
                      "'docker start sources-main-a-background'"):
-            self.assertIn(part, in_progress["failed"])
+            self.assertIn(part, in_progress["reason"])
 
     def test_handing_back_to_an_owner_that_never_exits_names_the_previous_background(self):
         # Guard fails, traffic goes back to the previous slot, and the new
@@ -1532,7 +1673,7 @@ class DeployTest(unittest.TestCase):
             self.assertIn(part, message)
         self.assertNotIn("docker start sources-main-a-background", message)
         self.assertIn("127.0.0.1:9426 max_fails", self.ops.files[self.cfg.upstream_file], "traffic is back")
-        self.assertEqual(message, self.state()["in_progress"]["failed"])
+        self.assertEqual(message, self.state()["in_progress"]["reason"])
 
     def test_a_reply_cut_off_mid_way_never_ends_the_handoff(self):
         # The old owner exits while answering a runtime read: the progress note

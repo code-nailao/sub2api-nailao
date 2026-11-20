@@ -78,6 +78,10 @@ class DrainTimeout(DeployError):
     """A container still runs after its drain deadline."""
 
 
+class RoutingFileNotRestored(FallbackFailed):
+    """The file needs repair, but this attempt never reloaded live routing."""
+
+
 # --------------------------------------------------------------------------
 # Configuration and state
 
@@ -182,6 +186,26 @@ def load_state(cfg: Config) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def load_main_state(cfg: Config) -> dict[str, Any]:
+    """Read older Main records without changing shared state readers or writing the file."""
+    state = load_state(cfg)
+    progress = state.get("in_progress")
+    paused = state.pop("paused", None)
+    if progress and "phase" not in progress:
+        reason = progress.pop("failed", None)
+        progress["phase"] = "failed" if reason else "deploying"
+        if reason:
+            progress.update(reason=reason, failed_step=progress.get("step", "unknown"))
+    elif not progress and paused:
+        phase = "aborting" if paused.get("phase") == "aborting" else "held"
+        reason = paused.pop("failed", None)
+        paused.update(phase=phase, held_at=paused.pop("since"))
+        if reason:
+            paused["reason"] = reason
+        state["in_progress"] = paused
+    return state
+
+
 def save_state(cfg: Config, state: dict[str, Any]) -> None:
     path = Path(cfg.state_file)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,9 +223,18 @@ def append_history(cfg: Config, record: dict[str, Any]) -> None:
 
 
 @contextlib.contextmanager
-def release_lock(path: str) -> Iterator[None]:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+def release_lock(path: str, *, create: bool = True) -> Iterator[None]:
+    if create:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    flags = (os.O_RDWR | os.O_CREAT) if create else os.O_RDONLY
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileNotFoundError:
+        if create:
+            raise
+        # No lock has been taken yet on this host. A read-only plan need not create one.
+        yield
+        return
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -329,6 +362,30 @@ class MainOps(Ops):
             except ValueError:
                 pass
         raise DeployError("cannot inspect container; Docker state is unknown; nothing may be removed")
+
+
+def release_process(ops: Ops, pid: int) -> dict[str, Any] | None:
+    """Identify a Linux process across PID reuse and host reboots."""
+    try:
+        boot_id = ops.read_text("/proc/sys/kernel/random/boot_id").strip()
+        stat = ops.read_text(f"/proc/{pid}/stat").rpartition(")")[2].split()
+    except FileNotFoundError:
+        return None
+    # /proc/<pid>/stat fields 3 (state) and 22 (start time), after `comm`.
+    if not boot_id or len(stat) <= 19 or stat[0] in ("Z", "X"):
+        return None
+    return {"pid": pid, "boot_id": boot_id, "started_at_tick": stat[19]}
+
+
+def release_running(ops: Ops, progress: dict[str, Any]) -> bool | None:
+    process = progress.get("process") or {}
+    pid = process.get("pid")
+    if type(pid) is not int or pid <= 0:
+        return False
+    try:
+        return release_process(ops, pid) == process
+    except OSError:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -603,18 +660,20 @@ class Deployer:
             previous = self.ops.read_text(self.cfg.upstream_file)
         except FileNotFoundError:
             previous = None
-        self.ops.write_file_atomic(self.cfg.upstream_file, text)
+        except OSError as err:
+            raise DeployError("cannot read the previous upstream file; routing unchanged") from err
         try:
+            self.ops.write_file_atomic(self.cfg.upstream_file, text)
             test = self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False)
             if test.returncode != 0:
                 raise DeployError("nginx -t rejected the upstream file")
         except (Exception, KeyboardInterrupt) as err:
             if previous is None:
-                raise FallbackFailed("Nginx test failed and no previous upstream file is available") from err
+                raise RoutingFileNotRestored(f"upstream update failed before reload ({err}) and no previous upstream file is available") from err
             try:
                 self.ops.write_file_atomic(self.cfg.upstream_file, previous)
             except (Exception, KeyboardInterrupt) as restore_err:
-                raise FallbackFailed("could not restore the previous upstream file after the Nginx test failed") from restore_err
+                raise RoutingFileNotRestored("could not restore the previous upstream file after failure before reload") from restore_err
             raise DeployError(f"{err}; previous file restored, routing unchanged") from err
         try:
             self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
@@ -634,18 +693,38 @@ class Deployer:
         self.install_upstreams(render_upstreams(ports["serving"], ports["standby"], ports["background"]))
 
     # steps ------------------------------------------------------------------
+    def nginx_preflight(self) -> list[str]:
+        return nginx_ready_for_fixed_upstreams(
+            self.ops.run([self.cfg.nginx_bin, "-T"], mutate=False, timeout=60).stdout)
+
+    def host_preflight(self) -> list[str]:
+        available = self.ops.meminfo_available()
+        if available and available < self.cfg.min_host_available_gib * GIB:
+            return [f"host MemAvailable {available / GIB:.1f}GiB below {self.cfg.min_host_available_gib}GiB"]
+        return []
+
+    def public_health_preflight(self, allow_failure: bool) -> list[str]:
+        # Use the same request the guard makes after switching.
+        status, _ = self.ops.http_json(self.cfg.public_health_url, timeout=10)
+        if status == 200:
+            return []
+        seen = f"public health check returned status {status} (0 means no response)"
+        if allow_failure:
+            self.log(f"   WARNING: {seen}; continuing because of --allow-public-health-failure; "
+                     "the guard still requires 200 after the switch")
+            return []
+        return [f"{seen}; the guard after the switch would fail the same way and roll back; "
+                "pass --allow-public-health-failure to deploy anyway"]
+
     def preflight(self, state: dict[str, Any], target: Target, reuse: bool,
                   allow_public_health_failure: bool = False) -> list[str]:
-        problems = nginx_ready_for_fixed_upstreams(
-            self.ops.run([self.cfg.nginx_bin, "-T"], mutate=False, timeout=60).stdout)
+        problems = self.nginx_preflight()
         current = state.get("current")
         if not current:
             problems.append("no current release recorded; run 'adopt' once first")
         elif current.get("slot") == target.slot:
             problems.append(f"target slot {target.slot} is the current slot")
-        available = self.ops.meminfo_available()
-        if available and available < self.cfg.min_host_available_gib * GIB:
-            problems.append(f"host MemAvailable {available / GIB:.1f}GiB below {self.cfg.min_host_available_gib}GiB")
+        problems += self.host_preflight()
         if not reuse:
             running = []
             for role, name in target.containers.items():
@@ -655,17 +734,7 @@ class Deployer:
                     problems.append(f"{name} (previous release in slot {target.slot}) is still running/draining")
             if not running:
                 problems += port_problems(self.ops, [target.ports[r] for r in ROLES])
-        # The same request the guard makes after the switch: if it fails now,
-        # the guard would fail too and roll back a healthy release.
-        status, _ = self.ops.http_json(self.cfg.public_health_url, timeout=10)
-        if status != 200:
-            seen = f"public health check returned status {status} (0 means no response)"
-            if allow_public_health_failure:
-                self.log(f"   WARNING: {seen}; continuing because of --allow-public-health-failure; "
-                         "the guard still requires 200 after the switch")
-            else:
-                problems.append(f"{seen}; the guard after the switch would fail the same way and roll back; "
-                                "pass --allow-public-health-failure to deploy anyway")
+        problems += self.public_health_preflight(allow_public_health_failure)
         if problems:
             raise DeployError("preflight failed, nothing changed:\n  - " + "\n  - ".join(problems))
         pending = self.result_line(self.one_off(target.image, "background", ["-list-pending-migrations"]), PENDING_PREFIX)
@@ -941,15 +1010,18 @@ class Deployer:
     # entrypoints --------------------------------------------------------------
     @staticmethod
     def require_idle(state: dict[str, Any]) -> None:
-        if state.get("in_progress"):
-            raise DeployError(f"a previous deploy did not finish: {json.dumps(state['in_progress'])}; "
-                              "inspect with 'status' and resolve before deploying again")
-        if state.get("paused"):
+        progress = state.get("in_progress") or {}
+        if progress.get("phase") == "held":
             raise DeployError("a release is paused; run 'resume' or 'abort' first (see 'status')")
+        if progress.get("phase") == "aborting":
+            raise DeployError("abort cleanup has started; retry 'abort' first (see 'status')")
+        if progress:
+            raise DeployError(f"a previous deploy did not finish: {json.dumps(progress)}; "
+                              "inspect with 'status' and resolve before deploying again")
 
     def deploy(self, image: str, allow_contract: bool = False,
                allow_public_health_failure: bool = False, hold_before_switch: bool = False) -> None:
-        state = load_state(self.cfg)
+        state = load_main_state(self.cfg)
         self.require_idle(state)
         current = state.get("current") or {}
         slot = "a" if current.get("slot") != "a" else "b"
@@ -1004,7 +1076,7 @@ class Deployer:
                         self.wait_ready(target.ports[role], self.token_for(target.view(), role), "serving",
                                         self.cfg.ready_timeout)
             if hold_before_switch:
-                self._hold(state, target, record)
+                self._hold(state, target, record, allow_public_health_failure)
             else:
                 self._finish_switch(state, current, target, record, create_background=True)
             if skip_check:
@@ -1018,10 +1090,14 @@ class Deployer:
                 append_history(self.cfg, record)
             raise
         except (OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
+            step = (state.get("in_progress") or {}).get("step")
+            if not hold_before_switch and step in (None, "migrate"):
+                # Keep ordinary preparation errors outside the hold and switch recovery paths.
+                raise
             self._unexpected(err, record)
 
     def rollback(self) -> None:
-        state = load_state(self.cfg)
+        state = load_main_state(self.cfg)
         self.require_idle(state)
         current, previous = state.get("current"), state.get("previous")
         if not current or not previous:
@@ -1049,6 +1125,8 @@ class Deployer:
                 append_history(self.cfg, record)
             raise
         except (OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
+            if not state.get("in_progress"):
+                raise
             self._unexpected(err, record)
 
     def config_fingerprint(self) -> str:
@@ -1057,7 +1135,8 @@ class Deployer:
     def upstream_fingerprint(self) -> str:
         return hashlib.sha256(self.ops.read_text(self.cfg.upstream_file).encode()).hexdigest()
 
-    def _hold(self, state: dict[str, Any], target: Target, record: dict[str, Any]) -> None:
+    def _hold(self, state: dict[str, Any], target: Target, record: dict[str, Any],
+              allow_public_health_failure: bool) -> None:
         if not self.ops.dry_run:
             containers = {}
             for role in SERVING_ROLES:
@@ -1069,24 +1148,26 @@ class Deployer:
             if len(image_ids) != 1:
                 raise DeployError("held serving images differ; nothing will switch")
             target.image_id = image_ids.pop()
-            state.update(paused={"target": target.view(), "containers": containers, "since": now(),
-                                 "phase": "ready", "current": state["current"],
-                                 "config_fingerprint": self.config_fingerprint(),
-                                 "upstream_fingerprint": self.upstream_fingerprint()}, in_progress=None)
-            save_state(self.cfg, state)
+            held = {"phase": "held", "target": target.view(), "containers": containers, "held_at": now(),
+                    "current": state["current"], "config_fingerprint": self.config_fingerprint(),
+                    "upstream_fingerprint": self.upstream_fingerprint(),
+                    "allow_public_health_failure": allow_public_health_failure}
+            self._save_progress(state, held)
             record.update(result="paused", steps=self.timings, finished_at=now())
             append_history(self.cfg, record)
         self.log("paused before background handoff; use 'resume' or 'abort'; no automatic expiry")
         for role in SERVING_ROLES:
             self.log(f"   {role}: http://127.0.0.1:{target.ports[role]}/ (access via your tunnel)")
 
-    def held_release(self, state: dict[str, Any]) -> tuple[dict[str, Any], Target]:
-        if state.get("in_progress"):
-            raise DeployError("an unfinished release needs manual recovery; inspect 'status'; this is not a pause")
-        paused = state.get("paused")
-        if not paused:
+    def held_release(self, state: dict[str, Any], *, aborting: bool = False) -> tuple[dict[str, Any], Target]:
+        held = state.get("in_progress")
+        if not held:
             raise DeployError("no paused release; nothing changed")
-        return paused, Target.from_view(paused["target"], self.cfg.runtime_token_file)
+        if held["phase"] == "aborting" and not aborting:
+            raise DeployError("abort cleanup has started; retry 'abort', not 'resume'")
+        if held["phase"] not in ("held", "aborting"):
+            raise DeployError("an unfinished release needs manual recovery; inspect 'status'; this is not a pause")
+        return held, Target.from_view(held["target"], self.cfg.runtime_token_file)
 
     def has_expected_held_networks(self, info: dict[str, Any], *, shared: bool) -> bool:
         networks = info.get("NetworkSettings", {}).get("Networks", {})
@@ -1094,20 +1175,18 @@ class Deployer:
             (self.cfg.serving_alias in (endpoint.get("Aliases") or [])) == shared
             for endpoint in networks.values())
 
-    def validate_hold(self, state: dict[str, Any], paused: dict[str, Any], target: Target) -> None:
-        if paused["phase"] != "ready":
-            raise DeployError("abort cleanup has started; retry 'abort', not 'resume'")
-        if state.get("current") != paused["current"] or target.slot == state["current"]["slot"]:
+    def validate_hold(self, state: dict[str, Any], held: dict[str, Any], target: Target) -> None:
+        if state.get("current") != held["current"] or target.slot == state["current"]["slot"]:
             raise DeployError("current release changed during pause; inspect 'status' before recovery")
-        if self.config_fingerprint() != paused["config_fingerprint"]:
+        if self.config_fingerprint() != held["config_fingerprint"]:
             raise DeployError("configuration changed during pause; restore it or abort")
-        if self.upstream_fingerprint() != paused["upstream_fingerprint"]:
+        if self.upstream_fingerprint() != held["upstream_fingerprint"]:
             raise DeployError("upstream file changed during pause; restore it or abort")
         if self.ops.inspect(target.containers["background"]):
             raise DeployError("unexpected target background container; inspect and resolve before resuming")
         for role in SERVING_ROLES:
             info = self.ops.inspect(target.containers[role]) or {}
-            identity = paused["containers"][role]
+            identity = held["containers"][role]
             if info.get("Id") != identity["id"] or info.get("Image") != identity["image_id"]:
                 raise DeployError(f"held {role} is missing or its identity/image changed; restore it or abort")
             if not self.has_expected_held_networks(info, shared=False):
@@ -1121,11 +1200,24 @@ class Deployer:
                         "background", self.cfg.background_ready_timeout,
                         container=current["containers"]["background"])
         self.check_held_background_port(target)
+        # nginx -T may open configured files. A resume plan only prints that check.
+        problems = []
+        if self.ops.dry_run:
+            self.ops.run([self.cfg.nginx_bin, "-T"], mutate=True, timeout=60)
+        else:
+            problems += self.nginx_preflight()
+        problems += self.host_preflight()
+        problems += self.public_health_preflight(held.get("allow_public_health_failure", False))
+        if problems:
+            raise DeployError("resume preflight failed:\n  - " + "\n  - ".join(problems))
 
     def check_held_background_port(self, target: Target) -> None:
         problems = port_problems(self.ops, [target.ports["background"]])
         if problems:
             raise DeployError("resume background port check failed:\n  - " + "\n  - ".join(problems))
+
+    def inspect_held_networks(self) -> None:
+        self.ops.run(["docker", "network", "inspect", *self.cfg.networks], mutate=False, timeout=30)
 
     def configure_held_networks(self, target: Target, identities: dict[str, str], *, shared: bool) -> None:
         if not self.cfg.serving_alias:
@@ -1155,7 +1247,7 @@ class Deployer:
                 self.ops.run(["docker", "network", "connect", *aliases, network, identities[role]], mutate=True)
         # A stopped container can store configuration for a network that no
         # longer exists. Reject that before activating either container.
-        self.ops.run(["docker", "network", "inspect", *self.cfg.networks], mutate=False, timeout=30)
+        self.inspect_held_networks()
         if not self.ops.dry_run:
             for role in SERVING_ROLES:
                 info = self.ops.inspect(target.containers[role]) or {}
@@ -1174,43 +1266,41 @@ class Deployer:
         for role in SERVING_ROLES:
             self.ops.run(["docker", "update", "--restart=unless-stopped", identities[role]], mutate=True)
 
-    def activate_hold(self, state: dict[str, Any], paused: dict[str, Any], target: Target,
+    def activate_hold(self, state: dict[str, Any], held: dict[str, Any], target: Target,
                       identities: dict[str, str]) -> None:
+        changed_networks = False
         try:
-            self.configure_held_networks(target, identities, shared=True)
+            if self.cfg.serving_alias:
+                self.inspect_held_networks()
+                changed_networks = True
+                self.configure_held_networks(target, identities, shared=True)
             # Drain and reconnect can take time. Check again before the handoff.
             self.check_held_background_port(target)
         except (Exception, KeyboardInterrupt) as err:
             if self.ops.dry_run:
                 raise
             try:
-                self.configure_held_networks(target, identities, shared=False)
-                restored = {**state, "paused": paused, "in_progress": None}
-                save_state(self.cfg, restored)
-                state.update(restored)
+                if changed_networks:
+                    self.configure_held_networks(target, identities, shared=False)
+                self._save_progress(state, held)
             except (Exception, KeyboardInterrupt) as restore_err:
                 raise FallbackFailed(f"held serving activation failed ({err}); restoring the pause failed too "
                                      f"({restore_err}); verify target networking and serving before clearing in_progress") from restore_err
             raise DeployError(f"held serving activation failed ({err}); pause restored; retry 'resume' or 'abort'") from err
 
     def resume(self) -> None:
-        state = load_state(self.cfg)
-        paused, target = self.held_release(state)
+        state = load_main_state(self.cfg)
+        held, target = self.held_release(state)
         # Validation never changes the pause: fix health/config and retry, or abort.
         try:
-            self.validate_hold(state, paused, target)
-        except (OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
-            raise DeployError("resume validation interrupted; pause unchanged; fix the cause and retry or abort") from err
+            self.validate_hold(state, held, target)
+        except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
+            raise DeployError(f"{err or 'resume validation interrupted'}; pause unchanged; fix the cause and retry or abort") from err
         record = {"started_at": now(), "action": "resume", "image": target.image, "slot": target.slot,
-                  "paused_at": paused["since"]}
-        identities = {role: paused["containers"][role]["id"] for role in SERVING_ROLES}
+                  "paused_at": held["held_at"]}
+        identities = {role: held["containers"][role]["id"] for role in SERVING_ROLES}
         try:
-            # Atomically consume the pause before the first mutating operation.
-            state["paused"] = None
-            self._mark(state, target, "activate held serving")
-            with self.step("activate held serving"):
-                self.activate_hold(state, paused, target, identities)
-            self._finish_switch(state, state["current"], target, record, create_background=True)
+            self._finish_switch(state, state["current"], target, record, create_background=True, held=held)
         except DeployError as err:
             self._abort(state, target, err, identities)
             if not self.ops.dry_run:
@@ -1221,30 +1311,28 @@ class Deployer:
             self._unexpected(err, record)
 
     def abort(self) -> None:
-        state = load_state(self.cfg)
-        paused, target = self.held_release(state)
+        state = load_main_state(self.cfg)
+        held, target = self.held_release(state, aborting=True)
         current = state.get("current") or {}
         if target.slot == current.get("slot") or set(target.containers.values()) & set(current.get("containers", {}).values()):
             raise DeployError("held containers overlap the current release; inspect status before manual recovery")
         if self.ops.inspect(target.containers["background"]):
             raise DeployError("unexpected target background container; inspect and resolve before aborting")
         record = {"started_at": now(), "action": "abort", "image": target.image, "slot": target.slot}
+        aborting = {key: value for key, value in held.items() if key not in ("reason", "failed_at", "process")}
+        aborting["phase"] = "aborting"
         try:
             # Persist intent before cleanup; after an interruption only abort may retry.
-            paused["phase"] = "aborting"
-            if not self.ops.dry_run:
-                save_state(self.cfg, state)
+            self._save_progress(state, self._with_process(aborting))
             for role in SERVING_ROLES:
-                self.remove_owned_serving(target, role, paused["containers"][role]["id"])
+                self.remove_owned_serving(target, role, held["containers"][role]["id"])
         except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
-            if not self.ops.dry_run:
-                paused.update(failed=str(err) or "interrupted", failed_at=now())
-                save_state(self.cfg, state)
+            if (state.get("in_progress") or {}).get("phase") == "aborting":
+                self._save_progress(state, {**aborting, "reason": str(err) or "interrupted", "failed_at": now()})
             raise DeployError(f"abort incomplete; pause retained, retry 'abort': {err}") from err
-        state["paused"] = None
         if not self.ops.dry_run:
             try:
-                save_state(self.cfg, state)
+                self._save_progress(state, None)
                 record.update(result="ok", finished_at=now())
                 append_history(self.cfg, record)
             except OSError as err:
@@ -1258,17 +1346,25 @@ class Deployer:
         if not self.ops.dry_run:
             # The last atomic write may have failed: the persisted state is
             # authoritative, not the in-memory transition we attempted.
-            persisted = load_state(self.cfg)
-            self._record_unrestored(persisted, failure)
+            persisted = load_main_state(self.cfg)
+            phase = (persisted.get("in_progress") or {}).get("phase")
+            if phase == "deploying":
+                self._record_unrestored(persisted, failure)
             record.update(result="failed", error=str(failure), steps=self.timings, finished_at=now())
             append_history(self.cfg, record)
-            if persisted.get("paused") and not persisted.get("in_progress"):
+            if phase == "held":
                 raise DeployError("operation interrupted while recording a pause; pause retained; "
                                   "inspect status, then resume or abort") from err
         raise failure from err
 
     def _finish_switch(self, state: dict[str, Any], current: dict[str, Any], target: Target,
-                       record: dict[str, Any], create_background: bool) -> None:
+                       record: dict[str, Any], create_background: bool, *, held: dict[str, Any] | None = None) -> None:
+        if held is not None:
+            # Ordinary serving containers already got their shared aliases at create time.
+            self._mark(state, target, "activate held serving")
+            with self.step("activate held serving"):
+                identities = {role: held["containers"][role]["id"] for role in SERVING_ROLES}
+                self.activate_hold(state, held, target, identities)
         view = target.view()
         self._mark(state, target, "background handoff")
         with self.step("background handoff"):
@@ -1294,6 +1390,13 @@ class Deployer:
         with self.step("switch"):
             try:
                 self.switch_to(view)
+            except RoutingFileNotRestored as err:
+                # Reload was never attempted. The old route still needs its background.
+                try:
+                    self.hand_back(target, current)
+                except FallbackFailed as handoff_err:
+                    raise FallbackFailed(f"{err}; {handoff_err}") from handoff_err
+                raise
             except FallbackFailed:
                 raise
             except DeployError as err:
@@ -1308,9 +1411,7 @@ class Deployer:
                 except (Exception, KeyboardInterrupt) as err:
                     reason = str(err) or type(err).__name__
                     self.restore_after_guard(target, current, reason)
-                    restored = {**state, "in_progress": None}
-                    save_state(self.cfg, restored)
-                    state.update(restored)
+                    self._save_progress(state, None)
                     raise DeployError(f"guard failed ({reason}); the previous release serves traffic and owns the "
                                       "background again; the new serving containers are draining or stopped and kept "
                                       "for inspection") from err
@@ -1331,21 +1432,40 @@ class Deployer:
         self.log(f"done: slot {target.slot} serving {target.image}")
 
     def _mark(self, state: dict[str, Any], target: Target, step: str) -> None:
-        state["in_progress"] = {"target": target.view(), "step": step, "since": now()}
+        progress = {"phase": "deploying", "target": target.view(), "step": step, "since": now()}
+        self._save_progress(state, self._with_process(progress))
+
+    def _with_process(self, progress: dict[str, Any]) -> dict[str, Any]:
         if not self.ops.dry_run:
-            save_state(self.cfg, state)
+            with contextlib.suppress(OSError):
+                process = release_process(self.ops, os.getpid())
+                if process:
+                    return {**progress, "process": process}
+        return progress
+
+    def _save_progress(self, state: dict[str, Any], progress: dict[str, Any] | None) -> None:
+        if not self.ops.dry_run:
+            save_state(self.cfg, {**state, "in_progress": progress})
+        state["in_progress"] = progress
 
     def _record_unrestored(self, state: dict[str, Any], err: DeployError) -> None:
         """Keep in_progress, with why, so the next run refuses and 'status'
         shows what a person has to do."""
-        if state.get("in_progress"):
-            state["in_progress"].update(failed=str(err), failed_at=now())
-            save_state(self.cfg, state)
+        progress = state.get("in_progress")
+        if progress:
+            failed = {key: value for key, value in progress.items() if key != "process"}
+            failed.update(phase="failed", failed_step=progress.get("step", "unknown"),
+                          reason=str(err) or type(err).__name__, failed_at=now())
+            self._save_progress(state, failed)
 
     def _abort(self, state: dict[str, Any], target: Target, err: DeployError, owned: dict[str, str]) -> None:
         """Clear a failure only when the old release still serves or recovery has finished."""
-        step = (state.get("in_progress") or {}).get("step")
+        progress = state.get("in_progress") or {}
+        step = progress.get("step")
         if self.ops.dry_run:
+            self.log(f"FAILED: {err}")
+            return
+        if progress.get("phase") == "held":
             self.log(f"FAILED: {err}")
             return
         if isinstance(err, FallbackFailed) or step not in (None, "migrate", "start serving", "background handoff", "switch"):
@@ -1365,8 +1485,7 @@ class Deployer:
                 self.log(f"FAILED AND NOT RESTORED: {failure}")
                 return
         if step:
-            state["in_progress"] = None
-            save_state(self.cfg, state)
+            self._save_progress(state, None)
         self.log(f"FAILED: {err}")
 
 
@@ -1385,26 +1504,28 @@ def observed_container(ops: Ops, name: str) -> tuple[dict[str, Any], str]:
 
 
 def status(cfg: Config, ops: Ops) -> dict[str, Any]:
-    state = load_state(cfg)
+    state = load_main_state(cfg)
     deployer = Deployer(cfg, ops)
-    report: dict[str, Any] = {"in_progress": state.get("in_progress")}
-    paused = state.get("paused")
-    report["paused"] = None
-    if paused:
-        since = dt.datetime.fromisoformat(paused["since"])
+    progress = state.get("in_progress")
+    report: dict[str, Any] = {"in_progress": dict(progress) if progress else None}
+    if progress and progress["phase"] in ("deploying", "aborting"):
+        report["in_progress"]["process_running"] = release_running(ops, progress)
+    if progress and progress["phase"] in ("held", "aborting"):
+        since = dt.datetime.fromisoformat(progress["held_at"])
         age = max(0, int((dt.datetime.now(dt.timezone.utc) - since).total_seconds()))
-        report["paused"] = {**paused, "age_seconds": age,
-                            "warning": ("held release is old; resume or abort after verification"
-                                        if age >= cfg.hold_warning_seconds else None), "live_containers": {}}
+        warning = None
+        if age >= cfg.hold_warning_seconds and progress["phase"] == "held":
+            warning = "held release is old; resume or abort after verification"
+        report["in_progress"].update(age_seconds=age, warning=warning, live_containers={})
         for role in SERVING_ROLES:
-            name = paused["target"]["containers"][role]
+            name = progress["target"]["containers"][role]
             info, container_status = observed_container(ops, name)
-            identity = paused["containers"][role]
+            identity = progress["containers"][role]
             runtime = None
             with contextlib.suppress(OSError):
-                runtime = deployer.runtime(paused["target"]["ports"][role],
-                                           deployer.token_for(paused["target"], role))
-            report["paused"]["live_containers"][role] = {
+                runtime = deployer.runtime(progress["target"]["ports"][role],
+                                           deployer.token_for(progress["target"], role))
+            report["in_progress"]["live_containers"][role] = {
                 "status": container_status,
                 "ready": (runtime or {}).get("ready"),
                 "identity_matches": None if container_status == "unknown" else info.get("Id") == identity["id"],
@@ -1433,12 +1554,17 @@ def status(cfg: Config, ops: Ops) -> dict[str, Any]:
 
 def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]]) -> list[dict[str, Any]]:
     """One resident sample of the current release; returns alerts."""
-    state = load_state(cfg)
+    state = load_main_state(cfg)
     alerts = []
-    if (state.get("in_progress") or {}).get("failed"):
-        alerts.append({"alert": ["release_incomplete"], "at": now(), "in_progress": state["in_progress"]})
-    if (state.get("paused") or {}).get("phase") == "aborting" and state["paused"].get("failed"):
-        alerts.append({"alert": ["abort_incomplete"], "at": now()})
+    progress = state.get("in_progress") or {}
+    phase = progress.get("phase")
+    if phase == "failed":
+        alerts.append({"alert": ["release_incomplete"], "at": now(), "in_progress": progress})
+    elif phase in ("deploying", "aborting") and release_running(ops, progress) is not True:
+        # Avoid an alert if the sampled process just completed and saved a new phase.
+        if load_main_state(cfg).get("in_progress") == progress:
+            alert = "release_incomplete" if phase == "deploying" else "abort_incomplete"
+            alerts.append({"alert": [alert], "at": now(), "in_progress": progress})
     current = state.get("current")
     if not current:
         return alerts
@@ -1662,7 +1788,8 @@ def main(argv: list[str] | None = None) -> int:
                 for alert in watch_once(cfg, ops, history):
                     print(json.dumps(alert, sort_keys=True), flush=True)
                 ops.sleep(cfg.guard_interval)
-        with release_lock(cfg.lock_file):
+        read_only_plan = args.dry_run and args.command in ("resume", "abort")
+        with release_lock(cfg.lock_file, create=not read_only_plan):
             deployer = Deployer(cfg, ops)
             if args.command == "main":
                 deployer.deploy(args.image, allow_contract=args.allow_contract,
