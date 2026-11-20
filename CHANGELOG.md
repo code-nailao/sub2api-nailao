@@ -1,16 +1,29 @@
-# Changes
+# 更新日志
+
+条目用中文，按「新增功能 / 优化改进 / Bug 修复 / 破坏性变更」归类，写用户能感知的变化，格式与原版 sub2api 的发布说明一致。
+
 
 ## Unreleased
 
-- Portal validates the configuration before opening state and reports the same configuration errors in normal startup and `-check-config`. Both validate the host and numeric port of `PORTAL_LISTEN`. Normal startup binds the listener after opening state, so a bind failure can occur after state has been written. Portal compares origins by scheme, host, and port after normalizing ASCII case, the scheme’s default port, and equivalent IPv6 spellings. Workbench and canvas configuration requires HTTPS. It rejects ambiguous spellings such as padded or empty ports, non-ASCII hostnames, trailing dots, and legacy IPv4 spellings. Separate workbench and canvas origins can use canonical private or loopback addresses. The registration file accepts `[]` and rejects `null`.
-- Portal cancels read-only balance queries during shutdown and logs the active HTTP requests, pending background work, current detection round and elapsed drain time. Reads interrupted by shutdown keep the entire prior balance record, schedule and alert state without recording a false failure; request deadlines and real upstream failures keep their existing handling. Slow synchronous refreshes no longer hold up the handoff; accepted writes and already-started detection submissions or polls still finish and persist before the state lock is released.
-- During a release the old background process keeps the admin pages and admin reads available while it drains. On SIGTERM it answers only admin `GET` and `HEAD`, except the few reads that reach an upstream provider (active account usage, wallet refresh, OpenAI, Grok and CN provider quota or balance, Claude reset credits, account model discovery) or the stopped media engine store; those, other methods, MCP and WebSocket upgrades get a 503 in the usual error envelope (reason `BACKGROUND_HANDOFF_READ_ONLY`, `Retry-After: 5`) before any handler runs, so a retry is always safe. It waits for the admin requests it now refuses (writes and those reads) that arrived before the signal, stops its background services, closes admin WebSockets (the ops realtime page reconnects by itself) and only then closes its listener. The admin API is now down only from that moment until the new background is ready, not for the whole drain; writes still wait for the new background. `/health` stays 200 while draining and the runtime reports `ready: false`. Serving and standalone shut down in the same order as before, and ownership of the background lock is unchanged. Before, an open ops realtime page could keep the old background from exiting at all.
-- The release tool polls every 0.5 seconds during the background handoff, says before the signal whether the admin API will be read-only or unavailable, and logs which services the old background is still stopping. An old background that has not exited within `background_exit_timeout` now ends the run as `FAILED AND NOT RESTORED` and keeps `in_progress` with the reason, the slot serving traffic, the serving containers left running without traffic and which background to start; before, the run cleared `in_progress` although no background would run once the old one exited. `status` shows each container's restart policy. A runtime reply cut off by a process exiting mid-response now counts as no reply instead of ending the run with a traceback.
-- In-chat DeepSeek web tools also recognize the provider's own tool types: `deepseek_web_search` is handled as `web_search` and `deepseek_read_url` as `web_fetch`, run and billed by the gateway in all three protocols, including when `tool_choice` forces one.
-- When the gateway's tool loop does not take a request (tools off for the group, or `tool_choice` `none`), those two provider tool types are removed before forwarding, with a notice that live information is unavailable unless `tool_choice` is `none`; otherwise the provider ran paid tool calls that were never billed. Outside Chat requests in groups with tools turned off, `web_search` and `web_fetch` keep their existing handling. Every other byte of the request is forwarded as sent.
-- A request that declares web tools itself is no longer refused when the tools cannot be set up (no usable tool account, prices not configured, an unsupported request shape, a background request, the usage journal unavailable): the web tools and `max_tool_calls` are removed, the model is told live information could not be checked, and the request is answered and billed as an ordinary one. A forced choice of a removed tool stops being forced, and an emptied tool list is dropped together with `tool_choice`.
-- Remove the unused native tool branch for DeepSeek accounts on the native Responses protocol, its hook in the shared response handling and its account switch. A saved `deepseek_native_tools_enabled` is still accepted and ignored.
-- DeepSeek groups with tools turned off now strip non-function tool types starting with `web_search`, `web_fetch`, `deepseek_web_search`, or `deepseek_read_url` from Chat requests before forwarding. This includes Responses-shaped requests sent to fixed Chat accounts. The filter preserves choices that explicitly name a surviving tool. It resets choices for removed tools, including bare `tool` or `function` selectors, to `auto` when tools remain. When filtering empties the list, it drops `tools` along with any such choice or the string `required`. The strings `auto` and `none` are preserved. When a notice is needed, it goes in the last `messages` field or in `input` for a Responses-shaped request. Requests without these tools keep their original bytes. Duplicate tool keys and oversized tool fields are rejected before forwarding.
+- 关闭联网工具的 DeepSeek 分组在转发前移除 `web_search`、`web_fetch`、`deepseek_web_search`、`deepseek_read_url` 家族的条目，包括带版本或 preview 后缀的写法，也覆盖发送到固定 Chat 账号的 Responses 形状请求。显式指定仍然存在的工具的选择保留；指向被移除工具的选择（含只写 `tool` 或 `function` 的写法）在还有工具时改为 `auto`，工具删空时连同 `tools` 一起移除，`required` 一并删除，`auto` 和 `none` 保持不变。需要提示时写进最后一个 `messages`，Responses 形状写进 `input`。不含这些工具的请求保持原字节；工具字段的重复键和超限在转发前拒绝。
+
+## Main / Portal 0.2.82 — 2026-11-20
+
+发布期间管理后台不再整段不可用；DeepSeek 关闭联网工具时的请求处理改正；Portal 的配置校验和关闭流程更稳。
+
+### 优化改进
+
+- 发布时旧后台在排空期间继续提供管理页面和管理读接口，只拒绝写请求和少数需要访问上游的读请求，返回带原因的 503 和 `Retry-After`。管理接口只在旧后台退出到新后台就绪之间短暂不可用，不再整段排空期都不可用；`/health` 全程返回 200。此前打开着运维实时页会让旧后台一直退不出去。
+- 发布工具在后台交接期间每 0.5 秒轮询一次，在发出停止信号前说明管理接口会变成只读还是不可用，并显示旧后台还在停止哪些服务。旧后台超出等待时间仍未退出时按失败结束，保留进行中状态、当前提供服务的槽位和人工处理说明；`status` 显示各容器的重启策略。
+- Portal 在打开状态之前校验配置，普通启动和 `-check-config` 报告同一套配置错误；工作台和画布要求 HTTPS，来源按规范化后的协议、主机和端口比较，拒绝有歧义或旧式写法的地址。
+- Portal 在关闭时取消只读的余额查询，并记录进行中的请求、待完成的后台任务、当前检测轮次和排空耗时。被关闭打断的读请求保留原有余额记录、计划与告警状态，不记为失败；慢的同步刷新不再拖住交接。
+- DeepSeek 联网工具识别供应商自己的工具类型：`deepseek_web_search` 按 `web_search`、`deepseek_read_url` 按 `web_fetch` 处理，三种协议下都由网关执行并计费，包括 `tool_choice` 强制指定的情况。
+- 移除 DeepSeek 账号在原生 Responses 协议上未使用的工具分支及其账号切换。
+
+### Bug 修复
+
+- 关闭联网工具的 DeepSeek 分组里，网关的工具循环不接管请求时，供应商自己的两个工具类型在转发前移除并附上实时信息不可用的提示。此前上游会执行没有计费的付费工具调用。其余字段按原始字节转发。
+- 客户端自己声明联网工具的请求，在工具无法建立时不再被直接拒绝：移除联网工具和工具调用上限，告诉模型无法核对实时信息，按普通请求回答和计费。
 
 ## Main / Portal 0.2.81 — 2026-11-20
 
