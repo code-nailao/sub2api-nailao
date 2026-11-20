@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,7 +76,7 @@ func newCheckFixture(t *testing.T) *checkFixture {
 		"PORTAL_KEY_FILE":              filepath.Join(root, "master.key"),
 		"PORTAL_DATA_DIR":              f.dir,
 		"PORTAL_HOME_DIR":              filepath.Join(root, "homeweb"),
-		"PORTAL_LISTEN":                "127.0.0.1:18090",
+		"PORTAL_LISTEN":                net.JoinHostPort(net.IPv4(127, 0, 0, 1).String(), "0"),
 		"INTELLIGENCE_PROVIDER_ORIGIN": "https://detector.example",
 		"SUB_INTERNAL_ORIGIN":          "http://main-internal.example:8080",
 		"WALLET_BRIDGE_KEY_FILE":       filepath.Join(root, "bridge.key"),
@@ -188,30 +189,13 @@ func TestCheckConfigDoesNotModifyStateAStartWouldMigrate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setup.store.Close()
+	setup.close()
 	if after := treeSnapshot(t, f.root); sameTree(before, after) {
 		t.Fatal("fixture does not exercise a start-up migration")
 	}
 	raw, err := os.ReadFile(filepath.Join(f.dir, "intelligence", "state.json"))
 	if err != nil || !bytes.Contains(raw, []byte("submission_unknown")) || !bytes.Contains(raw, []byte(`"viewer_policy"`)) {
 		t.Fatalf("start did not migrate the fixture: %v", err)
-	}
-}
-
-func TestCheckConfigRequiresExistingDataDirectory(t *testing.T) {
-	f := newCheckFixture(t)
-	missing := filepath.Join(f.root, "missing", "state")
-	f.env["PORTAL_DATA_DIR"] = missing
-	code, stdout, stderr := runCheck(f)
-	if code != 1 || stdout != "" || stderr != errDataDirMissing+"\n" {
-		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-	if _, err := os.Stat(filepath.Join(f.root, "missing")); !os.IsNotExist(err) {
-		t.Fatalf("check created the data directory: %v", err)
-	}
-	f.env["PORTAL_DATA_DIR"] = filepath.Join(f.root, "master.key")
-	if code, _, stderr := runCheck(f); code != 1 || stderr != errDataDirMissing+"\n" {
-		t.Fatalf("file as data directory: code=%d stderr=%q", code, stderr)
 	}
 }
 

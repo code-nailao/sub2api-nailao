@@ -33,7 +33,7 @@ func TestWorkbenchURLsRejectCanonicalMainOrigin(t *testing.T) {
 				}
 				setup, err := prepare(f.getenv, startState)
 				if setup != nil {
-					setup.store.Close()
+					setup.close()
 				}
 				if err == nil || err.Error() != want {
 					t.Fatalf("start: got %v, want %q", err, want)
@@ -77,7 +77,7 @@ func TestWorkbenchURLsAllowSeparateCanonicalOrigins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setup.store.Close()
+	setup.close()
 }
 
 func TestWorkbenchURLsRejectAmbiguousBrowserAuthorities(t *testing.T) {
@@ -122,7 +122,7 @@ func TestWorkbenchURLsRejectAmbiguousBrowserAuthorities(t *testing.T) {
 				}
 				setup, err := prepare(f.getenv, startState)
 				if setup != nil {
-					setup.store.Close()
+					setup.close()
 				}
 				if err == nil || err.Error() != want {
 					t.Errorf("start: got %v, want %q", err, want)
@@ -152,7 +152,7 @@ func TestWorkbenchURLsAllowCanonicalASCIIHosts(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				setup.store.Close()
+				setup.close()
 			})
 		}
 	}
@@ -178,7 +178,7 @@ func TestMainOriginsRejectAmbiguousBrowserAuthorities(t *testing.T) {
 				}
 				setup, err := prepare(f.getenv, startState)
 				if setup != nil {
-					setup.store.Close()
+					setup.close()
 				}
 				if err == nil || err.Error() != want {
 					t.Errorf("start: got %v, want %q", err, want)
@@ -200,7 +200,7 @@ func TestStudioConfigRequiresArray(t *testing.T) {
 			code, stdout, stderr := runCheck(f)
 			setup, err := prepare(f.getenv, startState)
 			if setup != nil {
-				setup.store.Close()
+				setup.close()
 			}
 			if content == "[]" {
 				if code != 0 || stdout != checkConfigOK+"\n" || stderr != "" || err != nil {
@@ -293,7 +293,7 @@ func TestInvalidStartupConfigDoesNotModifyState(t *testing.T) {
 				}
 				setup, err := prepare(f.getenv, startState)
 				if setup != nil {
-					setup.store.Close()
+					setup.close()
 				}
 				if err == nil || err.Error() != tc.want {
 					t.Errorf("start: got %v, want %q", err, tc.want)
@@ -306,16 +306,33 @@ func TestInvalidStartupConfigDoesNotModifyState(t *testing.T) {
 	}
 }
 
-func TestStartupCreatesMissingStateAfterValidation(t *testing.T) {
-	f := newCheckFixture(t)
-	dir := filepath.Join(f.root, "missing", "state")
-	f.env["PORTAL_DATA_DIR"] = dir
-	setup, err := prepare(f.getenv, startState)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer setup.store.Close()
-	if info, err := os.Stat(filepath.Join(dir, "portal.lock")); err != nil || !info.Mode().IsRegular() {
-		t.Fatalf("valid start did not create its state lock: %v", err)
+func TestStartupInitializesExistingEmptyDataDirectory(t *testing.T) {
+	for _, name := range []string{"directory", "symlink"} {
+		t.Run(name, func(t *testing.T) {
+			f := newCheckFixture(t)
+			dir := filepath.Join(f.root, "empty")
+			if err := os.Mkdir(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			f.env["PORTAL_DATA_DIR"] = dir
+			if name == "symlink" {
+				link := filepath.Join(f.root, "linked-state")
+				if err := os.Symlink(dir, link); err != nil {
+					t.Fatal(err)
+				}
+				f.env["PORTAL_DATA_DIR"] = link
+			}
+			if code, _, stderr := runCheck(f); code != 0 {
+				t.Fatalf("check: code=%d stderr=%q", code, stderr)
+			}
+			setup, err := prepare(f.getenv, startState)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer setup.close()
+			if info, err := os.Stat(filepath.Join(dir, "portal.lock")); err != nil || !info.Mode().IsRegular() {
+				t.Fatalf("valid start did not create its state lock: %v", err)
+			}
+		})
 	}
 }
