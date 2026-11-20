@@ -11,7 +11,7 @@ const session = new vm.SyntheticModule(['authorizedJSON'], function () { this.se
 const module = new vm.SourceTextModule(source, { context });
 await module.link(() => session);
 await module.evaluate();
-const { sortCandidates, managedGroups, customPrefix, customRequest } = module.namespace;
+const { sortCandidates, managedGroups, customPathPrefix, customAddressChoice, customPreview, customAPILabelRequest, customRequest } = module.namespace;
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
 test('model candidates list image models first and keep the given order otherwise', () => {
@@ -40,22 +40,38 @@ test('only what the administrator changed becomes a managed group', () => {
   assert.deepEqual(saved(entry(group('override', { file_models: ['f'] }), { reset: true }), entry(group('managed'), { reset: true }), entry(group('file', { locked: true }), { dirty: true, enabled: false })), { groups: [] });
 });
 
-test('a custom connection is a key, an interface, a prefix and models; paths are never typed', () => {
-  const base = { keyId: 11, protocol: 'openai_images', prefix: '', models: ['gpt-image-2'] };
-  // An empty prefix is the interface's usual one.
-  assert.deepEqual(plain(customRequest(base)), { body: { key_id: 11, protocol: 'openai_images', prefix: '/v1', models: ['gpt-image-2'] } });
-  assert.equal(customRequest({ ...base, protocol: 'gemini_native' }).body.prefix, '/v1beta');
-  assert.equal(customRequest({ ...base, protocol: 'gemini_native', prefix: ' /antigravity/v1beta ' }).body.prefix, '/antigravity/v1beta');
-  assert.equal(customRequest({ ...base, prefix: '/alt/v1' }).body.prefix, '/alt/v1');
-  assert.deepEqual(Object.keys(customRequest(base).body).sort(), ['key_id', 'models', 'prefix', 'protocol']);
-  for (const prefix of ['//elsewhere.example/v1', 'https://elsewhere.example/v1', '/a/../v1', '/v1?b=1', '/a b/v1', 'v1', '/%2e%2e/v1', '/a\\b/v1', '/{model}/v1', '/v1/', '/a/b/c/d/v1']) {
-    assert.ok(customRequest({ ...base, prefix }).error, prefix);
-    assert.ok(customPrefix('gemini_native', prefix).error, prefix);
+test('custom requests select a label and derive paths from the platform and interface', () => {
+  const base = { keyId: 11, protocol: 'openai_images', apiLabel: 'api', models: ['gpt-image-2'] };
+  assert.deepEqual(plain(customRequest(base)), { body: { key_id: 11, protocol: 'openai_images', api_label: 'api', models: ['gpt-image-2'] } });
+  assert.equal(customPathPrefix('gemini', 'openai_images'), '/v1');
+  assert.equal(customPathPrefix('openai', 'gemini_native'), '/v1beta');
+  assert.equal(customPathPrefix('antigravity', 'gemini_native'), '/antigravity/v1beta');
+  assert.equal(customPathPrefix('antigravity', 'openai_images'), null);
+  assert.equal(customRequest({ ...base, platform: 'antigravity', protocol: 'gemini_native' }).body.api_label, '');
+  assert.ok(customRequest({ ...base, platform: 'antigravity' }).error);
+  assert.ok(customRequest({ ...base, apiLabel: 'API' }).error);
+  assert.ok(customRequest({ ...base, keyId: 0 }).error);
+  assert.ok(customRequest({ ...base, protocol: 'unknown' }).error);
+  assert.ok(customRequest({ ...base, models: [] }).error);
+});
+
+test('saved allowed labels stay selected; removed or old labels use the default', () => {
+  assert.deepEqual(plain(customAddressChoice(['api', 'api2'], 'api', 'api2')), { label: 'api2', removed: false });
+  assert.deepEqual(plain(customAddressChoice(['api'], 'api', 'api2')), { label: 'api', removed: true });
+  assert.deepEqual(plain(customAddressChoice(['api'], 'api', undefined)), { label: 'api', removed: false });
+  assert.deepEqual(plain(customAddressChoice([], '', 'api')), { label: '', removed: true });
+});
+
+test('previews show the full derived address and editing path', () => {
+  assert.equal(customPreview('https://api.main.example', 'openai', 'openai_images'), '路径由系统自动拼接，不需要填写：https://api.main.example/v1/images/generations（编辑：https://api.main.example/v1/images/edits）');
+  assert.match(customPreview('https://main.example', 'antigravity', 'gemini_native'), /https:\/\/main.example\/antigravity\/v1beta\/models\/<模型>:generateContent/);
+  assert.match(customPreview('https://api.main.example', 'gemini', 'gemini_native'), /\/v1beta\/models\/<模型>:generateContent/);
+});
+
+test('admin address validation requires unique lowercase labels and a listed default', () => {
+  assert.deepEqual(plain(customAPILabelRequest([], '')), { custom_api_labels: [], custom_api_default: '' });
+  assert.equal(customAPILabelRequest(['api', 'api2'], 'api2').custom_api_default, 'api2');
+  for (const [labels, chosen] of [[['api', 'api'], 'api'], [['API'], 'API'], [['api'], ''], [[], 'api'], [Array(17).fill('api'), 'api']]) {
+    assert.ok(customAPILabelRequest(labels, chosen).error);
   }
-  // The Studio client always addresses the OpenAI and Grok interfaces below a /v1 segment.
-  assert.match(customRequest({ ...base, prefix: '/v1beta' }).error, /以 \/v1 结尾/);
-  assert.match(customRequest({ ...base, protocol: 'grok_image', prefix: '/grok' }).error, /以 \/v1 结尾/);
-  assert.match(customRequest({ ...base, protocol: 'grok_video' }).error, /接口类型/);
-  assert.match(customRequest({ ...base, keyId: 0 }).error, /密钥/);
-  assert.match(customRequest({ ...base, models: [] }).error, /模型/);
 });

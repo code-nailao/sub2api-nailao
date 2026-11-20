@@ -5,15 +5,14 @@ import { authorizedJSON } from "./session.js";
 // Portal checks every value again; the checks here only save a round trip.
 
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$/;
-const PREFIX = /^(\/[A-Za-z0-9][A-Za-z0-9._~-]{0,63}){1,4}$/;
+const API_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const MAX_MODELS = 32;
 const IMAGE_LIKE = /image|imagen|imagine|dall|flux|banana|seedream/i;
-// The prefix is where Main serves the interface; the paths below it are the
-// interface's own and are never typed by the user.
+// Paths mirror the server contract and are never typed by the user.
 const PROTOCOLS = [
-  { value: "openai_images", label: "OpenAI 图片接口", prefix: "/v1", paths: "/images/…（生成与编辑）" },
-  { value: "grok_image", label: "Grok 图片接口", prefix: "/v1", paths: "/images/…（生成与编辑）" },
-  { value: "gemini_native", label: "Gemini 原生接口", prefix: "/v1beta", paths: "/models/<模型>:generateContent" },
+  { value: "openai_images", label: "OpenAI 图片接口", prefix: "/v1" },
+  { value: "grok_image", label: "Grok 图片接口", prefix: "/v1" },
+  { value: "gemini_native", label: "Gemini 原生接口", prefix: "/v1beta" },
 ];
 const GROUP_BLOCKERS = {
   group_inactive: "分组未启用",
@@ -51,23 +50,38 @@ export function managedGroups(entries) {
   return { groups };
 }
 
-/** The prefix to use for an interface, or why the typed one cannot be used. */
-export function customPrefix(protocol, typed) {
-  const item = PROTOCOLS.find((entry) => entry.value === protocol);
-  if (!item) return { error: "请选择接口类型。" };
-  const prefix = typed.trim() || item.prefix;
-  if (prefix.length > 128 || !PREFIX.test(prefix)) return { error: "前缀需以 / 开头，由 1 到 4 段字母、数字和 . _ ~ - 组成，例如 /v1。" };
-  if (protocol !== "gemini_native" && !prefix.endsWith("/v1")) return { error: "OpenAI 和 Grok 接口的前缀需要以 /v1 结尾，例如 /v1。" };
-  return { prefix };
+/** Mirror the server's derived path for the read-only preview. */
+export function customPathPrefix(platform, protocol) {
+  if (platform === "antigravity") return protocol === "gemini_native" ? "/antigravity/v1beta" : null;
+  return PROTOCOLS.find((item) => item.value === protocol)?.prefix || null;
 }
 
-/** The body of a custom connection save, or the reason it cannot be saved. */
-export function customRequest({ keyId, protocol, prefix, models }) {
+export function customAddressChoice(labels, defaultLabel, savedLabel) {
+  return { label: labels.includes(savedLabel) ? savedLabel : defaultLabel,
+    removed: Boolean(savedLabel && !labels.includes(savedLabel)) };
+}
+
+export function customPreview(origin, platform, protocol) {
+  const prefix = customPathPrefix(platform, protocol);
+  if (!prefix) return "请选择接口类型。";
+  const paths = protocol === "gemini_native" ? `${origin}${prefix}/models/<模型>:generateContent`
+    : `${origin}${prefix}/images/generations（编辑：${origin}${prefix}/images/edits）`;
+  return `路径由系统自动拼接，不需要填写：${paths}`;
+}
+
+export function customAPILabelRequest(labels, defaultLabel) {
+  if (labels.length > 16 || labels.some((label) => !API_LABEL.test(label)) || new Set(labels).size !== labels.length ||
+      (labels.length ? !labels.includes(defaultLabel) : defaultLabel !== "")) return { error: "API 子域名需为不重复的小写 DNS 标签，最多 16 个，并选择默认地址。" };
+  return { custom_api_labels: labels, custom_api_default: defaultLabel };
+}
+
+/** The save request contains a selected address, never an editable path. */
+export function customRequest({ keyId, protocol, apiLabel = "", platform = "", models }) {
   if (!Number.isSafeInteger(keyId) || keyId < 1) return { error: "请选择一把密钥。" };
-  const checked = customPrefix(protocol, prefix);
-  if (checked.error) return checked;
+  if (!customPathPrefix(platform, protocol)) return { error: "请选择接口类型。" };
+  if (apiLabel && !API_LABEL.test(apiLabel)) return { error: "请选择 API 子域名。" };
   if (!models.length) return { error: "请至少选择一个模型。" };
-  return { body: { key_id: keyId, protocol, prefix: checked.prefix, models } };
+  return { body: { key_id: keyId, protocol, api_label: platform === "antigravity" ? "" : apiLabel, models } };
 }
 
 function el(tag, props = {}, ...children) {
@@ -233,18 +247,38 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
   const messages = {
     source_changed_refresh_page: "其他管理员刚修改过设置，已载入最新内容，请重新调整后保存。",
     studio_group_is_server_managed: "媒体引擎分组只能在服务器的登记文件里调整。",
-    invalid_studio_registry: "有分组或模型 ID 不符合要求，请检查后重试。",
+    invalid_studio_registry: "有分组、模型或 API 子域名不符合要求，请检查后重试。",
     persistence_uncertain_restart_required: "设置已写入但未确认落盘，请联系运维核对后重启 Portal。",
     admin_required: "只有管理员可以修改分组设置。",
   };
   const allowCustom = el("input", { type: "checkbox" });
   const list = el("ul", { class: "portal-rows" });
-  let revision = 0, rows = [];
+  let revision = 0, rows = [], addressRows = [];
+  const addressList = el("div");
+  const addressSource = el("p", { class: "portal-note" });
+  const addressDeployment = el("p", { class: "portal-note" });
+  let apiHost = "";
+  function addAddress(label = "", isDefault = false) {
+    if (addressRows.length >= 16) { say(view, "最多设置 16 个 API 子域名。", "error"); return; }
+    const input = el("input", { type: "text", value: label, autocomplete: "off", spellcheck: false, "aria-label": "API 子域名" });
+    const radio = el("input", { type: "radio", name: "custom-api-default", checked: isDefault });
+    const entry = { input, radio };
+    entry.node = el("div", { class: "portal-address" }, input, el("code", { text: "." + apiHost }),
+      el("label", {}, radio, "默认"), button("移除", () => {
+        addressRows = addressRows.filter((item) => item !== entry);
+        entry.node.remove();
+        if (!addressRows.some((item) => item.radio.checked) && addressRows.length) addressRows[0].radio.checked = true;
+      }, "portal-link", "移除 API 子域名"));
+    addressRows.push(entry);
+    addressList.append(entry.node);
+  }
   const save = () => {
     const { groups, error } = managedGroups(rows.map((row) => row.entry()));
     if (error) { say(view, error, "error"); return; }
+    const addresses = customAPILabelRequest(addressRows.map((row) => row.input.value.trim()), addressRows.find((row) => row.radio.checked)?.input.value.trim() || "");
+    if (addresses.error) { say(view, addresses.error, "error"); return; }
     void busy(view, "正在保存…", async () => {
-      const result = await authorizedJSON("/api/studio/admin/registry", { method: "PUT", body: { revision, custom_disabled: !allowCustom.checked, groups } });
+      const result = await authorizedJSON("/api/studio/admin/registry", { method: "PUT", body: { revision, custom_disabled: !allowCustom.checked, groups, ...addresses } });
       if (result.ok) {
         show(result.data);
         say(view, "已保存，已经生效。");
@@ -297,6 +331,13 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
   }
   function show(data) {
     revision = data.revision;
+    apiHost = data.api_host;
+    addressRows = [];
+    addressList.replaceChildren();
+    for (const label of data.custom_api_labels || []) addAddress(label, label === data.custom_api_default);
+    addressSource.textContent = `当前生效来源：${{ online: "在线设置", deployment: "部署配置", none: "未设置，使用主站地址" }[data.custom_api_source]}`;
+    const deployment = data.deployment_api_labels || [];
+    addressDeployment.textContent = deployment.length ? `部署初始值：${deployment.map((label) => label + "." + apiHost + (label === data.deployment_api_default ? "（默认）" : "")).join("、")}` : "部署初始值：未设置";
     allowCustom.checked = data.custom_disabled !== true;
     rows = data.groups.map(row);
     list.replaceChildren(...rows.map((item) => item.node));
@@ -304,7 +345,10 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
     saveButton.hidden = data.writable !== true;
     if (data.writable !== true) say(view, messages.persistence_uncertain_restart_required, "error");
   }
-  view.body.append(el("label", { class: "portal-toggle" }, allowCustom, "允许用户用自己的 API 密钥连接（自定义连接）"), list);
+  view.body.append(el("label", { class: "portal-toggle" }, allowCustom, "允许用户用自己的 API 密钥连接（自定义连接）"),
+    el("section", { class: "portal-api-settings" }, el("h3", { text: "自定义连接可选的 API 子域名" }), addressList,
+      button("添加", () => addAddress("", addressRows.length === 0), "portal-link", "添加 API 子域名"), addressSource, addressDeployment,
+      el("p", { class: "portal-note", text: "留空则使用部署配置的初始值；都没有时使用主站地址。" })), list);
   view.actions.append(button("关闭", view.close), saveButton);
   void busy(view, "正在读取分组…", async () => {
     const data = await request("/api/studio/admin/registry", undefined, messages);
@@ -315,10 +359,10 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
 
 /** Any user: connect with one of their own API keys. */
 export function openCustomSettings({ onSaved = () => {} } = {}) {
-  const view = openDialog("自定义连接", "用你在本站已有的 API 密钥连接图片工作台和无限画布，费用照常从余额扣除。域名固定为本站；前缀可以修改，其后的路径由系统自动拼接。");
+  const view = openDialog("自定义连接", "用你在本站已有的 API 密钥连接图片工作台和无限画布，费用照常从余额扣除。域名固定为本站，可以选择 API 子域名；路径由系统自动拼接。");
   const messages = {
-    invalid_custom_connection: "前缀或模型不符合要求，请检查后重试。",
-    custom_connection_unavailable: "这把密钥在该前缀下暂时不能使用：可能已撤销、已过期、无权访问，或者属于需要从分组列表进入的分组。",
+    invalid_custom_connection: "API 地址、接口或模型不符合要求，请检查后重试。",
+    custom_connection_unavailable: "这把密钥暂时不能使用：可能已撤销、已过期、无权访问，或者属于需要从分组列表进入的分组。",
     custom_connection_disabled: "管理员已关闭自定义连接。",
   };
   view.actions.append(button("关闭", view.close));
@@ -334,50 +378,57 @@ export function openCustomSettings({ onSaved = () => {} } = {}) {
     const keySelect = el("select", { "aria-label": "API 密钥" }, keys.map((key) => el("option", { value: String(key.id), disabled: Boolean(key.blocker),
       text: [key.name || "未命名", key.group_name || `分组 #${key.group_id}`, key.hint ? `…${key.hint}` : "", key.blocker ? `（${KEY_BLOCKERS[key.blocker] || "不可用"}）` : ""].filter(Boolean).join(" · ") })));
     const protocolSelect = el("select", { "aria-label": "接口类型" }, PROTOCOLS.map((item) => el("option", { value: item.value, text: item.label })));
-    const prefixInput = el("input", { type: "text", autocomplete: "off", spellcheck: false, "aria-label": "地址前缀" });
+    const labelSelect = el("select", { "aria-label": "API 子域名" }, (data.api_labels || []).map((label) => el("option", { value: label, text: label })));
+    const address = el("div", { class: "portal-address" });
     const preview = el("p", { class: "portal-note" });
+    const notice = el("p", { class: "portal-note" });
+    const antiHint = el("p", { class: "portal-note", text: "Antigravity 分组暂时只能使用主站地址。" });
     const selectedKey = () => keys.find((key) => String(key.id) === keySelect.value);
-    const protocol = () => PROTOCOLS.find((entry) => entry.value === protocolSelect.value) || PROTOCOLS[0];
+    const choice = customAddressChoice(data.api_labels || [], data.api_default || "", saved?.api_label);
+    labelSelect.value = choice.label;
+    // A connection saved before subdomains existed still uses the main address until it is saved again.
+    const legacy = Boolean(saved && !saved.api_label && (data.api_labels || []).length);
+    notice.textContent = choice.removed ? "之前选的地址已停用，已改用默认地址。" : legacy ? "现在的连接仍使用主站地址，保存后改用上面选择的地址。" : "";
     const picker = modelPicker({ selected: saved ? saved.models : [], preselect: true, load: async () => {
-      const { prefix, error } = customPrefix(protocolSelect.value, prefixInput.value);
-      if (error) throw Object.assign(Error(error), { fixInput: true });
-      return (await request("/api/studio/custom/models", { method: "POST", body: { key_id: Number(keySelect.value), prefix } }, messages)).models;
+      return (await request("/api/studio/custom/models", { method: "POST", body: { key_id: Number(keySelect.value), protocol: protocolSelect.value } }, messages)).models;
     } });
     const describe = () => {
-      const { prefix, error } = customPrefix(protocolSelect.value, prefixInput.value);
-      preview.textContent = error || `前缀后面的路径由系统自动拼接，不需要填写：${prefix}${protocol().paths}`;
-      preview.dataset.kind = error ? "error" : "";
+      const anti = selectedKey().platform === "antigravity";
+      const selectable = !anti && (data.api_labels || []).length > 0;
+      address.replaceChildren(...(selectable ? [el("code", { text: "https://" }), labelSelect, el("code", { text: "." + data.api_host })]
+        : [el("code", { class: "portal-fixed", text: data.api_origin })]));
+      antiHint.hidden = !anti;
+      notice.hidden = anti || !notice.textContent;
+      preview.textContent = customPreview(selectable ? `https://${labelSelect.value}.${data.api_host}` : data.api_origin, selectedKey().platform, protocolSelect.value);
     };
-    // The key's group decides where to start; the user may change either field.
-    const defaults = (key) => key.protocol === protocolSelect.value && key.prefix ? key.prefix : protocol().prefix;
+    const setProtocols = (value) => {
+      const options = selectedKey().platform === "antigravity" ? PROTOCOLS.filter((item) => item.value === "gemini_native") : PROTOCOLS;
+      protocolSelect.replaceChildren(...options.map((item) => el("option", { value: item.value, text: item.label })));
+      protocolSelect.value = options.some((item) => item.value === value) ? value : selectedKey().protocol;
+    };
     keySelect.value = String(saved ? saved.key_id : keys.find((key) => !key.blocker).id);
-    protocolSelect.value = saved ? saved.protocol : selectedKey().protocol;
-    prefixInput.value = saved ? saved.prefix : defaults(selectedKey());
+    setProtocols(saved ? saved.protocol : selectedKey().protocol);
     keySelect.addEventListener("change", () => {
-      // Another key is another group: its interface, prefix and models start over.
-      protocolSelect.value = selectedKey().protocol;
-      prefixInput.value = defaults(selectedKey());
+      setProtocols(selectedKey().protocol);
       describe();
       picker.reset();
       void picker.refresh();
     });
     protocolSelect.addEventListener("change", () => {
-      prefixInput.value = defaults(selectedKey());
       describe();
       picker.reset();
       void picker.refresh();
     });
-    prefixInput.addEventListener("input", describe);
-    prefixInput.addEventListener("change", () => void picker.refresh());
+    labelSelect.addEventListener("change", describe);
     describe();
     view.body.append(
       el("label", { class: "portal-field" }, "API 密钥", keySelect),
       el("label", { class: "portal-field" }, "接口类型", protocolSelect),
       el("div", { class: "portal-field" }, "请求地址",
-        el("div", { class: "portal-address" }, el("code", { class: "portal-fixed", text: data.api_origin || location.origin, title: "域名固定，不能修改" }), prefixInput), preview),
+        address, notice, antiHint, preview),
       el("div", { class: "portal-field" }, "模型", picker.node));
     const save = () => {
-      const { body, error } = customRequest({ keyId: Number(keySelect.value), protocol: protocolSelect.value, prefix: prefixInput.value, models: picker.value });
+      const { body, error } = customRequest({ keyId: Number(keySelect.value), protocol: protocolSelect.value, apiLabel: labelSelect.value, platform: selectedKey().platform, models: picker.value });
       if (error) { say(view, error, "error"); return; }
       void busy(view, "正在保存…", async () => {
         await request("/api/studio/custom", { method: "PUT", body }, messages);
