@@ -109,7 +109,7 @@ issue、评论和 PR 正文与代码一样公开，适用 [AGENTS](../../AGENTS.
 | `AGENTS.md` | 贡献与 Agent 的长期规则 |
 | `DEV_GUIDE.md` | 工具链、目录结构、开发命令、验证方法 |
 | `SOURCES.md` | 相对原版的能力差异及代码入口 |
-| `CHANGELOG.md` | 各版本面向用户的变化 |
+| `CHANGELOG.md` | 各版本面向用户的变化；中文，按「新增功能 / 优化改进 / Bug 修复 / 破坏性变更」归类 |
 | `docs/sources/README.md` | 二开文档索引 |
 | `docs/sources/*.md` | 单项能力的设计：为什么做、怎么做、怎么验证 |
 
