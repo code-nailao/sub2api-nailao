@@ -117,14 +117,12 @@ func containsClientFunction(tools gjson.Result, name string) bool {
 
 // Native Anthropic tool choices name a tool, including server tools. Only a
 // unique client tool declaration proves that hosted tools cannot run.
-func selectsDeclaredAnthropicClientTool(body []byte) bool {
-	choice := gjson.GetBytes(body, "tool_choice")
-	name := choice.Get("name")
-	if choice.Get("type").String() != "tool" || name.Type != gjson.String || name.Str == "" {
+func selectsDeclaredAnthropicClientTool(name, tools gjson.Result) bool {
+	if name.Type != gjson.String || name.Str == "" {
 		return false
 	}
 	found := false
-	for _, declaration := range gjson.GetBytes(body, "tools").Array() {
+	for _, declaration := range tools.Array() {
 		declaredName := declaration.Get("name")
 		if declaredName.Type != gjson.String || declaredName.Str != name.Str {
 			continue
@@ -220,10 +218,19 @@ func stopPaidResponsesSubmissionAfterTimeout(c *gin.Context, model string) (*Ope
 // Apply the outbound Messages tool choice even when the client expects an
 // OpenAI error response.
 func stopNativeAnthropicHostedToolTimeout(c *gin.Context, status int, outbound []byte, inboundProtocol string) error {
-	if status != http.StatusRequestTimeout || selectsDeclaredAnthropicClientTool(outbound) {
+	if status != http.StatusRequestTimeout {
 		return nil
 	}
-	return stopHostedToolTimeout(c, status, outbound, inboundProtocol)
+	choice := gjson.GetBytes(outbound, "tool_choice")
+	if choice.Get("type").String() != "tool" {
+		return stopHostedToolTimeout(c, status, outbound, inboundProtocol)
+	}
+	if selectsDeclaredAnthropicClientTool(choice.Get("name"), gjson.GetBytes(outbound, "tools")) {
+		return nil
+	}
+	// A named selection that cannot be resolved is inconclusive even when all
+	// listed tools are client tools.
+	return writeHostedToolTimeout(c, outbound, inboundProtocol)
 }
 
 // Call before error recovery can send the request again, using the request
@@ -232,9 +239,13 @@ func stopHostedToolTimeout(c *gin.Context, status int, outbound []byte, inboundP
 	if status != http.StatusRequestTimeout || !submissionMayRunHostedTools(outbound) {
 		return nil
 	}
+	return writeHostedToolTimeout(c, outbound, inboundProtocol)
+}
+
+func writeHostedToolTimeout(c *gin.Context, outbound []byte, inboundProtocol string) error {
 	if inboundProtocol == APIProtocolAnthropic {
 		err := markPaidSubmissionTimeout(c)
-		writeAnthropicError(c, status, "api_error", paidSubmissionTimeoutMessage)
+		writeAnthropicError(c, http.StatusRequestTimeout, "api_error", paidSubmissionTimeoutMessage)
 		return err
 	}
 	if inboundProtocol == APIProtocolChatCompletions && c.Writer.Written() && strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {

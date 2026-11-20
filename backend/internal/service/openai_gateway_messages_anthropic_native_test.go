@@ -85,25 +85,34 @@ data: {"type":"message_stop"}
 
 func TestNativeAnthropic408UsesTheEffectiveToolSelection(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	const responseShape = `{"model":"minimax-m3","input":"fixture","tools":[{"type":"web_search"},{"type":"function","name":"local_lookup","parameters":{"type":"object"}}],"tool_choice":{"type":"function","name":%q}}`
-	const messagesShape = `{"model":"minimax-m3","max_tokens":32,"messages":[{"role":"user","content":"fixture"}],"tools":[{"type":"web_search_20250305","name":"web_search"},{"type":"custom","name":"local_lookup","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":%q}}`
+	const responseShape = `{"model":"minimax-m3","input":"fixture","tools":[%s{"type":"function","name":"local_lookup","parameters":{"type":"object"}}],"tool_choice":{"type":"function","name":%q}}`
+	const messagesShape = `{"model":"minimax-m3","max_tokens":32,"messages":[{"role":"user","content":"fixture"}],"tools":[%s{"type":"custom","name":"local_lookup","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":%q}}`
+	const responsesSearch = `{"type":"web_search"}`
+	const messagesSearch = `{"type":"web_search_20250305","name":"web_search"}`
 	for _, ingress := range []struct {
-		path, template string
+		path, template, search string
 	}{
-		{"/v1/responses", responseShape},
-		{"/v1/chat/completions", responseShape},
-		{"/v1/messages", messagesShape},
+		{"/v1/responses", responseShape, responsesSearch},
+		{"/v1/chat/completions", responseShape, responsesSearch},
+		{"/v1/messages", messagesShape, messagesSearch},
 	} {
 		for _, scenario := range []struct {
-			selected string
-			failover bool
+			name, selected string
+			withSearch     bool
+			failover       bool
 		}{
-			{"local_lookup", true},
-			{"web_search", false},
-			{"undeclared", false},
+			{"client-selected-with-search", "local_lookup", true, true},
+			{"search-selected", "web_search", true, false},
+			{"undeclared-with-search", "missing", true, false},
+			{"undeclared-client-only", "missing", false, false},
+			{"client-selected-client-only", "local_lookup", false, true},
 		} {
-			t.Run(strings.TrimPrefix(ingress.path, "/v1/")+"/"+scenario.selected, func(t *testing.T) {
-				body := []byte(fmt.Sprintf(ingress.template, scenario.selected))
+			t.Run(strings.TrimPrefix(ingress.path, "/v1/")+"/"+scenario.name, func(t *testing.T) {
+				search := ""
+				if scenario.withSearch {
+					search = ingress.search + ","
+				}
+				body := []byte(fmt.Sprintf(ingress.template, search, scenario.selected))
 				c := adaptiveProtocolTestContext(ingress.path, body)
 				upstream := &httpUpstreamRecorder{resp: &http.Response{
 					StatusCode: http.StatusRequestTimeout,
@@ -130,8 +139,14 @@ func TestNativeAnthropic408UsesTheEffectiveToolSelection(t *testing.T) {
 				require.Equal(t, "/v1/messages", upstream.lastReq.URL.Path)
 				require.Equal(t, "tool", gjson.GetBytes(upstream.lastBody, "tool_choice.type").String())
 				require.Equal(t, scenario.selected, gjson.GetBytes(upstream.lastBody, "tool_choice.name").String())
-				require.Equal(t, "web_search_20250305", gjson.GetBytes(upstream.lastBody, "tools.0.type").String())
-				require.Equal(t, "local_lookup", gjson.GetBytes(upstream.lastBody, "tools.1.name").String())
+				tools := gjson.GetBytes(upstream.lastBody, "tools").Array()
+				if scenario.withSearch {
+					require.Len(t, tools, 2)
+					require.Equal(t, "web_search_20250305", tools[0].Get("type").String())
+				} else {
+					require.Len(t, tools, 1)
+				}
+				require.Equal(t, "local_lookup", tools[len(tools)-1].Get("name").String())
 				require.Nil(t, result)
 				var failover *UpstreamFailoverError
 				if scenario.failover {
@@ -142,6 +157,8 @@ func TestNativeAnthropic408UsesTheEffectiveToolSelection(t *testing.T) {
 					require.NotErrorAs(t, err, &failover)
 					require.ErrorContains(t, err, "outcome unknown")
 					require.True(t, IsResponseCommitted(c))
+					require.Equal(t, http.StatusRequestTimeout, c.Writer.Status())
+					require.Equal(t, "false", c.Writer.Header().Get("X-Should-Retry"))
 				}
 			})
 		}

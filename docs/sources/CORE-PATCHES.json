@@ -3264,8 +3264,8 @@
       "features": [
         "paid_submission_no_replay"
       ],
-      "sha256": "fd5ad1c85d5d2a22fdbfe559de20a7f698f1415fa39b3ed2dfdc91348d404cd0",
-      "reason": "Covers Responses, Responses-shaped Chat and Messages forwarded to a native Anthropic endpoint. Verifies 408 failover for a forced client tool and terminal errors when the selected tool is hosted or unresolved."
+      "sha256": "8b7a9099520022bf64987730a0a263e27f5bffd572cc22af3ec4c6ca52d9311d",
+      "reason": "Covers Responses, Responses-shaped Chat and Messages forwarded to a native Anthropic endpoint. Verifies 408 failover for a forced client tool and terminal errors when the selected tool is hosted or unresolved. Checks unresolved named selections even when the outbound request declares only a client tool."
     },
     {
       "path": "backend/internal/service/openai_gateway_messages_chat_fallback.go",
@@ -3369,8 +3369,8 @@
       "features": [
         "paid_submission_no_replay"
       ],
-      "sha256": "fa8791899ab39b9793402b0231ae4843045902f84c2220a9a99e066d9f724f38",
-      "reason": "Recognizes hosted Responses search declarations and reports a terminal HTTP 408 for paid submissions with an unknown outcome. Classifies provider-hosted retrieval and connector tools by category, protects unknown hosted tool types and keeps confirmed client-executed tools separate. Classifies effective hosted tools after protocol conversion, preserves a 408 failover for a forced declared client function and returns a terminal error in the client protocol. Resolves client-only tool restrictions and namespaced function selections before excluding hosted tools. Encodes a terminal response.failed event for a paid timeout after Responses streaming has started. Resolves native Anthropic tool choices against unambiguous client-tool declarations while preserving the inbound error protocol."
+      "sha256": "c6683afcb164284766c69b4d952535e0e9055925a8a4f62c550385dada2e39c9",
+      "reason": "Recognizes hosted Responses search declarations and reports a terminal HTTP 408 for paid submissions with an unknown outcome. Classifies provider-hosted retrieval and connector tools by category, protects unknown hosted tool types and keeps confirmed client-executed tools separate. Classifies effective hosted tools after protocol conversion, preserves a 408 failover for a forced declared client function and returns a terminal error in the client protocol. Resolves client-only tool restrictions and namespaced function selections before excluding hosted tools. Encodes a terminal response.failed event for a paid timeout after Responses streaming has started. Resolves native Anthropic tool choices against unambiguous client-tool declarations while preserving the inbound error protocol. Named Anthropic selections that cannot be matched are terminal on HTTP 408 even if the declaration list has no hosted tools."
     },
     {
       "path": "backend/internal/service/openai_gateway_usage.go",
