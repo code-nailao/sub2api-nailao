@@ -208,7 +208,7 @@ function modelPicker({ selected, load, isOpen, onChange = () => {}, preselect = 
     refreshButton.disabled = true;
     say("正在获取模型…");
     try {
-      const ids = sortCandidates(await load());
+      const ids = sortCandidates(await load(accepted));
       if (!accepted()) return;
       candidates = ids;
       loaded = true;
@@ -294,7 +294,9 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
     const addresses = customAPILabelRequest(addressRows.map((row) => row.input.value.trim()), addressRows.find((row) => row.radio.checked)?.input.value.trim() || "");
     if (addresses.error) { say(view, addresses.error, "error"); return; }
     void busy(view, "正在保存…", async (current) => {
-      const result = await authorizedJSON("/api/studio/admin/registry", { method: "PUT", body: { revision, custom_disabled: !allowCustom.checked, groups, ...addresses } });
+      const result = await authorizedJSON("/api/studio/admin/registry", {
+        method: "PUT", body: { revision, custom_disabled: !allowCustom.checked, groups, ...addresses }, isCurrent: current,
+      });
       if (!current()) return;
       if (result.ok) {
         show(result.data);
@@ -303,7 +305,7 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
         return;
       }
       if (result.data?.error === "source_changed_refresh_page") {
-        const data = await request("/api/studio/admin/registry", undefined, messages);
+        const data = await request("/api/studio/admin/registry", { isCurrent: current }, messages);
         if (!current()) return;
         show(data);
       }
@@ -316,7 +318,7 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
     const touched = () => { dirty = true; reset = false; note.textContent = ""; };
     const check = el("input", { type: "checkbox", checked: group.enabled, disabled: group.locked });
     const picker = group.locked ? null : modelPicker({ selected: group.models, isOpen: view.isOpen, onChange: touched, preselect: true,
-      load: async () => (await request(`/api/studio/admin/groups/${group.group_id}/models`, undefined, messages)).models });
+      load: async (isCurrent) => (await request(`/api/studio/admin/groups/${group.group_id}/models`, { isCurrent }, messages)).models });
     const note = el("span", { class: "portal-note" });
     const tags = [
       group.locked ? "媒体引擎 · 服务器登记，只读" : { file: "服务器登记", override: "已在此修改", managed: "已在此加入" }[group.source],
@@ -372,7 +374,7 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
       el("p", { class: "portal-note", text: "留空则使用部署配置的初始值；都没有时使用主站地址。" })), list);
   view.actions.append(button("关闭", view.close), saveButton);
   void busy(view, "正在读取分组…", async (current) => {
-    const data = await request("/api/studio/admin/registry", undefined, messages);
+    const data = await request("/api/studio/admin/registry", { isCurrent: current }, messages);
     if (!current()) return;
     say(view, "");
     show(data);
@@ -391,7 +393,7 @@ export function openCustomSettings({ getGeneration = () => undefined, onSaved = 
   function persistBinding(configured, options) {
     const pageRound = getGeneration();
     return busy(view, configured ? "正在保存…" : "正在删除…", async (current) => {
-      await request("/api/studio/custom", options, messages);
+      await request("/api/studio/custom", { ...options, isCurrent: current }, messages);
       if (!current()) return;
       view.close();
       onSaved(configured, pageRound);
@@ -420,8 +422,10 @@ export function openCustomSettings({ getGeneration = () => undefined, onSaved = 
     // A connection saved before subdomains existed still uses the main address until it is saved again.
     const legacy = Boolean(saved && !saved.api_label && (data.api_labels || []).length);
     notice.textContent = choice.removed ? "之前选的地址已停用，已改用默认地址。" : legacy ? "现在的连接仍使用主站地址，保存后改用上面选择的地址。" : "";
-    const picker = modelPicker({ selected: saved ? saved.models : [], isOpen: view.isOpen, preselect: true, load: async () => {
-      return (await request("/api/studio/custom/models", { method: "POST", body: { key_id: Number(keySelect.value), protocol: protocolSelect.value } }, messages)).models;
+    const picker = modelPicker({ selected: saved ? saved.models : [], isOpen: view.isOpen, preselect: true, load: async (isCurrent) => {
+      return (await request("/api/studio/custom/models", {
+        method: "POST", body: { key_id: Number(keySelect.value), protocol: protocolSelect.value }, isCurrent,
+      }, messages)).models;
     } });
     const describe = () => {
       const anti = selectedKey().platform === "antigravity";
@@ -469,7 +473,7 @@ export function openCustomSettings({ getGeneration = () => undefined, onSaved = 
     void picker.refresh();
   }
   void busy(view, "正在读取你的密钥…", async (current) => {
-    const data = await request("/api/studio/custom", undefined, messages);
+    const data = await request("/api/studio/custom", { isCurrent: current }, messages);
     if (!current()) return;
     show(data);
     say(view, "");

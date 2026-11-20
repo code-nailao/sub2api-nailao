@@ -141,8 +141,8 @@ document.querySelector("#canvas-connection-menu").addEventListener("keydown", (e
   event.currentTarget.open = false;
   event.currentTarget.querySelector("summary")?.focus();
 });
-async function api(path, body) {
-  const result = await authorizedJSON(path, { method: body ? "POST" : "GET", body });
+async function api(path, isCurrent, body) {
+  const result = await authorizedJSON(path, { method: body ? "POST" : "GET", body, isCurrent });
   if (path === "/api/canvas/connection" && result.status === 409 && result.data?.error === CUSTOM_CONNECTION_NEEDS_UPDATE) {
     throw Error(CUSTOM_RESAVE_HINT, { cause: CUSTOM_CONNECTION_NEEDS_UPDATE });
   }
@@ -206,7 +206,7 @@ async function restoreConnection(connectionId, requestId, target) {
     connection?.payload === activePayload && restoreRounds.get(connectionId) === restoreRound;
   let config;
   try {
-    config = await api("/api/canvas/connection", { group_id: Number(connectionId.slice(6)), restore_only: true });
+    config = await api("/api/canvas/connection", current, { group_id: Number(connectionId.slice(6)), restore_only: true });
   } catch (error) {
     if (!current()) return;
     restoreRounds.delete(connectionId);
@@ -280,9 +280,10 @@ async function authorize(operation, groupId) {
   operation.phase = "authorize";
   if (!needsCustomResave) frame.hidden = true;
   showState("loading", "正在连接所选分组…");
+  const waiting = () => isWaiting(operation);
   try {
-    const config = await api("/api/canvas/connection", { group_id: groupId });
-    if (!isWaiting(operation)) return;
+    const config = await api("/api/canvas/connection", waiting, { group_id: groupId });
+    if (!waiting()) return;
     needsCustomResave = false;
     restoreRounds.clear();
     granted.set(config.selectedConnectionId, config);
@@ -304,6 +305,7 @@ retry.onclick = () => {
   if (readingOrAuthorizing()) return;
   if (savedGroupToReconnect !== undefined) { void reconnectSavedGroup(savedGroupToReconnect); return; }
   if (!studioURL) { void bootstrap(); return; }
+  if (confirmed()) { showState("ready"); return; }
   if (connection && !connection.invalid) { repeatConfirmation(); return; }
   void connect();
 };
@@ -312,10 +314,11 @@ function watchSession() {
   checkTimer = setInterval(async () => {
     if (locked || document.visibilityState !== "visible") return;
     const pageRound = rounds.current, poll = groupPoll.advance();
+    const current = () => isCurrent(pageRound) && poll === groupPoll.current;
     try {
-      await api("/api/canvas/groups");
+      await api("/api/canvas/groups", current);
     } catch (error) {
-      if (isCurrent(pageRound) && poll === groupPoll.current) showState("recovery", error.message);
+      if (current()) showState("recovery", error.message);
     }
   }, 30000);
 }
@@ -349,7 +352,7 @@ async function reloadGroups() {
   const pageRound = rounds.current, refresh = groupRefresh.advance();
   const current = () => isCurrent(pageRound) && refresh === groupRefresh.current;
   try {
-    const data = await api("/api/canvas/groups");
+    const data = await api("/api/canvas/groups", current);
     if (!current()) return;
     const previous = select.value;
     if (!renderGroups(data, previous)) { showState("recovery", noGroups()); return; }
@@ -361,9 +364,10 @@ async function reloadGroups() {
 async function reconnectSavedGroup(selectId) {
   savedGroupToReconnect = selectId;
   const operation = begin("savedGroups", "recovery", "正在更新画布连接…");
+  const waiting = () => isWaiting(operation);
   try {
-    const data = await api("/api/canvas/groups");
-    if (!isWaiting(operation)) return;
+    const data = await api("/api/canvas/groups", waiting);
+    if (!waiting()) return;
     const previous = select.value;
     if (!renderGroups(data, selectId || previous)) {
       savedGroupToReconnect = undefined;
@@ -408,9 +412,10 @@ manageButton.onclick = () => {
 async function bootstrap() {
   if (locked || readingOrAuthorizing()) return;
   const operation = begin("bootstrap", "loading", "正在连接画布，请稍候…");
+  const waiting = () => isWaiting(operation);
   try {
-    const data = await api("/api/canvas/groups");
-    if (!isWaiting(operation)) return;
+    const data = await api("/api/canvas/groups", waiting);
+    if (!waiting()) return;
     studioURL = new URL(data.canvas_url);
     studioURL.searchParams.set("sources_account", String(data.user_id));
     studioURL.searchParams.set("ui_mode", "embedded");

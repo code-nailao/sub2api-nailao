@@ -99,6 +99,48 @@ test('an expired embedded session asks the exact parent to check native auth bef
   assert.equal(fixture.locks, 0);
 });
 
+test('a retired request does not ask the parent to check native auth', async () => {
+  const received = deferred(), release = deferred();
+  let current = true;
+  const fixture = await loadSession({
+    api: async () => {
+      received.resolve();
+      await release.promise;
+      return json(401, { error: 'admin_login_required' });
+    },
+    refresh: ({ data, message }) => message({ type: 'sub2api:session-checked', requestId: data.requestId, ok: false }),
+  });
+  const request = fixture.session.authorizedJSON('/api/studio/groups', { isCurrent: () => current });
+  await received.promise;
+  current = false;
+  release.resolve();
+  assert.equal((await request).status, 401);
+  assert.equal(fixture.checks, 0);
+  assert.equal(fixture.locks, 0);
+});
+
+test('a parent check cannot replay or lock a request retired while the check was pending', async () => {
+  for (const rotated of [false, true]) {
+    const checked = deferred();
+    let current = true;
+    const fixture = await loadSession({
+      api: ({ count }) => count === 1 ? json(401, { error: 'admin_login_required' }) : json(200, {}),
+      refresh: (details) => checked.resolve(details),
+    });
+    const request = fixture.session.authorizedJSON('/api/studio/connection', {
+      method: 'POST', body: { group_id: 26 }, isCurrent: () => current,
+    });
+    const { data, message, setToken } = await checked.promise;
+    current = false;
+    if (rotated) setToken(newToken);
+    message({ type: 'sub2api:session-checked', requestId: data.requestId, ok: rotated });
+    assert.equal(fixture.checks, 1);
+    assert.equal((await request).status, 401);
+    assert.equal(fixture.calls.length, 1);
+    assert.equal(fixture.locks, 0);
+  }
+});
+
 test('the same user with another session, logout, and account switch reject a late response', async () => {
   for (const replacement of [token(9, 'session-b'), token(10), null]) {
     const received = deferred(), release = deferred();

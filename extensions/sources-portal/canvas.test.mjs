@@ -453,6 +453,26 @@ test('a hung Canvas group refresh after saving exposes a usable retry', async ()
   assert.equal(f.frame.hidden, false);
 });
 
+test('retrying a failed Canvas poll keeps the acknowledged iframe visible without another ACK', async () => {
+  let pollFails = false;
+  const f = await fixture({ groupsResponse: () => pollFails ? { ok: false, status: 503 } : undefined });
+  f.host(); f.loaded(); await f.ack();
+  const config = f.last('sub2api:media-studio-config');
+  pollFails = true;
+  await [...f.timers.values()].find(({ delay }) => delay === 30000).callback();
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.frame.hidden, false);
+
+  const retry = f.elements['#canvas-retry'];
+  assert.equal(retry.disabled, false);
+  retry.onclick();
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.last('sub2api:media-studio-config'), config);
+  assert.equal(f.calls.filter(({ path }) => path.endsWith('/connection')).length, 1);
+  assert.equal(f.parentMessages.at(-1).integrated, true);
+});
+
 test('Canvas discards a group poll failure from an earlier connection generation', async () => {
   const oldPoll = Promise.withResolvers();
   let pollPending = false;

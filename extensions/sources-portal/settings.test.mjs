@@ -6,9 +6,11 @@ import vm from 'node:vm';
 // Test the same module with either no DOM (validation) or a small dialog fixture.
 const source = await readFile(new URL('./internal/portal/web/studio-settings.js', import.meta.url), 'utf8');
 const roundSource = await readFile(new URL('./internal/portal/web/request-round.js', import.meta.url), 'utf8');
+const sessionSource = await readFile(new URL('./internal/portal/web/session.js', import.meta.url), 'utf8');
 async function settingsModule(globals = {}, authorizedJSON = async () => { throw Error('not called'); }) {
   const context = vm.createContext({ setTimeout, clearTimeout, ...globals });
-  const session = new vm.SyntheticModule(['authorizedJSON'], function () { this.setExport('authorizedJSON', authorizedJSON); }, { context });
+  const session = globals.fetch ? new vm.SourceTextModule(sessionSource, { context })
+    : new vm.SyntheticModule(['authorizedJSON'], function () { this.setExport('authorizedJSON', authorizedJSON); }, { context });
   const module = new vm.SourceTextModule(source, { context });
   const rounds = new vm.SourceTextModule(roundSource, { context });
   await module.link((specifier) => specifier === './request-round.js' ? rounds : session);
@@ -92,6 +94,46 @@ test('only the latest open custom dialog accepts overlapping successful saves', 
     assert.deepEqual(results, ['second']);
     assert.deepEqual(body.querySelectorAll('dialog'), []);
   });
+});
+
+test('a closed custom dialog cannot lock its replacement with a late 401', async () => {
+  const window = new EventTarget(), body = new Element('body');
+  window.parent = window;
+  const origin = 'https://main.example';
+  const pending = Promise.withResolvers();
+  let writes = 0, saves = 0;
+  const { openCustomSettings } = await settingsModule({
+    window, document: { body, createElement: (tag) => new Element(tag) },
+    location: new URL(origin + '/canvas'), history: { replaceState() {} }, URL, URLSearchParams, atob, Event,
+    localStorage: { getItem: () => 'fixture-session' },
+    fetch: async (url, options) => {
+      if (url === '/public/runtime') return Response.json({ main_origin: origin });
+      if (options.method === 'PUT') return ++writes === 1 ? pending.promise : Response.json({});
+      if (url.pathname.endsWith('/models')) return Response.json({ models: ['image-fixture'] });
+      return Response.json({ enabled: true, api_labels: [], api_origin: origin,
+        keys: [{ id: 1, name: '示例密钥', protocol: 'openai_images' }],
+        binding: { key_id: 1, protocol: 'openai_images', models: ['image-fixture'] } });
+    },
+  });
+  const open = async () => {
+    openCustomSettings({ onSaved: () => saves++ });
+    await flush();
+    return body.querySelectorAll('dialog')[0];
+  };
+  const clickSave = (dialog) => dialog.querySelectorAll('button').find((button) => button.textContent === '保存并连接').click();
+  const first = await open();
+  clickSave(first);
+  await flush();
+  assert.equal(writes, 1);
+  first.close();
+  const second = await open();
+  pending.resolve(Response.json({ error: 'unauthorized' }, { status: 401 }));
+  await flush();
+  assert.equal(second.open, true);
+  clickSave(second);
+  await flush();
+  assert.equal(saves, 1);
+  assert.equal(second.open, false);
 });
 
 test('model candidates list image models first and keep the given order otherwise', () => {

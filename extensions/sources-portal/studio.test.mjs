@@ -195,6 +195,68 @@ test('Studio ignores the first legacy ACK when startup retries the same group', 
   assert.equal(f.calls.filter(({ path }) => path.endsWith('/connection')).length, authorizations);
 });
 
+test('Studio revalidates the custom connection after an ACK timeout', async () => {
+  let keyMoved = false;
+  const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID),
+    connection: (options, config) => keyMoved
+      ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
+      : { ok: true, status: 200, data: config(options.body.group_id) } });
+  const original = f.last('sub2api:image-studio-config');
+  assert.equal(original.payload.selectedConnectionId, `group-${CUSTOM_ID}`);
+  [...f.timers.values()].find(({ delay }) => delay === 20000).callback();
+  assert.equal(f.retry.disabled, false);
+
+  keyMoved = true;
+  f.retry.onclick();
+  await flush();
+  // Even a matching profile ID from the retry iframe cannot activate an old grant.
+  f.send({ type: 'sub2api:image-studio-config-applied', payload: {
+    status: 'applied', profileId: `sub2api-image-studio-${original.payload.selectedConnectionId}`,
+  } });
+  await flush();
+  assert.equal(f.frame.hidden, true);
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  assert.equal(f.last('sub2api:image-studio-config'), original);
+  assert.equal(connections(f), 2);
+  f.retry.onclick();
+  assert.equal(f.settings.at(-1)?.kind, 'custom');
+});
+
+test('a late 401 from a timed-out Studio authorization cannot lock a ready retry', async () => {
+  const oldRequest = Promise.withResolvers();
+  let firstAuthorization, rejectPoll = false;
+  const f = await fixture({ useSessionTransport: true,
+    groupsResponse: () => rejectPoll ? { status: 401, data: { error: 'unauthorized' } } : undefined,
+    connection: (options, config) => {
+      if (!firstAuthorization) {
+        firstAuthorization = options.headers.Authorization;
+        return oldRequest.promise;
+      }
+      assert.notEqual(options.headers.Authorization, firstAuthorization);
+      return { status: 200, data: config(options.body.group_id) };
+    } });
+  assert.ok(firstAuthorization);
+  [...f.timers.values()].find(({ delay }) => delay === 20000).callback();
+  assert.equal(f.retry.disabled, false);
+  f.setTokenVersion(2);
+  f.retry.onclick();
+  await flush();
+  await f.integrate();
+  assert.equal(f.document.body.dataset.state, 'ready');
+
+  oldRequest.resolve({ status: 401, data: { error: 'unauthorized' } });
+  await flush();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.locked, false);
+
+  rejectPoll = true;
+  await [...f.timers.values()].find(({ delay }) => delay === 30000).callback();
+  assert.equal(f.locked, true);
+  assert.equal(f.frame.hidden, true);
+});
+
 test('Studio can retry a hung group read on startup after saving settings', async () => {
   const hung = Promise.withResolvers();
   let readPending = true;

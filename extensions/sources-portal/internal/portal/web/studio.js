@@ -125,8 +125,8 @@ document.querySelector("#lock").onclick = () => {
 };
 window.addEventListener("sources:locked", () => lock("主站已退出或切换账号，请重新进入。"));
 
-async function api(path, body) {
-  const result = await authorizedJSON(path, { method: body ? "POST" : "GET", body });
+async function api(path, isCurrent, body) {
+  const result = await authorizedJSON(path, { method: body ? "POST" : "GET", body, isCurrent });
   if (path === "/api/studio/connection" && result.status === 409 && result.data?.error === CUSTOM_CONNECTION_NEEDS_UPDATE) {
     throw Error(CUSTOM_RESAVE_HINT, { cause: CUSTOM_CONNECTION_NEEDS_UPDATE });
   }
@@ -325,7 +325,9 @@ async function connect(groupId, request) {
   const expired = expiredLegacyAttempt;
   expiredLegacyAttempt = undefined;
   if (!pending.requestId && expired?.target) replaceExpiredLegacyFrame();
-  const cached = pending.requestId || needsCustomResave || expired?.groupId !== groupId ? undefined : expired.config;
+  // Retry custom connections through Portal so it checks the Key's current group.
+  const cached = !pending.requestId && !needsCustomResave && groupId !== custom.groupId && expired?.groupId === groupId
+    ? expired.config : undefined;
   rounds.deadline(pending.round, 20000, () => connectionTimedOut(pending, connectionTimeout));
   const connectingText = "正在连接所选分组…";
   if (needsCustomResave) recoverView(connectingText);
@@ -335,7 +337,7 @@ async function connect(groupId, request) {
   try {
     let config = cached;
     if (config) await currentToken();
-    else config = await api("/api/studio/connection", { group_id: groupId, ...(pending.restoreOnly ? { restore_only: true } : {}) });
+    else config = await api("/api/studio/connection", waiting, { group_id: groupId, ...(pending.restoreOnly ? { restore_only: true } : {}) });
     if (!waiting()) return;
     if (needsCustomResave) {
       needsCustomResave = false;
@@ -461,7 +463,7 @@ async function refreshMetadata() {
   const pageRound = rounds.current, refresh = metadata.advance();
   const current = () => isCurrent(pageRound) && refresh === metadata.current;
   try {
-    const fresh = await api("/api/studio/groups");
+    const fresh = await api("/api/studio/groups", current);
     if (!current()) return;
     updateMetadata(fresh);
     publishShell();
@@ -482,9 +484,10 @@ async function bootstrap() {
     bootstrapRound = undefined;
     recoverView(connectionTimeout);
   });
+  const waiting = () => !locked && rounds.isWaiting(round);
   try {
-    const data = await api("/api/studio/groups");
-    if (!rounds.isWaiting(round)) return;
+    const data = await api("/api/studio/groups", waiting);
+    if (!waiting()) return;
     const candidate = new URL(data.studio_url);
     if (data.main_origin !== location.origin || !["https:", "http:"].includes(candidate.protocol) || candidate.username || candidate.password) throw Error("工作台配置暂不可用。");
     studioURL = candidate;

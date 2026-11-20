@@ -93,8 +93,9 @@ function checkParentSession() {
 
 // One transport boundary for every authenticated UI. A late response must not
 // refill a cleared page or deliver a key after logout/account switch.
-/** @param {string} path @param {{method?:string,body?:unknown,rawBody?:Blob,contentType?:string,responseType?:string}} options */
+/** @param {string} path @param {{method?:string,body?:unknown,rawBody?:Blob,contentType?:string,responseType?:string,isCurrent?:()=>boolean}} options */
 export async function authorizedJSON(path, options = {}) {
+  const isCurrent = options.isCurrent ?? (() => true);
   const url = new URL(path, location.origin);
   if (
     url.origin !== location.origin ||
@@ -134,16 +135,20 @@ export async function authorizedJSON(path, options = {}) {
   };
   const token = await currentToken();
   let result = await send(token);
+  // Only the round that still owns this request may act on its 401.
+  // currentToken() and storage events still enforce logout and account switches.
+  if (result.status !== 401 || !isCurrent()) return result;
   // This exact error is emitted by Portal's identity middleware before dispatch.
   // Other 4xx, 5xx and network/unknown outcomes must never replay a business write.
-  if (result.status === 401 && result.data?.error === "admin_login_required") {
+  if (result.data?.error === "admin_login_required") {
     let freshToken = await currentToken();
+    if (!isCurrent()) return result;
     if (freshToken === token) {
       await checkParentSession();
       freshToken = await currentToken();
     }
-    if (freshToken !== token) result = await send(freshToken);
+    if (freshToken !== token && isCurrent()) result = await send(freshToken);
   }
-  if (result.status === 401) clearSession();
+  if (result.status === 401 && isCurrent()) clearSession();
   return result;
 }
