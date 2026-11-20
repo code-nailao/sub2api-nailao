@@ -258,17 +258,27 @@ func (r *deepSeekJSONReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-type deepSeekChatToolSelection struct {
-	typ, name, legacyName string
-	named                 bool
+type deepSeekChatToolFields struct {
+	typ, name, functionName string
+}
+
+func (f deepSeekChatToolFields) matchesKeptName(name string) bool {
+	if f.typ != "function" {
+		return name == f.name || name == f.typ
+	}
+	if f.functionName != "" {
+		return name == f.functionName
+	}
+	// Fixed Chat accounts can receive flat function definitions in a raw
+	// Responses-shaped request.
+	return name == f.name
 }
 
 type deepSeekChatToolScope uint8
 
 const (
 	deepSeekChatToolNested deepSeekChatToolScope = iota
-	deepSeekChatToolDefinition
-	deepSeekChatToolChoice
+	deepSeekChatToolTop
 	deepSeekChatToolFunction
 )
 
@@ -297,63 +307,60 @@ func (p deepSeekChatToolParser) next() (json.Token, error) {
 	return token, nil
 }
 
-func (p deepSeekChatToolParser) parseValue(first json.Token, depth int, scope deepSeekChatToolScope) (deepSeekChatToolSelection, error) {
-	var selection deepSeekChatToolSelection
+func (p deepSeekChatToolParser) parseValue(first json.Token, depth int, scope deepSeekChatToolScope) (deepSeekChatToolFields, error) {
+	var fields deepSeekChatToolFields
 	switch first {
 	case json.Delim('{'), json.Delim('['):
 		if depth > deepSeekChatJSONMaxDepth {
-			return selection, errors.New("tool JSON exceeds maximum nesting depth")
+			return fields, errors.New("tool JSON exceeds maximum nesting depth")
 		}
 		if first == json.Delim('{') {
 			return p.parseObject(depth, scope)
 		}
-		return selection, p.parseArray(depth, nil)
+		return fields, p.parseArray(depth, nil)
 	}
-	if scope == deepSeekChatToolChoice {
-		selection.typ, _ = first.(string)
-	}
-	return selection, nil
+	return fields, nil
 }
 
-func (p deepSeekChatToolParser) parseObject(depth int, scope deepSeekChatToolScope) (deepSeekChatToolSelection, error) {
-	var selection deepSeekChatToolSelection
+func (p deepSeekChatToolParser) parseObject(depth int, scope deepSeekChatToolScope) (deepSeekChatToolFields, error) {
+	var fields deepSeekChatToolFields
 	seen := make(map[string]struct{})
 	for {
 		token, err := p.next()
 		if err != nil || token == json.Delim('}') {
-			return selection, err
+			return fields, err
 		}
 		key, ok := token.(string)
 		if !ok {
-			return selection, errDeepSeekInvalidJSON
+			return fields, errDeepSeekInvalidJSON
 		}
 		if _, exists := seen[key]; exists {
-			return selection, errors.New("duplicate JSON keys inside tools or tool_choice")
+			return fields, errors.New("duplicate JSON keys inside tools or tool_choice")
 		}
 		seen[key] = struct{}{}
 		first, err := p.next()
 		if err != nil {
-			return selection, err
+			return fields, err
 		}
 		childScope := deepSeekChatToolNested
-		if scope == deepSeekChatToolDefinition || scope == deepSeekChatToolChoice {
+		if scope == deepSeekChatToolTop {
 			switch key {
 			case "type":
-				selection.typ, _ = first.(string)
+				fields.typ, _ = first.(string)
 			case "name":
-				selection.legacyName, _ = first.(string)
+				fields.name, _ = first.(string)
 			case "function":
 				childScope = deepSeekChatToolFunction
 			}
 		} else if scope == deepSeekChatToolFunction && key == "name" {
-			selection.name, selection.named = first.(string)
+			fields.name, _ = first.(string)
 		}
 		child, err := p.parseValue(first, depth+1, childScope)
 		if err != nil {
-			return selection, err
+			return fields, err
 		}
 		if childScope == deepSeekChatToolFunction {
-			selection.name, selection.named = child.name, child.named
+			fields.functionName = child.name
 		}
 	}
 }
@@ -401,6 +408,45 @@ func deepSeekChatWebToolFamily(typ string) string {
 	return ""
 }
 
+type deepSeekChatChoiceTarget struct {
+	typ, name string
+	isObject  bool
+}
+
+func normalizeDeepSeekChatToolChoice(ctx context.Context, raw []byte) (deepSeekChatChoiceTarget, error) {
+	p := newDeepSeekChatToolParser(ctx, raw)
+	first, err := p.next()
+	if err != nil {
+		return deepSeekChatChoiceTarget{}, err
+	}
+	fields, err := p.parseValue(first, 2, deepSeekChatToolTop)
+	if err != nil {
+		return deepSeekChatChoiceTarget{}, err
+	}
+	if int(p.dec.InputOffset()) != len(raw) {
+		return deepSeekChatChoiceTarget{}, errDeepSeekInvalidJSON
+	}
+	if first == json.Delim('{') {
+		name := fields.name
+		if name == "" {
+			name = fields.functionName
+		}
+		return deepSeekChatChoiceTarget{typ: fields.typ, name: name, isObject: true}, nil
+	}
+	mode, _ := first.(string)
+	return deepSeekChatChoiceTarget{typ: mode}, nil
+}
+
+func (c deepSeekChatChoiceTarget) needsDowngrade(keptMatch, removedMatch, toolsEmpty bool) bool {
+	if !c.isObject {
+		return toolsEmpty && c.typ == "required"
+	}
+	if c.name != "" {
+		return !keptMatch && removedMatch
+	}
+	return removedMatch || c.typ == "tool" || c.typ == "function"
+}
+
 // filterDeepSeekChatWebTools only runs for a Chat request whose group has tools
 // turned off. Copy raw slices for the surviving tools and unrelated fields.
 func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekChatEnvelope) ([]byte, error) {
@@ -411,22 +457,12 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 		return body, ctx.Err()
 	}
 
-	var choice deepSeekChatToolSelection
-	var choiceIsObject bool
+	var choice deepSeekChatChoiceTarget
 	if top.choice != nil {
-		raw := body[top.choice.value.start:top.choice.value.end]
-		p := newDeepSeekChatToolParser(ctx, raw)
-		first, err := p.next()
+		var err error
+		choice, err = normalizeDeepSeekChatToolChoice(ctx, body[top.choice.value.start:top.choice.value.end])
 		if err != nil {
 			return nil, err
-		}
-		choiceIsObject = first == json.Delim('{')
-		choice, err = p.parseValue(first, 2, deepSeekChatToolChoice)
-		if err != nil {
-			return nil, err
-		}
-		if int(p.dec.InputOffset()) != len(raw) {
-			return nil, errDeepSeekInvalidJSON
 		}
 	}
 
@@ -436,33 +472,27 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 		return nil, err
 	}
 	var kept []deepSeekChatSpan
-	var removed, removedChoice, keptFunction bool
-	functionChoice := choice.typ == "function" && choice.named
-	choiceTarget := choice.typ
-	switch choice.typ {
-	case "tool":
-		choiceTarget = choice.legacyName
-		removedChoice = deepSeekProviderTool(choiceTarget)
-	case "function":
-		choiceTarget = choice.name
-	case "auto", "none", "required":
-		// Choice modes can share a spelling with a declared tool alias.
-		choiceTarget = ""
+	var removed, removedMatch, keptMatch bool
+	// Only this request's target needs membership checks in the two sets.
+	removedLookup := choice.name
+	if removedLookup == "" {
+		removedLookup = choice.typ
 	}
 	err := p.parseArray(2, func(first json.Token, depth, offset int) error {
 		tokenEnd := int(p.dec.InputOffset())
-		tool, err := p.parseValue(first, depth, deepSeekChatToolDefinition)
+		tool, err := p.parseValue(first, depth, deepSeekChatToolTop)
 		if err != nil {
 			return err
 		}
 		if family := deepSeekChatWebToolFamily(tool.typ); family != "" {
 			removed = true
-			matchesAlias := choiceIsObject && tool.legacyName != "" && choiceTarget == tool.legacyName
-			removedChoice = removedChoice || choiceTarget == tool.typ || choiceTarget == family || matchesAlias
+			if choice.isObject && (removedLookup == tool.typ || removedLookup == family || (tool.name != "" && removedLookup == tool.name)) {
+				removedMatch = true
+			}
 			return nil
 		}
-		if choiceIsObject && tool.typ == "function" && tool.named && tool.name == choiceTarget {
-			keptFunction = true
+		if choice.name != "" && tool.matchesKeptName(choice.name) {
+			keptMatch = true
 		}
 		start := tokenEnd - 1
 		if _, container := first.(json.Delim); !container {
@@ -494,12 +524,13 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 
 	var edits []deepSeekChatEdit
 	removedFields := 0
-	if len(kept) == 0 {
-		edits, removedFields = removeDeepSeekChatToolFields(top)
+	toolsEmpty := len(kept) == 0
+	downgradeChoice := choice.needsDowngrade(keptMatch, removedMatch, toolsEmpty)
+	if toolsEmpty {
+		edits, removedFields = removeDeepSeekChatToolFields(top, downgradeChoice)
 	} else {
 		edits = append(edits, deepSeekChatEdit{span: top.tools.value, tools: kept})
-		// A retained function takes priority over a matching removed tool name.
-		if !keptFunction && (removedChoice || functionChoice) {
+		if downgradeChoice {
 			edits = append(edits, deepSeekChatEdit{span: top.choice.value, replacement: `"auto"`})
 		}
 	}
@@ -517,9 +548,9 @@ type deepSeekChatEdit struct {
 	prefix string
 }
 
-func removeDeepSeekChatToolFields(top deepSeekChatEnvelope) ([]deepSeekChatEdit, int) {
+func removeDeepSeekChatToolFields(top deepSeekChatEnvelope, removeChoice bool) ([]deepSeekChatEdit, int) {
 	first, second := top.tools, top.choice
-	if second == nil {
+	if !removeChoice {
 		return []deepSeekChatEdit{removeDeepSeekChatFields(first, first)}, 1
 	}
 	if second.index < first.index {

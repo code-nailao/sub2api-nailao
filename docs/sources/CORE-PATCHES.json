@@ -2536,8 +2536,8 @@
       "features": [
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "5fd397ab42e206a965f78e82e4118df960d3d290df5a34a912757ac4317cdc82",
-      "reason": "Scans the Chat request envelope once for groups with tools turned off. Filters web tools by type prefix and rejects duplicates only in the tool fields. Adds the unavailable notice to the last messages field or to input for raw Responses-shaped requests. Preserves untouched bytes and resolves forced choices by type, declared alias, or function name. Retained client functions take priority and mode values retain their meaning."
+      "sha256": "9185a4e8a3f545aabe06730d09de5e2bc1c7d46132d9f3f407a31c17c9a7e935",
+      "reason": "Scans the Chat request envelope once for groups with tools turned off. Filters web tools by type prefix and rejects duplicates only in the tool fields. Adds the unavailable notice to the last messages field or to input for raw Responses-shaped requests. Normalizes tool choices by type and name, gives explicitly named surviving tools priority, and downgrades choices for removed tools and bare tool or function selectors. Preserves unrelated bytes and drops required when filtering empties the tool list."
     },
     {
       "path": "backend/internal/service/deepseek_stream_timing_test.go",
@@ -2666,8 +2666,8 @@
       "features": [
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "795f98081b2cd1ebc3de229b63161991f072851992179a41ec175de43fc168b3",
-      "reason": "Tests stream and non-stream forwarding, prefix matching without separators, Responses-shaped requests on fixed Chat accounts, notice placement in the last messages field, direct and named alias choices, retained client functions, billing parity, bypassed protocols, bounded validation and preservation of context errors."
+      "sha256": "716177dc5d2ff2f42816d7ac6d20f19c3889a3984440440e4c8a1b89c04f15a0",
+      "reason": "Tests stream and non-stream forwarding, prefix matching without separators, Responses-shaped requests on fixed Chat accounts, notice placement in the last messages field, all tool choice shapes, surviving name collisions, empty filtered tool lists, billing parity, bypassed protocols, bounded validation and preservation of context errors."
     },
     {
       "path": "backend/internal/service/deepseek_tools_incremental.go",

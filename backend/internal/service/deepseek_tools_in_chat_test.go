@@ -356,19 +356,20 @@ func TestDeepSeekChatFiltersDisabledGroup(t *testing.T) {
 				{"legacy_named_choice", `{"type":"deepseek_web_search"},` + lookup, `{"type":"tool","name":"deepseek_web_search"}`, `[` + lookup + `]`, `"auto"`},
 				{"legacy_named_alias", aliasedSearch + `,` + lookup, `{"type":"tool","name":"search_alias"}`, `[` + lookup + `]`, `"auto"`},
 				{"direct_alias_choice", aliasedSearch + `,` + lookup, directAliasChoice, `[` + lookup + `]`, `"auto"`},
-				{"direct_alias_choice_of_retained_function", aliasedSearch + `,` + aliasFunction, directAliasChoice, `[` + aliasFunction + `]`, directAliasChoice},
+				{"type_only_removed_alias_shared_with_function", aliasedSearch + `,` + aliasFunction, directAliasChoice, `[` + aliasFunction + `]`, `"auto"`},
 				{"direct_alias_without_survivors", aliasedSearch, directAliasChoice, "", ""},
 				{"function_choice_of_removed_alias", aliasedSearch + `,` + lookup, `{"type":"function","function":{"name":"search_alias"}}`, `[` + lookup + `]`, `"auto"`},
 				{"required_mode_matching_alias", `{"type":"deepseek_web_search","name":"required"},` + lookup, `"required"`, `[` + lookup + `]`, `"required"`},
-				{"none_mode_matching_alias", `{"type":"deepseek_web_search","name":"none"},` + lookup, `{"type":"none"}`, `[` + lookup + `]`, `{"type":"none"}`},
+				{"type_only_none_alias", `{"type":"deepseek_web_search","name":"none"},` + lookup, `{"type":"none"}`, `[` + lookup + `]`, `"auto"`},
+				{"type_only_tool_alias", `{"type":"deepseek_web_search","name":"tool"},` + lookup, `{"type":"tool"}`, `[` + lookup + `]`, `"auto"`},
 				{"legacy_choice_of_retained_tool", `{"type":"deepseek_web_search"},` + lookup, `{"type":"tool","name":"lookup"}`, `[` + lookup + `]`, `{"type":"tool","name":"lookup"}`},
 				{"legacy_kept_function_named_after_provider_tool", `{"type":"web_fetch"},` + namedSearch, legacySearchChoice, `[` + namedSearch + `]`, legacySearchChoice},
 				{"legacy_kept_function_named_after_removed_alias", `{"type":"web_fetch","name":"lookup"},` + lookup, `{"type":"tool","name":"lookup"}`, `[` + lookup + `]`, `{"type":"tool","name":"lookup"}`},
 				{"choice_by_family", `{"type":"web_search_preview_future"},` + lookup, `{"type":"web_search"}`, `[` + lookup + `]`, `"auto"`},
-				{"removed_function_choice", `{"type":"web_fetch"},` + lookup, `{"type":"function","function":{"name":"missing"}}`, `[` + lookup + `]`, `"auto"`},
+				{"unmatched_function_choice", `{"type":"web_fetch"},` + lookup, `{"type":"function","function":{"name":"missing"}}`, `[` + lookup + `]`, `{"type":"function","function":{"name":"missing"}}`},
 				{"retained_function_choice", `{"type":"web_search"},{"type":"function","function":{"name":"web_search"}}`, `{"type":"function", "function":{"name":"web_search"}}`, `[{"type":"function","function":{"name":"web_search"}}]`, `{"type":"function", "function":{"name":"web_search"}}`},
 				{"required_without_survivors", `{"type":"deepseek_web_search"}`, `"required"`, "", ""},
-				{"no_notice_when_none", `{"type":"web_search"}`, `"none"`, "", ""},
+				{"no_notice_when_none", `{"type":"web_search"}`, `"none"`, "", `"none"`},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","messages":[],"stream":%t,"tools":[%s],"tool_choice":%s}`, stream, tc.tools, tc.choice))
@@ -391,6 +392,81 @@ func TestDeepSeekChatFiltersDisabledGroup(t *testing.T) {
 					}
 				})
 			}
+		})
+	}
+}
+
+func TestDeepSeekChatFilterNormalizesToolChoice(t *testing.T) {
+	const removed = `{"type":"web_search_future","name":"search_alias"}`
+	const kept = `[{"type":"function","function":{"name":"lookup"}},{"type":"custom","name":"inspect"}]`
+	const unchanged = "unchanged"
+	const auto = `"auto"`
+	cases := []struct {
+		name, choice       string
+		withTools, noTools string
+	}{
+		{"auto", `"auto"`, unchanged, unchanged},
+		{"none", `"none"`, unchanged, unchanged},
+		{"required", `"required"`, unchanged, ""},
+		{"tool_kept_name", `{"type":"tool", "name":"lookup"}`, unchanged, unchanged},
+		{"tool_removed_name", `{"type":"tool","name":"search_alias"}`, auto, ""},
+		{"tool_no_name", `{"type":"tool","name":""}`, auto, ""},
+		{"nested_function_kept_name", `{"type":"function","function":{"name":"lookup"}}`, unchanged, unchanged},
+		{"nested_function_removed_type", `{"type":"function","function":{"name":"web_search_future"}}`, auto, ""},
+		{"nested_function_no_name", `{"type":"function","function":{}}`, auto, ""},
+		{"flat_function_kept_name", `{"type":"function","name":"lookup"}`, unchanged, unchanged},
+		{"flat_function_removed_name", `{"type":"function","name":"search_alias"}`, auto, ""},
+		{"flat_function_no_name", `{"type":"function","name":""}`, auto, ""},
+		{"top_name_precedes_nested_name", `{"type":"function","function":{"name":"search_alias"},"name":"lookup"}`, unchanged, unchanged},
+		{"type_only_kept_type", `{"type":"custom"}`, unchanged, unchanged},
+		{"type_only_removed_type", `{"type":"web_search_future"}`, auto, ""},
+		{"type_only_removed_alias", `{"type":"search_alias"}`, auto, ""},
+		{"type_only_unknown_type", `{"type":"other"}`, unchanged, unchanged},
+		{"type_only_tool", `{"type":"tool"}`, auto, ""},
+		{"type_only_function", `{"type":"function"}`, auto, ""},
+		{"alias_with_kept_name", `{"type":"search_alias","name":"inspect"}`, unchanged, unchanged},
+		{"type_with_kept_type_as_name", `{"type":"tool","name":"custom"}`, unchanged, unchanged},
+		{"type_with_removed_name", `{"type":"custom","name":"search_alias"}`, auto, ""},
+		{"alias_with_no_name", `{"type":"search_alias","name":""}`, auto, ""},
+		{"other_type_with_no_name", `{"type":"other","name":""}`, unchanged, unchanged},
+	}
+	for _, stream := range []bool{false, true} {
+		for _, withSurvivors := range []bool{false, true} {
+			for _, tc := range cases {
+				t.Run(fmt.Sprintf("stream=%t/survivors=%t/%s", stream, withSurvivors, tc.name), func(t *testing.T) {
+					tools := `[` + removed + `]`
+					wantTools, wantChoice := "", tc.noTools
+					if withSurvivors {
+						tools = `[` + removed + `,` + kept[1:]
+						wantTools, wantChoice = kept, tc.withTools
+					}
+					if wantChoice == unchanged {
+						wantChoice = tc.choice
+					}
+					body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","stream":%t,"messages":[],"tools":%s,"tool_choice":%s}`, stream, tools, tc.choice))
+					run := runDeepSeekOrdinaryChat(t, body, false)
+					require.NoError(t, run.err)
+					require.Equal(t, 1, run.calls)
+					require.True(t, json.Valid(run.sent), "%s", run.sent)
+					require.Equal(t, wantTools, gjson.GetBytes(run.sent, "tools").Raw)
+					require.Equal(t, wantChoice, gjson.GetBytes(run.sent, "tool_choice").Raw)
+				})
+			}
+		}
+	}
+}
+
+func TestDeepSeekChatFilterKeepsFlatFunctionOnFixedChat(t *testing.T) {
+	const function = `{"type":"function","name":"lookup","parameters":{"type":"object"}}`
+	const choice = `{"type":"tool", "name":"lookup"}`
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","stream":%t,"input":"test","tools":[{"type":"web_search_future","name":"lookup"},%s],"tool_choice":%s}`, stream, function, choice))
+			run := runDeepSeekOrdinaryChat(t, body, false)
+			require.NoError(t, run.err)
+			require.Equal(t, 1, run.calls)
+			require.Equal(t, `[`+function+`]`, gjson.GetBytes(run.sent, "tools").Raw)
+			require.Equal(t, choice, gjson.GetBytes(run.sent, "tool_choice").Raw)
 		})
 	}
 }
@@ -481,7 +557,7 @@ func TestDeepSeekChatFilterAllowsDuplicateMessagesWithoutNotice(t *testing.T) {
 			withoutNotice := runDeepSeekOrdinaryChat(t, declined, false)
 			require.NoError(t, withoutNotice.err)
 			require.Equal(t, 1, withoutNotice.calls)
-			require.Equal(t, fmt.Sprintf(prefix+lastMessages, stream), string(withoutNotice.sent))
+			require.Equal(t, fmt.Sprintf(prefix+`"tool_choice":"none",`+lastMessages, stream), string(withoutNotice.sent))
 		})
 	}
 }
@@ -785,8 +861,9 @@ func TestDeepSeekChatJSONKeepsObjectScopesAndDecodedKeys(t *testing.T) {
 func TestDeepSeekChatFilterEditsOnlySelectedSpans(t *testing.T) {
 	for _, tc := range []struct{ name, body, want string }{
 		{"leading_fields_removed", ` {"tool_choice":{"type":"web_search"}, "\u0074ools":[{"type":"web_search"}], "meta":{"key":1,"key":2}} `, ` { "meta":{"key":1,"key":2},"messages":[` + deepSeekChatNoticeMessage + `]} `},
-		{"nonadjacent_fields_removed", `{"tools":[{"type":"web_fetch"}], "metadata":{"literal":"[}\"","big":12345678901234567890}, "tool_choice":{"type":"function","function":{"name":"missing"}}}`, `{ "metadata":{"literal":"[}\"","big":12345678901234567890},"messages":[` + deepSeekChatNoticeMessage + `]}`},
-		{"all_fields_removed", `{"tools":[{"type":"web_fetch"}], "tool_choice":"web_fetch" }`, `{ "messages":[` + deepSeekChatNoticeMessage + `]}`},
+		{"nonadjacent_fields_removed", `{"tools":[{"type":"web_fetch"}], "metadata":{"literal":"[}\"","big":12345678901234567890}, "tool_choice":{"type":"function","function":{"name":"web_fetch"}}}`, `{ "metadata":{"literal":"[}\"","big":12345678901234567890},"messages":[` + deepSeekChatNoticeMessage + `]}`},
+		{"all_fields_removed", `{"tools":[{"type":"web_fetch"}], "tool_choice":"required" }`, `{ "messages":[` + deepSeekChatNoticeMessage + `]}`},
+		{"leading_tools_only_removed", `{"tools":[{"type":"web_fetch"}], "tool_choice":"auto" }`, `{ "tool_choice":"auto" ,"messages":[` + deepSeekChatNoticeMessage + `]}`},
 		{"retained_bytes", `{"tools" : [ 99e100 , {"type":"web_fetch_preview_future"}, {"type":"web_searchable"}, { "type": "function", "function":{"name":"web_search"}}], "messages":[{"role":"user","content":"literal \\ \" [ ]"}],"meta": {"z":1,"z":2}}`, `{"tools" : [99e100,{ "type": "function", "function":{"name":"web_search"}}], "messages":[{"role":"user","content":"literal \\ \" [ ]"},` + deepSeekChatNoticeMessage + `],"meta": {"z":1,"z":2}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
