@@ -61,6 +61,8 @@ USER_AGENT = "sources-deploy"
 HANDOFF_POLL_SECONDS = 0.5
 # First progress note after TERM, then one per minute while the old owner drains.
 HANDOFF_FIRST_NOTE_SECONDS = 5
+# A backup can still be cleaning up an interrupted upload at its own deadline.
+BACKUP_FINISH_GRACE_SECONDS = 180
 
 
 class DeployError(Exception):
@@ -445,9 +447,9 @@ class Deployer:
         raise DeployError(f"port {port} not ready as {role} within {timeout}s (last runtime: {json.dumps(last)[:300]})")
 
     def wait_exit(self, name: str, timeout: int, poll: float = 2, first_note: float = 60,
-                  progress: Callable[[], str | None] | None = None) -> int:
-        """Wait for a container to exit on its own. progress, when given,
-        describes what it is still doing for the periodic note."""
+                  progress: Callable[[], str | None] | None = None,
+                  extra_wait: Callable[[], int] | None = None) -> int:
+        """Wait for the container to exit, with at most one deadline extension."""
         deadline = self.ops.monotonic() + timeout
         next_note = self.ops.monotonic() + first_note
         while True:
@@ -458,7 +460,13 @@ class Deployer:
             if not state.get("Running"):
                 return int(state.get("ExitCode", 0))
             if self.ops.monotonic() >= deadline:
-                raise DeployError(f"{name} still draining after {timeout}s; nothing was killed")
+                extension = extra_wait() if extra_wait else 0
+                extra_wait = None
+                if extension <= 0:
+                    raise DeployError(f"{name} is still draining after {timeout}s; nothing was killed")
+                timeout += extension
+                deadline += extension
+                self.log(f"   scheduled backup still active; allowing up to {extension}s more for it to finish")
             if self.ops.monotonic() >= next_note:
                 detail = progress() if progress else None
                 self.log(f"   {name} still finishing in-flight work" + (f": {detail}" if detail else " ..."))
@@ -635,6 +643,15 @@ class Deployer:
         except Exception:  # noqa: BLE001 - informational read inside the handoff
             return None
 
+    def scheduled_backup_remaining(self, view: dict[str, Any]) -> int | None:
+        runtime = self.owner_runtime(view) or {}
+        remaining = runtime.get("scheduled_backup_remaining_seconds")
+        return remaining if type(remaining) is int and remaining >= 0 else None
+
+    def scheduled_backup_exit_grace(self, view: dict[str, Any]) -> int:
+        remaining = self.scheduled_backup_remaining(view)
+        return 0 if remaining is None else remaining + BACKUP_FINISH_GRACE_SECONDS
+
     def drain_progress(self, view: dict[str, Any]) -> str | None:
         """What a draining owner still waits for, from its runtime status. It
         runs inside the wait after TERM, so it never raises."""
@@ -651,7 +668,7 @@ class Deployer:
         except Exception:  # noqa: BLE001 - a progress note must never end the wait
             return None
 
-    def stuck_owner(self, current: dict[str, Any], target: Target, back: bool, timeout: int) -> FallbackFailed:
+    def stuck_owner(self, current: dict[str, Any], target: Target, back: bool, wait_error: DeployError) -> FallbackFailed:
         """The old owner did not exit in time. Say which slot serves traffic,
         what is left running and which background a person has to start."""
         old = current["containers"]["background"]
@@ -666,7 +683,7 @@ class Deployer:
             idle = [target.containers[r] for r in SERVING_ROLES]
         not_this = f" (not {old})" if start != old else ""
         return FallbackFailed(
-            f"{old} is still draining after {timeout}s; nothing was killed and {new} was not started. "
+            f"{wait_error} and {new} was not started. "
             f"Traffic is on slot {traffic}. {old} is set not to restart, so once it exits no background owner runs. "
             f"Left running without traffic: {', '.join(idle) or 'none'}. "
             f"Wait for {old} to exit (docker ps -a), then start the background of slot {traffic}{not_this}: "
@@ -702,13 +719,14 @@ class Deployer:
             try:
                 code = self.wait_exit(old, timeout, poll=HANDOFF_POLL_SECONDS,
                                       first_note=HANDOFF_FIRST_NOTE_SECONDS,
-                                      progress=lambda: self.drain_progress(current))
+                                      progress=lambda: self.drain_progress(current),
+                                      extra_wait=lambda: self.scheduled_backup_exit_grace(current))
             except DeployError as err:
                 # The old owner will exit by itself later, and Docker does not
                 # restart a container stopped with docker kill: from then on no
                 # background owner runs. Keep in_progress so nothing deploys
                 # over this until a person has started one again.
-                raise self.stuck_owner(current, target, back, timeout) from err
+                raise self.stuck_owner(current, target, back, err) from err
             self.log(f"   {old} exited with code {code}")
         self.ops.run(["docker", "start", new], mutate=True)
         if self.ops.dry_run:
@@ -843,12 +861,21 @@ class Deployer:
 
     # entrypoints --------------------------------------------------------------
     def deploy(self, image: str, allow_contract: bool = False,
-               allow_public_health_failure: bool = False) -> None:
+               allow_public_health_failure: bool = False,
+               allow_running_backup: bool = False) -> None:
         state = load_state(self.cfg)
         if state.get("in_progress"):
             raise DeployError(f"a previous deploy did not finish: {json.dumps(state['in_progress'])}; "
                               "inspect with 'status' and resolve before deploying again")
         current = state.get("current") or {}
+        # Check before touching either slot or applying migrations. An older
+        # owner may not report backup status, and a backup can start after this
+        # read. The handoff still honors the old owner's in-flight work.
+        if current and self.scheduled_backup_remaining(current) is not None:
+            if not allow_running_backup:
+                raise DeployError("preflight failed, nothing changed: a scheduled backup is running; "
+                                  "wait for it to finish or pass --allow-running-backup")
+            self.log("   WARNING: a scheduled backup is running; continuing because of --allow-running-backup")
         slot = "a" if current.get("slot") != "a" else "b"
         target = Target.from_view({**self.cfg.slot_view(slot), "image": image}, self.cfg.runtime_token_file)
         record: dict[str, Any] = {"started_at": now(), "action": "deploy", "image": image, "slot": slot}
@@ -1193,6 +1220,8 @@ def main(argv: list[str] | None = None) -> int:
     p_main.add_argument("--allow-public-health-failure", action="store_true",
                         help="warn instead of stopping when the public health check fails before the switch "
                              "(the guard still requires 200 after it)")
+    p_main.add_argument("--allow-running-backup", action="store_true",
+                        help="start a release while a scheduled backup is running")
     sub.add_parser("rollback", help="switch back to the previous slot")
     sub.add_parser("status", help="show current and previous release")
     sub.add_parser("watch", help="resident sampler; one JSON line per alert")
@@ -1256,7 +1285,8 @@ def main(argv: list[str] | None = None) -> int:
             deployer = Deployer(cfg, ops)
             if args.command == "main":
                 deployer.deploy(args.image, allow_contract=args.allow_contract,
-                                allow_public_health_failure=args.allow_public_health_failure)
+                                allow_public_health_failure=args.allow_public_health_failure,
+                                allow_running_backup=args.allow_running_backup)
             elif args.command == "rollback":
                 deployer.rollback()
         return 0

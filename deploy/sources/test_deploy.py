@@ -174,7 +174,7 @@ class FakeOps(deploy.Ops):
             return (404, None) if token != "tok" else (200, {"ready": False, "role": c["role"]})
         return 200, {"ready": True, "role": c["role"], "owns_background": c["role"] == "background",
                      "instance_id": c["Id"], "active_http": c.get("active_http", 0),
-                     **{k: v for k, v in extra.items() if k == "admin_during_drain"}}
+                     **{k: v for k, v in extra.items() if k in ("admin_during_drain", "scheduled_backup_remaining_seconds")}}
 
     def read_text(self, path):
         if path in self.files:
@@ -472,6 +472,44 @@ class DeployTest(unittest.TestCase):
             self.deploy()
         self.assertIn("did not finish", str(ctx.exception))
         self.assertEqual([], self.ops.commands)
+
+    def test_preflight_refuses_running_backup_before_changing_release_state(self):
+        old = self.state()["current"]["containers"]["background"]
+        self.ops.runtime_extra[old] = {"scheduled_backup_remaining_seconds": 0}
+        before = self.state()
+        with self.assertRaisesRegex(deploy.DeployError, "scheduled backup is running.*--allow-running-backup"):
+            self.deploy()
+        self.assertEqual(before, self.state())
+        self.assertEqual([], self.ops.commands)
+        self.assertEqual([], self.history())
+
+    def test_running_backup_can_be_allowed_to_finish_before_handoff(self):
+        old = self.state()["current"]["containers"]["background"]
+        self.ops.runtime_extra[old] = {"scheduled_backup_remaining_seconds": 5}
+        self.ops.drain_seconds[old] = 5
+        self.cfg.background_exit_timeout = 2
+        self.deploy(allow_running_backup=True)
+        self.assertEqual("a", self.state()["current"]["slot"])
+        self.assertFalse(self.ops.containers[old]["State"]["Running"])
+        self.assertIn("scheduled backup still active", "\n".join(self.ops.logs))
+        self.assertEqual([["docker", "kill", "--signal=TERM", old]],
+                         [cmd for cmd in self.ops.commands if cmd[:2] == ["docker", "kill"] and cmd[-1] == old])
+
+    def test_handoff_waits_for_backup_started_after_preflight(self):
+        old = self.state()["current"]["containers"]["background"]
+        self.ops.drain_seconds[old] = 5
+        self.cfg.background_exit_timeout = 2
+        original_run = self.ops.run
+
+        def run(args, **kw):
+            if args[:2] == ["docker", "kill"] and args[-1] == old:
+                self.ops.runtime_extra[old] = {"scheduled_backup_remaining_seconds": 5}
+            return original_run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", run):
+            self.deploy()
+        self.assertEqual("a", self.state()["current"]["slot"])
+        self.assertIn("scheduled backup still active", "\n".join(self.ops.logs))
 
     def test_handoff_says_admin_stays_read_only_when_the_old_owner_reports_it(self):
         self.ops.runtime_extra["old-bg"] = {"admin_during_drain": "read-only"}

@@ -33,14 +33,14 @@
 
 同一时刻只能有一个后台。这由操作系统文件锁保证：background 在构造任何依赖之前对锁目录中的 `native-background.lock` 加 `flock`，媒体引擎存储在打开时再取一把自己的锁。进程退出时内核自动释放锁，所以新后台只有在旧后台真正退出后才能拿到锁。发布脚本只负责安排顺序，不需要证明“没有两个后台”，也从不发送 SIGKILL。
 
-每个实例通过内部接口 `/internal/sources/runtime` 报告角色、`ready` 和 `owns_background`；`/internal/sources/drain` 让 serving 实例进入排空状态。两个接口都需要运行令牌。background 还报告 `admin_during_drain`（值为 `read-only`，表示排空期间管理接口只读，见下节）、`active_admin_writes`（排空期间会被拒绝、仍在处理的管理请求数）和 `stopping`（尚未停完的后台服务）。对 background 调用 `/internal/sources/drain` 同样会让它进入只读排空，直到进程退出；发布工具只对 serving 调用这个接口。
+每个实例通过内部接口 `/internal/sources/runtime` 报告角色、`ready` 和 `owns_background`；`/internal/sources/drain` 让 serving 实例进入排空状态。两个接口都需要运行令牌。background 还报告 `admin_during_drain`（值为 `read-only`，表示排空期间管理接口只读，见下节）、`active_admin_writes`（排空期间会被拒绝、仍在处理的管理请求数）和 `stopping`（尚未停完的后台服务）。定时备份创建期间还报告 `scheduled_backup_remaining_seconds`，用剩余秒数表示原执行期限。到期后仍在收尾时报告 `0`，创建阶段结束后省略。对 background 调用 `/internal/sources/drain` 同样会让它进入只读排空，直到进程退出；发布工具只对 serving 调用这个接口。
 
 ## 应用为发布提供的支持
 
 - **后台优雅退出。** serving 和 standalone 收到 SIGTERM 后先关闭 HTTP，等在途请求结束，再停止各项服务后退出，顺序不变。background 不同，它在停止后台服务的整个过程中保持监听，让管理页面在交接期间继续可用：
   1. 进入只读排空：管理接口只应答 `GET` 和 `HEAD`。其它方法、MCP（`/api/v1/mcp`）、WebSocket 升级，以及少数 `GET`——媒体引擎审阅（它读的存储会在第 3 步关闭）和会访问上游供应商的查询（账号用量的主动查询、刷新余额、OpenAI/Grok/国内供应商额度与余额、Claude 重置额度、账号模型列表；它们会探测上游、可能刷新并保存 OAuth 凭据、写账号状态或启动超出请求的后台工作，清单在 `processrole/handoff.go`）——在进入处理器之前返回 503，使用原生错误信封（`reason` 为 `BACKGROUND_HANDOFF_READ_ONLY`，`message` 说明正在发版、暂时只读、请稍后重试），带 `Retry-After: 5`。请求没有执行任何部分，所以重试总是安全的。只读是因为写请求可能把工作交给已经停止的服务，或启动进程退出时会被截断的 goroutine。
   2. 等 SIGTERM 之前已经进入、排空期间会被拒绝的管理请求（写、MCP、上面那些会访问上游的查询；WebSocket 除外）处理完，与原来“先等在途请求、再停服务”的顺序一致。
-  3. 并行停止所有后台服务（下面各项的语义不变）。
+  3. 并行停止所有后台服务，按下面各项的规则等待在途工作。
   4. 结束打开着的管理 WebSocket：取消它们的请求上下文，运维实时页发送关闭帧后自动重连。否则被劫持的连接不会随 HTTP 关闭而结束，会一直拖住进程退出。
   5. 关闭 HTTP 监听，等在途读请求结束，停止其余服务（用量、计费缓存、OAuth、日志等）和 Redis、数据库连接，退出。锁仍然只在进程退出时由内核释放。
 
@@ -52,7 +52,7 @@
   - OAuth 刷新停止时不再发起新的刷新，但不取消已经在和供应商通信的刷新，等它们保存新凭据后再返回（单次刷新有超时上限）。否则供应商已轮换 refresh token 而新凭据被丢弃，账号下次刷新会失败。
   - 渠道探测和定时测试停止时立即取消在途探测；被取消的探测不写历史，避免交接产生假的“失败”记录。
   - 媒体引擎只等已领取的操作完成；新任务留在共享存储中，由下一个后台领取。提交结果不明的任务标为 unknown，不重发。
-  - 定时备份最多等 5 分钟，让正在进行的备份及其过期备份清理做完，超时就取消。所以在定时备份进行时发版，这次备份会被取消，交接期间写操作也要多等最多 5 分钟（读不受影响）。发版应避开定时备份时段。
+  - 定时备份的 dump、上传和完成记录沿用原有的两小时执行期限。已经开始的创建会完成或到达自身执行期限，旧后台随后才能退出。手动备份、恢复和过期备份清理仍走原有的停机等待与取消流程。
 - **一次性命令**（`backend/cmd/server/sources_deploy_commands.go`）。它们都不监听端口、不取后台锁、不启动后台服务，并且只输出一行带固定前缀的结果供脚本读取：
   - `-list-pending-migrations`：只读迁移账本，输出 `SOURCES_PENDING_MIGRATIONS a.sql,b.sql`，供 `-migrate-only` 使用。
   - `-check-startup`：用 serving 语义、临时锁目录和临时令牌，按生产配置构造全部依赖后退出，输出 `SOURCES_STARTUP_CHECK_OK {...}`。有待执行迁移时会失败，所以脚本先迁移再检查。
@@ -63,6 +63,8 @@
 
 整个命令持有发布锁，防止并发发布。上一次运行没有走完（状态里 `in_progress` 不为空）时，新的发布会拒绝执行，需要先人工确认现场。
 
+`deploy.py main` 在拉镜像、跑迁移或改动槽位前读取旧后台的定时备份状态。发现正在创建备份时，预检默认中止。确需立即发版可加 `--allow-running-backup`，管理写入将等旧后台完成排空。预检后才启动的备份同样会排空。旧后台还不支持备份状态和排空保护时，应避开定时备份时段升级。
+
 | 步骤 | 内容 | 失败时留下什么 |
 | --- | --- | --- |
 | 拉取镜像 | 本地没有时按引用拉取 | 现场不变 |
@@ -71,7 +73,7 @@
 | 启动检查 | 分别用 serving 和 background 两套环境运行 `-check-startup`，两套环境的配置错误都在这里暴露 | 退出，没有创建 serving 容器；已执行的迁移保留（旧版本兼容） |
 | 导出静态资源 | `-export-web-assets` 导出到临时目录，再追加进固定资源目录 | 退出；资源目录只多了新文件 |
 | 启动新 serving | 删除目标槽位的旧容器，创建并启动主、备两个 serving，等待就绪 | 删除新 serving 容器，退出；旧版本继续服务 |
-| 后台交接 | 旧后台改为不自动重启，发送一次 SIGTERM，等它处理完在途任务后自行退出；然后启动新后台，等待 `ready` 且 `owns_background`。发信号前日志写明旧后台排空期间管理接口是只读还是不可用（旧版本不报告 `admin_during_drain`，那一次仍不可用）；等待期间 SIGTERM 后约 5 秒、之后每分钟写一次它仍在停止的服务。交接中每 0.5 秒检查一次 | 新后台在超时内未就绪或容器退出：停止新后台，重新启动旧后台，删除新 serving，退出。旧后台在 `background_exit_timeout`（默认 2100 秒）内没有退出：`FAILED AND NOT RESTORED`，见“无法自动恢复的情况” |
+| 后台交接 | 旧后台改为不自动重启，发送一次 SIGTERM，等它处理完在途任务后自行退出；然后启动新后台，等待 `ready` 且 `owns_background`。发信号前日志写明旧后台排空期间管理接口是只读还是不可用（旧版本不报告 `admin_during_drain`，那一次仍不可用）；等待期间 SIGTERM 后约 5 秒、之后每分钟写一次它仍在停止的服务。交接中每 0.5 秒检查一次。普通等待期用完时，如果旧后台仍在创建定时备份，工具按该备份剩余期限加短暂收尾时间延长一次等待 | 新后台在超时内未就绪或容器退出：停止新后台，重新启动旧后台，删除新 serving，退出。旧后台在普通等待期 `background_exit_timeout`（默认 2100 秒）及适用的备份等待期内均未退出：`FAILED AND NOT RESTORED`，见“无法自动恢复的情况” |
 | 切流 | 生成新的 upstream 文件，`nginx -t` 通过后 reload 一次；旧 worker 继续服务已建立的连接直到结束 | `nginx -t` 失败：恢复原文件，后台交还旧版本，删除新 serving，退出 |
 | 守护 | 默认 5 分钟、每 10 秒检查一次（见下节） | 自动回滚（见下节） |
 | 退役 | 旧 serving 改为不自动重启，发起排空，再发送 SIGTERM，不等待；它处理完已转来的请求（包括流式连接）后自行退出。更新状态文件，追加历史 | — |
@@ -106,7 +108,7 @@
 
 如果恢复步骤本身也失败（例如切回旧槽位时 `nginx -t` 失败，或新后台失败后旧后台也无法重新就绪），脚本报告 `FAILED AND NOT RESTORED` 并保留 `in_progress`，原因写在 `in_progress.failed`。此时下一次发布会被拒绝，需要人工用 `deploy.py status` 和 `docker ps` 查看现场、恢复服务后再清除该标记。
 
-正在排空的后台在 `background_exit_timeout` 内没有退出也属于这种情况。工具没有杀任何进程，接手的后台已创建（或已停止）但没有启动；排空中的后台已设为不自动重启，Docker 也不会重启被 `docker kill` 停下的容器，所以它退出后就没有后台进程了，直到有人手动启动一个。它在排空期间仍应答管理读请求。`deploy.py status` 里它的 `status` 为 `running`、`restart_policy` 为 `no`，原因和处理步骤写在 `in_progress.failed`。错误信息写明当前哪个槽位在服务流量、哪些 serving 容器留着运行但没有流量、应该启动哪一个后台：
+正在排空的后台在 `background_exit_timeout` 和适用的备份等待期用完后仍未退出，也属于这种情况。工具没有杀任何进程，接手的后台已创建（或已停止）但没有启动；排空中的后台已设为不自动重启，Docker 也不会重启被 `docker kill` 停下的容器，所以它退出后就没有后台进程了，直到有人手动启动一个。它在排空期间仍应答管理读请求。`deploy.py status` 里它的 `status` 为 `running`、`restart_policy` 为 `no`，原因和处理步骤写在 `in_progress.failed`。错误信息写明当前哪个槽位在服务流量、哪些 serving 容器留着运行但没有流量、应该启动哪一个后台：
 
 - 正向发布或 `rollback` 时（切流之前）：流量仍在当前槽位；排空中的是当前槽位的后台；目标槽位的主、备 serving 留着运行、没有流量，可在恢复后手动停止。等它退出后启动的就是它本身：`docker update --restart=unless-stopped <当前槽位后台>`、`docker start <当前槽位后台>`。
 - 交还时（切流失败或守护失败、流量已经回到上一槽位之后）：排空中的是新版本的后台，不要重启它；新版本的主、备 serving 留着运行、没有流量，可在恢复后手动停止。等它退出后启动上一槽位（正在服务流量的那个）的后台：`docker update --restart=unless-stopped <上一槽位后台>`、`docker start <上一槽位后台>`。
