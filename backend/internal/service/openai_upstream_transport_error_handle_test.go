@@ -187,13 +187,13 @@ func TestHandleOpenAIUpstreamTransportError_PersistentEvictsAndFailsOver(t *test
 		Name:     "proxy-expired",
 		Platform: PlatformOpenAI,
 		ProxyID:  &proxyID,
-		Proxy:    &Proxy{ID: proxyID, Name: "wldsg82-ipv6-10060"},
+		Proxy:    &Proxy{ID: proxyID, Name: "fixture-proxy"},
 	}
 	c, rec := newOpenAITransportErrTestContext()
 
 	before := time.Now()
 	retErr := svc.handleOpenAIUpstreamTransportError(context.Background(), c, account,
-		errors.New(`Post "https://chatgpt.com/backend-api/codex/responses": socks connect tcp 85.255.176.68:12324->chatgpt.com:443: username/password authentication failed`), false)
+		errors.New(`Post "https://provider.example/backend-api/codex/responses": socks connect tcp 192.0.2.10:1080->provider.example:443: username/password authentication failed`), false)
 	after := time.Now()
 
 	// Failover error (handler will switch accounts), not a direct response.
@@ -221,7 +221,7 @@ func TestHandleOpenAIUpstreamTransportError_PersistentEvictsAndFailsOver(t *test
 	require.Len(t, events, 1)
 	require.NotNil(t, events[0].ProxyID)
 	require.Equal(t, proxyID, *events[0].ProxyID)
-	require.Equal(t, "wldsg82-ipv6-10060", events[0].ProxyName)
+	require.Equal(t, "fixture-proxy", events[0].ProxyName)
 }
 
 // A transient blip should fail over but must NOT evict the account.
