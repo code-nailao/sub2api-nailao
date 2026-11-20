@@ -16,13 +16,13 @@ type deepSeekToolHistoryMessage struct {
 }
 
 type deepSeekToolHistoryCall struct {
-	id           string
-	rawID        deepSeekChatSpan
-	owner        int
-	reused       bool // an earlier assistant message used this ID
-	adjacent     bool // the first candidate was adjacent to the call
-	result       *deepSeekToolHistoryMessage
-	alternatives []*deepSeekToolHistoryMessage
+	id            string
+	rawID         deepSeekChatSpan
+	owner         int
+	reused        bool // an earlier assistant message used this ID
+	adjacentCount int  // candidates in the tool block immediately after the call
+	result        *deepSeekToolHistoryMessage
+	alternatives  []*deepSeekToolHistoryMessage
 }
 
 // normalizeDeepSeekChatToolPairing repairs tool message adjacency using only
@@ -72,6 +72,9 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 		}
 
 		call := latestByID[message.resultID]
+		if call != nil && call.owner == adjacentOwner {
+			call.adjacentCount++
+		}
 		switch {
 		case call == nil:
 			changed = true
@@ -80,9 +83,8 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 			}
 		case call.result == nil:
 			call.result = message
-			call.adjacent = call.owner == adjacentOwner
 			missingResults--
-			changed = changed || !call.adjacent
+			changed = changed || call.adjacentCount == 0
 		default:
 			changed = true
 			call.alternatives = append(call.alternatives, message)
@@ -102,7 +104,7 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 		}
 		for j := range messages[i].calls {
 			call := &messages[i].calls[j]
-			if !call.reused && latestByID[call.id] == call && !call.adjacent {
+			if !call.reused && latestByID[call.id] == call && call.adjacentCount == 0 {
 				if early := beforeFirstCall[call.id]; early != nil {
 					call.result = early
 				}
@@ -138,19 +140,20 @@ func deepSeekToolResultKey(body []byte, result *deepSeekToolHistoryMessage) deep
 	return key
 }
 
-// Prefer the first candidate with content absent from earlier occurrences,
-// falling back to the first candidate when all content was seen. Record even
-// the discarded candidates for later occurrences.
+// Adjacent candidates come first and take priority. Within that group, or
+// among displaced candidates if there are no adjacent ones, prefer the first
+// result with unseen content. Record all candidates for later occurrences.
 func (call *deepSeekToolHistoryCall) preferNewResult(ctx context.Context, body []byte, seenCandidates map[deepSeekToolResultIdentity]struct{}) error {
 	firstKey := deepSeekToolResultKey(body, call.result)
 	_, preferredSeen := seenCandidates[firstKey]
 	seenCandidates[firstKey] = struct{}{}
-	for _, candidate := range call.alternatives {
+	for i, candidate := range call.alternatives {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		key := deepSeekToolResultKey(body, candidate)
-		if _, seen := seenCandidates[key]; preferredSeen && !seen {
+		samePlacement := call.adjacentCount == 0 || i+1 < call.adjacentCount
+		if _, seen := seenCandidates[key]; samePlacement && preferredSeen && !seen {
 			call.result = candidate
 			preferredSeen = false
 		}

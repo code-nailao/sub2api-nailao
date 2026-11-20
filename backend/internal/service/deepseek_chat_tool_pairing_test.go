@@ -42,6 +42,16 @@ func TestDeepSeekChatPairsToolMessagesBeforeForwarding(t *testing.T) {
 			callA + "," + resultA + "," + callA + "," + secondA + "," + followup,
 		},
 		{
+			"reused_id_keeps_adjacent_result",
+			callA + "," + resultA + "," + user + "," + callA + "," + resultA + "," + followup + "," + secondA,
+			callA + "," + resultA + "," + user + "," + callA + "," + resultA + "," + followup,
+		},
+		{
+			"reused_id_remembers_discarded_displaced_candidate",
+			callA + "," + resultA + "," + callA + "," + resultA + "," + followup + "," + secondA + "," + callA + "," + secondA + "," + thirdA,
+			callA + "," + resultA + "," + callA + "," + resultA + "," + followup + "," + callA + "," + thirdA,
+		},
+		{
 			"reused_id_cross_boundary_duplicate",
 			callA + "," + resultA + "," + callA + "," + resultA + "," + secondA,
 			callA + "," + resultA + "," + callA + "," + secondA,
@@ -114,9 +124,39 @@ func TestDeepSeekChatPairingPreservesAdjacentResultsWithReusedIDs(t *testing.T) 
 	require.Equal(t, want, string(run.sent))
 }
 
+func TestDeepSeekChatPairingOpenCodeGo(t *testing.T) {
+	const messages = `[{"role":"user","content":"Example"},{"role":"tool","tool_call_id":"unmatched","content":"Original"}]`
+	body := []byte(`{"model":"fixture-model","messages":` + messages + `}`)
+	for _, platform := range []string{PlatformOpenCodeGo, PlatformOpenAI} {
+		for _, tc := range []struct {
+			model        string
+			wantMessages string
+		}{
+			{"deepseek-v4-flash", `[{"role":"user","content":"Example"}]`},
+			{"glm-5", messages},
+		} {
+			t.Run(platform+"/"+tc.model, func(t *testing.T) {
+				c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
+				upstream := newOKChatCompletionsUpstream(t.Name(), deepSeekChatFallbackOKBody)
+				svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+				account := openaiPlatformDeepSeekAccount()
+				account.Platform = platform
+				account.Credentials["base_url"] = DefaultOpenCodeGoBaseURL
+				account.Credentials["model_mapping"] = map[string]any{"fixture-model": tc.model}
+
+				_, err := svc.ForwardAsChatCompletions(c.Request.Context(), c, account, body, "", "")
+				require.NoError(t, err)
+				require.Equal(t, buildOpenAIChatCompletionsURL(DefaultOpenCodeGoBaseURL), upstream.lastReq.URL.String())
+				require.Equal(t, tc.model, gjson.GetBytes(upstream.lastBody, "model").String())
+				require.Equal(t, tc.wantMessages, gjson.GetBytes(upstream.lastBody, "messages").Raw)
+			})
+		}
+	}
+}
+
 func TestDeepSeekChatPairingScope(t *testing.T) {
 	t.Run("another provider on the same raw Chat path", func(t *testing.T) {
-		body := []byte(`{"model":"fixture-model","messages":[{"role":"user","content":"Example"},{"role":"tool","tool_call_id":"unmatched","content":"Original"}]}`)
+		body := []byte(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Example"},{"role":"tool","tool_call_id":"unmatched","content":"Original"}]}`)
 		c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
 		upstream := newOKChatCompletionsUpstream(t.Name(), deepSeekChatFallbackOKBody)
 		svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
