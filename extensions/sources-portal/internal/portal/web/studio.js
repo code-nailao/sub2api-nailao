@@ -34,7 +34,7 @@ let bootstrapRound, compatibilityTimer, expiredLegacyAttempt, needsCustomResave 
 const rounds = connectionRounds();
 // Every staleness decision goes through the token the request started with.
 const isCurrent = (started) => !locked && rounds.isCurrent(started);
-const isConnecting = () => Boolean(connectionPending) && isCurrent(connectionPending.started);
+const isConnecting = () => Boolean(connectionPending) && isCurrent(connectionPending.attempt);
 const isBootstrapping = () => Boolean(bootstrapRound) && isCurrent(bootstrapRound);
 const ordinaryGroups = () => groups.filter(({ id }) => id !== custom.groupId);
 const connectionTimeout = "连接用时较长。可以重试连接，或稍后从主站重新进入。已有作品与草稿会保留。";
@@ -249,8 +249,10 @@ function updateMetadata(data) {
   }
   renderLegacyGroups();
 }
-function publishShell() {
-  if (!shellReady || !studioURL || !mainOrigin || locked || isConnecting() || selectionUncertain) return;
+function publishShell(force = false) {
+  // A new shell document gets its shell even while a connection is pending;
+  // periodic republishing still waits for that connection.
+  if (!shellReady || !studioURL || !mainOrigin || locked || (!force && isConnecting()) || selectionUncertain) return;
   clearInterval(shellTimer);
   const config = {
     type: "sub2api:image-studio-shell-config", version: 1,
@@ -285,17 +287,22 @@ function publishShell() {
 // text null sends an empty message: the client then shows no notice at all,
 // instead of its default "not confirmed" one.
 function selectionResult(pending, status, text = "", reconnectRequired = false) {
-  if (!pending?.requestId) return;
+  // Only a selection the child sent gets an answer: the raw message, or the
+  // attempt it started. The page's own attempt has a marker, not a selection.
+  const selection = pending?.fromChild ? pending : pending?.type === "sub2api:image-studio-select-group" ? pending : undefined;
+  if (!selection?.requestId) return;
   postStudio({ type: "sub2api:image-studio-select-group-result", version: 1,
-    requestId: pending.requestId, revision: pending.revision, status,
+    requestId: selection.requestId, revision: selection.revision, status,
     ...(text === null ? { message: "" } : text ? { message: text } : {}), reconnectRequired });
 }
 function sendConnection(pending) {
-  if (!pending?.config || connectionPending !== pending || !isCurrent(pending.started) || !rounds.isWaiting(pending.started)) return;
+  if (!pending?.config || connectionPending !== pending || !isCurrent(pending.view) || !rounds.isWaiting(pending.attempt)) return;
   pending.target = frame.contentWindow;
   if (!pending.target) return;
-  postStudio({ type: "sub2api:image-studio-config", payload: pending.config,
-    ...(pending.requestId ? { requestId: pending.requestId, revision: pending.revision } : {}) });
+  // Every configuration carries its own marker, so an acknowledgement from an
+  // earlier document never matches the one this document was sent.
+  postStudio({ type: "sub2api:image-studio-config", payload: pending.config, requestId: pending.requestId,
+    ...(pending.revision === undefined ? {} : { revision: pending.revision }) });
 }
 function bindFrameLoad(target) {
   target.addEventListener("load", () => {
@@ -312,13 +319,17 @@ function startDocument() {
   shellPending = null;
   clearInterval(shellTimer);
   if (connectionPending) {
-    if (connectionPending.requestId) {
+    if (connectionPending.fromChild) {
       // A selection the old child made is not the new child's request. Its
       // deadline stays armed but is inert: it no longer finds this attempt.
       clearInterval(connectionTimer);
       connectionPending = undefined;
     } else {
-      connectionPending.started = rounds.readdress(connectionPending.started);
+      // The page's own request is still owed, but not to the document that saw
+      // the last attempt: a new marker and a new view make its answer void.
+      connectionPending.requestId = crypto.randomUUID();
+      connectionPending.view = rounds.beginView();
+      connectionPending.target = undefined;
     }
   }
   frame.hidden = true;
@@ -337,7 +348,7 @@ function replaceFrame() {
 function connectionTimedOut(pending, text) {
   clearInterval(connectionTimer);
   connectionPending = undefined;
-  if (pending.config && !pending.requestId) expiredLegacyAttempt = pending;
+  if (pending.config && !pending.fromChild) expiredLegacyAttempt = pending;
   selectionUncertain = selectionUncertain || Boolean(pending.target);
   selectionResult(pending, "error", "连接尚未确认，请重新选择分组后再生成。", selectionUncertain);
   if (!integrated || needsCustomResave) recoverView(text);
@@ -347,27 +358,28 @@ function connectionTimedOut(pending, text) {
 async function connect(groupId, request) {
   if (locked || isConnecting() || isBootstrapping() || !groups.some((group) => group.id === groupId)) return;
   // A selection the child made ends with that child's document; the page's own
-  // menu outlives it.
-  const started = rounds.beginAttempt(request ? "view" : "page");
-  const pending = connectionPending = { groupId, started,
-    requestId: request?.requestId, revision: request?.revision,
-    restoreOnly: request?.restoreOnly === true, config: null };
+  // menu outlives it. The attempt follows the request; the view and the marker
+  // belong to the document the configuration is sent to.
+  const attempt = rounds.beginAttempt(request ? "view" : "page");
+  const pending = connectionPending = { groupId, attempt, view: rounds.beginView(),
+    fromChild: Boolean(request), requestId: request?.requestId ?? crypto.randomUUID(),
+    revision: request?.revision, restoreOnly: request?.restoreOnly === true, config: null };
   clearInterval(shellTimer);
   shellPending = null;
   clearTimeout(compatibilityTimer);
   const expired = expiredLegacyAttempt;
   expiredLegacyAttempt = undefined;
-  const replacePeer = !pending.requestId && (expired?.target || (shellRevision > 0 && (needsCustomResave || !connectionApplied)));
+  const replacePeer = !pending.fromChild && (expired?.target || (shellRevision > 0 && (needsCustomResave || !connectionApplied)));
   // Retry custom connections through Portal so it checks the Key's current group.
-  const cached = !pending.requestId && !needsCustomResave && groupId !== custom.groupId && expired?.groupId === groupId
+  const cached = !pending.fromChild && !needsCustomResave && groupId !== custom.groupId && expired?.groupId === groupId
     ? expired.config : undefined;
-  rounds.deadline(pending.started, 20000, () => connectionTimedOut(pending, connectionTimeout));
+  rounds.deadline(pending.attempt, 20000, () => connectionTimedOut(pending, connectionTimeout));
   const connectingText = "正在连接所选分组…";
   if (needsCustomResave) recoverView(connectingText);
   else message.textContent = connectingText;
   updateControls();
   const waiting = (token) => connectionPending === pending && isCurrent(token);
-  const authorizationCurrent = () => waiting(started);
+  const authorizationCurrent = () => waiting(attempt);
   try {
     let config = cached;
     if (config) await currentToken();
@@ -376,7 +388,8 @@ async function connect(groupId, request) {
     // A peer that saw the shell may reject a legacy selection even if its ACK
     // never arrived. A new frame also isolates retries from old legacy ACKs.
     if (replacePeer) replaceFrame();
-    pending.started = rounds.readdress(pending.started);
+    // A replaced frame is a new document: its configuration needs a new view.
+    pending.view = rounds.beginView();
     if (needsCustomResave) {
       needsCustomResave = false;
       recoverView("已收到工作台连接配置，正在等待确认…");
@@ -385,7 +398,7 @@ async function connect(groupId, request) {
     sendConnection(pending);
     let attempts = 0;
     const timer = setInterval(() => {
-      if (!waiting(pending.started) || timer !== connectionTimer) return;
+      if (!waiting(pending.attempt) || !isCurrent(pending.view) || timer !== connectionTimer) return;
       if (++attempts > 30) {
         rounds.retire();
         connectionTimedOut(pending, "连接尚未确认，请重新选择分组。");
@@ -397,7 +410,7 @@ async function connect(groupId, request) {
     updateControls();
   } catch (error) {
     if (!authorizationCurrent()) return;
-    rounds.finish(pending.started);
+    rounds.finish(pending.attempt);
     connectionPending = null;
     selectionResult(pending, "error", error.message);
     if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) needsCustomResave = true;
@@ -435,7 +448,7 @@ window.addEventListener("message", async (event) => {
     // the page answers it instead of the document that came before.
     startDocument();
     shellReady = true;
-    publishShell();
+    publishShell(true);
     sendConnection(connectionPending);
     return;
   }
@@ -474,11 +487,14 @@ window.addEventListener("message", async (event) => {
   }
   if (data.type !== "sub2api:image-studio-config-applied" || data.payload?.status !== "applied") return;
   const pending = connectionPending;
-  if (!pending?.config || !isCurrent(pending.started) || !isConnecting() || pending.target !== event.source) return;
+  if (!pending?.config || !isCurrent(pending.view) || !isConnecting() || pending.target !== event.source) return;
   if (!pending.restoreOnly && data.payload.profileId !== `sub2api-image-studio-group-${pending.groupId}`) return;
-  if (pending.requestId && (data.payload.requestId !== pending.requestId || data.payload.revision !== pending.revision)) return;
+  // The acknowledgement must be the one this document was sent: its marker,
+  // and the shell revision when a selection asked for it.
+  if (data.payload.requestId !== pending.requestId) return;
+  if (pending.revision !== undefined && data.payload.revision !== pending.revision) return;
   try { await currentToken(); } catch { return; }
-  if (!isCurrent(pending.started) || connectionPending !== pending || pending.target !== frame.contentWindow || !rounds.finish(pending.started)) return;
+  if (!isCurrent(pending.view) || connectionPending !== pending || pending.target !== frame.contentWindow || !rounds.finish(pending.attempt)) return;
   clearInterval(connectionTimer);
   connectionPending = null;
   selectionUncertain = false;

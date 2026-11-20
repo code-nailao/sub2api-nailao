@@ -156,15 +156,18 @@ test('lost shell ACK recovers through a new handshake before another group switc
   assert.equal(f.frameSets, 1);
 });
 
-test('initial connection timeout remains retryable before any new shell was published', async () => {
+test('initial connection timeout remains retryable after the shell restarted', async () => {
   const f = await fixture();
   const timedOutFrame = f.frame;
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
-  assert.equal(f.last('sub2api:image-studio-shell-config'), undefined);
+  // A new shell is published even while the connection is unconfirmed; the
+  // connection itself still needs a new attempt.
+  assert.ok(f.last('sub2api:image-studio-shell-config'));
   const timer = [...f.timers.values()].find((entry) => entry.delay === 500);
   for (let i = 0; i < 31; i++) timer.callback();
+  assert.notEqual(f.document.body.dataset.state, 'ready');
   assert.equal(f.select.disabled, false);
-  assert.equal(f.reconnect.hidden, true);
+  assert.equal(f.reconnect.hidden, false);
   f.select.value = '26';
   f.select.onchange();
   await flush();
@@ -628,6 +631,28 @@ test('a Studio selection made by a shell that already restarted is not applied',
   assert.doesNotMatch(f.message.textContent, /重新保存自定义连接/);
   assert.equal(f.retry.textContent, '重试连接');
   assert.equal(f.document.body.dataset.integrated, 'true');
+});
+
+test('a Studio shell restart voids the connection configured for the previous document', async () => {
+  const f = await fixture();
+  // The first configuration went out, but the child had not acknowledged it.
+  const initial = f.last('sub2api:image-studio-config');
+  assert.ok(initial);
+  assert.ok(initial.requestId, 'a page configuration carries its own request marker');
+
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackShell();
+  f.send({ type: 'sub2api:image-studio-config-applied', payload: { status: 'applied',
+    profileId: `sub2api-image-studio-${initial.payload.selectedConnectionId}`, requestId: initial.requestId } });
+  await flush();
+
+  assert.notEqual(f.document.body.dataset.state, 'ready');
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.frame.hidden, true);
+  // The new document was sent its own configuration with its own marker.
+  const resent = f.last('sub2api:image-studio-config');
+  assert.notEqual(resent.requestId, initial.requestId);
+  assert.equal(resent.payload.selectedConnectionId, initial.payload.selectedConnectionId);
 });
 
 test('a Studio settings save from before the shell restarted cannot close the dialog', async () => {
