@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -25,6 +26,8 @@ const (
 	checkConfigOK   = "SOURCES_PORTAL_CONFIG_OK"
 	usageLine       = "usage: sources-portal [-check-config]"
 )
+
+const workbenchURLRequirement = " requires a fixed HTTPS page without credentials or a nonempty query or fragment, with a canonical ASCII host and unpadded port (no trailing dot)"
 
 // Start-up failure messages. The normal start and -check-config report the
 // same message for the same problem; none contains a secret or an env value.
@@ -53,9 +56,11 @@ const (
 	errStudioConfig       = "invalid studio config"
 	errStudio             = "studio bindings initialization failed"
 	errStudioAPILabels    = "STUDIO_CUSTOM_API_LABELS must contain at most 16 unique lowercase DNS labels"
-	errStudioURL          = "STUDIO_URL requires a fixed HTTPS page with a canonical ASCII host and port (no Unicode, trailing dot or port padding)"
+	errStudioURL          = "STUDIO_URL" + workbenchURLRequirement
 	errStudioOrigin       = "STUDIO_URL must use a separate origin so the workbench cannot read Main login storage"
-	errCanvasURL          = "CANVAS_URL requires a fixed HTTPS page on a separate origin with a canonical ASCII host and port (no Unicode, trailing dot or port padding)"
+	errCanvasURL          = "CANVAS_URL" + workbenchURLRequirement
+	errCanvasOrigin       = "CANVAS_URL must use a separate origin so the canvas cannot read Main login storage"
+	errListenAddress      = "PORTAL_LISTEN requires host:port with an empty host, IP or valid hostname and a numeric port from 0 to 65535"
 	errListener           = "extension HTTP listener unavailable"
 	errServer             = "extension HTTP server failed"
 )
@@ -107,9 +112,8 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 	}
 }
 
-// checkConfig runs every start-up validation without taking the state lock,
-// writing state, listening or starting workers, so a deploy can verify a new
-// build against the real configuration while the old process still runs.
+// checkConfig validates startup settings and readable state while the old
+// process can still hold the lock. Only serve binds the listener.
 func checkConfig(getenv func(string) string) error {
 	setup, err := prepare(getenv, checkState)
 	if err != nil {
@@ -146,11 +150,11 @@ func serve(getenv func(string) string, logger *log.Logger) int {
 // the server. On failure it releases the store it opened and returns the message.
 func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup, failure error) {
 	fail := func(message string) (*portalSetup, error) { return nil, startupError(message) }
-	sub, err := canonicalBrowserOrigin(getenv("SUB_ORIGIN"))
+	sub, err := canonicalMainSiteOrigin(getenv("SUB_ORIGIN"))
 	if err != nil {
 		return fail(errSubOrigin)
 	}
-	public, err := canonicalBrowserOrigin(getenv("PORTAL_ORIGIN"))
+	public, err := canonicalMainSiteOrigin(getenv("PORTAL_ORIGIN"))
 	if err != nil {
 		return fail(errPortalOrigin)
 	}
@@ -258,28 +262,15 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 		if err := portal.CheckStudioCapabilities(caps, mediaEngineLegacyName); err != nil {
 			return fail(errStudio)
 		}
-		studio, e := url.Parse(getenv("STUDIO_URL"))
-		if e != nil || studio.Scheme != "https" || studio.Host == "" || studio.User != nil || studio.RawQuery != "" || studio.Fragment != "" {
-			return fail(errStudioURL)
+		server.StudioURL, err = validateWorkbenchURL(getenv("STUDIO_URL"), sub, errStudioURL, errStudioOrigin)
+		if err != nil {
+			return nil, err
 		}
-		studioOrigin, e := canonicalBrowserOrigin(studio.Scheme + "://" + studio.Host)
-		if e != nil {
-			return fail(errStudioURL)
-		}
-		if studioOrigin == sub {
-			return fail(errStudioOrigin)
-		}
-		server.StudioURL = studio.String()
 		if raw := getenv("CANVAS_URL"); raw != "" {
-			canvas, e := url.Parse(raw)
-			if e != nil || canvas.Scheme != "https" || canvas.Host == "" || canvas.User != nil || canvas.RawQuery != "" || canvas.Fragment != "" {
-				return fail(errCanvasURL)
+			server.CanvasURL, err = validateWorkbenchURL(raw, sub, errCanvasURL, errCanvasOrigin)
+			if err != nil {
+				return nil, err
 			}
-			canvasOrigin, e := canonicalBrowserOrigin(canvas.Scheme + "://" + canvas.Host)
-			if e != nil || canvasOrigin == sub {
-				return fail(errCanvasURL)
-			}
-			server.CanvasURL = canvas.String()
 		}
 	}
 	addr := getenv("PORTAL_LISTEN")
@@ -288,10 +279,12 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 	}
 	// Only binding proves an address; both modes validate its form before any
 	// lock file, directory or migration can be written.
-	if _, port, err := net.SplitHostPort(addr); err != nil {
-		return fail(errListener)
-	} else if _, err := net.LookupPort("tcp", port); err != nil {
-		return fail(errListener)
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || !validListenHost(host) {
+		return fail(errListenAddress)
+	}
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+		return fail(errListenAddress)
 	}
 	if open.check {
 		// A start creates a missing directory and would come up with empty state;
@@ -333,4 +326,31 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 		}
 	}
 	return &portalSetup{store: store, svc: svc, server: server, addr: addr}, nil
+}
+
+// The authorized client runs in an iframe of the HTTPS main site.
+func validateWorkbenchURL(raw, mainOrigin string, formatError, sameOriginError startupError) (string, error) {
+	page, err := url.Parse(raw)
+	if err != nil || page.Scheme != "https" || page.RawQuery != "" || page.Fragment != "" {
+		return "", formatError
+	}
+	origin, err := canonicalBrowserOrigin(page)
+	if err != nil {
+		return "", formatError
+	}
+	if origin == mainOrigin {
+		return "", sameOriginError
+	}
+	return page.String(), nil
+}
+
+func validListenHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	// Listen addresses may use fully qualified DNS names with a root dot.
+	return validDNSHostname(strings.TrimSuffix(host, "."))
 }
