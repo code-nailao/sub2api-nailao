@@ -521,6 +521,30 @@ class RollbackEndpoint:
     network: str
     network_ref: str
     aliases: tuple[str, ...]
+    options: tuple[str, ...]
+
+    @staticmethod
+    def connect_options(endpoint: dict[str, Any]) -> tuple[str, ...]:
+        # IPAddress and GlobalIPv6Address can be dynamic leases. IPAMConfig
+        # keeps only the addresses explicitly requested when configuring it.
+        ipam = endpoint.get("IPAMConfig") or {}
+        options = []
+        for key, flag in (("IPv4Address", "--ip"), ("IPv6Address", "--ip6")):
+            if ipam.get(key):
+                options.extend((flag, ipam[key]))
+        for address in sorted(ipam.get("LinkLocalIPs") or ()):
+            options.extend(("--link-local-ip", address))
+        for link in sorted(endpoint.get("Links") or ()):
+            options.extend(("--link", link))
+        for key, value in sorted((endpoint.get("DriverOpts") or {}).items()):
+            options.extend(("--driver-opt", f"{key}={value}"))
+        if endpoint.get("GwPriority"):
+            options.extend(("--gw-priority", str(endpoint["GwPriority"])))
+        return tuple(options)
+
+    @classmethod
+    def from_inspect(cls, role: str, network: str, endpoint: dict[str, Any], aliases: tuple[str, ...]) -> "RollbackEndpoint":
+        return cls(role, network, endpoint.get("NetworkID") or network, aliases, cls.connect_options(endpoint))
 
 
 class Deployer:
@@ -713,6 +737,7 @@ class Deployer:
         raise DeployError(f"no '{prefix}' line in command output")
 
     def install_upstreams(self, text: str, *, before_reload: Callable[[], None] | None = None,
+                          reload_started: Callable[[], None] | None = None,
                           recover_reload: Callable[[str | None, BaseException], NoReturn] | None = None) -> None:
         try:
             previous = self.ops.read_text(self.cfg.upstream_file)
@@ -720,6 +745,7 @@ class Deployer:
             previous = None
         except OSError as err:
             raise DeployError("cannot read the previous upstream file; routing unchanged") from err
+        reloading = False
         try:
             self.ops.write_file_atomic(self.cfg.upstream_file, text)
             test = self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False)
@@ -727,31 +753,35 @@ class Deployer:
                 raise DeployError("nginx -t rejected the upstream file")
             if before_reload is not None and not self.ops.dry_run:
                 before_reload()
+            reloading = True
+            if reload_started is not None:
+                reload_started()
+            self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
         except (Exception, KeyboardInterrupt) as err:
+            reason = str(err) or type(err).__name__
+            if reloading:
+                if recover_reload is not None:
+                    recover_reload(previous, err)
+                raise RoutingUnconfirmed(f"reload outcome is unknown ({reason}). Verify live routing with 'status' "
+                                         "and Nginx before changing background ownership") from err
             if previous is None:
-                raise RoutingFileNotRestored(f"upstream update failed before reload ({err}) and no previous upstream file is available") from err
+                raise RoutingFileNotRestored(f"upstream update failed before reload ({reason}) and no previous upstream file is available") from err
             try:
                 self.ops.write_file_atomic(self.cfg.upstream_file, previous)
             except (Exception, KeyboardInterrupt) as restore_err:
                 raise RoutingFileNotRestored("could not restore the previous upstream file after failure before reload") from restore_err
             if isinstance(err, RollbackBackgroundUnavailable):
                 raise
-            raise DeployError(f"{err}; previous file restored, routing unchanged") from err
-        try:
-            self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
-        except (Exception, KeyboardInterrupt) as err:
-            if recover_reload is not None:
-                recover_reload(previous, err)
-            raise RoutingUnconfirmed(f"reload outcome is unknown ({err}). Verify live routing with 'status' "
-                                      "and Nginx before changing background ownership") from err
+            raise DeployError(f"{reason}; previous file restored, routing unchanged") from err
 
     def switch_to(self, view: dict[str, Any], *, admin: dict[str, Any] | None = None,
                   before_reload: Callable[[], None] | None = None,
+                  reload_started: Callable[[], None] | None = None,
                   recover_reload: Callable[[str | None, BaseException], NoReturn] | None = None) -> None:
         ports = view["ports"]
         admin_port = (view if admin is None else admin)["ports"]["background"]
         self.install_upstreams(render_upstreams(ports["serving"], ports["standby"], admin_port),
-                               before_reload=before_reload, recover_reload=recover_reload)
+                               before_reload=before_reload, reload_started=reload_started, recover_reload=recover_reload)
 
     # steps ------------------------------------------------------------------
     def nginx_preflight(self) -> list[str]:
@@ -1006,7 +1036,7 @@ class Deployer:
             self.check_rollback_serving(view)
         if state is not None:
             self._mark(state, target, "background handoff")
-        with self.step("background handoff"):
+        def handoff() -> None:
             preparing = True
             try:
                 if not self.ops.dry_run:
@@ -1022,11 +1052,11 @@ class Deployer:
                 if self.ops.dry_run or (preparing and state is not None):
                     raise
                 self.route_rollback_serving_only(current, view, err, retire_current=publish_serving is None)
-        with self.step("switch"):
-            self.switch_after_handoff(current, target, state=state, rollback=True, publish_serving=publish_serving)
+
+        self.handoff_and_switch(current, target, handoff, state=state, rollback=True, publish_serving=publish_serving)
 
     def route_rollback_serving_only(self, current: dict[str, Any], view: dict[str, Any], err: BaseException,
-                                    *, retire_current: bool = True) -> None:
+                                    *, retire_current: bool = True) -> NoReturn:
         try:
             admin_available = self.background_answering(current, allow_draining=True)
         except (Exception, KeyboardInterrupt):
@@ -1035,33 +1065,40 @@ class Deployer:
             raise SwitchNotRestored(f"rollback background unavailable ({err}). Run 'status' and 'docker ps -a'. "
                                     "Wait for any draining owner to exit, then restore one background and verify "
                                     "its health, ownership and live routing before clearing in_progress") from err
+        reload_attempted = False
+
+        def mark_reload_attempted() -> None:
+            nonlocal reload_attempted
+            reload_attempted = True
+
         try:
             self.check_rollback_serving(view)
             self.switch_to(view, admin=current,
-                           before_reload=lambda: self.check_rollback_route(view, current, allow_draining=True))
+                           before_reload=lambda: self.check_rollback_route(view, current, allow_draining=True),
+                           reload_started=mark_reload_attempted)
+            if retire_current:
+                self.retire_degraded_rollback_serving(current)
         except (Exception, KeyboardInterrupt) as route_err:
-            failure = RoutingUnconfirmed if isinstance(route_err, RoutingUnconfirmed) else SwitchNotRestored
-            raise failure(f"rollback background unavailable ({err}); switching serving alone failed "
-                          f"({route_err or type(route_err).__name__}). Verify routing and background ownership "
-                          "before clearing in_progress") from route_err
-        if retire_current:
-            try:
-                self.retire_serving(current)
-            except (Exception, KeyboardInterrupt) as retire_err:
-                err = DeployError(f"{err}. Retirement of the unselected serving containers is incomplete ({retire_err})")
+            if isinstance(route_err, RoutingUnconfirmed) or not reload_attempted:
+                failure = RoutingUnconfirmed if isinstance(route_err, RoutingUnconfirmed) else SwitchNotRestored
+                raise failure(f"rollback background unavailable ({err}); switching serving alone failed "
+                              f"({route_err or type(route_err).__name__}). Verify routing and background ownership "
+                              "before clearing in_progress") from route_err
+            err = DeployError(f"{err}. Retirement of the unselected serving containers is incomplete "
+                              f"({route_err or type(route_err).__name__})")
         raise RollbackIncomplete(f"rollback background unavailable ({err}). Serving uses slot {view['slot']} and admin "
                                  f"uses slot {current['slot']}. Check 'status' before completing the rollback") from err
 
-    def restore_after_guard(self, target: Target, previous: dict[str, Any], reason: str) -> None:
+    def restore_after_guard(self, source: dict[str, Any], previous: dict[str, Any], reason: str) -> None:
         self.log(f"   guard failed: {reason}; switching traffic back to slot {previous['slot']}")
         try:
-            self.rollback_to(target.view(), Target.from_view(previous, self.cfg.runtime_token_file))
+            self.rollback_to(source, Target.from_view(previous, self.cfg.runtime_token_file))
         except RollbackIncomplete as err:
             raise RollbackIncomplete(f"guard failed ({reason}); {err}") from err
         except (Exception, KeyboardInterrupt) as err:
             raise FallbackFailed(f"guard failed ({reason}) and switching back failed ({err})") from err
         try:
-            self.retire_serving(target.view())
+            self.retire_serving(source)
         except (Exception, KeyboardInterrupt) as err:
             raise FallbackFailed("traffic and background restored, but target serving retirement "
                                  "is incomplete; inspect status before clearing in_progress") from err
@@ -1076,10 +1113,16 @@ class Deployer:
         except (Exception, KeyboardInterrupt) as err:
             raise FallbackFailed(f"handing the background back failed: {err}") from err
 
-    def switch_after_handoff(self, current: dict[str, Any], target: Target, *, state: dict[str, Any] | None,
-                             rollback: bool = False, verify_target: bool = False,
-                             publish_serving: Callable[[], None] | None = None) -> None:
+    def handoff_and_switch(self, current: dict[str, Any], target: Target, handoff: Callable[[], None], *,
+                           state: dict[str, Any] | None, rollback: bool = False, verify_target: bool = False,
+                           publish_serving: Callable[[], None] | None = None) -> None:
         view = target.view()
+        handoff_started = handoff_complete = reload_attempted = False
+        aliases_published = False
+
+        def mark_reload_attempted() -> None:
+            nonlocal reload_attempted
+            reload_attempted = True
 
         def restore_before_reloading_old_route(previous: str | None, err: BaseException) -> NoReturn:
             if previous is None:
@@ -1097,31 +1140,49 @@ class Deployer:
             raise RoutingRestored("reload failed; previous routing restored") from err
 
         def check_before_reload() -> None:
+            nonlocal aliases_published
             self.check_rollback_route(view, view)
             if publish_serving is not None:
                 publish_serving()
+                aliases_published = True
                 self.check_rollback_route(view, view)
 
         try:
-            # Nginx still serves the original route while recording progress,
-            # reading the file and validating readiness. Recover its owner if
-            # any of these steps fails.
-            if state is not None:
-                self._mark(state, target, "switch")
-            before_reload = None
-            if (rollback or verify_target) and not self.ops.dry_run:
-                self.check_rollback_route(view, view)
-                before_reload = check_before_reload
-            self.switch_to(view, before_reload=before_reload, recover_reload=restore_before_reloading_old_route)
+            # Start protecting the handoff before it can move ownership. The
+            # exit of its step and the entry of the switch step can be interrupted.
+            with self.step("background handoff"):
+                handoff_started = True
+                handoff()
+                handoff_complete = True
+            with self.step("switch"):
+                if state is not None:
+                    self._mark(state, target, "switch")
+                before_reload = None
+                if (rollback or verify_target) and not self.ops.dry_run:
+                    self.check_rollback_route(view, view)
+                    before_reload = check_before_reload
+                self.switch_to(view, before_reload=before_reload, reload_started=mark_reload_attempted,
+                               recover_reload=restore_before_reloading_old_route)
         except (Exception, KeyboardInterrupt) as err:
-            if self.ops.dry_run or isinstance(err, (RoutingUnconfirmed, RoutingRestored)):
-                # A reload was attempted. Its recovery callback owns the
-                # outcome, and disk config alone does not tell us the live route.
+            if self.ops.dry_run or isinstance(err, (RoutingUnconfirmed, RoutingRestored, RollbackIncomplete)):
                 raise
+            if reload_attempted:
+                raise RoutingUnconfirmed(f"switch interrupted after starting reload ({err or type(err).__name__}). "
+                                         "Verify live routing and background ownership with 'status'") from err
+            if not handoff_started:
+                raise
+            if not handoff_complete and isinstance(err, DeployError):
+                # The handoff normally reconciles its own errors. If it was
+                # interrupted just as it returned, its target may own the lock.
+                with contextlib.suppress(Exception, KeyboardInterrupt):
+                    handoff_complete = self.background_answering(view)
+                if not handoff_complete:
+                    raise
             reason = str(err) or type(err).__name__
             if isinstance(err, OSError):
                 reason = f"switch state write or upstream I/O failed ({reason})"
-            self.log("   switch failed before reload; handing the background back")
+            with contextlib.suppress(OSError, KeyboardInterrupt):
+                self.log("   switch failed before reload; handing the background back")
             try:
                 if not self.background_answering(current):
                     self.hand_back(target, current)
@@ -1134,7 +1195,8 @@ class Deployer:
                                         "then restore the original restart policy and use 'docker start' on that container. "
                                         "Verify its health, ownership and live routing before clearing in_progress") from restore_err
             if rollback and isinstance(err, RollbackBackgroundUnavailable):
-                self.route_rollback_serving_only(current, view, err, retire_current=publish_serving is None)
+                self.route_rollback_serving_only(current, view, err,
+                                                 retire_current=publish_serving is None or aliases_published)
             if isinstance(err, RoutingFileNotRestored):
                 raise SwitchNotRestored(f"{reason}; the original background owns the lock again. "
                                         "Verify the upstream file before reloading Nginx") from err
@@ -1214,6 +1276,7 @@ class Deployer:
         # not leave the standby accepting new requests through the alias.
         failures = []
         signaled = []
+        timed_out = False
         for role, cid in identities.items():
             try:
                 if self.stop_owned_serving(target, role, cid, allow_missing=True, wait=False):
@@ -1224,10 +1287,14 @@ class Deployer:
             for role, cid in signaled:
                 try:
                     self.wait_exit(cid, self.cfg.ready_timeout)
+                except DrainTimeout as err:
+                    timed_out = True
+                    failures.append(f"{role}: {err}")
                 except (Exception, KeyboardInterrupt) as err:
                     failures.append(f"{role}: {err or type(err).__name__}")
         if failures:
-            raise DeployError("; ".join(failures))
+            failure = DrainTimeout if timed_out else DeployError
+            raise failure(". ".join(failures))
 
     def remove_owned_serving(self, target: Target, role: str, cid: str) -> None:
         name = target.containers[role]
@@ -1352,7 +1419,8 @@ class Deployer:
         try:
             self._mark(state, target, "prepare rollback serving")
             with self.step("start previous serving"):
-                self.prepare_rollback_serving(current, target, identities, endpoints)
+                self.prepare_rollback_serving(current, target, identities, endpoints,
+                                              previous.get("withdrawn_serving_alias_networks", {}))
             publish = (lambda: self.configure_rollback_aliases(target, identities, endpoints, shared=True)) if endpoints else None
             self._finish_switch(state, current, target, record, create_background=False, publish_serving=publish)
         except (Exception, KeyboardInterrupt) as err:
@@ -1367,7 +1435,7 @@ class Deployer:
             self.fail_switch_operation(state, record, err, cleanup=stop_candidates if identities and unselected else None)
 
     def prepare_rollback_serving(self, current: dict[str, Any], target: Target, identities: dict[str, str],
-                                 endpoints: list[RollbackEndpoint]) -> None:
+                                 endpoints: list[RollbackEndpoint], withdrawn: dict[str, list[str]]) -> None:
         if (set(current["containers"].values()) & set(target.containers.values())
                 or set(current["ports"].values()) & set(target.ports.values())):
             raise DeployError("rollback target overlaps the current release")
@@ -1380,10 +1448,16 @@ class Deployer:
             if not info.get("Id"):
                 raise DeployError(f"previous container {name} no longer exists")
             candidates[role] = info["Id"]
-            for network, endpoint in info.get("NetworkSettings", {}).get("Networks", {}).items():
+            networks = info.get("NetworkSettings", {}).get("Networks", {})
+            restore_alias = set(withdrawn.get(role, ())) if self.cfg.serving_alias else set()
+            if restore_alias.difference(networks):
+                raise DeployError(f"previous {role} is missing networks required for its shared alias")
+            for network, endpoint in networks.items():
                 aliases = tuple(endpoint.get("Aliases") or ())
+                if network in restore_alias and self.cfg.serving_alias not in aliases:
+                    aliases += (self.cfg.serving_alias,)
                 if self.cfg.serving_alias in aliases:
-                    endpoints.append(RollbackEndpoint(role, network, endpoint.get("NetworkID") or network, aliases))
+                    endpoints.append(RollbackEndpoint.from_inspect(role, network, endpoint, aliases))
         if endpoints:
             roles_with_alias = {endpoint.role for endpoint in endpoints}
             identities.update((role, cid) for role, cid in candidates.items() if role in roles_with_alias)
@@ -1398,6 +1472,30 @@ class Deployer:
                 self.wait_ready(target.ports[role], self.token_for(target.view(), role), "serving",
                                 self.cfg.ready_timeout, container=cid, check_health=True)
 
+    def retire_degraded_rollback_serving(self, view: dict[str, Any]) -> None:
+        # The serving route has switched. Drain the old pair without
+        # disconnecting in-flight requests.
+        target = Target.from_view(view, self.cfg.runtime_token_file)
+        identities = {}
+        endpoints = []
+        for role in SERVING_ROLES:
+            info = self.ops.inspect(target.containers[role]) or {}
+            if not info:
+                continue
+            identities[role] = info["Id"]
+            for network, endpoint in info.get("NetworkSettings", {}).get("Networks", {}).items():
+                aliases = tuple(endpoint.get("Aliases") or ())
+                if self.cfg.serving_alias in aliases:
+                    endpoints.append(RollbackEndpoint.from_inspect(role, network, endpoint, aliases))
+        if endpoints:
+            # The failure record retains this release view. Preserve where it
+            # should advertise again if it is selected in a future rollback.
+            view["withdrawn_serving_alias_networks"] = {
+                role: [endpoint.network for endpoint in endpoints if endpoint.role == role] for role in SERVING_ROLES
+            }
+        self.drain_serving_group(target, identities)
+        self.configure_rollback_aliases(target, identities, endpoints, shared=False)
+
     def configure_rollback_aliases(self, target: Target, identities: dict[str, str],
                                    endpoints: list[RollbackEndpoint], *, shared: bool) -> None:
         if self.ops.dry_run:
@@ -1405,20 +1503,23 @@ class Deployer:
         for endpoint in endpoints:
             cid = identities[endpoint.role]
             info = self.ops.inspect(target.containers[endpoint.role]) or {}
-            if info.get("Id") != cid or (not shared and info.get("State", {}).get("Running")):
+            state = info.get("State", {})
+            if info.get("Id") != cid or (not shared and (state.get("Running") or state.get("Restarting"))):
                 raise DeployError(f"cannot safely configure the rollback {endpoint.role} network")
             aliases = tuple(alias for alias in endpoint.aliases if shared or alias != self.cfg.serving_alias)
             current = info.get("NetworkSettings", {}).get("Networks", {}).get(endpoint.network)
             if current is not None:
-                if set(current.get("Aliases") or ()) == set(aliases):
+                if (set(current.get("Aliases") or ()) == set(aliases)
+                        and endpoint.connect_options(current) == endpoint.options):
                     continue
                 self.ops.run(["docker", "network", "disconnect", endpoint.network_ref, cid], mutate=True)
             options = [arg for alias in aliases for arg in ("--alias", alias)]
-            self.ops.run(["docker", "network", "connect", *options, endpoint.network_ref, cid], mutate=True)
+            self.ops.run(["docker", "network", "connect", *options, *endpoint.options, endpoint.network_ref, cid], mutate=True)
             info = self.ops.inspect(cid) or {}
             actual = info.get("NetworkSettings", {}).get("Networks", {}).get(endpoint.network)
-            if actual is None or set(actual.get("Aliases") or ()) != set(aliases):
-                raise DeployError(f"rollback {endpoint.role} network aliases are unconfirmed")
+            if (actual is None or set(actual.get("Aliases") or ()) != set(aliases)
+                    or endpoint.connect_options(actual) != endpoint.options):
+                raise DeployError(f"rollback {endpoint.role} network configuration is unconfirmed")
 
     def config_fingerprint(self) -> str:
         return hashlib.sha256(json.dumps(asdict(self.cfg), sort_keys=True).encode()).hexdigest()
@@ -1440,12 +1541,28 @@ class Deployer:
             try:
                 content = self.ops.read_bytes(self.cfg.env_files[role])
                 digest.update(hashlib.sha256(content).digest())
-                env = {}
-                for line in content.decode("utf-8-sig").splitlines():
-                    key, sep, value = line.lstrip().partition("=")
-                    if key and not key.startswith("#"):
-                        env[key] = value if sep else os.environ.get(key, "")
-                env.update(self.cfg.extra_env.get(role, {}))
+                env: dict[str, str] = {}
+                inherited: dict[str, str | None] = {}
+                for line in content.decode("utf-8-sig").split("\n"):
+                    key, sep, value = line.removesuffix("\r").lstrip().partition("=")
+                    if not key or key.startswith("#"):
+                        continue
+                    if sep:
+                        env[key] = value
+                        inherited.pop(key, None)
+                    else:
+                        host_value = os.environ.get(key)
+                        inherited[key] = host_value
+                        if host_value is not None:
+                            env[key] = host_value
+                overrides = self.cfg.extra_env.get(role, {})
+                env.update(overrides)
+                for key in (*overrides, "SOURCES_PROCESS_ROLE"):
+                    inherited.pop(key, None)
+                if inherited:
+                    # Docker resolves bare keys in --env-file against its
+                    # inherited environment. Keep unset distinct from empty.
+                    digest.update(hashlib.sha256(json.dumps(inherited, sort_keys=True).encode()).digest())
 
                 mounts = self.cfg.mounts["common"] + self.cfg.mounts[role]
                 files: set[Path] = set()
@@ -1483,7 +1600,7 @@ class Deployer:
         if not held.get("input_fingerprint"):
             raise DeployError("pause predates mounted configuration verification; abort and prepare a new hold")
         if self.input_fingerprint() != held["input_fingerprint"]:
-            raise DeployError("environment files changed or mounted configuration changed during pause; "
+            raise DeployError("environment files changed, inherited environment changed, or mounted configuration changed during pause; "
                               "abort and prepare a new hold")
 
     def upstream_fingerprint(self) -> str:
@@ -1670,13 +1787,17 @@ class Deployer:
         for role in SERVING_ROLES:
             self.ops.run(["docker", "update", "--restart=unless-stopped", identities[role]], mutate=True)
 
-    def held_aliases_withdrawn(self, target: Target, identities: dict[str, str], alias: str) -> bool:
+    def held_aliases_withdrawn(self, target: Target, identities: dict[str, str], alias: str,
+                               *, require_stopped: bool = False) -> bool:
         for role, cid in identities.items():
             info = self.ops.inspect(target.containers[role]) or {}
             candidates = [info]
             if info.get("Id") != cid:
                 candidates.append(self.ops.inspect(cid) or {})
             for candidate in candidates:
+                status = candidate.get("State", {})
+                if require_stopped and (status.get("Running") or status.get("Restarting")):
+                    return False
                 endpoints = candidate.get("NetworkSettings", {}).get("Networks", {})
                 if any(alias in (ep.get("Aliases") or []) for ep in endpoints.values()):
                     return False
@@ -1696,6 +1817,11 @@ class Deployer:
             if self.ops.dry_run:
                 raise
             reason = str(err) or type(err).__name__
+            if isinstance(err, DrainTimeout):
+                # Both candidates were signalled. A second drain attempt
+                # cannot restore an isolated pause while either is still up.
+                raise FallbackFailed(f"held serving activation failed ({reason}). Verify both candidates have drained "
+                                     "and are isolated before clearing in_progress") from err
             reclaimed = held
             if changed_networks:
                 try:
@@ -1704,7 +1830,10 @@ class Deployer:
                     reason = (f"held serving activation failed ({reason}); network restoration is incomplete "
                               f"({restore_err or type(restore_err).__name__})")
                     try:
-                        isolated = self.held_aliases_withdrawn(target, identities, self.cfg.serving_alias)
+                        # If isolation was not rebuilt, keep an abortable pause
+                        # only after confirming the candidates actually stopped.
+                        isolated = self.held_aliases_withdrawn(target, identities, self.cfg.serving_alias,
+                                                               require_stopped=True)
                     except (Exception, KeyboardInterrupt):
                         isolated = False
                     if not isolated:
@@ -1875,10 +2004,8 @@ class Deployer:
         view = target.view()
         if create_background:
             self._mark(state, target, "background handoff")
-            with self.step("background handoff"):
-                self.handoff_for_deploy(current, target)
-            with self.step("switch"):
-                self.switch_after_handoff(current, target, state=state, verify_target=held is not None)
+            self.handoff_and_switch(current, target, lambda: self.handoff_for_deploy(current, target),
+                                    state=state, verify_target=held is not None)
         else:
             self.rollback_to(current, target, state, publish_serving=publish_serving)
         if not self.ops.dry_run:
@@ -1888,7 +2015,7 @@ class Deployer:
                     self.guard(target)
                 except (Exception, KeyboardInterrupt) as err:
                     reason = str(err) or type(err).__name__
-                    self.restore_after_guard(target, current, reason)
+                    self.restore_after_guard(state["in_progress"]["target"], current, reason)
                     if held is None:
                         self._save_progress(state, None)
                     raise DeployError(f"guard failed ({reason}); the previous release serves traffic and owns the "

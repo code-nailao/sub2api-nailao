@@ -59,7 +59,7 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 
 查看 `status` 的 `in_progress.phase` 区分暂停、正在发布和故障。若为 `held`，用 `resume` 或 `abort`。若为 `aborting`，重试 `abort`。若失败步骤为 `prepare held slot`，可用 `resume` 重试准备，或用 `abort` 放弃。其它失败或发布进程已退出时，先用 `status` 和 `docker ps` 核对现场，恢复后再清除 `in_progress`。失败位置和原因分别记录在 `failed_step` 与 `reason`。容器的 `restart_policy` 为 `no` 时，退出后不会自动重启。通过日志和运行时状态确认它是否已收到 SIGTERM。
 
-后台排空超过 `background_exit_timeout` 时，接手的后台尚未启动。自动回退和手动回滚都要求目标后台返回 `/health` 200 并确认持锁后才切换管理 upstream。若原管理后台仍能应答，工具只回退用户流量，记录 `ROLLBACK INCOMPLETE`。两边都无法确认可用时保留已加载的路由，记录 `FAILED AND NOT RESTORED`。原后台可能仍在排空并已关闭自动重启。先用 `status` 和实际路由确认现场，等它退出后再启动选定的后台。确认后台健康并持锁后才更新路由和恢复记录。详见 [DEPLOY.md](../../docs/sources/DEPLOY.md#无法自动恢复的情况)。
+后台排空超过 `background_exit_timeout` 时，接手的后台尚未启动。自动回退和手动回滚都要求目标后台返回 `/health` 200 并确认持锁后才切换管理 upstream。若原管理后台仍能应答，工具只回退用户流量，记录 `ROLLBACK INCOMPLETE`。候选已发布共享别名时，切换后会排空原主备并撤下它们的共享别名。两边都无法确认可用时保留已加载的路由，记录 `FAILED AND NOT RESTORED`。原后台可能仍在排空并已关闭自动重启。先用 `status` 和实际路由确认现场，等它退出后再启动选定的后台。确认后台健康并持锁后才更新路由和恢复记录。详见 [DEPLOY.md](../../docs/sources/DEPLOY.md#无法自动恢复的情况)。
 
 ## 首次接入
 

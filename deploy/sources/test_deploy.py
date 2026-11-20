@@ -146,7 +146,15 @@ class FakeOps(deploy.Ops):
         elif args[:3] == ["docker", "network", "connect"]:
             if name in self.containers:
                 aliases = [args[i + 1] for i, arg in enumerate(args) if arg == "--alias"]
-                self.containers[name]["NetworkSettings"]["Networks"][self.network_name(args[-2])] = {"Aliases": aliases}
+                endpoint = {"Aliases": aliases}
+                ipam = {key: args[args.index(flag) + 1] for flag, key in
+                        (("--ip", "IPv4Address"), ("--ip6", "IPv6Address")) if flag in args}
+                link_local = [args[i + 1] for i, arg in enumerate(args) if arg == "--link-local-ip"]
+                if link_local:
+                    ipam["LinkLocalIPs"] = link_local
+                if ipam:
+                    endpoint["IPAMConfig"] = ipam
+                self.containers[name]["NetworkSettings"]["Networks"][self.network_name(args[-2])] = endpoint
         elif args[:3] == ["docker", "network", "inspect"]:
             networks = []
             for ref in args[3:]:
@@ -442,6 +450,36 @@ class DeployTest(unittest.TestCase):
         self.assertTrue(self.ops.inspect(view["containers"]["serving"])["State"]["Running"])
         self.assert_release_failure("failed", "still draining")
 
+    def test_resume_alerts_when_initial_serving_drain_never_completes(self):
+        held = self.hold()
+        view = held["target"]
+        primary, standby = (view["containers"][role] for role in deploy.SERVING_ROLES)
+        self.ops.drain_seconds[primary] = float("inf")
+        with self.assertRaises(deploy.DeployError):
+            deploy.Deployer(self.cfg, self.ops).resume()
+        self.assert_loaded_interfaces(LEGACY, LEGACY)
+        self.assertTrue(self.ops.inspect(primary)["State"]["Running"])
+        self.assertFalse(self.ops.inspect(standby)["State"]["Running"])
+        self.assert_no_shared_serving(view)
+        self.assert_release_failure("failed", "still draining")
+        for role in deploy.SERVING_ROLES:
+            command = ["docker", "kill", "--signal=TERM", held["containers"][role]["id"]]
+            self.assertEqual(1, self.ops.commands.count(command))
+
+    def test_resume_rejects_changed_inherited_background_environment(self):
+        self.ops.files[self.cfg.env_files["background"]] = "DATABASE_HOST\n"
+        with mock.patch.dict(os.environ, {"DATABASE_HOST": "fixture-inherited-before"}):
+            held = self.hold()
+        self.ops.commands.clear()
+        with mock.patch.dict(os.environ, {"DATABASE_HOST": "fixture-inherited-after"}):
+            with self.assertRaisesRegex(deploy.DeployError, "abort and prepare a new hold"):
+                deploy.Deployer(self.cfg, self.ops).resume()
+        self.assertEqual([], self.ops.commands)
+        self.assert_loaded_interfaces(LEGACY, LEGACY)
+        self.assert_no_shared_serving(held["target"])
+        self.assert_release_failure("held")
+        self.assertNotIn("fixture-inherited", Path(self.cfg.state_file).read_text())
+
     def assert_failure_before_reload(self, command, failure, *, restores_owner=True):
         if command == "rollback":
             self.deploy()
@@ -453,7 +491,7 @@ class DeployTest(unittest.TestCase):
             target = self.cfg.slot_view("a")
         current = self.state()["current"]
         target_bg, current_bg = (view["containers"]["background"] for view in (target, current))
-        run, read, save = self.ops.run, self.ops.read_text, deploy.save_state
+        run, read, save, log = self.ops.run, self.ops.read_text, deploy.save_state, self.ops.log
         injected = False
 
         def fail_save(cfg, state):
@@ -478,9 +516,18 @@ class DeployTest(unittest.TestCase):
                 raise deploy.DeployError("fixture original background cannot start")
             return run(args, **kw)
 
+        def interrupt_switch_log(message):
+            nonlocal injected
+            if failure == "step" and message.endswith("== switch") and not injected:
+                self.assertTrue(self.ops.inspect(target_bg)["State"]["Running"])
+                self.assertFalse(self.ops.inspect(current_bg)["State"]["Running"])
+                injected = True
+                raise KeyboardInterrupt
+            log(message)
+
         self.ops.commands.clear()
         with mock.patch.object(deploy, "save_state", fail_save), mock.patch.object(self.ops, "read_text", interrupt_read), \
-                mock.patch.object(self.ops, "run", fail_restore):
+                mock.patch.object(self.ops, "run", fail_restore), mock.patch.object(self.ops, "log", interrupt_switch_log):
             with self.assertRaises(deploy.DeployError) as outcome:
                 if command == "main":
                     self.deploy()
@@ -488,6 +535,8 @@ class DeployTest(unittest.TestCase):
                     getattr(deploy.Deployer(self.cfg, self.ops), command)()
         self.assertTrue(injected)
         self.assert_loaded_interfaces(current, current, admin_healthy=restores_owner)
+        if restores_owner:
+            self.assert_live_release(current)
         self.assert_no_shared_serving(target)
         self.assertNotIn([self.cfg.nginx_bin, "-s", "reload"], self.ops.commands)
         if command == "main":
@@ -512,6 +561,12 @@ class DeployTest(unittest.TestCase):
 
     def test_rollback_upstream_read_interrupt_restores_original_background(self):
         self.assert_failure_before_reload("rollback", "read")
+
+    def test_resume_switch_step_interrupt_restores_loaded_admin(self):
+        self.assert_failure_before_reload("resume", "step")
+
+    def test_rollback_switch_step_interrupt_restores_loaded_admin(self):
+        self.assert_failure_before_reload("rollback", "step")
 
     def test_main_switch_state_write_failure_restores_original_background(self):
         self.assert_failure_before_reload("main", "state")
@@ -627,6 +682,115 @@ class DeployTest(unittest.TestCase):
         self.assert_loaded_interfaces(previous, previous)
         self.assertIsNone(self.state()["in_progress"])
         self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
+
+    def test_degraded_rollback_removes_shared_alias_from_unselected_slot_after_drain(self):
+        self.deploy()
+        self.deploy(image="another@sha256:3")
+        state = self.state()
+        current, previous = state["current"], state["previous"]
+        current_names = [current["containers"][role] for role in deploy.SERVING_ROLES]
+        current_ids = {self.ops.inspect(name)["Id"]: name for name in current_names}
+        standby = self.ops.inspect(previous["containers"]["standby"])["Id"]
+        self.ops.drain_seconds.update(dict.fromkeys(current_names, 3))
+        expected_route = self.upstreams_for({"ports": {**previous["ports"], "background": current["ports"]["background"]}})
+        run = self.ops.run
+        exited = False
+
+        def exit_background_after_alias_publication(args, **kw):
+            nonlocal exited
+            if args[-1] in current_ids:
+                if args[:2] == ["docker", "kill"]:
+                    self.assertEqual(expected_route, self.ops.loaded_upstreams)
+                if args[:3] == ["docker", "network", "disconnect"]:
+                    self.assertFalse(self.ops.inspect(args[-1])["State"]["Running"])
+            result = run(args, **kw)
+            if (args[:3] == ["docker", "network", "connect"] and self.cfg.serving_alias in args
+                    and args[-2:] == [self.cfg.networks[-1], standby]):
+                self.ops.containers[previous["containers"]["background"]]["State"].update(Running=False, Status="exited")
+                exited = True
+            return result
+
+        with mock.patch.object(self.ops, "run", exit_background_after_alias_publication):
+            with self.assertRaises(deploy.RollbackIncomplete):
+                deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertTrue(exited)
+        self.assert_loaded_interfaces(previous, current)
+        for name in current_names:
+            info = self.ops.inspect(name)
+            self.assertFalse(info["State"]["Running"], name)
+            self.assertTrue(all(self.cfg.serving_alias not in endpoint.get("Aliases", [])
+                                for endpoint in info["NetworkSettings"]["Networks"].values()))
+        for role in deploy.SERVING_ROLES:
+            self.assertTrue(all(self.cfg.serving_alias in endpoint.get("Aliases", []) for endpoint in
+                                self.ops.inspect(previous["containers"][role])["NetworkSettings"]["Networks"].values()))
+        self.assert_release_failure("failed", "not answering health checks")
+
+        # Simulate the operator completing the split recovery. The retired
+        # slot can advertise again on a later rollback despite its withdrawn aliases.
+        retired = self.state()["current"]
+        self.ops.run(["docker", "kill", "--signal=TERM", current["containers"]["background"]], mutate=True)
+        self.ops.run(["docker", "start", previous["containers"]["background"]], mutate=True)
+        self.ops.loaded_upstreams = self.ops.files[self.cfg.upstream_file] = self.upstreams_for(previous)
+        deploy.save_state(self.cfg, {"current": previous, "previous": retired, "in_progress": None})
+        deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assert_live_release(current)
+        for role in deploy.SERVING_ROLES:
+            networks = self.ops.inspect(current["containers"][role])["NetworkSettings"]["Networks"]
+            self.assertTrue(all(self.cfg.serving_alias in networks[network]["Aliases"] for network in self.cfg.networks))
+
+    def test_rollback_keeps_adopted_serving_static_ipam_when_reconnecting_alias(self):
+        original = {}
+        for role in deploy.SERVING_ROLES:
+            name = LEGACY["containers"][role]
+            endpoints = self.ops.containers[name]["NetworkSettings"]["Networks"]
+            for network, endpoint in endpoints.items():
+                endpoint.update(Aliases=[name, self.cfg.serving_alias], IPAMConfig={
+                    "IPv4Address": f"fixture-ipv4-{role}-{network}",
+                    "IPv6Address": f"fixture-ipv6-{role}-{network}",
+                    "LinkLocalIPs": [f"fixture-link-local-{role}-{network}"],
+                })
+            original[name] = json.loads(json.dumps(endpoints))
+        config = self.tmp / "adopted.json"
+        work = self.tmp / "adopted"
+        work.mkdir()
+        (work / "runtime.token").write_text("tok\n")
+        write = self.ops.write_file_atomic
+
+        def write_adoption(path, text, mode=0o644):
+            if Path(path) == config:
+                config.write_text(text)
+            write(path, text, mode)
+
+        with mock.patch.object(deploy, "DEFAULT_RELEASE_LOCK", self.cfg.lock_file), \
+                mock.patch.object(self.ops, "write_file_atomic", write_adoption):
+            deploy.adopt(str(config), self.ops, *(LEGACY["containers"][role] for role in deploy.ROLES),
+                         str(work), self.cfg.public_health_url)
+        self.cfg = deploy.Config.load(str(config))
+        self.deploy()
+        previous = self.state()["previous"]
+        run = self.ops.run
+        names_by_id = {self.ops.inspect(name)["Id"]: name for name in original}
+        snapshots = []
+
+        def verify_each_reconnect(args, **kw):
+            result = run(args, **kw)
+            if args[:3] == ["docker", "network", "connect"] and args[-1] in names_by_id:
+                network = self.ops.network_name(args[-2])
+                endpoint = self.ops.inspect(args[-1])["NetworkSettings"]["Networks"][network]
+                snapshots.append((original[names_by_id[args[-1]]][network]["IPAMConfig"], endpoint.get("IPAMConfig")))
+            return result
+
+        self.ops.commands.clear()
+        with mock.patch.object(self.ops, "run", verify_each_reconnect):
+            deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assert_loaded_interfaces(previous, previous)
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertTrue(any(cmd[:3] == ["docker", "network", "disconnect"] for cmd in self.ops.commands))
+        self.assertTrue(snapshots)
+        for expected, actual in snapshots:
+            self.assertEqual(expected, actual)
+        for name, endpoints in original.items():
+            self.assertEqual(endpoints, self.ops.inspect(name)["NetworkSettings"]["Networks"])
 
     def assert_rollback_waits_for_background(self, *, manual):
         target = self.cfg.slot_view("a")
