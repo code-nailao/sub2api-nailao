@@ -1197,24 +1197,24 @@
       "features": [
         "paid_submission_no_replay"
       ],
-      "sha256": "2334c92b7541d321a3d3705bae1300bdb6eb3e75469457baf768d64c2eec44a1",
-      "reason": "Defines the unknown outcome used to stop search provider failover after HTTP 408. Uses transport events to prove when a search could not have been sent; makes write, response and decode failures terminal when submission is possible."
+      "sha256": "9b4dd887c3c01764a37a591435c52153c1fa9840fb05d3fd88c1f4af3c7766b8",
+      "reason": "Classifies search failures using transport evidence and response status. Allows a backup after a confirmed failure before sending or a definitive HTTP 401 authentication rejection. Makes 408, ambiguous writes, and other response or decode failures terminal when submission is possible."
     },
     {
       "path": "backend/internal/pkg/websearch/manager.go",
       "features": [
         "paid_submission_no_replay"
       ],
-      "sha256": "8807ae60277a4420c647a678df5a2b80789820f92deb279b973e000a917e2255",
-      "reason": "Stops provider selection when a submitted search gets HTTP 408 because the result may be unknown. Disables connection reuse for the search transport so it cannot silently replay an already-written GET. Stops an administrator test search before selecting another provider when the first submission has an unknown outcome."
+      "sha256": "50e03b6768c1a25d0c8c09addc6df7c598780141433396bef074da00931e6166",
+      "reason": "Stops provider selection when a normal or administrator search has an unknown outcome, including HTTP 408, and preserves fallback on definite errors such as HTTP 401. Disables connection reuse for the search transport so it cannot silently replay an already-written GET."
     },
     {
       "path": "backend/internal/pkg/websearch/manager_test.go",
       "features": [
         "paid_submission_no_replay"
       ],
-      "sha256": "eaf55153c907c43724bb135f41dfbb5dc8aa3d4ea2cc3c4d6f14d96f5c576de0",
-      "reason": "Verifies an HTTP 408 from each search provider prevents a second upstream search. Tests pre-connection fallback and prohibits a second provider after a write, transport timeout, error response or invalid JSON across all search providers. A real local HTTP handler verifies that losing a response after a GET does not trigger a second submission. Verifies admin search fallback across a 408, a lost response and a confirmed pre-connection failure."
+      "sha256": "a22cb22fcb106cdc799c51c3793c3de85c8dad8f661da60acb6bc540016c30ce",
+      "reason": "Covers fallback after an HTTP 401 or confirmed pre-connection failure, and prevents a second provider after an ambiguous write, timeout, response, or decode failure. Exercises all three providers and both ordinary and administrator searches. A local HTTP server verifies that losing a response after a GET does not replay the request."
     },
     {
       "path": "backend/internal/pkg/websearch/tavily.go",
@@ -3264,8 +3264,8 @@
       "features": [
         "paid_submission_no_replay"
       ],
-      "sha256": "8b7a9099520022bf64987730a0a263e27f5bffd572cc22af3ec4c6ca52d9311d",
-      "reason": "Covers Responses, Responses-shaped Chat and Messages forwarded to a native Anthropic endpoint. Verifies 408 failover for a forced client tool and terminal errors when the selected tool is hosted or unresolved. Checks unresolved named selections even when the outbound request declares only a client tool."
+      "sha256": "f69f8a7ac8029f315c1f22f2a9026dd8b45abc9b60b929855797a2693e37efe2",
+      "reason": "Covers Responses, Responses-shaped Chat and Messages forwarded to a native Anthropic endpoint. Verifies 408 failover for a forced client tool and terminal errors when the selected tool is hosted or unresolved, including when only client tools are listed or tools is given as a JSON object."
     },
     {
       "path": "backend/internal/service/openai_gateway_messages_chat_fallback.go",
@@ -3369,8 +3369,8 @@
       "features": [
         "paid_submission_no_replay"
       ],
-      "sha256": "c6683afcb164284766c69b4d952535e0e9055925a8a4f62c550385dada2e39c9",
-      "reason": "Recognizes hosted Responses search declarations and reports a terminal HTTP 408 for paid submissions with an unknown outcome. Classifies provider-hosted retrieval and connector tools by category, protects unknown hosted tool types and keeps confirmed client-executed tools separate. Classifies effective hosted tools after protocol conversion, preserves a 408 failover for a forced declared client function and returns a terminal error in the client protocol. Resolves client-only tool restrictions and namespaced function selections before excluding hosted tools. Encodes a terminal response.failed event for a paid timeout after Responses streaming has started. Resolves native Anthropic tool choices against unambiguous client-tool declarations while preserving the inbound error protocol. Named Anthropic selections that cannot be matched are terminal on HTTP 408 even if the declaration list has no hosted tools."
+      "sha256": "028fc960bb9c0a0e3d6c9b96be825b682b0f4b388186eab9038a9a89e80a2af5",
+      "reason": "Recognizes hosted Responses search declarations and reports a terminal HTTP 408 for paid submissions with an unknown outcome. Classifies provider-hosted retrieval and connector tools by category, protects unknown hosted tool types and keeps confirmed client-executed tools separate. Classifies effective hosted tools after protocol conversion, preserves a 408 failover for a forced declared client function and returns a terminal error in the client protocol. Resolves client-only tool restrictions and namespaced function selections before excluding hosted tools. Encodes a terminal response.failed event for a paid timeout after Responses streaming has started. Resolves native Anthropic tool choices against unambiguous client-tool declarations while preserving the inbound error protocol. Named Anthropic selections that cannot be matched are terminal on HTTP 408 even if the declaration list has no hosted tools. Requires an actual tools array before allowing a forced Anthropic client tool to fail over."
     },
     {
       "path": "backend/internal/service/openai_gateway_usage.go",

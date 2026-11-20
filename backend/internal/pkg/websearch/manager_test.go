@@ -77,7 +77,7 @@ func TestManager_SearchWithBestProvider_UsesFirstAvailable(t *testing.T) {
 	require.Equal(t, "from brave", resp.Results[0].Snippet)
 }
 
-func TestManagerTestSearchOnlyFallsBackBeforeSubmission(t *testing.T) {
+func TestManagerTestSearchStopsAfterUnknownOutcome(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		status int
@@ -122,6 +122,49 @@ func TestManagerTestSearchOnlyFallsBackBeforeSubmission(t *testing.T) {
 	}
 }
 
+func TestManagerSearchFallsBackAfterHTTP401(t *testing.T) {
+	for _, first := range []string{ProviderTypeBrave, ProviderTypeTavily, ProviderTypeExa} {
+		backup := ProviderTypeTavily
+		if first == backup {
+			backup = ProviderTypeExa
+		}
+		for _, entry := range []struct {
+			name   string
+			search func(*Manager, context.Context, SearchRequest) (*SearchResponse, string, error)
+		}{
+			{"normal", (*Manager).SearchWithBestProvider},
+			{"admin", (*Manager).TestSearch},
+		} {
+			t.Run(first+"/"+entry.name, func(t *testing.T) {
+				manager := NewManager([]ProviderConfig{
+					{Type: first, APIKey: "fixture-first"}, {Type: backup, APIKey: "fixture-backup"},
+				}, nil)
+				var hosts []string
+				manager.clientCache[""] = &http.Client{Transport: exaRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					hosts = append(hosts, req.URL.Hostname())
+					if len(hosts) == 1 {
+						trace := httptrace.ContextClientTrace(req.Context())
+						trace.WroteRequest(httptrace.WroteRequestInfo{})
+						return &http.Response{StatusCode: http.StatusUnauthorized, Header: make(http.Header),
+							Body: io.NopCloser(strings.NewReader(`{"message":"Invalid API key"}`))}, nil
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+						Body: io.NopCloser(strings.NewReader(`{"results":[{"title":"Backup result","url":"https://fixture.example/result"}]}`))}, nil
+				})}
+
+				result, provider, err := entry.search(manager, t.Context(), SearchRequest{Query: "fixture"})
+
+				require.NoError(t, err)
+				require.Equal(t, backup, provider)
+				require.Len(t, hosts, 2)
+				require.NotEqual(t, hosts[0], hosts[1], "the search must use a different provider")
+				require.Len(t, result.Results, 1)
+				require.Equal(t, "Backup result", result.Results[0].Title)
+			})
+		}
+	}
+}
+
 func TestManagerDoesNotReplaySearchAfterHTTP408(t *testing.T) {
 	for _, first := range []string{"exa", "brave", "tavily"} {
 		t.Run(first, func(t *testing.T) {
@@ -149,7 +192,7 @@ func TestManagerDoesNotReplaySearchAfterHTTP408(t *testing.T) {
 	}
 }
 
-func TestManagerOnlyFallsBackBeforeAnySearchCouldBeSent(t *testing.T) {
+func TestManagerSearchStopsAfterUnknownOutcome(t *testing.T) {
 	cases := []struct {
 		name       string
 		send       bool

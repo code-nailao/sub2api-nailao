@@ -14,10 +14,9 @@ import (
 // The manager must not repeat it with another provider.
 var ErrSearchOutcomeUnknown = errors.New("websearch: search outcome unknown")
 
-// searchJSON permits switching providers only when connection acquisition
-// failed before the transport could write anything. Missing trace events and
-// partial writes are ambiguous. Even a malformed or non-200 response proves
-// that a request may have been submitted.
+// searchJSON permits switching providers after an explicit HTTP 401 rejection
+// or when the transport proves it could not have sent anything. Missing trace
+// events, partial writes, and other failures after submission are ambiguous.
 func searchJSON(client *http.Client, request *http.Request, provider string, result any) error {
 	var obtainingConn, possiblySent atomic.Bool
 	trace := &httptrace.ClientTrace{
@@ -37,7 +36,10 @@ func searchJSON(client *http.Client, request *http.Request, provider string, res
 		return cause
 	}
 	defer func() { _ = response.Body.Close() }()
-	if response.StatusCode == http.StatusRequestTimeout {
+	switch response.StatusCode {
+	case http.StatusUnauthorized:
+		return fmt.Errorf("%s: status %d: authentication rejected", provider, response.StatusCode)
+	case http.StatusRequestTimeout:
 		return fmt.Errorf("%w: %s returned HTTP %d", ErrSearchOutcomeUnknown, provider, response.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseSize))

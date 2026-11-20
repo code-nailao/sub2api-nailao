@@ -353,7 +353,8 @@ func (m *Manager) rollbackQuota(ctx context.Context, cfg ProviderConfig) {
 // --- Search execution ---
 
 // TestSearch executes an admin search without reserving quota. As in normal
-// searches, it only falls back if the previous request could not have been sent.
+// searches, an unknown outcome stops provider selection. A confirmed pre-send
+// failure or an HTTP 401 authentication rejection can fall back.
 func (m *Manager) TestSearch(ctx context.Context, req SearchRequest) (*SearchResponse, string, error) {
 	if strings.TrimSpace(req.Query) == "" {
 		return nil, "", fmt.Errorf("websearch: empty search query")

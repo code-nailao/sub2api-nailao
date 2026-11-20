@@ -118,7 +118,7 @@ func containsClientFunction(tools gjson.Result, name string) bool {
 // Native Anthropic tool choices name a tool, including server tools. Only a
 // unique client tool declaration proves that hosted tools cannot run.
 func selectsDeclaredAnthropicClientTool(name, tools gjson.Result) bool {
-	if name.Type != gjson.String || name.Str == "" {
+	if name.Type != gjson.String || name.Str == "" || !tools.IsArray() {
 		return false
 	}
 	found := false
