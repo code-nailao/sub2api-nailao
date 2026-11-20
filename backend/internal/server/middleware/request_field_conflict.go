@@ -7,6 +7,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/requestmodel"
+	"github.com/Wei-Shaw/sub2api/internal/service"
 
 	"github.com/gin-gonic/gin"
 )
@@ -55,9 +56,14 @@ func RejectConflictingRequestFields() gin.HandlerFunc {
 		if doc := requestmodel.TrimUTF8BOM(body); len(doc) != len(body) && requestmodel.LooksLikeJSON(doc) {
 			body = doc
 		}
-		requestmodel.ResetRequestBody(c.Request, body)
-
-		field, conflict := requestmodel.ConflictingField(c.GetHeader("Content-Type"), body)
+		var field string
+		var conflict bool
+		if needsChatFieldIndex(c) {
+			field, conflict = requestmodel.ResetAndCheckChatBody(c.Request, body)
+		} else {
+			requestmodel.ResetRequestBody(c.Request, body)
+			field, conflict = requestmodel.ConflictingField(c.GetHeader("Content-Type"), body)
+		}
 		if !conflict {
 			c.Next()
 			return
@@ -67,6 +73,18 @@ func RejectConflictingRequestFields() gin.HandlerFunc {
 		writeGatewayInvalidRequest(c, http.StatusBadRequest, fmt.Sprintf("Request body declares field %.64q more than once", field))
 		c.Abort()
 	}
+}
+
+// A composite key can still select DeepSeek after this middleware runs.
+func needsChatFieldIndex(c *gin.Context) bool {
+	if !strings.HasSuffix(c.FullPath(), "/chat/completions") {
+		return false
+	}
+	key, ok := GetAPIKeyFromContext(c)
+	if !ok || key == nil || key.Group == nil || key.Group.DeepSeekTools.Enabled {
+		return false
+	}
+	return key.Group.Platform == service.PlatformDeepseek || key.Group.Platform == service.PlatformComposite
 }
 
 // writeGatewayInvalidRequest 按入口协议输出 invalid_request_error：

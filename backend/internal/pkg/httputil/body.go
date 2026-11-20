@@ -61,6 +61,9 @@ func (p *PrereadBody) Bytes() []byte {
 	return p.body
 }
 
+// Embedding PrereadBody can attach request-local data without losing the fast path.
+func (p *PrereadBody) prereadBytes() []byte { return p.Bytes() }
+
 // ReadRequestBodyWithPrealloc reads request body with preallocated buffer based
 // on content length, transparently decoding any Content-Encoding the upstream
 // client used to compress the body (zstd, gzip, deflate).
@@ -92,8 +95,8 @@ func readRequestBodyWithBudget(req *http.Request) (requestBodyBuffer, error) {
 	if err := req.Context().Err(); err != nil {
 		return requestBodyBuffer{}, err
 	}
-	if preread, ok := req.Body.(*PrereadBody); ok {
-		return requestBodyBuffer{data: preread.Bytes()}, nil
+	if preread, ok := req.Body.(interface{ prereadBytes() []byte }); ok {
+		return requestBodyBuffer{data: preread.prereadBytes()}, nil
 	}
 
 	capHint := requestBodyReadInitCap

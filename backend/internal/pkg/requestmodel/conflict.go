@@ -65,12 +65,16 @@ func LooksLikeJSON(body []byte) bool {
 // 本身拒绝这种深度），其后的同层成员仍继续检查。扫描在首个顶层值结束时停止，
 // 与 gjson 读取的范围一致（其后的内容 encoding/json 会拒绝）。
 func ConflictingField(contentType string, body []byte) (string, bool) {
+	return conflictingField(contentType, body, nil)
+}
+
+func conflictingField(contentType string, body []byte, chat *chatBodyScanner) (string, bool) {
 	// 两种解读都要检查：JSON handler 不看请求头，按 JSON 读首个值；multipart
 	// handler 按 boundary 解析，并跳过首个 boundary 之前的前导内容（RFC 2046
 	// preamble），前导内容可以是任意 JSON。
 	looksJSON := LooksLikeJSON(TrimUTF8BOM(body))
 	if looksJSON {
-		if field, conflict := scanDuplicateMember(TrimUTF8BOM(body), false); conflict {
+		if field, conflict := scanDuplicateMember(TrimUTF8BOM(body), false, chat); conflict {
 			return field, true
 		}
 	}
@@ -93,7 +97,7 @@ func ConflictingField(contentType string, body []byte) (string, bool) {
 // ConflictingClaudeMetadataField scans the metadata object bound by Antigravity.
 // Its user_id field follows the case folding of encoding/json struct fields.
 func ConflictingClaudeMetadataField(body []byte) (string, bool) {
-	return scanDuplicateMember(body, true)
+	return scanDuplicateMember(body, true, nil)
 }
 
 // maxConflictDepth 与 encoding/json 的嵌套上限一致。
@@ -128,7 +132,7 @@ type duplicateScanner struct {
 	names          []byte
 }
 
-func scanDuplicateMember(body []byte, claudeMetadata bool) (string, bool) {
+func scanDuplicateMember(body []byte, claudeMetadata bool, chat *chatBodyScanner) (string, bool) {
 	s := duplicateScanner{body: body, claudeMetadata: claudeMetadata}
 	s.hash.SetSeed(conflictHashSeed)
 	overflow := 0 // 超过 maxConflictDepth 后未闭合的括号数
@@ -146,6 +150,9 @@ func scanDuplicateMember(body []byte, claudeMetadata bool) (string, bool) {
 				overflow--
 			} else if n := len(s.stack); n > 0 {
 				if top := s.stack[n-1]; top.object {
+					if chat != nil && n == 1 && c == '}' {
+						chat.delimiter(body, i, false)
+					}
 					s.hashes = s.hashes[:top.hashStart]
 				}
 				s.stack = s.stack[:n-1]
@@ -157,6 +164,9 @@ func scanDuplicateMember(body []byte, claudeMetadata bool) (string, bool) {
 		case ',':
 			if n := len(s.stack); overflow == 0 && n > 0 {
 				if top := &s.stack[n-1]; top.object {
+					if chat != nil && n == 1 {
+						chat.delimiter(body, i, true)
+					}
 					top.wantKey = true
 				} else {
 					top.index++
@@ -171,6 +181,16 @@ func scanDuplicateMember(body []byte, claudeMetadata bool) (string, bool) {
 				top.keyStart, top.keyEnd, top.keyEscaped = i+1, end, escaped
 				if s.repeated(top) {
 					return s.path(), true
+				}
+				if chat != nil && n == 1 {
+					name := body[i+1 : end]
+					// Only short escaped keys can match an indexed field.
+					if escaped && len(name) <= 6*len("tool_choice") {
+						s.names = appendMemberName(s.names[:0], name, true, false)
+						name = s.names
+					}
+					i = chat.member(body, name, i, end+1)
+					continue
 				}
 			}
 			i = end + 1
@@ -473,7 +493,7 @@ func multipartConflictingField(contentType string, body []byte) (field string, c
 			continue
 		}
 		if doc := TrimUTF8BOM(data); LooksLikeJSON(doc) {
-			if field, conflict := scanDuplicateMember(doc, false); conflict {
+			if field, conflict := scanDuplicateMember(doc, false, nil); conflict {
 				return "session." + field, true, parts
 			}
 		}

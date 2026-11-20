@@ -532,7 +532,7 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 	}
 	if protocol == "chat" {
 		if !key.Group.DeepSeekTools.Enabled {
-			top, err := scanDeepSeekChatEnvelope(ctx, body)
+			top, err := deepSeekChatEnvelopeForRequest(ctx, c.Request, body)
 			if err != nil {
 				return nil, body, true, rejectDeepSeekChatFilter(c, err)
 			}

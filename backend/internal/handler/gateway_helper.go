@@ -142,6 +142,8 @@ const (
 	SSEPingFormatComment SSEPingFormat = ":\n\n"
 )
 
+const noRetryOnQueueHeartbeatKey = "gateway.no_retry_on_queue_heartbeat"
+
 // ConcurrencyError represents a concurrency limit error with context
 type ConcurrencyError struct {
 	SlotType  string
@@ -421,6 +423,9 @@ func (h *ConcurrencyHelper) waitForSlotWithPingTimeout(c *gin.Context, slotType 
 				c.Header("Cache-Control", "no-cache")
 				c.Header("Connection", "keep-alive")
 				c.Header("X-Accel-Buffering", "no")
+				if c.GetBool(noRetryOnQueueHeartbeatKey) {
+					c.Header("X-Should-Retry", "false")
+				}
 				*streamStarted = true
 			}
 			written, err := fmt.Fprint(c.Writer, string(h.pingFormat))

@@ -218,7 +218,15 @@ func ResetRequestBody(req *http.Request, body []byte) {
 	if req == nil {
 		return
 	}
-	req.Body = httputil.NewPrereadBody(body)
+	resetPrereadBody(req, body, ChatFieldsForBody(req, body))
+}
+
+func resetPrereadBody(req *http.Request, body []byte, fields *ChatBodyFields) {
+	preread := httputil.NewPrereadBody(body)
+	req.Body = preread
+	if fields != nil {
+		req.Body = &indexedChatBody{PrereadBody: preread, fields: *fields}
+	}
 	req.ContentLength = int64(len(body))
 	req.Header.Set("Content-Length", strconv.Itoa(len(body)))
 }

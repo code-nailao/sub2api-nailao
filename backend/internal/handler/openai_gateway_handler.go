@@ -1309,6 +1309,11 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
 	routingStart := time.Now()
 
+	// A queue heartbeat commits a Messages stream before the upstream outcome
+	// is known. Send the retry policy with that first response header.
+	if reqStream {
+		c.Set(noRetryOnQueueHeartbeatKey, true)
+	}
 	userReleaseFunc, acquired := h.acquireResponsesUserSlot(c, subject.UserID, subject.Concurrency, reqStream, &streamStarted, reqLog)
 	if !acquired {
 		return

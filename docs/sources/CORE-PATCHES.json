@@ -721,8 +721,8 @@
       "features": [
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "68a9b0f5c681068d909522add9e8964754fc01ecb1af1843414f4c16b358e01a",
-      "reason": "Verifies a parseable Chat SSE validation error frame after a queue heartbeat and verifies that local 400 responses, cancellations and deadlines at account slot acquisition create no advanced scheduler account samples."
+      "sha256": "e06d0cee14cbb2ba384a762bb1fe8579e7a5e323779849748fd1de2afc8f59e2",
+      "reason": "Verifies a parseable Chat SSE validation error frame after a queue heartbeat and verifies that local 400 responses, cancellations and deadlines at account slot acquisition create no advanced scheduler account samples. Verifies against the real ingress that unchanged Chat JSON avoids another full tool-envelope scan and that indexed ranges preserve the tool filter edits."
     },
     {
       "path": "backend/internal/handler/deepseek_chat_transport_failover_test.go",
@@ -810,6 +810,14 @@
       ],
       "sha256": "0697b047eb7fadddbf8113429106e8198feb395a23b3824501f872dcfeda6e67",
       "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Shows customers only a neutral description and the fixed amount of a content-rejection charge in pricing, usage and billing views, while administrators keep the internal evidence; ordinary usage snapshots stay compatible. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields."
+    },
+    {
+      "path": "backend/internal/handler/gateway_helper.go",
+      "features": [
+        "paid_submission_no_replay"
+      ],
+      "sha256": "03ec6721dc93908e956217399f05d9b90e8162971fe1b5fc0a254480fbe55dce",
+      "reason": "Sends the opted-in retry header before the initial queue heartbeat commits the response."
     },
     {
       "path": "backend/internal/handler/grok_media.go",
@@ -909,10 +917,19 @@
       "features": [
         "grok_content_rejection_billing",
         "deepseek_builtin_tools",
-        "upstream_022_request_speed_gateway"
+        "upstream_022_request_speed_gateway",
+        "paid_submission_no_replay"
       ],
-      "sha256": "65a2ae6322cf7e3bbc8f20f05541d7627eb50bfd67e22d55b08f4017027cda70",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling."
+      "sha256": "126df3329d83dacce43da23af3d87f4759b2a1cd4dec79e0513e5bddefec7173",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling. Marks OpenAI-compatible Messages streams to discourage client replay in the initial queue heartbeat response."
+    },
+    {
+      "path": "backend/internal/handler/openai_gateway_messages_pre_content_failover_test.go",
+      "features": [
+        "paid_submission_no_replay"
+      ],
+      "sha256": "9a9d1323fdfadd290b6e29dd7d66ee261dabde57386ffc5984dbd916b45ef1d1",
+      "reason": "Verifies a native Anthropic 408 sends the retry header at the wire boundary, with and without a queue heartbeat, and only submits once."
     },
     {
       "path": "backend/internal/handler/payment_webhook_handler.go",
@@ -1152,12 +1169,37 @@
       "reason": "Covers rejection of equivalent user_id aliases at Claude metadata binding and acceptance of an unambiguous alias."
     },
     {
-      "path": "backend/internal/pkg/requestmodel/conflict.go",
-      "sha256": "0ec3c0b7252fdadee39699fbbd1cf9f324762753d51abb703242f6fdd75487d7",
+      "path": "backend/internal/pkg/httputil/body.go",
       "features": [
-        "upstream_metadata_key_compatibility"
+        "deepseek_in_chat_tool_types"
       ],
-      "reason": "Compares user metadata keys exactly at gateway ingress and provides a scoped scan for the case-insensitive user_id field bound by Antigravity."
+      "sha256": "38cafc46ee3ce0eea21189bd16848921d5f8c7d99938438bf391c4ae7e054fde",
+      "reason": "Preserves zero-copy reading of preread request bodies that carry an ingress field index."
+    },
+    {
+      "path": "backend/internal/pkg/requestmodel/chat_fields.go",
+      "features": [
+        "deepseek_in_chat_tool_types"
+      ],
+      "sha256": "51020b084c01948cb94209c18488fa8143b4445cb286d8d4388fd8204435bed9",
+      "reason": "Records byte ranges for Chat tool and history fields during duplicate detection and binds the offset index to the original immutable request body."
+    },
+    {
+      "path": "backend/internal/pkg/requestmodel/chat_fields_test.go",
+      "features": [
+        "deepseek_in_chat_tool_types"
+      ],
+      "sha256": "8d3fcff82b313222f5f8504d69a501a8d387bdd9ccf9b7d7622ba45e2300cb78",
+      "reason": "Verifies byte ranges, zero-copy reads, index invalidation after replacement, and duplicate rejection for indexed Chat input. Also verifies resetting the reader preserves the index for the same byte slice."
+    },
+    {
+      "path": "backend/internal/pkg/requestmodel/conflict.go",
+      "sha256": "c2be9886746530230f02c3f9116a65499a14f02e20608442880458c9f06405f7",
+      "features": [
+        "upstream_metadata_key_compatibility",
+        "deepseek_in_chat_tool_types"
+      ],
+      "reason": "Compares user metadata keys exactly at gateway ingress and provides a scoped scan for the case-insensitive user_id field bound by Antigravity. Records Chat envelope offsets in the existing duplicate-field scan for requests that opt in."
     },
     {
       "path": "backend/internal/pkg/requestmodel/conflict_test.go",
@@ -1166,6 +1208,14 @@
         "upstream_metadata_key_compatibility"
       ],
       "reason": "Tests distinct mixed-case metadata keys including user_id and rejects repeated keys including equivalent JSON spellings."
+    },
+    {
+      "path": "backend/internal/pkg/requestmodel/requestmodel.go",
+      "features": [
+        "deepseek_in_chat_tool_types"
+      ],
+      "sha256": "0d98073644846560972e392173bba40aa4644344f99a7ad07bffe58604da98f7",
+      "reason": "Preserves the existing Chat field index when rewinding an unchanged preread body and drops it for replacement bytes."
     },
     {
       "path": "backend/internal/pkg/websearch/brave.go",
@@ -2059,6 +2109,14 @@
       "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Tests for this behaviour."
     },
     {
+      "path": "backend/internal/server/middleware/request_field_conflict.go",
+      "features": [
+        "deepseek_in_chat_tool_types"
+      ],
+      "sha256": "b71d3edec3965d3eae1d9dce904265101e93b76d774fcc70646ebd766b596bb5",
+      "reason": "Indexes fields during duplicate detection on Chat routes that may use the disabled DeepSeek tool filter."
+    },
+    {
       "path": "backend/internal/server/router.go",
       "features": [
         "account_wallet_management"
@@ -2703,8 +2761,8 @@
       "features": [
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "9185a4e8a3f545aabe06730d09de5e2bc1c7d46132d9f3f407a31c17c9a7e935",
-      "reason": "Scans the Chat request envelope once for groups with tools turned off. Filters web tools by type prefix and rejects duplicates only in the tool fields. Adds the unavailable notice to the last messages field or to input for raw Responses-shaped requests. Normalizes tool choices by type and name, gives explicitly named surviving tools priority, and downgrades choices for removed tools and bare tool or function selectors. Preserves unrelated bytes and drops required when filtering empties the tool list."
+      "sha256": "415a4ee698388ee364ea022917c00ac1e14180801b8ddc2b255741a9d851e37c",
+      "reason": "Scans the Chat request envelope once for groups with tools turned off. Filters web tools by type prefix and rejects duplicates only in the tool fields. Adds the unavailable notice to the last messages field or to input for raw Responses-shaped requests. Normalizes tool choices by type and name, gives explicitly named surviving tools priority, and downgrades choices for removed tools and bare tool or function selectors. Preserves unrelated bytes and drops required when filtering empties the tool list. Reuses indexed Chat field boundaries for unchanged HTTP input and scans rewritten or internal bodies before applying tool edits."
     },
     {
       "path": "backend/internal/service/deepseek_stream_timing_test.go",
@@ -2829,8 +2887,8 @@
         "deepseek_tool_compat",
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "0ff94253dfef90d49fc63689469879aaf32ca0832d19564cc3c2affabf1af102",
-      "reason": "Runs optional hosted search and fetch with existing eligibility, streaming and usage checkpoint rules. Routes disabled-group Chat requests, including Responses-shaped bodies on fixed Chat accounts, through the bounded web-tool filter. Marks local validation rejections and interruptions so they do not count as account failures. Optional setup failures use ordinary forwarding after removing unavailable declarations and adding a notice."
+      "sha256": "e98c60b56bed273b5d0bb97e2810ed1eb6aced6fdf4734d46ac5e7a54c7a8e70",
+      "reason": "Runs optional hosted search and fetch with existing eligibility, streaming and usage checkpoint rules. Routes disabled-group Chat requests, including Responses-shaped bodies on fixed Chat accounts, through the bounded web-tool filter. Marks local validation rejections and interruptions so they do not count as account failures. Optional setup failures use ordinary forwarding after removing unavailable declarations and adding a notice. Uses the ingress index when preparing the disabled-tool Chat filter for the original request body."
     },
     {
       "path": "backend/internal/service/deepseek_tools_in_chat_test.go",
