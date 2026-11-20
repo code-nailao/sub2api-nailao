@@ -344,6 +344,12 @@ func TestDeepSeekChatFiltersDisabledGroup(t *testing.T) {
 				name, tools, choice, wantTools, wantChoice string
 			}{
 				{"future_types", `{"type":"web_search_future"},{"type":"web_fetch_preview_future"},{"type":"deepseek_web_search_future"},{"type":"deepseek_read_url_preview_future"},` + lookup, `"auto"`, `[` + lookup + `]`, `"auto"`},
+				{"hyphen_suffix", `{"type":"web_search-v2099"},` + lookup, `"auto"`, `[` + lookup + `]`, `"auto"`},
+				{"dot_suffix", `{"type":"web_fetch.preview"},` + lookup, `"auto"`, `[` + lookup + `]`, `"auto"`},
+				{"underscore_suffix", `{"type":"web_search_preview_2025_03_11"},` + lookup, `"auto"`, `[` + lookup + `]`, `"auto"`},
+				{"legacy_named_choice", `{"type":"deepseek_web_search"},` + lookup, `{"type":"tool","name":"deepseek_web_search"}`, `[` + lookup + `]`, `"auto"`},
+				{"legacy_named_alias", `{"type":"deepseek_web_search","name":"search_alias"},` + lookup, `{"type":"tool","name":"search_alias"}`, `[` + lookup + `]`, `"auto"`},
+				{"legacy_choice_of_retained_tool", `{"type":"deepseek_web_search"},` + lookup, `{"type":"tool","name":"lookup"}`, `[` + lookup + `]`, `{"type":"tool","name":"lookup"}`},
 				{"choice_by_family", `{"type":"web_search_preview_future"},` + lookup, `{"type":"web_search"}`, `[` + lookup + `]`, `"auto"`},
 				{"removed_function_choice", `{"type":"web_fetch"},` + lookup, `{"type":"function","function":{"name":"missing"}}`, `[` + lookup + `]`, `"auto"`},
 				{"retained_function_choice", `{"type":"web_search"},{"type":"function","function":{"name":"web_search"}}`, `{"type":"function", "function":{"name":"web_search"}}`, `[{"type":"function","function":{"name":"web_search"}}]`, `{"type":"function", "function":{"name":"web_search"}}`},
@@ -394,6 +400,41 @@ func TestDeepSeekChatFilterRejectsDuplicateToolKeys(t *testing.T) {
 				requireDeepSeekChatFilterRejected(t, run, "duplicate")
 			})
 		}
+	}
+}
+
+func TestDeepSeekChatFilterRejectsDuplicateMessagesWhenAddingNotice(t *testing.T) {
+	const duplicateMessages = `"messages":[],"tools":[%s],"messages":[{"role":"user","content":"hello"}]`
+	const escapedMessages = `"messages":[{"role":"user","content":"hello"}],"tools":[%s],"\u006dessages":[]`
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			for _, fields := range []string{duplicateMessages, escapedMessages} {
+				body := []byte(fmt.Sprintf(`{"model":"deepseek-flash","stream":%t,`+fields+`}`, stream, `{"type":"web_search"}`))
+				run := runDeepSeekOrdinaryChat(t, body, false)
+				require.ErrorContains(t, run.err, "duplicate top-level JSON key: messages")
+				requireDeepSeekChatFilterRejected(t, run, "duplicate top-level JSON key: messages")
+			}
+		})
+	}
+}
+
+func TestDeepSeekChatFilterAllowsDuplicateMessagesWithoutNotice(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			const prefix = `{"model":"deepseek-flash","stream":%t,"stream_options":{"include_usage":true},"messages":[],`
+			const lastMessages = `"messages":[{"role":"user","content":"hello"}]}`
+			unchanged := []byte(fmt.Sprintf(prefix+`"tools":[{"type":"function","function":{"name":"lookup"}}],`+lastMessages, stream))
+			withoutWeb := runDeepSeekOrdinaryChat(t, unchanged, false)
+			require.NoError(t, withoutWeb.err)
+			require.Equal(t, 1, withoutWeb.calls)
+			require.Equal(t, unchanged, withoutWeb.sent)
+
+			declined := []byte(fmt.Sprintf(prefix+`"tools":[{"type":"web_search"}],"tool_choice":"none",`+lastMessages, stream))
+			withoutNotice := runDeepSeekOrdinaryChat(t, declined, false)
+			require.NoError(t, withoutNotice.err)
+			require.Equal(t, 1, withoutNotice.calls)
+			require.Equal(t, fmt.Sprintf(prefix+lastMessages, stream), string(withoutNotice.sent))
+		})
 	}
 }
 

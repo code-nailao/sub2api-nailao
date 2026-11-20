@@ -30,6 +30,7 @@ type deepSeekChatField struct {
 type deepSeekChatEnvelope struct {
 	tools, choice, messages *deepSeekChatField
 	hasInput                bool
+	duplicateMessages       bool
 	duplicate               string
 	end, fields             int
 }
@@ -197,6 +198,7 @@ func scanDeepSeekChatEnvelope(ctx context.Context, body []byte) (deepSeekChatEnv
 			case "tool_choice":
 				field = &top.choice
 			case "messages":
+				top.duplicateMessages = top.messages != nil
 				field = &top.messages
 			case "input":
 				top.hasInput = true
@@ -254,8 +256,8 @@ func (r *deepSeekJSONReader) Read(p []byte) (int, error) {
 }
 
 type deepSeekChatToolSelection struct {
-	typ, name string
-	named     bool
+	typ, name, legacyName string
+	named                 bool
 }
 
 type deepSeekChatToolScope uint8
@@ -335,6 +337,8 @@ func (p deepSeekChatToolParser) parseObject(depth int, scope deepSeekChatToolSco
 			switch key {
 			case "type":
 				selection.typ, _ = first.(string)
+			case "name":
+				selection.legacyName, _ = first.(string)
 			case "function":
 				childScope = deepSeekChatToolFunction
 			}
@@ -387,7 +391,8 @@ func (p deepSeekChatToolParser) parseArray(depth int, element func(json.Token, i
 // Hosted tool eligibility continues to use the existing provider rules.
 func deepSeekChatWebToolFamily(typ string) string {
 	for _, family := range [...]string{"web_search", "web_fetch", "deepseek_web_search", "deepseek_read_url"} {
-		if typ == family || strings.HasPrefix(typ, family+"_") {
+		suffix, ok := strings.CutPrefix(typ, family)
+		if ok && (suffix == "" || strings.ContainsRune("_-.", rune(suffix[0]))) {
 			return family
 		}
 	}
@@ -427,7 +432,13 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 		return nil, err
 	}
 	var kept []deepSeekChatSpan
-	var removed, removedType, keptFunction bool
+	var removed, removedChoice, keptFunction bool
+	selectedType := choice.typ
+	if choice.typ == "tool" {
+		// The legacy named form can select a provider type or a tool's top-level name.
+		selectedType = choice.legacyName
+		removedChoice = deepSeekProviderTool(selectedType)
+	}
 	err := p.parseArray(2, func(first json.Token, depth, offset int) error {
 		tokenEnd := int(p.dec.InputOffset())
 		tool, err := p.parseValue(first, depth, deepSeekChatToolDefinition)
@@ -436,7 +447,8 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 		}
 		if family := deepSeekChatWebToolFamily(tool.typ); family != "" {
 			removed = true
-			removedType = removedType || choice.typ == tool.typ || choice.typ == family
+			removedChoice = removedChoice || selectedType == tool.typ || selectedType == family ||
+				(choice.typ == "tool" && selectedType != "" && selectedType == tool.legacyName)
 			return nil
 		}
 		keptFunction = keptFunction || (tool.typ == "function" && tool.named && tool.name == choice.name)
@@ -468,18 +480,22 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 		return body, ctx.Err()
 	}
 
-	choiceTargetsRemovedTool := removedType || (choice.typ == "function" && choice.named && !keptFunction)
+	needsNotice := choice.typ != "none"
+	if needsNotice && top.duplicateMessages {
+		return nil, errors.New("duplicate top-level JSON key: messages")
+	}
+
 	var edits []deepSeekChatEdit
 	removedFields := 0
 	if len(kept) == 0 {
 		edits, removedFields = removeDeepSeekChatToolFields(top)
 	} else {
 		edits = append(edits, deepSeekChatEdit{span: top.tools.value, tools: kept})
-		if choiceTargetsRemovedTool {
+		if removedChoice || (choice.typ == "function" && choice.named && !keptFunction) {
 			edits = append(edits, deepSeekChatEdit{span: top.choice.value, replacement: `"auto"`})
 		}
 	}
-	if choice.typ != "none" {
+	if needsNotice {
 		edits = append(edits, deepSeekChatNoticeEdit(body, top, removedFields))
 	}
 	return applyDeepSeekChatEdits(ctx, body, edits)

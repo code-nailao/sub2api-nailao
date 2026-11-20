@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -29,7 +31,8 @@ func (u *chatToolFilterUpstream) Do(*http.Request, string, int64, int) (*http.Re
 	return nil, io.ErrUnexpectedEOF
 }
 
-func TestDeepSeekChatFilterWritesSSEErrorAfterQueueHeartbeat(t *testing.T) {
+func newDeepSeekChatFilterHandler(t *testing.T, acquireUserSlot func() bool, settings service.SettingRepository) (*OpenAIGatewayHandler, *service.APIKey, *chatToolFilterUpstream) {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{RunMode: config.RunModeSimple}
 	cfg.Default.RateMultiplier = 1
@@ -44,26 +47,36 @@ func TestDeepSeekChatFilterWritesSSEErrorAfterQueueHeartbeat(t *testing.T) {
 	repo := &openAIWSFailoverHandlerAccountRepoStub{accounts: []service.Account{account}}
 	billing := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
 	t.Cleanup(billing.Stop)
-	gateway := service.NewOpenAIGatewayService(repo, nil, nil, nil, nil, nil, nil, cfg, nil, nil,
-		service.NewBillingService(cfg, nil), nil, billing, upstream, &service.DeferredService{}, nil, nil, nil, nil, nil, nil, nil)
-	rec := httptest.NewRecorder()
 	slots := service.NewConcurrencyService(&concurrencyCacheMock{
-		acquireUserSlotFn:    func(context.Context, int64, int, string) (bool, error) { return rec.Flushed, nil },
+		acquireUserSlotFn:    func(context.Context, int64, int, string) (bool, error) { return acquireUserSlot(), nil },
 		acquireAccountSlotFn: func(context.Context, int64, int, string) (bool, error) { return true, nil },
 	})
+	var rate *service.RateLimitService
+	if settings != nil {
+		rate = service.NewRateLimitService(repo, nil, cfg, nil, nil)
+		rate.SetSettingService(service.NewSettingService(settings, cfg))
+	}
+	gateway := service.NewOpenAIGatewayService(repo, nil, nil, nil, nil, nil, nil, cfg, nil, slots,
+		service.NewBillingService(cfg, nil), rate, billing, upstream, &service.DeferredService{}, nil, nil, nil, nil, nil, nil, nil)
 	h := NewOpenAIGatewayHandler(gateway, slots, billing, &service.APIKeyService{}, nil, nil, nil, nil, cfg)
 	h.concurrencyHelper = NewConcurrencyHelper(slots, SSEPingFormatComment, time.Millisecond)
+	user := &service.User{ID: 1, Status: service.StatusActive}
+	key := &service.APIKey{ID: 1, UserID: user.ID, User: user, GroupID: &group.ID, Group: group}
+	return h, key, upstream
+}
+
+func TestDeepSeekChatFilterWritesSSEErrorAfterQueueHeartbeat(t *testing.T) {
+	rec := httptest.NewRecorder()
+	h, key, upstream := newDeepSeekChatFilterHandler(t, func() bool { return rec.Flushed }, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	user := &service.User{ID: 1, Status: service.StatusActive}
-	key := &service.APIKey{ID: 1, UserID: user.ID, User: user, GroupID: &group.ID, Group: group}
 	c, _ := gin.CreateTestContext(rec)
 	const body = `{"model":"deepseek-flash","messages":[],"stream":true,"tools":[],"tools":[{"type":"web_search"}]}`
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)).WithContext(ctx)
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Set(string(middleware2.ContextKeyAPIKey), key)
-	c.Set(string(middleware2.ContextKeyUser), middleware2.AuthSubject{UserID: user.ID, Concurrency: 1})
+	c.Set(string(middleware2.ContextKeyUser), middleware2.AuthSubject{UserID: key.UserID, Concurrency: 1})
 	h.ChatCompletions(c)
 
 	require.Equal(t, http.StatusOK, rec.Code, "the heartbeat commits the response headers")
@@ -83,4 +96,41 @@ func TestDeepSeekChatFilterWritesSSEErrorAfterQueueHeartbeat(t *testing.T) {
 	require.Equal(t, "invalid_request_error", gjson.Get(events[0], "error.type").String())
 	require.Contains(t, gjson.Get(events[0], "error.message").String(), "duplicate top-level JSON key: tools")
 	require.Zero(t, upstream.calls)
+}
+
+type chatToolFilterSchedulerSettings struct{ service.SettingRepository }
+
+func (chatToolFilterSchedulerSettings) GetMultiple(context.Context, []string) (map[string]string, error) {
+	return map[string]string{"openai_advanced_scheduler_enabled": "true"}, nil
+}
+
+func (chatToolFilterSchedulerSettings) GetValue(context.Context, string) (string, error) {
+	return "", service.ErrSettingNotFound
+}
+
+func TestDeepSeekChatFilterRejectsWithoutAccountFailure(t *testing.T) {
+	// The advanced scheduler setting is cached process-wide. Run this case
+	// in isolation so other handler tests cannot mask it or inherit it.
+	const child = "SUB2API_TEST_DEEPSEEK_CHAT_SCHEDULER_CHILD"
+	if os.Getenv(child) != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		binary, err := os.Executable()
+		require.NoError(t, err)
+		cmd := exec.CommandContext(ctx, binary, "-test.run=^TestDeepSeekChatFilterRejectsWithoutAccountFailure$")
+		cmd.Env = append(os.Environ(), child+"=1")
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "%s", out)
+		return
+	}
+
+	h, key, upstream := newDeepSeekChatFilterHandler(t, func() bool { return true }, chatToolFilterSchedulerSettings{})
+	const body = `{"model":"deepseek-flash","messages":[],"tools":[],"tools":[{"type":"web_search"}]}`
+	rec := serveRejectionHTTPBody(t, h, key, "chat/completions", body)
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	require.Equal(t, "invalid_request_error", gjson.Get(rec.Body.String(), "error.type").String())
+	require.Zero(t, upstream.calls)
+	metrics := h.gatewayService.SnapshotOpenAIAccountSchedulerMetrics()
+	require.Positive(t, metrics.SelectTotal, "advanced scheduling must have selected the account")
+	require.Zero(t, metrics.RuntimeStatsAccountCount, "a local validation error must not create an account result sample")
 }

@@ -486,6 +486,10 @@ func (s *OpenAIGatewayService) deepSeekBodyWithout(body []byte, protocol string,
 	return next
 }
 
+// ErrDeepSeekChatToolValidation means the Chat filter rejected the request
+// and returned a client error before forwarding it to the selected account.
+var ErrDeepSeekChatToolValidation = errors.New("invalid DeepSeek Chat tool fields")
+
 func rejectDeepSeekChatFilter(c *gin.Context, err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
@@ -498,10 +502,10 @@ func rejectDeepSeekChatFilter(c *gin.Context, err error) error {
 		if _, writeErr := c.Writer.WriteString(buildChatStreamErrorSSE(errType, err.Error())); writeErr == nil {
 			c.Writer.Flush()
 		}
-		return err
+	} else {
+		writeChatCompletionsError(c, http.StatusBadRequest, errType, err.Error())
 	}
-	writeChatCompletionsError(c, http.StatusBadRequest, errType, err.Error())
-	return err
+	return fmt.Errorf("%w: %w", ErrDeepSeekChatToolValidation, err)
 }
 
 // tryForwardDeepSeekTools runs the hosted web tool loop when the request is
