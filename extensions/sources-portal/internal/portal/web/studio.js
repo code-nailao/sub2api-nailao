@@ -29,12 +29,12 @@ let selectedGroupId = null, authorizationName = "";
 let shellRevision = 0, appliedShellRevision = 0;
 let shellReady = false, integrated = false, locked = false, selectionUncertain = false;
 // A document gives the page a small fixed set of facts: its child announces
-// itself (a starting client sends two) and its frame loads once, in either
-// order. Anything beyond that set belongs to another document. This reads a
-// slow start (an early announcement, a late load, a second announcement) and a
-// reload (its announcements before or after its load) without guessing at the
-// order they arrive in.
-let announcements = 0, frameLoads = 0;
+// itself at most twice (a starting client sends two) and its frame loads once,
+// in either order. Anything beyond that set belongs to another document. This
+// reads a slow start (an early announcement, a late load, a second
+// announcement) and a reload (its announcements before or after its load)
+// without guessing at the order they arrive in.
+let announcements = 0, frameLoaded = false, navigated = false;
 let connectionPending, shellPending, connectionTimer, shellTimer, checkTimer;
 let connectionApplied = false, initialGroupId = null;
 let bootstrapRound, compatibilityTimer, expiredLegacyAttempt, needsCustomResave = false;
@@ -323,8 +323,12 @@ function bindFrameLoad(target) {
     // The first load is this document's own, even when it arrives after the
     // child announced itself. A later load in a document that has already
     // spoken is a replacement.
-    if (frameLoads >= 1 && announcements > 0) startDocument();
-    frameLoads++;
+    // Until the page has sent the frame to the workbench, a load is the
+    // document the frame was born with, not a workbench document.
+    if (!navigated) return;
+    if (frameLoaded && announcements > 0) startDocument();
+    else if (frameLoaded) return; // the empty document reported itself twice
+    frameLoaded = true;
     sendConnection(connectionPending);
     if (shellPending && isCurrent(shellPending.started)) postStudio(shellPending.config);
     else if (!integrated) publishShell();
@@ -357,7 +361,8 @@ function startDocument() {
   selectionUncertain = false;
   appliedShellRevision = 0;
   announcements = 0;
-  frameLoads = 0;
+  frameLoaded = false;
+  navigated = false;
   if (integrated) setIntegrated(false);
   frame.hidden = true;
 }
@@ -365,6 +370,7 @@ function replaceFrame() {
   const previous = frame;
   frame = previous.cloneNode(false);
   startDocument();
+  navigated = true;
   shellReady = false;
   shellRevision = 0;
   bindFrameLoad(frame);

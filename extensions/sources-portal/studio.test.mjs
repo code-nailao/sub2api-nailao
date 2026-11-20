@@ -689,6 +689,41 @@ test('a page configuration keeps the released client shape, and a restart voids 
   assert.equal(f.frame.hidden, true);
 });
 
+test('the empty frame load before the workbench starts is not a document', async () => {
+  const f = await fixture();
+  // The iframe is born without an address, so its empty document loads. A
+  // slow store announces itself, the connection is confirmed, the workbench
+  // document loads, and the store's second announcement follows. That order
+  // must leave the document and its confirmed connection alone.
+  f.blankLoad();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackConnection();
+  const shell = await f.ackShell();
+  f.loaded();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await flush();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.document.body.dataset.integrated, 'true');
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.last('sub2api:image-studio-shell-config').revision, shell.revision, 'the shell is not replaced');
+});
+
+test('a real reload after the workbench document loaded is still a new document', async () => {
+  const f = await fixture();
+  const shell = await f.integrate();
+  f.loaded();
+  assert.equal(f.document.body.dataset.integrated, 'true');
+
+  // The child reloads: its document loads again and announces itself.
+  f.loaded();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await flush();
+  const restarted = f.last('sub2api:image-studio-shell-config');
+  assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.retry.hidden, false);
+});
+
 test('a slow-starting shell that announces itself twice keeps the confirmed workspace', async () => {
   const f = await fixture();
   f.loaded();
