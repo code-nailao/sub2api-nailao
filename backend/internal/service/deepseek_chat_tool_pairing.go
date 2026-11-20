@@ -8,11 +8,12 @@ import (
 )
 
 type deepSeekToolHistoryMessage struct {
-	span     deepSeekChatSpan
-	calls    []deepSeekToolHistoryCall
-	tool     bool
-	resultID string
-	content  deepSeekChatSpan
+	span      deepSeekChatSpan
+	pairedEnd int // end of an intact call and result block, or zero
+	calls     []deepSeekToolHistoryCall
+	tool      bool
+	resultID  string
+	content   deepSeekChatSpan
 }
 
 type deepSeekToolHistoryCall struct {
@@ -102,8 +103,15 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		for j := range messages[i].calls {
-			call := &messages[i].calls[j]
+		message := &messages[i]
+		// If the chosen results fill the next slots, retain the full block
+		// in its input order, including its original separators.
+		pairedEnd := 0
+		if last := i + len(message.calls); last > i && last < len(messages) {
+			pairedEnd = messages[last].span.end
+		}
+		for j := range message.calls {
+			call := &message.calls[j]
 			if !call.reused && latestByID[call.id] == call && call.adjacentCount == 0 {
 				if early := beforeFirstCall[call.id]; early != nil {
 					call.result = early
@@ -114,7 +122,11 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 					return nil, err
 				}
 			}
+			if call.result == nil || call.result.span.start < message.span.end || call.result.span.end > pairedEnd {
+				pairedEnd = 0
+			}
 		}
+		message.pairedEnd = pairedEnd
 	}
 	return writeDeepSeekToolHistory(ctx, body, span, messages)
 }
@@ -283,6 +295,10 @@ func writeDeepSeekToolHistory(ctx context.Context, body []byte, span deepSeekCha
 		if message.tool {
 			continue
 		}
+		if message.pairedEnd != 0 {
+			capacity += message.pairedEnd - message.span.start + 1
+			continue
+		}
 		capacity += message.span.end - message.span.start + 1
 		for _, call := range message.calls {
 			if call.result != nil {
@@ -311,6 +327,12 @@ func writeDeepSeekToolHistory(ctx context.Context, body []byte, span deepSeekCha
 	}
 	for _, message := range messages {
 		if message.tool {
+			continue
+		}
+		if message.pairedEnd != 0 {
+			if err := appendMessage(deepSeekChatSpan{start: message.span.start, end: message.pairedEnd}); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		if err := appendMessage(message.span); err != nil {

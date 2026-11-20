@@ -215,15 +215,10 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	grokCacheIdentity string,
 ) (*http.Response, error) {
 	if inboundProtocol == APIProtocolChatCompletions {
-		// Forced tool choice can disable thinking. On OpenCode's shared
-		// routes, the mapped model identifies which provider owns the history.
-		// Direct DeepSeek accounts can use a model alias without that prefix.
+		// Forced tool choice can disable thinking. Check the final mode before
+		// adding reasoning to the native Chat history.
 		body = normalizeDeepSeekForcedToolChoice(account, body)
-		deepSeekModel := targetsDeepSeekAPIHost(account)
-		if targetsOpenCodeZenUpstream(account) {
-			deepSeekModel = isDeepSeekCatalogModel(gjson.GetBytes(body, "model").String())
-		}
-		if deepSeekModel && gjson.GetBytes(body, "thinking.type").String() != "disabled" {
+		if targetsDeepSeekChatModel(account, body) && gjson.GetBytes(body, "thinking.type").String() != "disabled" {
 			body = ensureDeepSeekChatReasoningPlaceholders(account, body)
 		}
 	} else {

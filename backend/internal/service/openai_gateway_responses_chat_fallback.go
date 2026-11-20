@@ -471,6 +471,15 @@ func isDeepSeekCatalogModel(model string) bool {
 	return strings.HasPrefix(normalizeOpenCodeGoModelID(model), "deepseek")
 }
 
+// targetsDeepSeekChatModel uses the final model for OpenCode's shared routes.
+// Direct DeepSeek routes also accept custom model aliases.
+func targetsDeepSeekChatModel(account *Account, body []byte) bool {
+	if targetsOpenCodeZenUpstream(account) {
+		return isDeepSeekCatalogModel(gjson.GetBytes(body, "model").String())
+	}
+	return targetsDeepSeekAPIHost(account)
+}
+
 // requiresDeepSeekChatReasoning 报告该 Chat Completions 请求的上游是否按
 // DeepSeek thinking mode 语义校验 reasoning_content。
 //

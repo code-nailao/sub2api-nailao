@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
@@ -199,25 +200,54 @@ func TestDeepSeekChatThinkingAliasKeepsReasoningPlaceholder(t *testing.T) {
 	}
 }
 
+func TestDeepSeekChatAliasRepairsToolHistory(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			body := fmt.Appendf(nil, `{"model":"fixture-model","thinking":{"type":"enabled"},"messages":[{"role":"user","content":"Example"},{"role":"tool","tool_call_id":"orphan","content":"Unmatched"},{"role":"assistant","content":null,"tool_calls":[{"id":"missing","type":"function","function":{"name":"record","arguments":"{}"}}]},{"role":"user","content":"Continue"}],"stream":%t}`, stream)
+			c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
+			account := deepSeekForcedToolChoiceAccount()
+			account.Credentials["model_mapping"] = map[string]any{"fixture-model": "thinking-alias"}
+			upstream := &httpUpstreamRecorder{resp: deepSeekFixtureModelResponse(t, stream, deepSeekChatFallbackOKBody)}
+			svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+
+			_, err := svc.ForwardAsChatCompletions(c.Request.Context(), c, account, body, "", "")
+			require.NoError(t, err)
+			require.Equal(t, "thinking-alias", gjson.GetBytes(upstream.lastBody, "model").String())
+			messages := gjson.GetBytes(upstream.lastBody, "messages").Array()
+			require.Len(t, messages, 4)
+			require.Equal(t, "assistant", messages[1].Get("role").String())
+			require.Equal(t, deepSeekChatReasoningPlaceholderText, messages[1].Get("reasoning_content").String())
+			require.Equal(t, `{"role":"tool","tool_call_id":"missing","content":""}`, messages[2].Raw)
+		})
+	}
+}
+
+func runDeepSeekHostedChatWithSearch(t *testing.T, cfg *config.Config, body []byte) (*OpenAIForwardResult, [][]byte, error) {
+	t.Helper()
+	stream := gjson.GetBytes(body, "stream").Bool()
+	var requests [][]byte
+	result, _, _, err := deepSeekHostedWireFixture(t, cfg, "chat", body, func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/tools/search") {
+			return deepSeekFixtureResponse(`{"results":[{"url":"https://source.example/page"}]}`), nil
+		}
+		require.True(t, strings.HasSuffix(req.URL.Path, "/chat/completions"))
+		wire, err := io.ReadAll(req.Body)
+		require.NoError(t, err)
+		requests = append(requests, wire)
+		if len(requests) == 1 {
+			req.Body = io.NopCloser(strings.NewReader(string(wire)))
+			return deepSeekFixtureModelResponse(t, stream, deepSeekModelFixtureBody(t, req, "search_call", "example")), nil
+		}
+		return deepSeekFixtureModelResponse(t, stream, deepSeekChatFallbackOKBody), nil
+	})
+	return result, requests, err
+}
+
 func TestDeepSeekChatHostedKeepsPairedHistoryBytes(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
 			body := fmt.Appendf(nil, `{"model":"deepseek-flash","messages":%s,"thinking":{"type":"disabled"},"tools":[{"type":"web_search"}],"stream":%t}`, deepSeekPairedChatFixture, stream)
-			var requests [][]byte
-			result, _, _, err := deepSeekHostedWireFixture(t, "chat", body, func(req *http.Request) (*http.Response, error) {
-				if strings.HasSuffix(req.URL.Path, "/tools/search") {
-					return deepSeekFixtureResponse(`{"results":[{"url":"https://source.example/page"}]}`), nil
-				}
-				require.True(t, strings.HasSuffix(req.URL.Path, "/chat/completions"))
-				wire, err := io.ReadAll(req.Body)
-				require.NoError(t, err)
-				requests = append(requests, wire)
-				if len(requests) == 1 {
-					req.Body = io.NopCloser(strings.NewReader(string(wire)))
-					return deepSeekFixtureModelResponse(t, stream, deepSeekModelFixtureBody(t, req, "search_call", "example")), nil
-				}
-				return deepSeekFixtureModelResponse(t, stream, deepSeekChatFallbackOKBody), nil
-			})
+			result, requests, err := runDeepSeekHostedChatWithSearch(t, deepSeekChatFallbackTestConfig(), body)
 			require.NoError(t, err)
 			require.Equal(t, 1, result.DeepSeekTools.SearchCount)
 			require.Len(t, requests, 2)
@@ -230,6 +260,63 @@ func TestDeepSeekChatHostedKeepsPairedHistoryBytes(t *testing.T) {
 			require.Equal(t, "search_call", messages[3].Get("tool_calls.0.id").String())
 			require.Equal(t, "search_call", messages[4].Get("tool_call_id").String())
 		})
+	}
+}
+
+func TestDeepSeekChatHostedRepairKeepsCompleteBlock(t *testing.T) {
+	const calls = `{ "role":"assistant","content":null, "tool_calls":[{"id":"a","type":"function","function":{"name":"record","arguments":"{}"}},{"id":"b","type":"function","function":{"name":"record","arguments":"{}"}}] }`
+	const resultB = `{ "role":"tool","tool_call_id":"b","content":"Result B" }`
+	const resultA = `{ "role":"tool","tool_call_id":"a","content":"Result A" }`
+	const block = calls + ",\n  " + resultB + ", " + resultA
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			body := fmt.Appendf(nil, `{"model":"deepseek-flash","messages":[{"role":"user","content":"Example"},%s,{"role":"user","content":"Continue"},{"role":"tool","tool_call_id":"orphan","content":"Unmatched"}],"thinking":{"type":"disabled"},"tools":[{"type":"web_search"}],"stream":%t}`, block, stream)
+			result, requests, err := runDeepSeekHostedChatWithSearch(t, deepSeekChatFallbackTestConfig(), body)
+			require.NoError(t, err)
+			require.Equal(t, 1, result.DeepSeekTools.SearchCount)
+			require.Len(t, requests, 2)
+			for _, wire := range requests {
+				messages := gjson.GetBytes(wire, "messages")
+				require.False(t, messages.Get(`#(tool_call_id=="orphan")`).Exists())
+				require.Contains(t, messages.Raw, block)
+			}
+		})
+	}
+}
+
+func TestDeepSeekChatHostedContinuationBodyBudget(t *testing.T) {
+	const limit = 4096
+	const prompt = "Find an example with  two spaces"
+	const bodyFormat = `{"model":"deepseek-flash","messages":[%s{"role":"user","content":%q}],"thinking":{"type":"disabled"},"tools":[{"type":"web_search"}],"stream":%t}`
+	for _, stream := range []bool{false, true} {
+		for _, insideString := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/padding_inside_string=%t", stream, insideString), func(t *testing.T) {
+				cfg := deepSeekChatFallbackTestConfig()
+				cfg.Gateway.MaxBodySize = limit
+				cfg.Gateway.TextMaxBodySize = limit
+				padding := strings.Repeat(" ", limit-850-len(fmt.Sprintf(bodyFormat, "", prompt, stream)))
+				content := prompt
+				if insideString {
+					content += padding
+					padding = ""
+				}
+				body := fmt.Appendf(nil, bodyFormat, padding, content, stream)
+				result, requests, err := runDeepSeekHostedChatWithSearch(t, cfg, body)
+				if insideString {
+					require.ErrorContains(t, err, "DeepSeek conversation exceeds request body limit")
+					require.Len(t, requests, 1)
+				} else {
+					require.NoError(t, err)
+					require.Len(t, requests, 2)
+					require.Equal(t, gjson.GetBytes(body, "messages").Raw, gjson.GetBytes(requests[0], "messages").Raw)
+				}
+				require.Equal(t, 1, result.DeepSeekTools.SearchCount)
+				for _, wire := range requests {
+					require.LessOrEqual(t, len(wire), limit)
+					require.Equal(t, content, gjson.GetBytes(wire, "messages.0.content").String())
+				}
+			})
+		}
 	}
 }
 

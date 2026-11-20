@@ -132,10 +132,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 		return nil, policyErr
 	}
 	upstreamBody = updatedBody
-	// Use the mapped model for native Chat on DeepSeek and OpenCode routes,
-	// since either account can serve multiple model families.
-	if inboundProtocol == APIProtocolChatCompletions && isDeepSeekCatalogModel(upstreamModel) &&
-		(targetsDeepSeekAPIHost(account) || targetsOpenCodeZenUpstream(account)) {
+	if inboundProtocol == APIProtocolChatCompletions && targetsDeepSeekChatModel(account, upstreamBody) {
 		pairedBody, err := normalizeDeepSeekChatToolPairing(ctx, upstreamBody)
 		if err != nil {
 			return nil, rejectDeepSeekChatFilter(c, err)

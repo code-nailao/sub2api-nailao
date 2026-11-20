@@ -257,9 +257,10 @@ func prepareDeepSeekHosted(body []byte, protocol string, auto bool) (*deepSeekHo
 	return r, true, nil
 }
 
-// marshalModelRequest inserts the original Chat history verbatim before any
-// messages the loop appended. json.Marshal would compact even a RawMessage.
-func (r *deepSeekHostedRequest) marshalModelRequest(ctx context.Context) ([]byte, error) {
+// marshalModelRequest inserts the original Chat history before the messages
+// the loop appended. Only compact its JSON whitespace if the turn would be
+// over budget. json.Marshal would compact even a RawMessage on every turn.
+func (r *deepSeekHostedRequest) marshalModelRequest(ctx context.Context, limit int64) ([]byte, error) {
 	body, err := json.Marshal(r.Body)
 	if err != nil || r.chatHistory == nil {
 		return body, err
@@ -271,15 +272,30 @@ func (r *deepSeekHostedRequest) marshalModelRequest(ctx context.Context) ([]byte
 	if top.messages == nil {
 		return nil, errors.New("hosted Chat request lost its messages field")
 	}
+	history := r.chatHistory
 	span := top.messages.value
-	out := make([]byte, 0, len(body)+len(r.chatHistory)+1)
+	// Merging the arrays adds the original history, drops two brackets and
+	// needs one comma only when both arrays contain messages.
+	join := top.messages.nonemptyArray && len(bytes.TrimSpace(history[1:len(history)-1])) != 0
+	turnSize := len(body) - 2 + len(history)
+	if join {
+		turnSize++
+	}
+	if int64(turnSize) > limit {
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, history); err != nil {
+			return nil, err
+		}
+		history = compact.Bytes()
+	}
+	out := make([]byte, 0, len(body)+len(history)+1)
 	out = append(out, body[:span.start]...)
 	if !top.messages.nonemptyArray {
-		out = append(out, r.chatHistory...)
+		out = append(out, history...)
 		return append(out, body[span.end:]...), nil
 	}
-	out = append(out, r.chatHistory[:len(r.chatHistory)-1]...)
-	if len(bytes.TrimSpace(r.chatHistory[1:len(r.chatHistory)-1])) > 0 {
+	out = append(out, history[:len(history)-1]...)
+	if join {
 		out = append(out, ',')
 	}
 	return append(out, body[span.start+1:]...), nil
@@ -691,13 +707,13 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 				return result, nil, true, err
 			}
 		}
-		current, marshalErr := req.marshalModelRequest(loopCtx)
-		if marshalErr != nil {
-			return result, nil, true, marshalErr
-		}
 		limit := int64(32 << 20)
 		if s.cfg != nil && s.cfg.Gateway.MaxBodySize > 0 {
 			limit = s.cfg.Gateway.MaxBodySize
+		}
+		current, marshalErr := req.marshalModelRequest(loopCtx, limit)
+		if marshalErr != nil {
+			return result, nil, true, marshalErr
 		}
 		if int64(len(current)) > limit {
 			return result, nil, true, errors.New("DeepSeek conversation exceeds request body limit")
