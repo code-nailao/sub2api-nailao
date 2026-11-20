@@ -155,9 +155,9 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 			if err != nil {
 				return nil, err
 			}
-			return s.forwardAsRawChatCompletions(ctx, c, account, chatBody, defaultMappedModel)
+			body = chatBody
 		}
-		return s.forwardAsRawChatCompletions(ctx, c, account, body, defaultMappedModel)
+		return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, inbound, time.Now())
 	}
 	// 上游为 Responses（含 adaptive 下 Responses 形状入站且供应商有原生
 	// Responses 端点）：走下方 Chat Completions ↔ Responses 转换链。
@@ -401,7 +401,7 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 				zap.Int("upstream_status", resp.StatusCode),
 				zap.String("upstream_message", upstreamMsg),
 			)
-			return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, startTime)
+			return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, inbound, startTime)
 		}
 		responsesMode, _ := account.Extra[openai_compat.ExtraKeyResponsesMode].(string)
 		if account.IsOpenAIApiKey() &&
@@ -418,7 +418,7 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 				zap.Int64("account_id", account.ID),
 				zap.Int("upstream_status", resp.StatusCode),
 			)
-			return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, startTime)
+			return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, inbound, startTime)
 		}
 		if foErr := s.failoverOpenAIUpstreamHTTPError(ctx, c, account, resp, respBody, upstreamMsg, upstreamModel); foErr != nil {
 			return nil, foErr

@@ -61,7 +61,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 	body []byte,
 	defaultMappedModel string,
 ) (*OpenAIForwardResult, error) {
-	return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, time.Now())
+	return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, APIProtocolChatCompletions, time.Now())
 }
 
 func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
@@ -70,6 +70,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	account *Account,
 	body []byte,
 	defaultMappedModel string,
+	inboundProtocol string,
 	startTime time.Time,
 ) (out *OpenAIForwardResult, forwardError error) {
 	observedHTTPStatus := 0
@@ -131,7 +132,8 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 		return nil, policyErr
 	}
 	upstreamBody = updatedBody
-	if targetsDeepSeekAPIHost(account) {
+	// Converted Responses input keeps its own tool history semantics.
+	if inboundProtocol == APIProtocolChatCompletions && targetsDeepSeekAPIHost(account) {
 		pairedBody, err := normalizeDeepSeekChatToolPairing(ctx, upstreamBody)
 		if err != nil {
 			return nil, rejectDeepSeekChatFilter(c, err)

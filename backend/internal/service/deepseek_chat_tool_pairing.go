@@ -39,9 +39,8 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 	}
 
 	// Preserve existing adjacent matches first, even if different turns reused
-	// an ID. A displaced result can be moved only if its ID has a unique owner.
+	// an ID.
 	adjacent := make(map[string]*deepSeekToolHistoryCall)
-	byID := make(map[string]*deepSeekToolHistoryCall)
 	changed := false
 	for i := range messages {
 		if err := ctx.Err(); err != nil {
@@ -65,22 +64,30 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 				return body, nil
 			}
 			adjacent[call.id] = call
-			if _, exists := byID[call.id]; exists {
-				byID[call.id] = nil
+		}
+	}
+
+	// Only calls still missing a result can own a displaced result. Multiple
+	// unmatched calls with the same ID leave that result ambiguous.
+	unpairedByID := make(map[string]*deepSeekToolHistoryCall)
+	for i := range messages {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for j := range messages[i].calls {
+			call := &messages[i].calls[j]
+			if call.paired {
+				continue
+			}
+			if _, exists := unpairedByID[call.id]; exists {
+				unpairedByID[call.id] = nil
 			} else {
-				byID[call.id] = call
+				unpairedByID[call.id] = call
 			}
 		}
 	}
-	if !changed {
-		for _, message := range messages {
-			for _, call := range message.calls {
-				changed = changed || !call.paired
-			}
-		}
-		if !changed {
-			return body, ctx.Err()
-		}
+	if !changed && len(unpairedByID) == 0 {
+		return body, ctx.Err()
 	}
 	for i := range messages {
 		if err := ctx.Err(); err != nil {
@@ -91,7 +98,7 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 			continue
 		}
 		if message.owner < 0 {
-			if call := byID[message.resultID]; call != nil && !call.paired {
+			if call := unpairedByID[message.resultID]; call != nil && !call.paired {
 				message.owner, call.paired = call.owner, true
 			}
 		}

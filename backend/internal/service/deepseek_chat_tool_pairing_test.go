@@ -3,7 +3,6 @@
 package service
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"testing"
@@ -58,16 +57,15 @@ func TestDeepSeekChatPairsToolMessagesBeforeForwarding(t *testing.T) {
 }
 
 func TestDeepSeekChatPairingPreservesAdjacentResultsWithReusedIDs(t *testing.T) {
-	const call = `{"role":"assistant","tool_calls":[{"id":"reused","type":"function","function":{"name":"lookup","arguments":"{}"}}]}`
-	const first = `{"role":"tool","tool_call_id":"reused","content":"First"}`
-	const late = `{"role":"tool","tool_call_id":"reused","content":"Unclear owner"}`
-	const missing = `{"role":"tool","tool_call_id":"reused","content":""}`
+	const call = `{"role":"assistant","reasoning_content":"Example reasoning","tool_calls":[{"id":"reused","type":"function","function":{"name":"lookup","arguments":"{}"}}]}`
+	const first = `{"role":"tool","tool_call_id":"reused","content":"First result"}`
+	const late = `{"role":"tool","tool_call_id":"reused","content":"Second result"}`
 	const user = `{"role":"user","content":"Continue"}`
-	body := []byte(`{"messages":[` + call + `,` + first + `,` + call + `,` + user + `,` + late + `]}`)
-	want := `{"messages":[` + call + `,` + first + `,` + call + `,` + missing + `,` + user + `]}`
-	got, err := normalizeDeepSeekChatToolPairing(context.Background(), body)
-	require.NoError(t, err)
-	require.Equal(t, want, string(got))
+	body := []byte(`{"model":"deepseek-flash","messages":[` + call + `,` + first + `,` + call + `,` + user + `,` + late + `]}`)
+	want := `{"model":"deepseek-flash","messages":[` + call + `,` + first + `,` + call + `,` + late + `,` + user + `]}`
+	run := runDeepSeekOrdinaryChat(t, body, false)
+	require.NoError(t, run.err)
+	require.Equal(t, want, string(run.sent))
 }
 
 func TestDeepSeekChatPairingScope(t *testing.T) {
@@ -79,6 +77,22 @@ func TestDeepSeekChatPairingScope(t *testing.T) {
 		_, err := svc.forwardAsRawChatCompletions(c.Request.Context(), c, rawChatCompletionsTestAccount(), body, "")
 		require.NoError(t, err)
 		require.Equal(t, body, upstream.lastBody)
+	})
+	t.Run("Responses-shaped input on the Chat endpoint", func(t *testing.T) {
+		body := []byte(`{"model":"deepseek-flash","input":[{"role":"user","content":"Example"},{"role":"tool","content":"Original tool result"}]}`)
+		c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
+		upstream := newOKChatCompletionsUpstream(t.Name(), deepSeekChatFallbackOKBody)
+		svc := &OpenAIGatewayService{cfg: deepSeekChatFallbackTestConfig(), httpUpstream: upstream}
+		account := adaptiveProtocolTestAccount(PlatformZhipu, map[string]any{
+			APIProtocolChatCompletions: DefaultDeepseekBaseURL,
+		})
+
+		_, err := svc.ForwardAsChatCompletions(c.Request.Context(), c, account, body, "", "")
+		require.NoError(t, err)
+		require.Equal(t, "/v1/chat/completions", upstream.lastReq.URL.Path)
+		tool := gjson.GetBytes(upstream.lastBody, `messages.#(role=="tool")`)
+		require.Equal(t, "Original tool result", tool.Get("content").String())
+		require.False(t, tool.Get("tool_call_id").Exists())
 	})
 	t.Run("Responses forwarding to DeepSeek Chat", func(t *testing.T) {
 		body := []byte(`{"model":"deepseek-flash","input":[{"role":"user","content":"Example"},{"role":"assistant","content":"Original"},{"type":"function_call","call_id":"unmatched","name":"lookup","arguments":"{}"},{"role":"user","content":"Continue"}]}`)

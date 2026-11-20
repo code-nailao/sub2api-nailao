@@ -2520,16 +2520,16 @@
       "features": [
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Repairs native DeepSeek Chat history by removing orphan tool results, moving unambiguously matched results next to their calls and supplying empty results for unanswered calls. Keeps valid history unchanged and copies retained messages from their original byte spans.",
-      "sha256": "ab92ea5f77df56ed924fd11619bd629b10993e28adfb4e571a6f1f841b2ca4b8"
+      "reason": "Repairs native DeepSeek Chat history by removing orphan tool results, moving displaced results with a unique remaining call after preserving adjacent pairs, and supplying empty results for unanswered calls. Keeps valid history unchanged and copies retained messages from their original byte spans.",
+      "sha256": "2794aa45e4b7a4b5f31c11bd8ffba77014c3c2938d2e677c7a527065009c46ec"
     },
     {
       "path": "backend/internal/service/deepseek_chat_tool_pairing_test.go",
       "features": [
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Checks outgoing stream and buffered Chat payloads for orphan, missing, and displaced tool messages, byte preservation, repeated IDs and protocol scope.",
-      "sha256": "4d4cd450662061f038ec8ebd7f1ed6083a89ec63f7e22c254a74a6e42ba31198"
+      "reason": "Checks outgoing stream and buffered Chat payloads for orphan, missing, and displaced tool messages, byte preservation, reused call IDs and Responses-shaped input on the Chat endpoint.",
+      "sha256": "fb21028ecc710b1c943d1a6b7288cb36d562a58f21bc7012e6461b452275b2c5"
     },
     {
       "path": "backend/internal/service/deepseek_forced_tool_choice.go",
@@ -2991,10 +2991,11 @@
       "features": [
         "deepseek_builtin_tools",
         "upstream_022_request_speed_gateway",
-        "deepseek_in_chat_tool_types"
+        "deepseek_in_chat_tool_types",
+        "deepseek_chat_tool_pairing"
       ],
-      "sha256": "40f303b7c9b836906012dcf570c3e102504150db2e68bf2cdec3e5655e4b89db",
-      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook."
+      "sha256": "036f218f6d9b39b947d8027c5738d4745c9f974ce65b3cf272f5d4e5a543fe6f",
+      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook. Passes the inbound protocol to raw Chat forwarding to scope tool history pairing to native Chat."
     },
     {
       "path": "backend/internal/service/openai_gateway_chat_completions_raw.go",
@@ -3002,8 +3003,8 @@
         "grok_content_rejection_billing",
         "deepseek_chat_tool_pairing"
       ],
-      "sha256": "fae25504416764fcd477eeeb30838b2894cb638d1a1dabe872e22b6b3facfeba",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Normalizes tool call and result pairing before streaming or buffered native Chat forwarding to DeepSeek."
+      "sha256": "d83b318829f322c34bf89188686e0f491e156730e9a993c085eff7411aacfd7e",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Normalizes tool call and result pairing for native Chat before streaming or buffered forwarding to DeepSeek. Responses-shaped input keeps the existing conversion."
     },
     {
       "path": "backend/internal/service/openai_gateway_forward.go",
