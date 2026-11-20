@@ -289,10 +289,8 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
 		return fail(errListenAddress)
 	}
-	// A normal start can create a missing directory. The read-only check
-	// requires it to exist, and both modes reject an existing non-directory.
-	info, err = os.Stat(dir)
-	if (err == nil && !info.IsDir()) || (open.check && err != nil) {
+	// Both modes require an existing directory before opening any state.
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 		return fail(errDataDirMissing)
 	}
 	var listener net.Listener

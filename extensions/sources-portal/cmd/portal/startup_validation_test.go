@@ -306,16 +306,33 @@ func TestInvalidStartupConfigDoesNotModifyState(t *testing.T) {
 	}
 }
 
-func TestStartupCreatesMissingStateAfterValidation(t *testing.T) {
-	f := newCheckFixture(t)
-	dir := filepath.Join(f.root, "missing", "state")
-	f.env["PORTAL_DATA_DIR"] = dir
-	setup, err := prepare(f.getenv, startState)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer setup.close()
-	if info, err := os.Stat(filepath.Join(dir, "portal.lock")); err != nil || !info.Mode().IsRegular() {
-		t.Fatalf("valid start did not create its state lock: %v", err)
+func TestStartupInitializesExistingEmptyDataDirectory(t *testing.T) {
+	for _, name := range []string{"directory", "symlink"} {
+		t.Run(name, func(t *testing.T) {
+			f := newCheckFixture(t)
+			dir := filepath.Join(f.root, "empty")
+			if err := os.Mkdir(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			f.env["PORTAL_DATA_DIR"] = dir
+			if name == "symlink" {
+				link := filepath.Join(f.root, "linked-state")
+				if err := os.Symlink(dir, link); err != nil {
+					t.Fatal(err)
+				}
+				f.env["PORTAL_DATA_DIR"] = link
+			}
+			if code, _, stderr := runCheck(f); code != 0 {
+				t.Fatalf("check: code=%d stderr=%q", code, stderr)
+			}
+			setup, err := prepare(f.getenv, startState)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer setup.close()
+			if info, err := os.Stat(filepath.Join(dir, "portal.lock")); err != nil || !info.Mode().IsRegular() {
+				t.Fatalf("valid start did not create its state lock: %v", err)
+			}
+		})
 	}
 }

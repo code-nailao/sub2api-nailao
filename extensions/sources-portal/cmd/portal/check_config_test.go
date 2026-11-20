@@ -199,23 +199,6 @@ func TestCheckConfigDoesNotModifyStateAStartWouldMigrate(t *testing.T) {
 	}
 }
 
-func TestCheckConfigRequiresExistingDataDirectory(t *testing.T) {
-	f := newCheckFixture(t)
-	missing := filepath.Join(f.root, "missing", "state")
-	f.env["PORTAL_DATA_DIR"] = missing
-	code, stdout, stderr := runCheck(f)
-	if code != 1 || stdout != "" || stderr != errDataDirMissing+"\n" {
-		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-	if _, err := os.Stat(filepath.Join(f.root, "missing")); !os.IsNotExist(err) {
-		t.Fatalf("check created the data directory: %v", err)
-	}
-	f.env["PORTAL_DATA_DIR"] = filepath.Join(f.root, "master.key")
-	if code, _, stderr := runCheck(f); code != 1 || stderr != errDataDirMissing+"\n" {
-		t.Fatalf("file as data directory: code=%d stderr=%q", code, stderr)
-	}
-}
-
 func TestCheckConfigPassesOnReadOnlyState(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores file permissions, so read-only access cannot be tested")

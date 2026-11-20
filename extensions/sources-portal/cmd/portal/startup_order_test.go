@@ -60,25 +60,56 @@ func TestStartupListenFailureLeavesStateUnchanged(t *testing.T) {
 	}
 }
 
-func TestStartupRejectsFileAsDataDirectory(t *testing.T) {
-	f := newCheckFixture(t)
-	file := filepath.Join(f.root, "not-a-directory")
-	writeFile(t, file, "fixture", 0600)
-	f.env["PORTAL_DATA_DIR"] = file
-	before := treeSnapshot(t, f.root)
+func TestStartupRejectsInvalidDataDirectory(t *testing.T) {
+	for _, name := range []string{"file", "file-with-trailing-slash", "missing", "fifo", "dangling-symlink", "symlink-loop"} {
+		t.Run(name, func(t *testing.T) {
+			f := newCheckFixture(t)
+			candidate := filepath.Join(f.root, "candidate")
+			switch name {
+			case "file", "file-with-trailing-slash":
+				writeFile(t, candidate, "fixture", 0600)
+				if name == "file-with-trailing-slash" {
+					candidate += string(os.PathSeparator)
+				}
+			case "missing":
+				candidate = filepath.Join(candidate, "state")
+			case "fifo":
+				if err := syscall.Mkfifo(candidate, 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "dangling-symlink":
+				if err := os.Symlink("missing", candidate); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink-loop":
+				if err := os.Symlink(filepath.Base(candidate), candidate); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.env["PORTAL_DATA_DIR"] = candidate
+			before := treeSnapshot(t, f.root)
 
-	if code, stdout, stderr := runCheck(f); code != 1 || stdout != "" || stderr != errDataDirMissing+"\n" {
-		t.Errorf("check: code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-	if !sameTree(before, treeSnapshot(t, f.root)) {
-		t.Error("read-only check changed the fixture")
-	}
-	var stderr bytes.Buffer
-	if code := serve(f.getenv, log.New(&stderr, "", 0)); code != 1 || stderr.String() != errDataDirMissing+"\n" {
-		t.Errorf("start: code=%d stderr=%q", code, stderr.String())
-	}
-	if !sameTree(before, treeSnapshot(t, f.root)) {
-		t.Error("start with invalid data directory changed the fixture")
+			code, stdout, stderr := runCheck(f)
+			if code != 1 || stdout != "" || stderr != errDataDirMissing+"\n" {
+				t.Errorf("check: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+			}
+			if !sameTree(before, treeSnapshot(t, f.root)) {
+				t.Error("read-only check changed the fixture")
+			}
+
+			// Exercise the real startup preparation without running any workers
+			// if a regression allows the invalid configuration to start.
+			setup, err := prepare(f.getenv, startState)
+			if setup != nil {
+				setup.close()
+			}
+			if err != startupError(errDataDirMissing) {
+				t.Errorf("start: got %v, want %q", err, errDataDirMissing)
+			}
+			if !sameTree(before, treeSnapshot(t, f.root)) {
+				t.Error("start with invalid data directory changed the fixture")
+			}
+		})
 	}
 }
 
