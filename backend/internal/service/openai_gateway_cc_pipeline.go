@@ -16,6 +16,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
 
@@ -207,17 +208,26 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	account *Account,
 	targetURL string,
 	body []byte,
+	inboundProtocol string,
 	stream bool,
 	bearerToken string,
 	userAgent string,
 	grokCacheIdentity string,
 ) (*http.Response, error) {
-	// DeepSeek thinking mode 要求历史 assistant 回传 reasoning_content。
-	// Responses→CC 回退在加密-only / 缺 reasoning item 且缓存未命中时会漏掉该
-	// 字段，上游 400 "The `reasoning_content` in the thinking mode must be
-	// passed back to the API"。在共用出站点补空格占位，真实明文不覆盖。
-	body = ensureDeepSeekChatReasoningPlaceholders(account, body)
-	body = normalizeDeepSeekForcedToolChoice(account, body)
+	if inboundProtocol == APIProtocolChatCompletions {
+		// Forced tool choice can disable thinking. Check the final mode and
+		// mapped model before adding anything to the native Chat history.
+		body = normalizeDeepSeekForcedToolChoice(account, body)
+		if isDeepSeekCatalogModel(gjson.GetBytes(body, "model").String()) &&
+			gjson.GetBytes(body, "thinking.type").String() != "disabled" {
+			body = ensureDeepSeekChatReasoningPlaceholders(account, body)
+		}
+	} else {
+		// Bridges can lose reasoning plaintext on an encrypted-only cache miss.
+		// Preserve their existing placeholder and forced-tool compatibility.
+		body = ensureDeepSeekChatReasoningPlaceholders(account, body)
+		body = normalizeDeepSeekForcedToolChoice(account, body)
+	}
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 	upstreamReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, targetURL, bytes.NewReader(body))
 	releaseUpstreamCtx()

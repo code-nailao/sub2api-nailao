@@ -2537,8 +2537,8 @@
       "features": [
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Checks streaming and buffered Chat payloads for orphan, missing, and displaced results, adjacency priority and discarded candidates with reused IDs, parallel call order and byte preservation. Covers direct DeepSeek, mapped DeepSeek models on both OpenCode Go account paths, non-DeepSeek models on shared upstreams and Responses-shaped input.",
-      "sha256": "fe8588e9d76fe0d7f0011649937b30a4914c3fd7163a21149effeaca059c57e7"
+      "reason": "Checks streaming and buffered Chat payloads for orphan, missing, and displaced results, adjacency priority and discarded candidates with reused IDs, parallel call order and byte preservation. Covers direct DeepSeek, mapped DeepSeek models on both OpenCode Go account paths, non-DeepSeek models on shared upstreams and Responses-shaped input. Checks aligned native Chat histories without reasoning content for disabled and forced-off thinking, mapped GLM over OpenCode, and enabled DeepSeek thinking.",
+      "sha256": "4ed68bfc24be63263bcdd2e63a3378210cc844d21d5726e4d164c0ebf8ce2c48"
     },
     {
       "path": "backend/internal/service/deepseek_forced_tool_choice.go",
@@ -2999,10 +2999,11 @@
       "path": "backend/internal/service/openai_gateway_cc_pipeline.go",
       "features": [
         "deepseek_chat_transport_safety",
-        "deepseek_tool_compat"
+        "deepseek_tool_compat",
+        "deepseek_chat_tool_pairing"
       ],
-      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point. For DeepSeek groups with tools off, a Chat transport error permits failover only when delivery tracking confirms the request did not obtain a connection or write request bytes. Makes the protected POST body non-replayable by the underlying HTTP client, including HTTP/2 retries after REFUSED_STREAM.",
-      "sha256": "b80a7dc9a0dbfd99d1e47875c9001016475ac9560986778574725ae439d3c218"
+      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point. For DeepSeek groups with tools off, a Chat transport error permits failover only when delivery tracking confirms the request did not obtain a connection or write request bytes. Makes the protected POST body non-replayable by the underlying HTTP client, including HTTP/2 retries after REFUSED_STREAM. Uses the inbound protocol to keep the existing bridge preparation. In native Chat it checks the mapped model and the final thinking state after forced tool selection before adding DeepSeek reasoning placeholders.",
+      "sha256": "a2eeb24fc6770f79eaded532367d6d0471f6e903a9ab102f30af2a890c7186bb"
     },
     {
       "path": "backend/internal/service/openai_gateway_chat_completions.go",
@@ -3021,8 +3022,8 @@
         "grok_content_rejection_billing",
         "deepseek_chat_tool_pairing"
       ],
-      "sha256": "ab2ef1e24dde840a390d5d735305db87dbcaee192c4f28bd9491784e8fb64054",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Normalizes tool call and result pairing in native Chat for mapped DeepSeek models on direct DeepSeek and recognized OpenCode routes. Responses-shaped input keeps the existing conversion."
+      "sha256": "7e5302f4f46222a2529d222ba60e83f5798055fc9ccee846b53ef1a25a190c38",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Normalizes tool call and result pairing in native Chat for mapped DeepSeek models on direct DeepSeek and recognized OpenCode routes. Responses-shaped input keeps the existing conversion. Passes the inbound protocol to the shared sender for native Chat reasoning checks."
     },
     {
       "path": "backend/internal/service/openai_gateway_forward.go",
@@ -3057,10 +3058,11 @@
     {
       "path": "backend/internal/service/openai_gateway_messages_chat_fallback.go",
       "features": [
-        "upstream_022_request_speed_gateway"
+        "upstream_022_request_speed_gateway",
+        "deepseek_chat_tool_pairing"
       ],
-      "sha256": "464bad8d7d9fb7f6084f0cbf529bf5e5e115f295af05413e972f947dd808e24b",
-      "reason": "Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling."
+      "sha256": "a8e217cc8bcccc5025ca003293669937ecc3a2a4e9ed040815b2837885838699",
+      "reason": "Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling. Identifies the Messages bridge to the shared Chat sender so existing reasoning compatibility is retained."
     },
     {
       "path": "backend/internal/service/openai_gateway_passthrough.go",
@@ -3113,6 +3115,14 @@
       ],
       "sha256": "e7442cdb21a0a03f081717e29ad00fe0dea148ffa94b4d8da34bfa69b2d2d40f",
       "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling."
+    },
+    {
+      "path": "backend/internal/service/openai_gateway_responses_chat_fallback.go",
+      "features": [
+        "deepseek_chat_tool_pairing"
+      ],
+      "reason": "Identifies the Responses bridge to the shared Chat sender so existing reasoning placeholders are retained when native Chat gets stricter placeholder checks.",
+      "sha256": "a03ce72ce4ff1445122a9b96629414c95a41b0fa88590ccb8e584fb5a50bb137"
     },
     {
       "path": "backend/internal/service/openai_gateway_scheduling.go",
@@ -3184,6 +3194,14 @@
       ],
       "sha256": "c096203e07d9bbf1bebfe19ae4e516985e83b825b6148f69f4df87df0e2673d5",
       "reason": "Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling."
+    },
+    {
+      "path": "backend/internal/service/openai_opencode_session_test.go",
+      "features": [
+        "deepseek_chat_tool_pairing"
+      ],
+      "reason": "Identifies native Chat in the OpenCode session header test after the shared Chat sender learns the inbound protocol.",
+      "sha256": "db40bad0fe16f21337b1af36d0b08ad4696563c6df79befe53dc41f6ac0a38fb"
     },
     {
       "path": "backend/internal/service/openai_request_speed.go",

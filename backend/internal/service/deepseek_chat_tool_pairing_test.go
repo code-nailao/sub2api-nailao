@@ -124,6 +124,47 @@ func TestDeepSeekChatPairingPreservesAdjacentResultsWithReusedIDs(t *testing.T) 
 	require.Equal(t, want, string(run.sent))
 }
 
+func TestDeepSeekChatPairingKeepsAlignedHistory(t *testing.T) {
+	const messages = `[
+	  {"role":"user","content":"Example"},
+	  { "role":"assistant", "content":null, "tool_calls":[{"id":"call_a","type":"function","function":{"name":"record","arguments":"{}"}}] },
+	  {"role":"tool","tool_call_id":"call_a","content":"Result"}
+	]`
+	cases := []struct {
+		name, baseURL, model, options, wantThinking string
+		wantPlaceholder                             bool
+	}{
+		{"thinking_disabled", DefaultDeepseekBaseURL, "deepseek-flash", `,"thinking":{"type":"disabled"}`, "disabled", false},
+		{"forced_tool_disables_thinking", DefaultDeepseekBaseURL, "deepseek-flash", `,"thinking":{"type":"enabled"},"tool_choice":"required",` + deepSeekForcedToolChoiceTools, "disabled", false},
+		{"glm_through_go", DefaultOpenCodeGoBaseURL, "glm-5", `,"thinking":{"type":"enabled"}`, "enabled", false},
+		{"glm_through_zen", DefaultOpenCodeZenBaseURL, "glm-5", "", "", false},
+		{"thinking_enabled", DefaultDeepseekBaseURL, "deepseek-flash", `,"thinking":{"type":"enabled"}`, "enabled", true},
+	}
+	for _, tc := range cases {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", tc.name, stream), func(t *testing.T) {
+				body := fmt.Appendf(nil, `{"model":"fixture-model","messages":%s,"stream":%t%s}`, messages, stream, tc.options)
+				c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
+				upstream := &httpUpstreamRecorder{resp: deepSeekFixtureModelResponse(t, stream, deepSeekChatFallbackOKBody)}
+				svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+				account := deepSeekForcedToolChoiceAccount()
+				account.Credentials["base_url"] = tc.baseURL
+				account.Credentials["model_mapping"] = map[string]any{"fixture-model": tc.model}
+
+				_, err := svc.ForwardAsChatCompletions(c.Request.Context(), c, account, body, "", "")
+				require.NoError(t, err)
+				require.Equal(t, tc.model, gjson.GetBytes(upstream.lastBody, "model").String())
+				require.Equal(t, tc.wantThinking, gjson.GetBytes(upstream.lastBody, "thinking.type").String())
+				if tc.wantPlaceholder {
+					require.Equal(t, deepSeekChatReasoningPlaceholderText, gjson.GetBytes(upstream.lastBody, "messages.1.reasoning_content").String())
+				} else {
+					require.Equal(t, messages, gjson.GetBytes(upstream.lastBody, "messages").Raw)
+				}
+			})
+		}
+	}
+}
+
 func TestDeepSeekChatPairingOpenCodeGo(t *testing.T) {
 	const messages = `[{"role":"user","content":"Example"},{"role":"tool","tool_call_id":"unmatched","content":"Original"}]`
 	body := []byte(`{"model":"fixture-model","messages":` + messages + `}`)
