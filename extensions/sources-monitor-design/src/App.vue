@@ -5,6 +5,12 @@ import Icon from './Icon.vue'
 import ChannelCard from './ChannelCard.vue'
 import { brands, demoCards, realCards, labels, percent, seconds, time, type Brand, type Card, type Point, type Range, type Snapshot } from './model'
 
+const mainOrigin = import.meta.env.VITE_MONITOR_PREVIEW_MAIN_ORIGIN || ''
+
+function mainLink(path: string) {
+  return { href: `${mainOrigin}${path}`, target: '_blank', rel: 'noopener noreferrer' }
+}
+
 type Orders = { brands: Brand[]; cards: Record<string, string[]> }
 const defaultOrders = (): Orders => ({ brands: brands.map(b => b.id), cards: {} })
 const storageKey = 'sources-monitor-design-order-v1'
@@ -100,17 +106,17 @@ onMounted(async () => {
       <a class="site-brand" href="/" aria-label="Sources 设计预览首页"><span class="sources-logo">S</span><span class="brand-type">Sources<span>CODE · AI WORKSPACE</span></span></a>
       <div class="workspace-caption">我的工作空间</div>
       <nav class="main-nav" aria-label="工作空间导航">
-        <a href="https://sourcesdata.com/dashboard" target="_blank" rel="noopener noreferrer"><Icon name="grid" /><span>仪表盘</span></a>
-        <a href="https://sourcesdata.com/keys" target="_blank" rel="noopener noreferrer"><Icon name="key" /><span>API 密钥</span></a>
-        <a href="https://sourcesdata.com/usage" target="_blank" rel="noopener noreferrer"><Icon name="chart" /><span>使用记录</span></a>
-        <a href="https://sourcesdata.com/available-channels" target="_blank" rel="noopener noreferrer"><Icon name="layers" /><span>可用渠道</span></a>
+        <a v-bind="mainLink('/dashboard')" aria-label="仪表盘"><Icon name="grid" /><span>仪表盘</span></a>
+        <a v-bind="mainLink('/keys')" aria-label="API 密钥"><Icon name="key" /><span>API 密钥</span></a>
+        <a v-bind="mainLink('/usage')" aria-label="使用记录"><Icon name="chart" /><span>使用记录</span></a>
+        <a v-bind="mainLink('/available-channels')" aria-label="可用渠道"><Icon name="layers" /><span>可用渠道</span></a>
         <a href="#main" class="active" aria-current="page"><Icon name="activity" /><span>渠道状态</span><i></i></a>
-        <a href="https://sourcesdata.com/purchase" target="_blank" rel="noopener noreferrer"><Icon name="wallet" /><span>充值</span></a>
+        <a v-bind="mainLink('/purchase')" aria-label="充值"><Icon name="wallet" /><span>充值</span></a>
       </nav>
       <div class="sidebar-bottom"><div class="preview-note"><span class="tiny-label">DESIGN PREVIEW</span><strong>渠道状态 · 第一版</strong><p>让每条渠道的表现<br>一目了然。</p></div><button class="theme-toggle" @click="dark = !dark"><Icon :name="dark ? 'sun' : 'moon'" /><span>{{ dark ? '浅色模式' : '深色模式' }}</span></button><button class="theme-toggle collapse-button" @click="collapsedSidebar = !collapsedSidebar" :aria-label="collapsedSidebar ? '展开侧栏' : '收起侧栏'"><Icon name="chevron" :class="{ rotate: !collapsedSidebar }" /><span>收起侧栏</span></button></div>
     </aside>
     <div class="workspace">
-      <header class="topbar"><div class="breadcrumb"><span>我的账户</span><Icon name="chevron" :size="13" /><strong>渠道状态</strong></div><div class="topbar-right"><span class="local-badge"><i></i>本地设计预览</span><a class="top-link" href="https://sourcesdata.com/model-plaza" target="_blank" rel="noopener noreferrer"><Icon name="grid" :size="16" />模型广场<Icon name="external" :size="13" /></a><span class="avatar">S</span></div></header>
+      <header class="topbar"><div class="breadcrumb"><span>我的账户</span><Icon name="chevron" :size="13" /><strong>渠道状态</strong></div><div class="topbar-right"><span class="local-badge"><i></i>本地设计预览</span><a class="top-link" v-bind="mainLink('/model-plaza')" aria-label="模型广场"><Icon name="grid" :size="16" />模型广场<Icon name="external" :size="13" /></a><span class="avatar">S</span></div></header>
       <main id="main">
         <div class="page-heading"><div><div class="eyebrow">SOURCES / CHANNEL STATUS</div><h1><span class="heading-icon"><Icon name="chart" :size="23" /></span>渠道状态</h1><p>找到适合你的渠道，随时掌握可用性与响应表现。</p></div><div class="heading-actions"><button class="button quiet" @click="helpDialog?.showModal()"><Icon name="info" :size="16" />指标说明</button><button class="button" @click="openSort()"><Icon name="filter" :size="16" />自定义排序</button></div></div>
 
