@@ -7,7 +7,7 @@ One command replaces Main serving and the unique background with one image:
                                switch, guard (auto-rollback), retire
     deploy.py rollback         return to the previous slot's containers
     deploy.py resume           validate a held release, then finish switching
-    deploy.py abort            discard the held serving containers
+    deploy.py abort            restore the original release and discard held candidates
     deploy.py status           current/previous slot and container health
     deploy.py watch            resident sampler for systemd (journal only)
     deploy.py adopt ...        one-time: record running legacy containers
@@ -48,6 +48,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -354,6 +355,9 @@ class Ops:
         data = json.loads(proc.stdout)
         return data[0] if data else None
 
+    def inspect_snapshot(self, name: str) -> dict[str, Any] | None:
+        return self.inspect(name)
+
     # http ---------------------------------------------------------------------
     def http_json(self, url: str, token: str | None = None, method: str = "GET",
                   body: dict[str, Any] | None = None, timeout: float = 5) -> tuple[int, Any]:
@@ -496,6 +500,65 @@ class MainOps(Ops):
                     return data[0]
             except ValueError:
                 pass
+        raise DeployError("cannot inspect container; Docker state is unknown; nothing may be removed")
+
+    def docker_socket_path(self) -> str | None:
+        """Resolve the Docker CLI's selected endpoint if it uses a Unix socket."""
+        config_dir = Path(os.environ.get("DOCKER_CONFIG") or Path.home() / ".docker")
+        context = os.environ.get("DOCKER_CONTEXT")
+        host = os.environ.get("DOCKER_HOST") or None
+        try:
+            if not context and not host:
+                try:
+                    config = json.loads(self.read_text(str(config_dir / "config.json")))
+                except FileNotFoundError:
+                    config = {}
+                context = config.get("currentContext")
+            if context and context != "default":
+                digest = hashlib.sha256(context.encode()).hexdigest()
+                meta = json.loads(self.read_text(str(config_dir / "contexts" / "meta" / digest / "meta.json")))
+                if meta.get("Name") != context:
+                    return None
+                host = meta["Endpoints"]["docker"]["Host"]
+                if not host:
+                    return None
+        except (OSError, ValueError, AttributeError, KeyError, TypeError):
+            # Let the CLI resolve configurations we cannot interpret.
+            return None
+        if host is None:
+            return "/var/run/docker.sock"
+        if isinstance(host, str) and host.startswith("unix:///"):
+            return host.removeprefix("unix://")
+        return None
+
+    def inspect_snapshot(self, name: str) -> dict[str, Any] | None:
+        # Topology and restart policy need fresh observations in addition to
+        # the original deploy commands. Use the local Engine's read-only API.
+        path = self.docker_socket_path()
+        if path is None:
+            return self.inspect(name)
+        timeout = 30
+        connection = http.client.HTTPConnection("localhost", timeout=timeout)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                sock.connect(path)
+                connection.sock = sock
+                escaped = urllib.parse.quote(name, safe="")
+                connection.request("GET", f"/containers/{escaped}/json", headers={"Connection": "close"})
+                with connection.getresponse() as response:
+                    data = json.load(response)
+                    if isinstance(data, dict):
+                        if response.status == 200 and data.get("Id"):
+                            return data
+                        if response.status == 404 and str(data.get("message", "")).lower().startswith("no such container:"):
+                            return None
+        except TimeoutError as err:
+            raise CommandTimedOut(subprocess.TimeoutExpired(["Docker", "inspection"], timeout)) from err
+        except (OSError, http.client.HTTPException, ValueError):
+            pass
+        finally:
+            connection.close()
         raise DeployError("cannot inspect container; Docker state is unknown; nothing may be removed")
 
 
@@ -1061,7 +1124,7 @@ class Deployer:
         old = current["containers"]["background"]
         new = target.containers["background"]
         before = self.owner_runtime(current)  # read-only, also in a dry run
-        source = self.ops.inspect(old) if not self.ops.dry_run else None
+        source = self.ops.inspect_snapshot(old) if not self.ops.dry_run else None
         old_running = not check_health or self.ops.dry_run or bool((source or {}).get("State", {}).get("Running"))
         progress = state.get("in_progress") or {}
         policies = progress.get("background_restart_policies", {})
@@ -1215,7 +1278,7 @@ class Deployer:
         if observed is None:
             return self.ops.inspect(name) or {}
         if name not in observed:
-            observed[name] = self.ops.inspect(name) or {}
+            observed[name] = self.ops.inspect_snapshot(name) or {}
         return observed[name]
 
     def check_rollback_serving(self, view: dict[str, Any], *, observed: dict[str, dict[str, Any]] | None = None,
@@ -1560,6 +1623,18 @@ class Deployer:
         except (Exception, KeyboardInterrupt) as err:
             raise FallbackFailed(f"handing the background back failed: {err}") from err
 
+    def restore_loaded_background(self, state: dict[str, Any], displaced: Target, loaded: dict[str, Any],
+                                  reason: str) -> None:
+        try:
+            if not self.background_answering(loaded):
+                self.hand_back(state, displaced, loaded)
+            if not self.background_answering(loaded):
+                raise DeployError("the background selected by the loaded route did not confirm health and ownership")
+        except (Exception, KeyboardInterrupt) as restore_err:
+            raise SwitchNotRestored(f"{reason}. Restoring the background selected by the loaded route failed ({restore_err}). "
+                                    "Wait for other owners to exit, then restore the restart policy, "
+                                    "use 'docker start' and verify ownership or retry 'abort'") from restore_err
+
     def handoff_and_switch(self, state: dict[str, Any], active: MainRoute, target: Target, handoff: Callable[[], None], *,
                            rollback: bool = False, alias_plan: dict[str, list[str]] | None = None) -> MainRoute:
         view = target.view()
@@ -1603,15 +1678,7 @@ class Deployer:
                 reason = f"switch state write or upstream I/O failed ({reason})"
             with contextlib.suppress(OSError, KeyboardInterrupt):
                 self.log("   switch failed with the original route still loaded; handing the background back")
-            try:
-                if not self.background_answering(current):
-                    self.hand_back(state, target, current)
-                if not self.background_answering(current):
-                    raise DeployError("the original background did not confirm health and ownership")
-            except (Exception, KeyboardInterrupt) as restore_err:
-                raise SwitchNotRestored(f"{reason}. Restoring the original background failed ({restore_err}). "
-                                        "The loaded route is unchanged. Wait for other owners to exit, then restore "
-                                        "the original restart policy, use 'docker start' and verify ownership or retry 'abort'") from restore_err
+            self.restore_loaded_background(state, target, current, reason)
             if rollback and isinstance(err, RollbackBackgroundUnavailable):
                 self.route_rollback_serving_only(state, active, view, err, alias_plan=alias_plan)
             if isinstance(err, RoutingFileNotRestored):
@@ -2598,6 +2665,9 @@ class Deployer:
         aborting = {**progress, "origin": origin, "phase": "aborting", "abort_recovery": recovering}
         try:
             self._save_progress(state, self._with_process(aborting))
+            has_held_background = recovering and bool(held or progress.get("held_background_id"))
+            if has_held_background:
+                self.inspect_held_background(state, target)
             active, disk = self.abort_routes(state, current, target.view())
             if recovering:
                 active = self.restore_abort_route(state, active, disk, current, target)
@@ -2621,6 +2691,8 @@ class Deployer:
                     self.stop_owned_serving(target, role, cid, allow_missing=True)
             for role, cid in owned.items():
                 self.remove_owned_serving(target, role, cid)
+            if has_held_background:
+                self.remove_held_background(state, target)
         except (Exception, KeyboardInterrupt) as err:
             reason = str(err) or type(err).__name__
             if (state.get("in_progress") or {}).get("phase") == "aborting":
@@ -2708,13 +2780,34 @@ class Deployer:
                     # The previous recovery may have restored ownership but
                     # failed to undo the temporary restart policy.
                     self.ops.run(["docker", "update", f"--restart={restart}", old_name], mutate=True)
-        needs_reload = (not active.revision or active.excluded_serving is not None or active.serving["slot"] != restore.slot
+        progress = state["in_progress"]
+        # An adopted file has no probe. If no route update was ever recorded,
+        # there is no attempted switch to recover from or verify with a reload.
+        unproven_switch = not active.revision and (progress.get("verified_route") or progress.get("pending_route"))
+        needs_reload = (unproven_switch or active.excluded_serving is not None or active.serving["slot"] != restore.slot
                         or active.admin["slot"] != restore.slot or active != disk)
-        if needs_reload:
-            route = MainRoute(original, original)
-            self.apply_route(state, active, route, target.view())
-            return route
-        return active
+        if not needs_reload:
+            return active
+
+        attempted = False
+
+        def start_reload() -> None:
+            nonlocal attempted
+            attempted = True
+
+        route = MainRoute(original, original)
+        try:
+            self.apply_route(state, active, route, target.view(), reload_started=start_reload)
+        except (Exception, KeyboardInterrupt) as err:
+            if (not active.revision or isinstance(err, RoutingUnconfirmed)
+                    or (attempted and not isinstance(err, (ReloadNotApplied, RoutingFileNotRestored)))):
+                # Without proof that the pre-abort generation is still loaded,
+                # keep both pairs and the recovery record for a later abort.
+                raise
+            reason = str(err) or type(err).__name__
+            self.restore_loaded_background(state, restore, active.admin, reason)
+            raise DeployError(f"{reason}. The background selected by the loaded route is answering again") from err
+        return route
 
     @staticmethod
     def load_serving_endpoints(saved: list[dict[str, Any]]) -> list[ServingEndpoint]:
@@ -2723,6 +2816,24 @@ class Deployer:
 
     def original_serving_endpoints(self, state: dict[str, Any]) -> list[ServingEndpoint]:
         return self.load_serving_endpoints(state["in_progress"].get("original_endpoints", []))
+
+    def inspect_held_background(self, state: dict[str, Any], target: Target) -> dict[str, Any] | None:
+        info = self.ops.inspect(target.containers["background"])
+        cid = state["in_progress"].get("held_background_id")
+        if info and (not cid or info.get("Id") != cid):
+            raise DeployError("the candidate background identity is unconfirmed")
+        return info
+
+    def remove_held_background(self, state: dict[str, Any], target: Target) -> None:
+        info = self.inspect_held_background(state, target)
+        if not info:
+            return
+        status = info.get("State", {})
+        if status.get("Running") is not False or status.get("Restarting"):
+            raise DeployError("the candidate background exit is unconfirmed")
+        self.ops.run(["docker", "rm", info["Id"]], mutate=True)
+        if self.ops.inspect(target.containers["background"]):
+            raise DeployError("the candidate background was not removed")
 
     def restore_held_after_alias_failure(self, state: dict[str, Any], target: Target,
                                          held: dict[str, Any], endpoints: list[ServingEndpoint]) -> None:
@@ -2744,15 +2855,7 @@ class Deployer:
             network = info.get("NetworkSettings", {}).get("Networks", {}).get(endpoint.network)
             if info.get("Id") != original_ids[endpoint.role] or not endpoint.matches(network, endpoint.aliases):
                 raise DeployError("the original shared alias network was not restored")
-        bg = self.ops.inspect(target.containers["background"])
-        if bg:
-            cid = state["in_progress"].get("held_background_id")
-            running = bg.get("State", {})
-            if not cid or bg.get("Id") != cid or running.get("Running") or running.get("Restarting"):
-                raise DeployError("the candidate background identity or exit is unconfirmed")
-            self.ops.run(["docker", "rm", cid], mutate=True)
-            if self.ops.inspect(target.containers["background"]):
-                raise DeployError("the candidate background was not removed")
+        self.remove_held_background(state, target)
         recovered = {**state, "current": original}
         self._save_progress(recovered, {**reclaimed, "upstream_fingerprint": self.upstream_fingerprint()})
         state.update(recovered)

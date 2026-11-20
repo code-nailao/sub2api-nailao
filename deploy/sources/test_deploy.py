@@ -1,6 +1,7 @@
 import contextlib
 import hashlib
 import http.client
+import http.server
 import io
 import json
 import multiprocessing
@@ -1364,7 +1365,11 @@ class DeployTest(unittest.TestCase):
         self.assert_live_release(LEGACY)
         self.assertIsNone(self.state()["in_progress"])
 
-    def assert_abort_recovers_hold_during_create(self, *, unrelated=False):
+    def assert_abort_recovers_hold_during_create(self, *, unrelated=False, legacy_upstream=False):
+        if legacy_upstream:
+            self.load_fixture_route(LEGACY, proof=False)
+            original = self.ops.loaded_upstreams.replace("server 127.0.0.1:", "server localhost:")
+            self.ops.files[self.cfg.upstream_file] = self.ops.loaded_upstreams = original
         target = self.cfg.slot_view("a")
         primary = target["containers"]["serving"]
         run = self.ops.run
@@ -1392,16 +1397,94 @@ class DeployTest(unittest.TestCase):
             self.assertEqual(candidate, self.ops.inspect(primary))
             self.assertEqual("aborting", self.state()["in_progress"]["phase"])
         else:
-            deploy.Deployer(self.cfg, self.ops).abort()
+            runner = deploy.Deployer(self.cfg, self.ops)
+            if legacy_upstream:
+                def reject_reload(args, **kw):
+                    if args == [self.cfg.nginx_bin, "-s", "reload"]:
+                        return subprocess.CompletedProcess(args, 1, "", "fixture reload rejected")
+                    return run(args, **kw)
+
+                with mock.patch.object(self.ops, "run", reject_reload), \
+                        mock.patch.object(self.ops, "write_file_atomic", wraps=self.ops.write_file_atomic) as write:
+                    runner.abort()
+                write.assert_not_called()
+                self.assertEqual(original, self.ops.loaded_upstreams)
+                self.assertEqual(original, self.ops.files[self.cfg.upstream_file])
+                self.assertTrue(runner.background_answering(LEGACY))
+            else:
+                runner.abort()
+                self.assert_live_release(LEGACY)
             self.assertIsNone(self.ops.inspect(primary))
             self.assertIsNone(self.state()["in_progress"])
-        self.assert_live_release(LEGACY)
+        if unrelated:
+            self.assert_live_release(LEGACY)
+
+    def test_abort_early_hold_with_localhost_upstream_skips_reload(self):
+        self.assert_abort_recovers_hold_during_create(legacy_upstream=True)
 
     def test_abort_finds_held_candidate_created_before_docker_returns_id(self):
         self.assert_abort_recovers_hold_during_create()
 
     def test_abort_preserves_untracked_container_without_the_hold_creation_label(self):
         self.assert_abort_recovers_hold_during_create(unrelated=True)
+
+    def test_abort_rejected_reload_restores_background_of_still_loaded_route(self):
+        held = self.hold()
+        runner = deploy.Deployer(self.cfg, self.ops)
+        run = self.ops.run
+
+        class ProcessKilled(BaseException):
+            pass
+
+        with mock.patch.object(runner, "guard", side_effect=ProcessKilled):
+            with self.assertRaises(ProcessKilled):
+                runner.resume()
+        self.assert_live_release(held["target"])
+        live = self.ops.loaded_upstreams
+
+        def reject_reload(args, **kw):
+            if args == [self.cfg.nginx_bin, "-s", "reload"]:
+                return subprocess.CompletedProcess(args, 1, "", "fixture reload rejected")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", reject_reload):
+            with self.assertRaisesRegex(deploy.DeployError, "abort incomplete"):
+                runner.abort()
+        self.assertEqual(live, self.ops.files[self.cfg.upstream_file])
+        self.assert_live_release(held["target"])
+        self.assertEqual(held["target"]["slot"], self.state()["current"]["slot"])
+        self.assertEqual("aborting", self.state()["in_progress"]["phase"])
+        self.assertIn(["abort_incomplete"], [alert["alert"] for alert in deploy.watch_once(self.cfg, self.ops, {})])
+        runner.abort()
+        self.assert_live_release(LEGACY)
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_abort_removes_recorded_background_after_resume_dies_in_start(self):
+        held = self.hold()
+        runner = deploy.Deployer(self.cfg, self.ops)
+        run = self.ops.run
+        name = held["target"]["containers"]["background"]
+
+        class ProcessKilled(BaseException):
+            pass
+
+        def lose_process(args, **kw):
+            result = run(args, **kw)
+            if args == ["docker", "start", name]:
+                raise ProcessKilled
+            return result
+
+        with mock.patch.object(self.ops, "run", lose_process):
+            with self.assertRaises(ProcessKilled):
+                runner.resume()
+        info = self.ops.inspect(name)
+        self.assertTrue(info["State"]["Running"])
+        self.assertEqual(info["Id"], self.state()["in_progress"]["held_background_id"])
+        runner.abort()
+        self.assertIsNone(self.ops.inspect(name))
+        self.assertIn(["docker", "rm", info["Id"]], self.ops.commands)
+        self.assert_live_release(LEGACY)
+        self.assertIsNone(self.state()["in_progress"])
 
     def test_abort_can_recover_resume_abandoned_at_background_handoff(self):
         held = self.hold()
@@ -1465,7 +1548,13 @@ class DeployTest(unittest.TestCase):
                          [args for args in self.ops.commands if args[0] == self.cfg.nginx_bin])
         self.assert_live_release(self.state()["current"])
 
-    def test_main_full_command_trace_does_not_repeat_docker_queries_within_a_check(self):
+    def test_main_matches_baseline_commands_including_container_inspections(self):
+        # Capture both ordinary releases from 4925fc0a3 with this FakeOps
+        # fixture. Normalize only generated names, paths and creation times.
+        baseline = (
+            "1d1d94a4a669fcd4339cc5d71059afdfb88b9229e0df383a3a00cabb65fdac11",
+            "25d24ae8cf854d7849298afd9a8d33a11232d4a74456cd14de8fb07de8faa29d",
+        )
         self.load_fixture_route(LEGACY, proof=False)
         inspect = self.ops.inspect
 
@@ -1473,24 +1562,27 @@ class DeployTest(unittest.TestCase):
             self.ops.commands.append(["docker", "inspect", name])
             return inspect(name)
 
-        with mock.patch.object(self.ops, "inspect", record_inspect):
-            for sequence, slot in enumerate(("a", "b")):
-                with self.subTest(release=sequence + 1):
-                    original = self.state()["current"]["containers"]
-                    target = self.cfg.slot_view(slot)["containers"]
-                    old_serving = [original[role] for role in deploy.SERVING_ROLES]
-                    new_serving = [target[role] for role in deploy.SERVING_ROLES]
+        # Fake the daemon's read-only snapshot transport independently of
+        # the CLI. A direct daemon read has no subprocess in the trace.
+        with mock.patch.object(self.ops, "inspect", record_inspect), \
+                mock.patch.object(self.ops, "inspect_snapshot", inspect, create=True):
+            for image, expected in zip(("fixture:first", "fixture:second"), baseline):
+                with self.subTest(image=image):
                     self.ops.commands.clear()
-                    self.deploy(image=f"fixture:release-{sequence}")
-                    inspected = [args[-1] for args in self.ops.commands if args[:2] == ["docker", "inspect"]]
-                    self.assertEqual(52, len(self.ops.commands) - len(inspected))
-                    expected = [target[role] for role in deploy.ROLES]  # preflight
-                    expected += old_serving + (new_serving if sequence else [])  # confirm before slot reuse
-                    expected += [original["background"], original["background"], target["background"]]
-                    expected += new_serving * 2  # check each port before and after reload
-                    expected += [target["serving"]] * 8  # guard polls
-                    expected += new_serving + old_serving * 2  # readiness, alias coverage and retirement
-                    self.assertEqual(expected, inspected)
+                    self.deploy(image=image)
+                    self.assertEqual(15, sum(args[:2] == ["docker", "inspect"] for args in self.ops.commands))
+                    self.assertEqual(67, len(self.ops.commands))
+                    commands = []
+                    for args in self.ops.commands:
+                        command = []
+                        for arg in args:
+                            arg = re.sub(r"(?<=-oneoff-)\d+-\d+(?=(?:-id)?$)", "FIXTURE", arg)
+                            if arg.startswith("com.sources.deploy.created="):
+                                arg = "com.sources.deploy.created=FIXED"
+                            command.append(arg.replace(str(self.tmp), "FIXTURE_DIR"))
+                        commands.append(command)
+                    digest = hashlib.sha256(json.dumps(commands, separators=(",", ":")).encode()).hexdigest()
+                    self.assertEqual(expected, digest, commands)
 
     def test_main_second_release_publishes_alias_at_create_using_baseline_commands(self):
         self.deploy()
@@ -3251,6 +3343,67 @@ class DeployTest(unittest.TestCase):
             with mock.patch.object(ops, "run", return_value=subprocess.CompletedProcess([], 0, bad_response, "")):
                 with self.assertRaisesRegex(deploy.DeployError, "state is unknown"):
                     ops.inspect("placeholder-container")
+
+    def test_main_snapshot_reads_local_docker_without_spawning_inspect(self):
+        ops = deploy.MainOps()
+        requests = []
+
+        class EngineFixture(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def address_string(self):
+                return "local"
+
+            def do_GET(self):
+                requests.append(self.path)
+                views = {
+                    "/containers/snapshot%20fixture/json": (200, {"Id": "fixture-id"}),
+                    "/containers/missing/json": (404, {"message": "No such container: missing"}),
+                    "/containers/unknown/json": (503, {"message": "fixture unavailable"}),
+                }
+                code, body = views[self.path]
+                data = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        with tempfile.TemporaryDirectory(prefix="snapshot-", dir="/tmp") as tmp:
+            path = str(Path(tmp) / "engine.sock")
+            with socketserver.UnixStreamServer(path, EngineFixture) as server:
+                worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+                worker.start()
+                try:
+                    with mock.patch.dict(os.environ, {"DOCKER_HOST": f"unix://{path}", "DOCKER_CONTEXT": ""}), \
+                            mock.patch.object(ops, "run", side_effect=AssertionError("unexpected Docker subprocess")):
+                        self.assertEqual({"Id": "fixture-id"}, ops.inspect_snapshot("snapshot fixture"))
+                        self.assertIsNone(ops.inspect_snapshot("missing"))
+                        with self.assertRaisesRegex(deploy.DeployError, "Docker state is unknown"):
+                            ops.inspect_snapshot("unknown")
+                finally:
+                    server.shutdown()
+                    worker.join()
+        self.assertEqual(["/containers/snapshot%20fixture/json", "/containers/missing/json", "/containers/unknown/json"],
+                         requests)
+
+    def test_main_snapshot_resolves_named_docker_context_and_preserves_cli_fallback(self):
+        name = "fixture-context"
+        root = self.tmp / "docker-config"
+        meta = root / "contexts" / "meta" / hashlib.sha256(name.encode()).hexdigest() / "meta.json"
+        meta.parent.mkdir(parents=True)
+        local = self.tmp / "context.sock"
+        meta.write_text(json.dumps({"Name": name, "Endpoints": {"docker": {"Host": f"unix://{local}"}}}))
+        (root / "config.json").write_text(json.dumps({"currentContext": name}))
+        ops = deploy.MainOps()
+        with mock.patch.dict(os.environ, {"DOCKER_CONFIG": str(root), "DOCKER_HOST": "", "DOCKER_CONTEXT": ""}):
+            self.assertEqual(str(local), ops.docker_socket_path())
+            os.environ["DOCKER_HOST"] = "tcp://fixture.invalid"
+            with mock.patch.object(ops, "inspect", return_value={"Id": "fixture-id"}) as inspect:
+                self.assertEqual({"Id": "fixture-id"}, ops.inspect_snapshot("fixture-container"))
+                inspect.assert_called_once_with("fixture-container")
+            os.environ["DOCKER_CONTEXT"] = name
+            self.assertEqual(str(local), ops.docker_socket_path())
 
     def test_main_accepts_an_applied_route_even_when_reload_reports_failure(self):
         run = self.ops.run
