@@ -3,17 +3,92 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+type deepSeekCancelDuringScan struct {
+	context.Context
+	cancel        context.CancelFunc
+	checks, after int
+}
+
+func (c *deepSeekCancelDuringScan) Err() error {
+	c.checks++
+	if c.checks == c.after {
+		c.cancel()
+	}
+	return c.Context.Err()
+}
+
+func TestDeepSeekChatJSONCancellationDuringScan(t *testing.T) {
+	for _, tc := range []struct{ name, value string }{
+		{"large_string", `"` + strings.Repeat("x", 8<<20) + `"`},
+		{"many_tokens", `[` + strings.Repeat(`null,`, 1<<16) + `null]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			probe := &deepSeekCancelDuringScan{Context: ctx, cancel: cancel, after: 16}
+			body := []byte(`{"metadata":` + tc.value + `}`)
+			started := time.Now()
+			err := validateDeepSeekChatJSON(probe, body)
+			require.Less(t, time.Since(started), 2*time.Second)
+			require.ErrorIs(t, err, context.Canceled)
+			require.GreaterOrEqual(t, probe.checks, probe.after)
+		})
+	}
+}
+
+func TestDeepSeekChatJSONDepthBoundary(t *testing.T) {
+	for _, array := range []bool{false, true} {
+		for _, depth := range []int{deepSeekChatJSONMaxDepth, deepSeekChatJSONMaxDepth + 1} {
+			t.Run(fmt.Sprintf("array=%t/depth=%d", array, depth), func(t *testing.T) {
+				open, close := `{"next":`, `}`
+				if array {
+					open, close = `[`, `]`
+				}
+				body := []byte(`{"metadata":` + strings.Repeat(open, depth-1) + `null` + strings.Repeat(close, depth-1) + `}`)
+				err := validateDeepSeekChatJSON(context.Background(), body)
+				if depth == deepSeekChatJSONMaxDepth {
+					require.NoError(t, err)
+				} else {
+					require.ErrorContains(t, err, "nesting")
+				}
+			})
+		}
+	}
+}
+
+func TestDeepSeekChatJSONKeepsObjectScopesAndDecodedKeys(t *testing.T) {
+	for _, tc := range []struct{ name, body, failure string }{
+		{"siblings", `{"metadata":[{"name":"lookup"},{"name":"lookup"}],"seed":123456789012345678901234567890}`, ""},
+		{"nested_scope", `{"metadata":{"nested":{"name":"lookup"},"name":"lookup","empty":{}},"array":[[],{},true,false,null]}`, ""},
+		{"escaped_duplicate", `{"metadata":[{"\u006eame":"lookup","name":"lookup"}]}`, "duplicate"},
+		{"escaped_quotes", `{"metadata":{"a\"b":null,"a\u0022b":null}}`, "duplicate"},
+		{"trailing_document", `{"metadata":null}{}`, "invalid"},
+		{"unfinished_object", `{"metadata":`, "invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateDeepSeekChatJSON(context.Background(), []byte(tc.body))
+			if tc.failure == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.failure)
+			}
+		})
+	}
+}
 
 func TestDeepSeekReviewUnknownTransportMustNotReplayWithoutTools(t *testing.T) {
 	calls := 0

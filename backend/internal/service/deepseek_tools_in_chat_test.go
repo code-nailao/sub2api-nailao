@@ -441,9 +441,16 @@ func TestDeepSeekChatReviewNestedForcedChoice(t *testing.T) {
 				enabled                         bool
 			}{
 				{"removed_web_search", `{"type":"web_search"}`, lookup, `{"type":"function","function":{"name":"web_search"}}`, `"auto"`, false},
+				{"official_search_preview", `{"type":"web_search_preview_2025_03_11"}`, lookup, `{"type":"function","function":{"name":"web_search_preview_2025_03_11"}}`, `"auto"`, false},
+				{"versioned_tool_forced_by_base_name", `{"type":"web_search_preview_2025_03_11"}`, lookup, `{"type":"function","function":{"name":"web_search"}}`, `"auto"`, false},
+				{"future_search_preview", `{"type":"web_search_preview_2099_01_01"}`, lookup, `{"type":"function","function":{"name":"web_search_preview_2099_01_01"}}`, `"auto"`, false},
+				{"future_fetch_preview", `{"type":"web_fetch_preview_2099_01_01"}`, lookup, `{"type":"function","function":{"name":"web_fetch_preview_2099_01_01"}}`, `"auto"`, false},
+				{"future_provider_search", `{"type":"deepseek_web_search_preview_future"}`, lookup, `{"type":"function","function":{"name":"deepseek_web_search_preview_future"}}`, `"auto"`, false},
+				{"future_provider_fetch", `{"type":"deepseek_read_url_preview_future"}`, lookup, `{"type":"function","function":{"name":"deepseek_read_url_preview_future"}}`, `"auto"`, false},
 				{"removed_named_web_fetch", `{"type":"web_fetch","name":"fetch_page"}`, lookup, `{"type":"function","function":{"name":"fetch_page"}}`, `"auto"`, false},
 				{"client_function", `{"type":"web_search"}`, lookup, `{"type":"function", "function":{"name":"lookup"}}`, `{"type":"function", "function":{"name":"lookup"}}`, false},
 				{"client_function_with_web_name", `{"type":"web_search"}`, `{"type":"function","function":{"name":"web_search"}}`, `{"type":"function","function":{"name":"web_search"}}`, `{"type":"function","function":{"name":"web_search"}}`, false},
+				{"versioned_tool_with_client_web_name", `{"type":"web_search_preview_2025_03_11"}`, `{"type":"function","function":{"name":"web_search"}}`, `{"type":"function","function":{"name":"web_search"}}`, `{"type":"function","function":{"name":"web_search"}}`, false},
 				{"tool_choice_none", `{"type":"web_search"}`, lookup, `"none"`, `"none"`, true},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
@@ -524,5 +531,89 @@ func TestDeepSeekChatReviewOtherProtocolsKeepDuplicateFields(t *testing.T) {
 				require.Equal(t, body, forward)
 			})
 		}
+	}
+}
+
+func TestDeepSeekChatReviewVersionedFamiliesKeepOtherProtocolBytes(t *testing.T) {
+	account := deepSeekForcedToolChoiceAccount()
+	svc := &OpenAIGatewayService{}
+	for _, protocol := range []string{"responses", "messages"} {
+		for _, typ := range []string{"web_search_preview_2025_03_11", "web_search_preview_2099_01_01", "web_fetch_preview_2099_01_01", "deepseek_web_search_preview_future", "deepseek_read_url_preview_future"} {
+			t.Run(protocol+"/"+typ, func(t *testing.T) {
+				body := []byte(fmt.Sprintf(`{"tools":[{"type":%q}],"messages":[],"input":[]}`, typ))
+				c := newDeepSeekForcedToolChoiceContext(t, "/v1/test", body)
+				c.Set("api_key", &APIKey{Group: &Group{ID: account.ID, Platform: PlatformDeepseek}})
+				result, forward, handled, err := svc.tryForwardDeepSeekTools(c.Request.Context(), c, account, body, protocol, "")
+				require.NoError(t, err)
+				require.Nil(t, result)
+				require.False(t, handled)
+				require.Equal(t, body, forward)
+			})
+		}
+	}
+}
+
+func TestDeepSeekHostedToolsRecognizeFutureSearchFamilies(t *testing.T) {
+	for _, protocol := range []string{"chat", "responses", "messages"} {
+		for _, typ := range []string{"web_search_preview_2099_01_01", "deepseek_web_search_preview_future"} {
+			t.Run(protocol+"/"+typ, func(t *testing.T) {
+				run := runDeepSeekInChat(t, protocol, map[string]any{"tools": []any{map[string]any{"type": typ}}}, nil)
+				require.True(t, run.handled)
+				require.NoError(t, run.err)
+				require.NotNil(t, run.result.DeepSeekTools)
+				require.Equal(t, 1, run.toolCalls)
+				require.Equal(t, 1, run.result.DeepSeekTools.SearchCount)
+			})
+		}
+	}
+}
+
+func TestDeepSeekChatReviewScanBounds(t *testing.T) {
+	const deadline = 2 * time.Second
+	for _, tc := range []struct {
+		name, metadata string
+		cancel         bool
+	}{
+		{"already_canceled", strings.Repeat(`{"next":`, 8000) + `"` + strings.Repeat("x", 8<<20) + `"` + strings.Repeat("}", 8000), true},
+		{"depth_limit", strings.Repeat(`{"next":`, 256) + `null` + strings.Repeat("}", 256), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"metadata":` + tc.metadata + `,"messages":[],"model":"deepseek-flash"}`)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancel {
+				cancel()
+			}
+			account := deepSeekForcedToolChoiceAccount()
+			c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
+			c.Request = c.Request.WithContext(ctx)
+			c.Set("api_key", &APIKey{Group: &Group{ID: account.ID, Platform: PlatformDeepseek}})
+			svc := &OpenAIGatewayService{}
+			type outcome struct {
+				result  *OpenAIForwardResult
+				handled bool
+				err     error
+			}
+			done := make(chan outcome, 1)
+			go func() {
+				result, _, handled, err := svc.tryForwardDeepSeekTools(ctx, c, account, body, "chat", "")
+				done <- outcome{result, handled, err}
+			}()
+			timer := time.NewTimer(deadline)
+			defer timer.Stop()
+			select {
+			case got := <-done:
+				require.Nil(t, got.result)
+				require.True(t, got.handled)
+				if tc.cancel {
+					require.ErrorIs(t, got.err, context.Canceled)
+				} else {
+					require.ErrorContains(t, got.err, "nesting")
+					require.Equal(t, http.StatusBadRequest, c.Writer.Status())
+				}
+			case <-timer.C:
+				t.Fatal("Chat JSON validation exceeded its time bound")
+			}
+		})
 	}
 }
