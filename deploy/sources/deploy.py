@@ -34,10 +34,12 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -217,6 +219,19 @@ def release_lock(path: str) -> Iterator[None]:
         yield
     finally:
         os.close(fd)
+
+
+@contextlib.contextmanager
+def finish_handoff_cleanup() -> Iterator[None]:
+    """Let an interrupted release record its failure and restore restart policy."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 # --------------------------------------------------------------------------
@@ -506,20 +521,21 @@ class Deployer:
 
         while True:
             info, removed = self.background_container(name, deadline=confirm_deadline)
+            seen_at = self.ops.monotonic()
+            if confirm_deadline is not None and seen_at >= confirm_deadline:
+                raise BackgroundExitTimeout(f"could not confirm exit of {name} within {timeout}s")
             if removed:
                 return None
             state = (info or {}).get("State") or {}
             if state.get("Running") is False and not state.get("Restarting"):
                 return int(state.get("ExitCode", 0))
-
-            seen_at = self.ops.monotonic()
-            if confirm_deadline is not None and seen_at >= confirm_deadline:
-                raise BackgroundExitTimeout(f"could not confirm exit of {name} within {timeout}s")
             at_cutoff = deadline is not None and seen_at >= deadline
             if read_runtime and (seen_at >= next_probe or (at_cutoff and not cutoff_probed)):
                 cutoff_probed = cutoff_probed or at_cutoff
                 runtime = read_runtime(confirm_deadline)
                 seen_at = self.ops.monotonic()
+                if confirm_deadline is not None and seen_at >= confirm_deadline:
+                    raise BackgroundExitTimeout(f"could not confirm exit of {name} within {timeout}s")
                 remaining = self.scheduled_backup_remaining(runtime)
                 if (allow_backup_wait and runtime is not None and remaining is None
                         and "scheduled_backup_remaining_seconds" in runtime):
@@ -727,19 +743,36 @@ class Deployer:
         self.ops.run(["cp", "-Rn", staging + "/.", self.cfg.assets_dir + "/"], mutate=True)
 
     def owner_runtime(self, view: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any] | None:
-        """Runtime of a slot's background owner, or None when it cannot be read.
-        A failed read may change how soon we retry. Only Docker's exit status
-        confirms that the old process has released ownership."""
-        try:
-            token = self.token_for(view, "background")
-            timeout = RUNTIME_STATUS_TIMEOUT_SECONDS
-            if deadline is not None:
-                timeout = min(timeout, deadline - self.ops.monotonic())
-                if timeout <= 0:
-                    return None
-            return self.runtime(view["ports"]["background"], token, timeout=timeout)
-        except Exception:  # noqa: BLE001 - read failures do not prove shutdown
+        """Read the owner status and discard replies completed after the deadline."""
+        result = None
+
+        def probe() -> None:
+            nonlocal result
+            try:
+                token = self.token_for(view, "background")
+                timeout = RUNTIME_STATUS_TIMEOUT_SECONDS
+                if deadline is not None:
+                    timeout = min(timeout, deadline - self.ops.monotonic())
+                    if timeout <= 0:
+                        return
+                result = self.runtime(view["ports"]["background"], token, timeout=timeout)
+            except Exception:  # noqa: BLE001 - read failures do not prove shutdown
+                return
+
+        if deadline is None:
+            probe()
+            return result
+
+        if self.ops.monotonic() >= deadline:
             return None
+        # urllib's socket timeout covers one I/O, not the full response. A
+        # delayed header and body must not hold up the failure handling.
+        pending = threading.Thread(target=probe, daemon=True)
+        pending.start()
+        pending.join(max(0, deadline - self.ops.monotonic()))
+        if pending.is_alive() or self.ops.monotonic() >= deadline:
+            return None
+        return result
 
     @staticmethod
     def scheduled_backup_remaining(runtime: dict[str, Any] | None) -> int | None:
@@ -852,13 +885,23 @@ class Deployer:
 
         def restore_restart_policy() -> None:
             try:
-                self.ops.run(["docker", "update", f"--restart={restart}", old], mutate=True)
-            except (DeployError, OSError, subprocess.SubprocessError) as err:
+                with finish_handoff_cleanup():
+                    try:
+                        self.ops.run(["docker", "update", f"--restart={restart}", old], mutate=True,
+                                     timeout=DOCKER_STATUS_TIMEOUT_SECONDS)
+                    except KeyboardInterrupt:
+                        # Docker may have applied the update before interruption.
+                        # Restoring the same policy again is safe.
+                        self.ops.run(["docker", "update", f"--restart={restart}", old], mutate=True,
+                                     timeout=DOCKER_STATUS_TIMEOUT_SECONDS)
+            except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
                 raise FallbackFailed(f"SIGTERM to {old} could not be confirmed and its restart policy could not be restored: {err}") from err
 
         def read_runtime(deadline: float | None) -> dict[str, Any] | None:
             nonlocal term_confirmed, before
             runtime = self.owner_runtime(current, deadline=deadline)
+            if deadline is not None and self.ops.monotonic() >= deadline:
+                return None
             # The drain endpoint can make an owner read-only without shutting
             # it down. Only the shutdown cleanup reports stopping services.
             stopping = (runtime or {}).get("stopping")
@@ -890,11 +933,15 @@ class Deployer:
                                           initial_runtime=before)
         except (BackgroundExitTimeout, KeyboardInterrupt) as err:
             if not term_confirmed:
-                # The confirmation budget is spent. Restore the policy and
-                # leave the unresolved handoff recorded without another probe.
-                restore_restart_policy()
-                raise FallbackFailed(f"could not confirm SIGTERM or exit of {old}. Its restart policy was restored. "
-                                     f"Verify that it has exited before starting {successor}.") from err
+                # Keep a failure record even if cleanup is interrupted before
+                # the outer handler can record the outcome of the update.
+                message = f"could not confirm SIGTERM or exit of {old}."
+                follow_up = f"Verify that it has exited before starting {successor}."
+                with finish_handoff_cleanup():
+                    self._record_unrestored(load_state(self.cfg), FallbackFailed(
+                        f"{message} Its restart policy may still need to be restored. {follow_up}"))
+                    restore_restart_policy()
+                    raise FallbackFailed(f"{message} Its restart policy was restored. {follow_up}") from err
             failure = err if isinstance(err, BackgroundExitTimeout) else DeployError("handoff interrupted")
             self.log(f"   {failure}. Waiting to restore the background after {old} exits.")
             # Keep the release lock until an owner can be restored or replaced.

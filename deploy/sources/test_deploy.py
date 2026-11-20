@@ -843,6 +843,110 @@ class DeployTest(unittest.TestCase):
                 self.assertEqual("unless-stopped", ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
                 self.assertNotIn(["docker", "start", successor], ops.commands)
 
+    def test_term_confirmation_rejects_runtime_response_completed_after_deadline(self):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        successor = self.cfg.container("a", "background")
+        original_run = self.ops.run
+        original_inspect = self.ops.inspect
+        original_http = self.ops.http_json
+        term_at = None
+        probes = []
+
+        def run(args, **kwargs):
+            nonlocal term_at
+            if args == ["docker", "kill", "--signal=TERM", old]:
+                term_at = self.ops.clock
+                return subprocess.CompletedProcess(args, 1, "", "signal rejected")
+            return original_run(args, **kwargs)
+
+        def inspect(name, **kwargs):
+            if name == old and term_at is not None:
+                probes.append("inspect")
+                if len(probes) == 1:
+                    self.ops.clock += 27
+                else:
+                    # Only a query started outside the deadline would see exit.
+                    self.ops.containers[old]["State"].update(Running=False, Status="exited")
+            return original_inspect(name, **kwargs)
+
+        case = self
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                case.ops.clock += 2.2
+                return b'{"draining":true,"stopping":["BackupService"]}'
+
+        def urlopen(req, timeout):
+            # Neither phase times out on its own. The full response is late.
+            self.assertGreater(timeout, 2.2)
+            self.ops.clock += 2.2
+            return Response()
+
+        def http_json(url, **kwargs):
+            if term_at is not None and url.endswith(f':{current["ports"]["background"]}/internal/sources/runtime'):
+                probes.append("runtime")
+                with mock.patch.object(deploy.urllib.request, "urlopen", urlopen):
+                    return deploy.Ops.http_json(self.ops, url, **kwargs)
+            return original_http(url, **kwargs)
+
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "inspect", inspect), \
+                mock.patch.object(self.ops, "http_json", http_json), deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "SIGTERM"):
+                self.deploy()
+        self.assertEqual(["inspect", "runtime"], probes)
+        self.assertTrue(self.state()["in_progress"]["failed"])
+        self.assertNotIn(["docker", "start", successor], self.ops.commands)
+        self.assertFalse(self.ops.switched)
+
+    def test_ctrl_c_during_restart_policy_restore_still_records_failed_handoff(self):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        successor = self.cfg.container("a", "background")
+        original_run = self.ops.run
+        original_http = self.ops.http_json
+        term_rejected = False
+        restored = 0
+
+        def run(args, **kwargs):
+            nonlocal term_rejected, restored
+            if args == ["docker", "kill", "--signal=TERM", old]:
+                term_rejected = True
+                return subprocess.CompletedProcess(args, 1, "", "signal rejected")
+            if term_rejected and args == ["docker", "update", "--restart=unless-stopped", old]:
+                restored += 1
+                if restored == 1:
+                    self.assertIn("failed", self.state()["in_progress"])
+                    raise KeyboardInterrupt
+            return original_run(args, **kwargs)
+
+        def http_json(url, **kwargs):
+            if term_rejected and url.endswith("/internal/sources/runtime"):
+                return 200, {"ready": False, "draining": True}
+            return original_http(url, **kwargs)
+
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "http_json", http_json), \
+                deploy.release_lock(self.cfg.lock_file):
+            try:
+                with self.assertRaisesRegex(deploy.FallbackFailed, "SIGTERM"):
+                    self.deploy()
+            except KeyboardInterrupt:
+                self.fail("Ctrl-C aborted failure handling before the policy and state were restored")
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertEqual(current, self.state()["current"])
+            self.assertTrue(self.state()["in_progress"]["failed"])
+        self.assertEqual(2, restored)
+        self.assertEqual("unless-stopped", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertNotIn(["docker", "start", successor], self.ops.commands)
+
     def test_failed_term_to_unready_candidate_releases_publish_lock(self):
         current = self.state()["current"]
         old = current["containers"]["background"]
