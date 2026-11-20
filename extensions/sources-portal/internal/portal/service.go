@@ -218,6 +218,13 @@ func (s *Service) Refresh(ctx context.Context, id string) (Source, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, balanceOperationTimeout)
 	defer cancel()
+	// Balance probes are read-only and can stop at process shutdown, including
+	// synchronous HTTP refreshes whose request context is still alive.
+	stop := context.AfterFunc(s.asyncCtx, cancel)
+	defer stop()
+	if s.asyncCtx.Err() != nil {
+		cancel()
+	}
 	balance, probeErr := s.Provider.Probe(ctx, rec.Source.Origin, token, rec.Source.AccountID)
 	var result Source
 	err = s.Store.change(func(rows map[string]record) error {
@@ -330,6 +337,9 @@ func (s *Service) balanceDue(src Source, now time.Time) bool {
 
 func (s *Service) Run(ctx context.Context) {
 	defer s.StopAsync()
+	// Do not wait for the intelligence worker before cancelling balance reads.
+	stop := context.AfterFunc(ctx, s.asyncCancel)
+	defer stop()
 	var workers sync.WaitGroup
 	if s.Bridge != nil {
 		workers.Add(1)

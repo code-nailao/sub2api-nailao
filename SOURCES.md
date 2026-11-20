@@ -35,6 +35,7 @@
 | 工作台 / Canvas 授权 | 内嵌会话恢复；为用户发放普通、可见、可撤销的 Key；原生“使用密钥”与“导入到 CCS”保留；登记的原生 Gemini 分组可用于工作台；管理员可在页面内在线登记原生分组；用户可用自己的 Key 建立域名固定为本站的自定义连接 | 前端挂接、Portal；[Portal 说明](extensions/sources-portal/README.md) |
 | 智商检测计划 | Portal 内的定时模型检测：管理员写、用户只读，可见性、排序、删除；兼容不限期、不限总额的 Key；Key 失效时可暂停计划 | `extensions/sources-portal` |
 | serving / 唯一后台 | 进程分为接流（serving）和后台（background）两种角色，后台唯一性由文件锁保证；正常排空；`-migrate-only` 迁移入口；管理 MCP 与 OAuth 回调归后台；后台退出时等待在途 OAuth 刷新保存；后台交接期间旧后台只读排空，停后台服务时仍应答管理读请求（写、MCP、WebSocket 升级返回 503），最后才关闭监听；探测类任务快速取消且不记假失败；启动致命错误直接写 stderr；发布用一次性命令 `-list-pending-migrations`、`-check-startup`、`-export-web-assets` | `internal/processrole`、`cmd/server/sources_*.go`；[发布与部署](docs/sources/DEPLOY.md) |
+| Portal 退出交接 | 关闭时取消只读余额查询，包括同步刷新；日志显示在途 HTTP 请求、后台等待、检测当前轮次与排空耗时；已接受的写入和已开始的检测提交或轮询保存完成后才释放状态目录文件锁，不强杀、不重放结果未知的付费请求 | `extensions/sources-portal/cmd/portal/lifecycle.go`、Portal Service；[Portal 说明](extensions/sources-portal/README.md) |
 | 日志保留归属 | 外部日志保留归属开关（默认关闭）；开启后拒绝原生用量清理；管理员统计在明细删除后仍保留汇总 | `external_log_cleanup.go`、retention 统计；开关只表示归属，不会触发删除 |
 | 备份时限与磁盘 | 备份总时限两小时，租约与截止时间隔离；完整 gzip 只生成一次，各分片按偏移直接从该文件上传，不再另存分片临时文件，避免两倍磁盘占用 | 原备份服务 |
 | 依赖安全与协议兼容 | 已登记的安全依赖升级、图片解码修复和上游兼容修复 | 核心清单中的 `dependency_security`、`image_decoder_security`、`upstream_compatibility` 标签 |
