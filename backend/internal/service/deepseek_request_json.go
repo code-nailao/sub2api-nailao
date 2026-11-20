@@ -433,10 +433,12 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 	}
 	var kept []deepSeekChatSpan
 	var removed, removedChoice, keptFunction bool
-	selectedType := choice.typ
-	if choice.typ == "tool" {
+	legacyChoice := choice.typ == "tool"
+	functionChoice := choice.typ == "function" && choice.named
+	selectedType, selectedFunctionName := choice.typ, choice.name
+	if legacyChoice {
 		// The legacy named form can select a provider type or a tool's top-level name.
-		selectedType = choice.legacyName
+		selectedType, selectedFunctionName = choice.legacyName, choice.legacyName
 		removedChoice = deepSeekProviderTool(selectedType)
 	}
 	err := p.parseArray(2, func(first json.Token, depth, offset int) error {
@@ -448,10 +450,12 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 		if family := deepSeekChatWebToolFamily(tool.typ); family != "" {
 			removed = true
 			removedChoice = removedChoice || selectedType == tool.typ || selectedType == family ||
-				(choice.typ == "tool" && selectedType != "" && selectedType == tool.legacyName)
+				(legacyChoice && selectedType != "" && selectedType == tool.legacyName)
 			return nil
 		}
-		keptFunction = keptFunction || (tool.typ == "function" && tool.named && tool.name == choice.name)
+		if (legacyChoice || functionChoice) && tool.typ == "function" && tool.named && tool.name == selectedFunctionName {
+			keptFunction = true
+		}
 		start := tokenEnd - 1
 		if _, container := first.(json.Delim); !container {
 			// A scalar entry is outside the tool schema, but is kept verbatim.
@@ -491,7 +495,8 @@ func filterDeepSeekChatWebTools(ctx context.Context, body []byte, top deepSeekCh
 		edits, removedFields = removeDeepSeekChatToolFields(top)
 	} else {
 		edits = append(edits, deepSeekChatEdit{span: top.tools.value, tools: kept})
-		if removedChoice || (choice.typ == "function" && choice.named && !keptFunction) {
+		// A retained function takes priority over a matching removed tool name.
+		if !keptFunction && (removedChoice || functionChoice) {
 			edits = append(edits, deepSeekChatEdit{span: top.choice.value, replacement: `"auto"`})
 		}
 	}

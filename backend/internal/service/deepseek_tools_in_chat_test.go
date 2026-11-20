@@ -333,6 +333,8 @@ func runDeepSeekOrdinaryChat(t *testing.T, body []byte, enabled bool) deepSeekOr
 
 func TestDeepSeekChatFiltersDisabledGroup(t *testing.T) {
 	const lookup = `{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}`
+	const namedSearch = `{"type":"function","function":{"name":"deepseek_web_search"}}`
+	const legacySearchChoice = `{"type":"tool", "name":"deepseek_web_search"}`
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
 			ordinary := runDeepSeekOrdinaryChat(t, []byte(fmt.Sprintf(`{"model":"deepseek-flash","messages":[],"stream":%t}`, stream)), false)
@@ -350,6 +352,8 @@ func TestDeepSeekChatFiltersDisabledGroup(t *testing.T) {
 				{"legacy_named_choice", `{"type":"deepseek_web_search"},` + lookup, `{"type":"tool","name":"deepseek_web_search"}`, `[` + lookup + `]`, `"auto"`},
 				{"legacy_named_alias", `{"type":"deepseek_web_search","name":"search_alias"},` + lookup, `{"type":"tool","name":"search_alias"}`, `[` + lookup + `]`, `"auto"`},
 				{"legacy_choice_of_retained_tool", `{"type":"deepseek_web_search"},` + lookup, `{"type":"tool","name":"lookup"}`, `[` + lookup + `]`, `{"type":"tool","name":"lookup"}`},
+				{"legacy_kept_function_named_after_provider_tool", `{"type":"web_fetch"},` + namedSearch, legacySearchChoice, `[` + namedSearch + `]`, legacySearchChoice},
+				{"legacy_kept_function_named_after_removed_alias", `{"type":"web_fetch","name":"lookup"},` + lookup, `{"type":"tool","name":"lookup"}`, `[` + lookup + `]`, `{"type":"tool","name":"lookup"}`},
 				{"choice_by_family", `{"type":"web_search_preview_future"},` + lookup, `{"type":"web_search"}`, `[` + lookup + `]`, `"auto"`},
 				{"removed_function_choice", `{"type":"web_fetch"},` + lookup, `{"type":"function","function":{"name":"missing"}}`, `[` + lookup + `]`, `"auto"`},
 				{"retained_function_choice", `{"type":"web_search"},{"type":"function","function":{"name":"web_search"}}`, `{"type":"function", "function":{"name":"web_search"}}`, `[{"type":"function","function":{"name":"web_search"}}]`, `{"type":"function", "function":{"name":"web_search"}}`},
@@ -603,6 +607,35 @@ func TestDeepSeekChatFilterScanBounds(t *testing.T) {
 			case <-timer.C:
 				t.Fatal("Chat JSON validation exceeded its time bound")
 			}
+		})
+	}
+}
+
+func TestDeepSeekChatFilterPreservesContextError(t *testing.T) {
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if cause == context.DeadlineExceeded {
+				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			} else {
+				ctx, cancel = context.WithCancel(context.Background())
+				cancel()
+			}
+			defer cancel()
+
+			body := []byte(`{"model":"deepseek-flash","messages":[],"tools":[{"type":"web_search"}]}`)
+			account := deepSeekForcedToolChoiceAccount()
+			c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
+			c.Request = c.Request.WithContext(ctx)
+			c.Set("api_key", &APIKey{Group: &Group{Platform: PlatformDeepseek}})
+			svc := &OpenAIGatewayService{}
+			result, err := svc.ForwardAsChatCompletions(ctx, c, account, body, "", "")
+			require.Nil(t, result)
+			require.ErrorIs(t, err, cause)
+			require.EqualError(t, err, cause.Error())
+			require.False(t, c.Writer.Written())
+			require.ErrorIs(t, err, ErrDeepSeekChatToolValidation)
 		})
 	}
 }
