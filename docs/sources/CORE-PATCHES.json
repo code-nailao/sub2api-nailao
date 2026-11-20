@@ -2300,8 +2300,8 @@
         "scheduled_backup_handoff",
         "backup_connection_credentials"
       ],
-      "sha256": "8d6365481af3dcb45a424639cdf5634ba77408ad401e0170d72d25afd2b8ea29",
-      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Lets admitted scheduled backup creation keep its own deadline during shutdown, while retention cleanup remains cancellable under the original shutdown grace period. Reuses a saved S3 secret for connection tests when the configured endpoint, region, bucket and access key match. The addressing mode can change. An optional trailing slash matches at the root or in path-style addressing. A non-empty virtual-hosted path must match verbatim."
+      "sha256": "203e9172b3e003cc5c8083b921ad3ef0fb4c3b0fce8c2ab00357b9ba39ef1889",
+      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Lets admitted scheduled backup creation keep its own deadline during shutdown, while retention cleanup remains cancellable under the original shutdown grace period. Reuses a saved S3 secret for connection tests when the configured endpoint, region and access key match. A bucket change is allowed when both configurations use path-style addressing. The addressing mode can change. An optional trailing slash matches at the root or in path-style addressing. A non-empty virtual-hosted path must match verbatim."
     },
     {
       "path": "backend/internal/service/backup_service_test.go",
@@ -2310,8 +2310,8 @@
         "backup_bounded_disk",
         "backup_connection_credentials"
       ],
-      "sha256": "011ac7aad988073c129c0023e09171ddff26812afa19dc7b5f537a8e69905c0b",
-      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Tests for this behaviour. Covers saved-secret reuse for either addressing mode at the saved S3 target and rejects reuse across endpoint, region, bucket or access key changes. Uses the S3 SDK with an in-memory transport to verify the signed request paths in both addressing modes, including refusal to reuse secrets if a slash changes the virtual-hosted path."
+      "sha256": "a1136a060d0004c39cbe6dd0bb4363ea788fc2ed412842aa7f4456e486360657",
+      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Tests for this behaviour. Covers saved-secret reuse for either addressing mode at the saved S3 target and for bucket changes in path style. Rejects endpoint, region, access key and virtual-hosted bucket changes. Uses the S3 SDK with an in-memory transport to verify the signed request paths in both addressing modes, including refusal to reuse secrets if a slash changes the virtual-hosted path."
     },
     {
       "path": "backend/internal/service/backup_shutdown_test.go",

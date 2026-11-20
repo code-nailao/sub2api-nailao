@@ -65,7 +65,7 @@ HANDOFF_POLL_SECONDS = 0.5
 HANDOFF_FIRST_NOTE_SECONDS = 5
 HANDOFF_TERM_CONFIRM_SECONDS = 30
 HANDOFF_RECOVERY_SECONDS = 30
-# Reserve part of recovery for restoring the policy even if exit stays unknown.
+# Reserve time to record failure and restore the policy if exit is still unknown.
 HANDOFF_RECOVERY_CLEANUP_SECONDS = 5
 DOCKER_STATUS_TIMEOUT_SECONDS = 30
 RUNTIME_STATUS_TIMEOUT_SECONDS = 5
@@ -85,6 +85,10 @@ class FallbackFailed(DeployError):
 class BackgroundRestored(DeployError):
     """The handoff failed, and the original background is ready again."""
 
+    def __init__(self, message: str, *, deadline: float | None = None):
+        super().__init__(message)
+        self.deadline = deadline
+
 
 class BackgroundExitTimeout(DeployError):
     def __init__(self, name: str, deadline: float):
@@ -96,6 +100,19 @@ class BackgroundExitTimeout(DeployError):
 class BackgroundExit:
     code: int | None  # None only when Docker confirmed container removal
     timed_out_at: float | None = None
+
+
+@dataclass(frozen=True)
+class BackgroundRecovery:
+    deadline: float
+    failure_recorded: bool = False
+
+    @property
+    def work_until(self) -> float:
+        # Once the failure is durable, a late exit can use the remaining time.
+        if self.failure_recorded:
+            return self.deadline
+        return self.deadline - HANDOFF_RECOVERY_CLEANUP_SECONDS
 
 
 # --------------------------------------------------------------------------
@@ -866,13 +883,18 @@ class Deployer:
                                 poll=HANDOFF_POLL_SECONDS, deadline=deadline)
 
     def restore_background(self, current: dict[str, Any], failed: DeployError, *, restart: str,
-                           deadline: float | None = None) -> NoReturn:
+                           recovery: BackgroundRecovery | None = None) -> NoReturn:
         old = current["containers"]["background"]
         try:
-            self.start_background(current, restart=restart, deadline=deadline)
+            self.start_background(current, restart=restart, deadline=recovery.work_until if recovery else None)
         except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as restore_err:
-            raise FallbackFailed(f"background handoff failed ({failed}); could not restart {old}: {restore_err}") from restore_err
-        raise BackgroundRestored(f"background handoff failed ({failed}); previous background {old} is running again") from failed
+            error = FallbackFailed(f"background handoff failed ({failed}); could not restart {old}: {restore_err}")
+            if recovery is not None and not self.ops.dry_run:
+                # Persist failure before the caller checks for container removal.
+                self._record_unrestored(load_state(self.cfg), error)
+            raise error from restore_err
+        raise BackgroundRestored(f"background handoff failed ({failed}); previous background {old} is running again",
+                                 deadline=recovery.deadline if recovery else None) from failed
 
     def handoff_background(self, current: dict[str, Any], target: Target, create: bool,
                            back: bool = False) -> None:
@@ -894,34 +916,34 @@ class Deployer:
         # Protect the transition before changing the restart policy or sending
         # TERM. Installing the handler after a timeout leaves a signal gap.
         with finish_handoff_cleanup() as interrupted:
-            recovery_deadline = None
+            recovery = None
             if old_info is not None:
-                recovery_deadline = self.drain_background(current, old_info, before, successor=new, back=back,
-                                                          interrupted=interrupted)
+                recovery = self.drain_background(current, old_info, before, successor=new, back=back,
+                                                 interrupted=interrupted)
             else:
                 self.log(f"   {old} is absent. Starting the prepared background {new}.")
             try:
-                self.start_background(view, deadline=recovery_deadline)
+                self.start_background(view, deadline=recovery.work_until if recovery else None)
             except (DeployError, OSError, subprocess.SubprocessError) as err:
-                if recovery_deadline is not None:
+                if recovery is not None:
                     raise FallbackFailed(f"could not make {new} ready during background recovery: {err}") from err
                 self.log(f"   new background failed: {err}. Restoring {old} once {new} exits.")
                 new_info, new_removed = self.background_container(new)
                 if new_info is not None:
                     try:
-                        recovery_deadline = self.drain_background(view, new_info, self.owner_runtime(view), successor=old,
-                                                                  back=True, interrupted=interrupted)
+                        recovery = self.drain_background(view, new_info, self.owner_runtime(view), successor=old,
+                                                         back=True, interrupted=interrupted)
                     except (DeployError, OSError, subprocess.SubprocessError) as stop_err:
                         raise FallbackFailed(f"new background {new} did not become ready ({err}). "
                                              f"Could not finish stopping it before restoring {old}: {stop_err}") from stop_err
                 elif not new_removed:
                     raise FallbackFailed(f"could not confirm the state of new background {new} before restoring {old}") from err
                 self.restore_background(current, DeployError(f"new background did not become ready: {err}"),
-                                        restart=self.background_restart_policy(old_info), deadline=recovery_deadline)
+                                        restart=self.background_restart_policy(old_info), recovery=recovery)
 
     def drain_background(self, current: dict[str, Any], old_info: dict[str, Any],
                          before: dict[str, Any] | None, successor: str, back: bool,
-                         interrupted: Callable[[], bool]) -> float | None:
+                         interrupted: Callable[[], bool]) -> BackgroundRecovery | None:
         old = current["containers"]["background"]
         restart = self.background_restart_policy(old_info)
 
@@ -1015,7 +1037,7 @@ class Deployer:
                                   first_note=HANDOFF_FIRST_NOTE_SECONDS, read_runtime=read_runtime, initial_runtime=before)
 
         failure = None
-        recovery_deadline = None
+        recovery = None
         try:
             if term_confirmed:
                 exited = wait_for_drain()
@@ -1039,37 +1061,40 @@ class Deployer:
                 failure = DeployError("handoff interrupted")
                 interrupted_at = self.ops.monotonic()
                 cutoff = min(normal_deadline, interrupted_at) if normal_deadline is not None else interrupted_at
-            recovery_deadline = cutoff + HANDOFF_RECOVERY_SECONDS
+            recovery = BackgroundRecovery(cutoff + HANDOFF_RECOVERY_SECONDS)
             self.log(f"   {failure}. Trying to restore the background within the recovery window.")
             try:
-                exited = self.wait_recovery_exit(old, recovery_deadline - HANDOFF_RECOVERY_CLEANUP_SECONDS)
+                exited = self.wait_recovery_exit(old, recovery.work_until)
             except BackgroundExitTimeout:
                 unresolved = restore_policy_after_timeout(f"could not confirm exit of {old} after the handoff and recovery waits.",
-                                                          deadline=recovery_deadline)
+                                                          deadline=recovery.deadline)
                 # A fast policy update leaves time to catch an exit near the
                 # end of recovery. The update and final poll share the deadline.
+                recovery = BackgroundRecovery(recovery.deadline, failure_recorded=True)
                 try:
-                    exited = self.wait_recovery_exit(old, recovery_deadline)
+                    exited = self.wait_recovery_exit(old, recovery.deadline)
                 except BackgroundExitTimeout as cleanup_err:
                     raise unresolved from cleanup_err
         if exited.timed_out_at is not None:
             failure = BackgroundExitTimeout(old, exited.timed_out_at)
-            recovery_deadline = exited.timed_out_at + HANDOFF_RECOVERY_SECONDS
+            recovery = BackgroundRecovery(exited.timed_out_at + HANDOFF_RECOVERY_SECONDS)
         code = exited.code
         if not back and code is not None and (failure is not None or interrupted()):
             try:
                 self.restore_background(current, failure or DeployError("handoff interrupted"), restart=restart,
-                                        deadline=recovery_deadline)
+                                        recovery=recovery)
             except FallbackFailed:
-                _, removed = self.background_container(old, deadline=recovery_deadline)
+                _, removed = self.background_container(old, deadline=recovery.deadline if recovery else None)
                 if not removed:
                     raise
+                if recovery is not None:
+                    recovery = BackgroundRecovery(recovery.deadline, failure_recorded=True)
                 code = None
         if code is None:
             self.log(f"   {old} was removed. Starting the prepared background {successor}.")
         else:
             self.log(f"   {old} exited with code {code}")
-        return recovery_deadline
+        return recovery
 
     def guard(self, target: Target, previous: dict[str, Any]) -> None:
         name = target.containers["serving"]
@@ -1334,10 +1359,7 @@ class Deployer:
             save_state(self.cfg, state)
 
     def _abort(self, state: dict[str, Any], target: Target, err: DeployError) -> None:
-        """Every failure path leaves the previous release serving traffic and
-        owning the background (the step restores it before raising). Before
-        traffic moved, remove the new serving containers; after a guard
-        failure they are stopped and kept for inspection."""
+        """Record failed recovery or clean up after the previous release is ready."""
         step = (state.get("in_progress") or {}).get("step")
         if self.ops.dry_run:
             self.log(f"FAILED: {err}")
@@ -1349,8 +1371,26 @@ class Deployer:
             self.log(f"FAILED AND NOT RESTORED: {err}")
             return
         if step in (None, "migrate", "start serving", "background handoff", "switch"):
-            for role in SERVING_ROLES:
-                self.ops.run(["docker", "rm", "-f", target.containers[role]], mutate=True, check=False)
+            deadline = err.deadline if isinstance(err, BackgroundRestored) else None
+            protect = finish_handoff_cleanup(ignore=True) if deadline is not None else contextlib.nullcontext()
+            with protect:
+                try:
+                    for role in SERVING_ROLES:
+                        name = target.containers[role]
+                        result = self.ops.run(["docker", "rm", "-f", name], mutate=True, check=False,
+                                              timeout=self.recovery_timeout(deadline, 600))
+                        if deadline is not None and result.returncode:
+                            timeout = self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS)
+                            if not self.ops.container_missing(name, timeout=timeout):
+                                raise DeployError(f"could not remove {name} (exit {result.returncode})")
+                except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as cleanup_err:
+                    if deadline is None:
+                        raise
+                    failure = FallbackFailed(f"{err}. Incomplete serving cleanup: {cleanup_err}. "
+                                             "Check the target slot before clearing in_progress.")
+                    self._record_unrestored(state, failure)
+                    self.log(f"FAILED: {failure}")
+                    return
         state["in_progress"] = None
         save_state(self.cfg, state)
         self.log(f"FAILED: {err}")

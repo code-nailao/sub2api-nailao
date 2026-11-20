@@ -473,13 +473,13 @@ func sameBackupS3Endpoint(a, b string, forcePathStyle bool) bool {
 }
 
 func (s *BackupService) TestS3Connection(ctx context.Context, cfg BackupS3Config) error {
-	// Reuse the saved secret for the same configured endpoint, bucket, region
-	// and access key. This lets admins test either addressing mode for it.
+	// Changing the bucket in path style keeps the request on the same host.
+	// Virtual-host addressing puts the bucket in the host name.
 	if cfg.SecretAccessKey == "" {
 		old, _ := s.loadS3Config(ctx)
-		if old != nil && sameBackupS3Endpoint(old.Endpoint, cfg.Endpoint, cfg.ForcePathStyle) && old.Bucket == cfg.Bucket &&
-			cmp.Or(old.Region, "auto") == cmp.Or(cfg.Region, "auto") &&
-			old.AccessKeyID == cfg.AccessKeyID {
+		if old != nil && sameBackupS3Endpoint(old.Endpoint, cfg.Endpoint, cfg.ForcePathStyle) &&
+			cmp.Or(old.Region, "auto") == cmp.Or(cfg.Region, "auto") && old.AccessKeyID == cfg.AccessKeyID &&
+			(old.Bucket == cfg.Bucket || (old.ForcePathStyle && cfg.ForcePathStyle)) {
 			cfg.SecretAccessKey = old.SecretAccessKey
 		}
 	}

@@ -57,7 +57,7 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 
 如果某次运行没有走完（`status` 里 `in_progress` 不为空），下一次 `main` 会拒绝执行。先用 `status` 和 `docker ps` 看清现场，处理完后再把 `state.json` 的 `in_progress` 清空。`FAILED AND NOT RESTORED` 时原因写在 `in_progress.failed`；`status` 里的 `restart_policy` 可用来确认容器的重启策略。
 
-常规排空、备份延长和恢复等待期间，Docker 的 `inspect` 和容器列表查询共用当前期限。超过 `background_exit_timeout` 和适用的备份等待期后，状态查询、退出确认、恢复重启策略和启动后台共用一个 30 秒恢复窗口。备份状态读不到时在窗口内重试。切流前若确认旧后台退出，就按原重启策略恢复当前槽位。若 Docker 确认旧容器已被移除，则继续交接给已准备好的目标后台。到期仍无法恢复时，工具保留失败记录并释放发布锁。详见 [发布与部署](../../docs/sources/DEPLOY.md)。
+常规排空、备份延长和恢复等待期间，Docker 的 `inspect` 和容器列表查询共用当前期限。超过 `background_exit_timeout` 和适用的备份等待期后，状态查询、退出确认、恢复后台和清理新 serving 共用一个 30 秒恢复窗口。备份状态读不到时在窗口内重试。切流前若确认旧后台退出，就按原重启策略恢复当前槽位。若 Docker 确认旧容器已被移除，则继续交接给已准备好的目标后台。恢复就绪检查为写失败记录预留最后 5 秒。后台恢复后，serving 清理用尽剩余时间时也会留下失败记录并释放发布锁。详见 [发布与部署](../../docs/sources/DEPLOY.md)。
 
 ## 首次接入
 

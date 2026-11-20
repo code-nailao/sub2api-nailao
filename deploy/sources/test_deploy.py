@@ -839,7 +839,7 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(1, len(update_timeouts))
         self.assertGreater(update_timeouts[0], 0)
 
-    def test_recovered_owner_readiness_uses_remaining_recovery_time(self):
+    def test_recovered_owner_readiness_preserves_time_to_record_failure(self):
         current = self.state()["current"]
         old = current["containers"]["background"]
         self.cfg.background_exit_timeout = 2
@@ -847,7 +847,9 @@ class DeployTest(unittest.TestCase):
         self.ops.drain_seconds[old] = 8
         self.ops.unready_ports.add(current["ports"]["background"])
         original_run = self.ops.run
+        original_save_state = deploy.save_state
         term_at = None
+        failure_times = []
 
         def run(args, **kwargs):
             nonlocal term_at
@@ -855,7 +857,13 @@ class DeployTest(unittest.TestCase):
                 term_at = self.ops.clock
             return original_run(args, **kwargs)
 
-        with mock.patch.object(self.ops, "run", run), deploy.release_lock(self.cfg.lock_file):
+        def save_state(cfg, state):
+            if (state.get("in_progress") or {}).get("failed"):
+                failure_times.append(self.ops.clock - term_at)
+            original_save_state(cfg, state)
+
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(deploy, "save_state", save_state), \
+                deploy.release_lock(self.cfg.lock_file):
             with self.assertRaisesRegex(deploy.FallbackFailed, "could not restart"):
                 self.deploy()
         with deploy.release_lock(self.cfg.lock_file):
@@ -863,7 +871,54 @@ class DeployTest(unittest.TestCase):
             self.assertIn("recovery deadline", self.state()["in_progress"]["failed"])
         self.assertIn(["docker", "start", old], self.ops.commands)
         self.assertFalse(self.ops.switched)
+        self.assertLess(failure_times[0], 27.5, "the readiness check consumed the failure reserve")
         self.assertLess(self.ops.clock - term_at, 33)
+
+    def test_late_background_recovery_bounds_serving_cleanup(self):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        target_serving = [self.cfg.container("a", role) for role in deploy.SERVING_ROLES]
+        self.cfg.background_exit_timeout = 2
+        self.ops.drain_seconds[old] = 30.5
+        original_run = self.ops.run
+        original_http = self.ops.http_json
+        term_at = None
+        restarted = False
+        cleanup_attempts = []
+
+        def run(args, **kwargs):
+            nonlocal term_at, restarted
+            if args == ["docker", "kill", "--signal=TERM", old]:
+                term_at = self.ops.clock
+            if args == ["docker", "start", old]:
+                restarted = True
+            if restarted and args[:3] == ["docker", "rm", "-f"] and args[-1] in target_serving:
+                cleanup_attempts.append(args[-1])
+                if args[-1] == target_serving[0]:
+                    timeout = kwargs.get("timeout", 600)
+                    self.ops.clock += min(5, timeout)
+                    if timeout < 5:
+                        raise subprocess.TimeoutExpired(args, timeout)
+            return original_run(args, **kwargs)
+
+        def http_json(url, **kwargs):
+            status, body = original_http(url, **kwargs)
+            if term_at is not None and isinstance(body, dict) and body.get("role") == "background" and body.get("draining"):
+                return 0, None
+            return status, body
+
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "http_json", http_json), \
+                deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaises(deploy.BackgroundRestored):
+                self.deploy()
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertLess(self.ops.clock - term_at, 33, "serving cleanup outlasted background recovery")
+            self.assertEqual(current, self.state()["current"])
+            failure = self.state()["in_progress"]["failed"]
+            self.assertIn("serving cleanup", failure)
+        self.assertEqual(target_serving[:1], cleanup_attempts)
+        self.assertTrue(self.ops.containers[old]["State"]["Running"])
+        self.assertFalse(self.ops.switched)
 
     def test_sigint_to_restart_clients_does_not_abandon_old_background(self):
         current = self.state()["current"]
