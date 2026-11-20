@@ -1036,7 +1036,8 @@ class Deployer:
             self._record_unrestored(state, err)
             self.log(f"FAILED AND NOT RESTORED: {err}")
             return
-        if step in (None, "migrate", "start serving", "background handoff", "switch"):
+        # Before "start serving", the target slot may still hold the rollback containers.
+        if step in ("start serving", "background handoff", "switch"):
             for role in SERVING_ROLES:
                 self.ops.run(["docker", "rm", "-f", target.containers[role]], mutate=True, check=False)
         state["in_progress"] = None

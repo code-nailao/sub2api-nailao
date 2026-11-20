@@ -459,6 +459,80 @@ class DeployTest(unittest.TestCase):
                         "a crash must not wait for the whole readiness timeout")
         self.assertTrue(self.ops.containers["old-bg"]["State"]["Running"])
 
+    def test_rejected_upstream_file_restores_previous_file_state(self):
+        # FakeOps is the filesystem here. The host path never has an old file.
+        path = self.cfg.upstream_file = str(self.tmp / "upstreams.conf")
+        self.ops.nginx_test_rc = 1
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        for previous in ("previous config\n", None):
+            with self.subTest(had_file=previous is not None):
+                if previous is None:
+                    self.ops.files.pop(path, None)
+                else:
+                    self.ops.files[path] = previous
+                with self.assertRaisesRegex(deploy.DeployError, "nginx -t rejected"):
+                    deployer.install_upstreams("candidate config\n")
+                self.assertEqual(previous, self.ops.files.get(path))
+                self.assertFalse(self.ops.switched)
+
+    def test_migration_command_timeout_clears_progress_and_records_failure(self):
+        previous = {**self.cfg.slot_view("a"), "image": "previous@sha256:1"}
+        deploy.save_state(self.cfg, {**self.state(), "previous": previous})
+        for role, name in previous["containers"].items():
+            self.ops.add(name, previous["ports"][role], running=False)
+        run = self.ops.run
+
+        def timeout_migration(args, **kwargs):
+            if (args[:3] == ["docker", "start", "--attach"]
+                    and self.ops.containers[args[-1]]["cmd"][0] == "-migrate-only"):
+                with mock.patch.object(deploy.subprocess, "run",
+                                       side_effect=subprocess.TimeoutExpired(args, kwargs["timeout"])):
+                    return deploy.Ops.run(self.ops, args, **kwargs)
+            return run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "run", side_effect=timeout_migration):
+            with self.assertRaisesRegex(deploy.DeployError, "timed out"):
+                self.deploy()
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual(LEGACY, self.state()["current"])
+        self.assertEqual(previous, self.state()["previous"])
+        self.assertTrue(set(previous["containers"].values()) <= self.ops.containers.keys())
+        self.assertFalse(any("oneoff" in name for name in self.ops.containers))
+        record, = self.history()
+        self.assertEqual("failed", record["result"])
+        self.assertIn("timed out", record["error"])
+
+    def test_reload_timeout_keeps_candidates_when_routing_is_unconfirmed(self):
+        run = self.ops.run
+
+        def timeout_after_reload(args, **kwargs):
+            result = run(args, **kwargs)
+            if args == [self.cfg.nginx_bin, "-s", "reload"]:
+                with mock.patch.object(deploy.subprocess, "run",
+                                       side_effect=subprocess.TimeoutExpired(args, 600)):
+                    return deploy.Ops.run(self.ops, args, **kwargs)
+            return result
+
+        with mock.patch.object(self.ops, "run", side_effect=timeout_after_reload):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "routing is unconfirmed"):
+                self.deploy()
+        self.assertTrue(self.ops.switched)
+        for name in self.cfg.slot_view("a")["containers"].values():
+            self.assertTrue(self.ops.containers[name]["State"]["Running"])
+        self.assertEqual("switch", self.state()["in_progress"]["step"])
+        self.assertIn("routing is unconfirmed", self.state()["in_progress"]["failed"])
+        self.assertEqual("failed", self.history()[-1]["result"])
+
+    def test_failed_handoff_restores_previous_background_retry_limit(self):
+        old = LEGACY["containers"]["background"]
+        self.ops.containers[old]["HostConfig"]["RestartPolicy"] = {"Name": "on-failure", "MaximumRetryCount": 3}
+        self.ops.unready_ports.add(self.cfg.slots["a"]["background"])
+        with self.assertRaisesRegex(deploy.DeployError, "is running again"):
+            self.deploy()
+        updates = [cmd[2] for cmd in self.ops.commands if cmd[:2] == ["docker", "update"] and cmd[-1] == old]
+        self.assertEqual(["--restart=no", "--restart=on-failure:3"], updates)
+        self.assertTrue(self.ops.containers[old]["State"]["Running"])
+
     def test_nginx_test_failure_hands_background_back(self):
         self.ops.nginx_test_rc = 1
         with self.assertRaises(deploy.DeployError) as ctx:
@@ -794,74 +868,6 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(["active_http"], reasons["old-serving"])
         self.assertEqual(["memory"], reasons["old-bg"])
         self.assertNotIn("old-spare", reasons)
-
-    def test_rejected_upstream_file_restores_previous_file_state(self):
-        # FakeOps is the filesystem here. The host path never has an old file.
-        path = self.cfg.upstream_file = str(self.tmp / "upstreams.conf")
-        self.ops.nginx_test_rc = 1
-        deployer = deploy.Deployer(self.cfg, self.ops)
-        for previous in ("previous config\n", None):
-            with self.subTest(had_file=previous is not None):
-                if previous is None:
-                    self.ops.files.pop(path, None)
-                else:
-                    self.ops.files[path] = previous
-                with self.assertRaisesRegex(deploy.DeployError, "nginx -t rejected"):
-                    deployer.install_upstreams("candidate config\n")
-                self.assertEqual(previous, self.ops.files.get(path))
-                self.assertFalse(self.ops.switched)
-
-    def test_migration_command_timeout_clears_progress_and_records_failure(self):
-        run = self.ops.run
-
-        def timeout_migration(args, **kwargs):
-            if (args[:3] == ["docker", "start", "--attach"]
-                    and self.ops.containers[args[-1]]["cmd"][0] == "-migrate-only"):
-                with mock.patch.object(deploy.subprocess, "run",
-                                       side_effect=subprocess.TimeoutExpired(args, kwargs["timeout"])):
-                    return deploy.Ops.run(self.ops, args, **kwargs)
-            return run(args, **kwargs)
-
-        with mock.patch.object(self.ops, "run", side_effect=timeout_migration):
-            with self.assertRaisesRegex(deploy.DeployError, "timed out"):
-                self.deploy()
-        self.assertIsNone(self.state()["in_progress"])
-        self.assertEqual(LEGACY, self.state()["current"])
-        self.assertFalse(any("oneoff" in name for name in self.ops.containers))
-        record, = self.history()
-        self.assertEqual("failed", record["result"])
-        self.assertIn("timed out", record["error"])
-
-    def test_reload_timeout_keeps_candidates_when_routing_is_unconfirmed(self):
-        run = self.ops.run
-
-        def timeout_after_reload(args, **kwargs):
-            result = run(args, **kwargs)
-            if args == [self.cfg.nginx_bin, "-s", "reload"]:
-                with mock.patch.object(deploy.subprocess, "run",
-                                       side_effect=subprocess.TimeoutExpired(args, 600)):
-                    return deploy.Ops.run(self.ops, args, **kwargs)
-            return result
-
-        with mock.patch.object(self.ops, "run", side_effect=timeout_after_reload):
-            with self.assertRaisesRegex(deploy.FallbackFailed, "routing is unconfirmed"):
-                self.deploy()
-        self.assertTrue(self.ops.switched)
-        for name in self.cfg.slot_view("a")["containers"].values():
-            self.assertTrue(self.ops.containers[name]["State"]["Running"])
-        self.assertEqual("switch", self.state()["in_progress"]["step"])
-        self.assertIn("routing is unconfirmed", self.state()["in_progress"]["failed"])
-        self.assertEqual("failed", self.history()[-1]["result"])
-
-    def test_failed_handoff_restores_previous_background_retry_limit(self):
-        old = LEGACY["containers"]["background"]
-        self.ops.containers[old]["HostConfig"]["RestartPolicy"] = {"Name": "on-failure", "MaximumRetryCount": 3}
-        self.ops.unready_ports.add(self.cfg.slots["a"]["background"])
-        with self.assertRaisesRegex(deploy.DeployError, "is running again"):
-            self.deploy()
-        updates = [cmd[2] for cmd in self.ops.commands if cmd[:2] == ["docker", "update"] and cmd[-1] == old]
-        self.assertEqual(["--restart=no", "--restart=on-failure:3"], updates)
-        self.assertTrue(self.ops.containers[old]["State"]["Running"])
 
     def test_adopt_writes_config_and_never_logs_secrets(self):
         ops = FakeOps(self.tmp)
