@@ -85,8 +85,8 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 			changed = changed || !call.adjacent
 		default:
 			changed = true
+			call.alternatives = append(call.alternatives, message)
 			if call.reused {
-				call.alternatives = append(call.alternatives, message)
 				competingIDs[call.id] = true
 			}
 		}
@@ -95,7 +95,7 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 		return body, ctx.Err()
 	}
 
-	previousResults := make(map[deepSeekToolResultIdentity]struct{})
+	seenCandidates := make(map[deepSeekToolResultIdentity]struct{})
 	for i := range messages {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -108,7 +108,7 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 				}
 			}
 			if call.result != nil && competingIDs[call.id] {
-				if err := call.preferNewResult(ctx, body, previousResults); err != nil {
+				if err := call.preferNewResult(ctx, body, seenCandidates); err != nil {
 					return nil, err
 				}
 			}
@@ -138,24 +138,24 @@ func deepSeekToolResultKey(body []byte, result *deepSeekToolHistoryMessage) deep
 	return key
 }
 
-// Only break a tie between candidates. A sole result can legitimately repeat
-// the content of a previous call, and ties retain the first candidate.
-func (call *deepSeekToolHistoryCall) preferNewResult(ctx context.Context, body []byte, previous map[deepSeekToolResultIdentity]struct{}) error {
-	key := deepSeekToolResultKey(body, call.result)
-	if _, seen := previous[key]; seen {
-		for _, candidate := range call.alternatives {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			candidateKey := deepSeekToolResultKey(body, candidate)
-			if _, seen := previous[candidateKey]; !seen {
-				call.result = candidate
-				key = candidateKey
-				break
-			}
+// Prefer the first candidate with content absent from earlier occurrences,
+// falling back to the first candidate when all content was seen. Record even
+// the discarded candidates for later occurrences.
+func (call *deepSeekToolHistoryCall) preferNewResult(ctx context.Context, body []byte, seenCandidates map[deepSeekToolResultIdentity]struct{}) error {
+	firstKey := deepSeekToolResultKey(body, call.result)
+	_, preferredSeen := seenCandidates[firstKey]
+	seenCandidates[firstKey] = struct{}{}
+	for _, candidate := range call.alternatives {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+		key := deepSeekToolResultKey(body, candidate)
+		if _, seen := seenCandidates[key]; preferredSeen && !seen {
+			call.result = candidate
+			preferredSeen = false
+		}
+		seenCandidates[key] = struct{}{}
 	}
-	previous[key] = struct{}{}
 	return nil
 }
 

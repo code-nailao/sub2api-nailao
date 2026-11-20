@@ -2529,16 +2529,16 @@
       "features": [
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Repairs native DeepSeek Chat tool history. Matches reused IDs within each call occurrence and prefers content absent from earlier results for the same ID when candidates compete. Writes results and empty placeholders in tool call order using retained message bytes. Passes through complete adjacent history byte for byte.",
-      "sha256": "c3abf3458109945b17921bd27086f0cae863f62ff7b899f101017c95523810b9"
+      "reason": "Repairs native DeepSeek Chat tool history. Matches reused IDs within each call occurrence and prefers content absent from all earlier candidates for that ID, including discarded results. Writes results and empty placeholders in tool call order using retained message bytes. Passes through complete adjacent history byte for byte.",
+      "sha256": "223d095fa4d759a075b9547ecb182fd0fa4b430ee00d9d0fdb83d8f2f262f0a5"
     },
     {
       "path": "backend/internal/service/deepseek_chat_tool_pairing_test.go",
       "features": [
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Checks streaming and buffered Chat payloads for orphan, missing, and displaced tool messages, displaced results in independent occurrences of a reused ID, competing copies and legitimate repeated content, parallel call order, byte preservation and Responses-shaped input on the Chat endpoint.",
-      "sha256": "08e9cdfde6f38f0ad3002f78242b4427c25c3b5cc219f0eccb74f404cd7945a6"
+      "reason": "Checks streaming and buffered Chat payloads for orphan, missing, and displaced tool messages, reused IDs and discarded candidates, parallel call order and byte preservation. Covers Responses-shaped input, non-DeepSeek models on a shared upstream, and a mapped DeepSeek outbound model.",
+      "sha256": "ac440a7832021df9190a4294bd9034b6aebbf81be61623bc9f187704daac0402"
     },
     {
       "path": "backend/internal/service/deepseek_forced_tool_choice.go",
@@ -3021,8 +3021,8 @@
         "grok_content_rejection_billing",
         "deepseek_chat_tool_pairing"
       ],
-      "sha256": "d83b318829f322c34bf89188686e0f491e156730e9a993c085eff7411aacfd7e",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Normalizes tool call and result pairing for native Chat before streaming or buffered forwarding to DeepSeek. Responses-shaped input keeps the existing conversion."
+      "sha256": "f267a59859c06c76a7b9b73a515bc8afd6ee81b70113963dc3ad5c33fe0fa004",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Normalizes tool call and result pairing for native Chat when both the upstream and mapped outbound model are DeepSeek. Responses-shaped input keeps the existing conversion."
     },
     {
       "path": "backend/internal/service/openai_gateway_forward.go",

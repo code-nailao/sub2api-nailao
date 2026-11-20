@@ -21,6 +21,7 @@ func TestDeepSeekChatPairsToolMessagesBeforeForwarding(t *testing.T) {
 		copyOfA  = `{"content":"Result \u0041 [}\u0022","tool_call_id":"call_a","role":"tool"}`
 		resultB  = `{"role":"tool","tool_call_id":"call_b","content":"Result B"}`
 		secondA  = `{"role":"tool","tool_call_id":"call_a","content":"Second result for A"}`
+		thirdA   = `{"role":"tool","tool_call_id":"call_a","content":"Third result for A"}`
 		orphan   = `{"role":"tool","tool_call_id":"unmatched","content":"Orphan"}`
 		missingA = `{"role":"tool","tool_call_id":"call_a","content":""}`
 		missingB = `{"role":"tool","tool_call_id":"call_b","content":""}`
@@ -44,6 +45,11 @@ func TestDeepSeekChatPairsToolMessagesBeforeForwarding(t *testing.T) {
 			"reused_id_cross_boundary_duplicate",
 			callA + "," + resultA + "," + callA + "," + resultA + "," + secondA,
 			callA + "," + resultA + "," + callA + "," + secondA,
+		},
+		{
+			"reused_id_remembers_discarded_candidates",
+			callA + "," + resultA + "," + secondA + "," + callA + "," + secondA + "," + thirdA,
+			callA + "," + resultA + "," + callA + "," + thirdA,
 		},
 		{
 			"reused_id_displaced_cross_boundary_duplicate",
@@ -117,6 +123,32 @@ func TestDeepSeekChatPairingScope(t *testing.T) {
 		_, err := svc.forwardAsRawChatCompletions(c.Request.Context(), c, rawChatCompletionsTestAccount(), body, "")
 		require.NoError(t, err)
 		require.Equal(t, body, upstream.lastBody)
+	})
+	t.Run("GLM on a DeepSeek OpenCode Go mount", func(t *testing.T) {
+		body := []byte(`{"model":"glm-5","messages":[{"role":"user","content":"Example"},{"role":"tool","tool_call_id":"unmatched","content":"Original"}]}`)
+		c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
+		upstream := newOKChatCompletionsUpstream(t.Name(), deepSeekChatFallbackOKBody)
+		svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+		account := deepSeekForcedToolChoiceAccount()
+		account.Credentials["base_url"] = DefaultOpenCodeGoBaseURL
+
+		_, err := svc.ForwardAsChatCompletions(c.Request.Context(), c, account, body, "", "")
+		require.NoError(t, err)
+		require.Equal(t, "glm-5", gjson.GetBytes(upstream.lastBody, "model").String())
+		require.Equal(t, gjson.GetBytes(body, "messages").Raw, gjson.GetBytes(upstream.lastBody, "messages").Raw)
+	})
+	t.Run("mapped DeepSeek model on an OpenAI account", func(t *testing.T) {
+		body := []byte(`{"model":"fixture-model","messages":[{"role":"user","content":"Example"},{"role":"tool","tool_call_id":"unmatched","content":"Original"}]}`)
+		c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
+		upstream := newOKChatCompletionsUpstream(t.Name(), deepSeekChatFallbackOKBody)
+		svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+		account := openaiPlatformDeepSeekAccount()
+		account.Credentials["model_mapping"] = map[string]any{"fixture-model": "deepseek-flash"}
+
+		_, err := svc.ForwardAsChatCompletions(c.Request.Context(), c, account, body, "", "")
+		require.NoError(t, err)
+		require.Equal(t, "deepseek-flash", gjson.GetBytes(upstream.lastBody, "model").String())
+		require.Equal(t, `[{"role":"user","content":"Example"}]`, gjson.GetBytes(upstream.lastBody, "messages").Raw)
 	})
 	t.Run("Responses-shaped input on the Chat endpoint", func(t *testing.T) {
 		body := []byte(`{"model":"deepseek-flash","input":[{"role":"user","content":"Example"},{"role":"tool","content":"Original tool result"}]}`)

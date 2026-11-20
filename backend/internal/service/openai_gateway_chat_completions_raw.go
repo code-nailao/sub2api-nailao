@@ -132,8 +132,9 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 		return nil, policyErr
 	}
 	upstreamBody = updatedBody
-	// Converted Responses input keeps its own tool history semantics.
-	if inboundProtocol == APIProtocolChatCompletions && targetsDeepSeekAPIHost(account) {
+	// Use the mapped model because DeepSeek accounts can point at gateways
+	// that serve multiple model families. Responses input keeps its own history.
+	if inboundProtocol == APIProtocolChatCompletions && isDeepSeekCatalogModel(upstreamModel) && targetsDeepSeekAPIHost(account) {
 		pairedBody, err := normalizeDeepSeekChatToolPairing(ctx, upstreamBody)
 		if err != nil {
 			return nil, rejectDeepSeekChatFilter(c, err)
