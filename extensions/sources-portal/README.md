@@ -34,7 +34,14 @@
 
 只把上述固定路径送到Portal，**`/api/v1/*`、`/v1/*`、登录及其它路由仍给原版 Sub**。不要把主站根路由或全部 `/api` 交给Portal。主站原自定义菜单照常创建；管理员可见只是入口控制，API检查不可省略。
 
-工作台静态客户端由 `STUDIO_URL` 指向固定HTTPS页面，必须独立origin（可以仍由同一Nginx提供静态文件，不增加业务服务），防止画布直接读取Main登录存储。每轮使用新iframe且校验窗口、origin、组ID、applied ACK；旧页面迟到消息不确认新授权。
+工作台静态客户端由 `STUDIO_URL` 指向固定HTTPS页面，必须独立origin（可以仍由同一Nginx提供静态文件，不增加业务服务），防止画布直接读取Main登录存储。工作台与 Canvas 的源统一采用保守校验：只对 ASCII 大小写和标准默认端口做规范化，再与 Main 比较；浏览器可能另作解释的主机或端口写法直接报配置错误。每轮使用新iframe且校验窗口、origin、组ID、applied ACK；旧页面迟到消息不确认新授权。
+
+`SUB_ORIGIN`、`PORTAL_ORIGIN`、`STUDIO_URL` 和 `CANVAS_URL` 参与这条同源边界时遵守相同规则：
+
+- 主机使用 ASCII DNS 名或规范的 IP 文本；域名标签只含字母、数字和连字符，标签首尾不能是连字符。不做 Unicode/IDNA 转换，非 ASCII、全角字符、Unicode 点号、末尾点号及其它含糊的 authority 写法直接拒绝；已用 ASCII 表达的 Punycode 域名可用。
+- 端口省略或使用不带前导零的十进制形式；显式空端口、前导零端口均拒绝。标准默认 HTTPS 端口与省略端口视为同源，规范的非默认端口仍可用。
+- 可能触发浏览器旧式 IPv4 解释的非规范地址、数值式域名尾标签，以及带 zone、映射地址或展开写法的非规范 IPv6 文本均拒绝。
+- 错误信息说明对应变量要求规范 ASCII 主机和端口，不回显配置值。正常启动与 `-check-config` 结果相同，这些地址配置校验失败时不写状态。
 
 无限画布通过可选 `CANVAS_URL` 指向真实 Canvas 静态客户端。例如 `https://YOUR_SEPARATE_CANVAS_ORIGIN/infinite/canvas`；构建必须设置 `VITE_BASE=/infinite/`，同一站点根路径保留 Studio。Canvas 必须与 Main 不同 origin。仅设置环境变量不会创建菜单或发布静态包；发布时还须固定 Canvas 制品、为 Main 增加 `/canvas` 用户菜单和上述 Portal 路由，并验证模型 API 的精确跨域白名单。原 `STUDIO_URL` 和工作台路由保持独立。
 
@@ -90,7 +97,7 @@ studio.json是外部能力登记，不授予分组权限；每次仍交原版判
 - 生效的列表 = 登记文件 + 在线登记。在线登记的分组一律是原生（`sub2api`）分组，引擎不能从请求指定。同一原生分组两边都有时以在线登记为准，可用来改模型或隐藏；撤销在线修改即回到文件内容。
 - 媒体引擎分组只认登记文件：Main 读取同一文件选择账号并校验模型，界面里只读显示，保存请求里出现它会被拒绝。文件后来把某个在线登记过的分组交给媒体引擎时，以文件为准。
 - 登记不授予权限。用户仍然只看到 Main 判定其可用、状态为启用并已开启图片生成的分组；尚不满足条件的分组可以先登记，界面会标出原因。
-- 登记文件可以是空数组 `[]`，此时全部原生分组都在界面里管理。`STUDIO_CONFIG_FILE` 仍须设置，它同时是工作台功能的开关。
+- 登记文件可以是空数组 `[]`，此时全部原生分组都在界面里管理；`null` 不是数组，会被启动校验拒绝。`STUDIO_CONFIG_FILE` 仍须设置，它同时是工作台功能的开关。
 - 接口在已有的 `/api/studio/` 前缀下（`/api/studio/admin/registry`、`/api/studio/admin/groups/{id}/models`），由 Portal 逐个校验管理员身份，不需要新增反向代理路由或主站菜单。Portal 为此只多调用 Main 的两个管理员只读接口：启用分组列表和单个分组的候选模型。
 
 ### 自定义连接
@@ -120,7 +127,8 @@ Portal 的状态目录由进程锁保证单写者，新进程要等旧进程退�
 /app/sources-portal -check-config
 ```
 
-- 按正常启动的顺序执行全部校验，失败信息与正常启动相同：各环境变量、master.key 与钱包桥密钥文件的权限和格式、`PORTAL_HOME_DIR/index.html`、`STUDIO_CONFIG_FILE`，以及正常启动会读取的状态文件——`sources.json`（含用当前密钥解密每条来源）、`account-bindings.json`、`intelligence/state.json`（含解密监测 Key）、设置 `PORTAL_HOME_DIR` 时的 `home.json`、设置 `STUDIO_CONFIG_FILE` 时的 `studio-bindings.json`、`studio-registry.json`、`studio-custom.json`。不存在的状态文件按正常启动的方式视为空状态。
+- 与正常启动共用配置校验，失败信息一致：先校验各环境变量、master.key 与钱包桥密钥文件的权限和格式、`PORTAL_HOME_DIR/index.html`、`STUDIO_CONFIG_FILE`，再读取状态。正常启动也只在这些配置全部通过后才获取状态锁、创建目录或执行迁移，配置错误不会改写中断任务或旧版状态。
+- 状态校验包含正常启动会读取的文件——`sources.json`（含用当前密钥解密每条来源）、`account-bindings.json`、`intelligence/state.json`（含解密监测 Key）、设置 `PORTAL_HOME_DIR` 时的 `home.json`、设置 `STUDIO_CONFIG_FILE` 时的 `studio-bindings.json`、`studio-registry.json`、`studio-custom.json`。不存在的状态文件按正常启动的方式视为空状态。
 - `PORTAL_DATA_DIR` 必须是已存在的目录（空目录可以）；不存在说明挂载错了，正常启动会在那里静默建一份空状态。
 - `PORTAL_LISTEN` 只检查 `host:port` 格式，端口能否绑定只有真正监听才知道。
 - 刻意不做：不取也不等待进程锁，不建目录，不写、改名、改权限或删除任何文件（启动迁移和中断任务的改写只校验输入、不落盘），不监听端口，不启动 worker，不访问网络。状态目录和密钥文件只读挂载时也能运行。旧进程运行中原子替换文件，检查期间读取是安全的。

@@ -29,8 +29,8 @@ const (
 // Start-up failure messages. The normal start and -check-config report the
 // same message for the same problem; none contains a secret or an env value.
 const (
-	errSubOrigin          = "SUB_ORIGIN must be a fixed HTTPS main-site origin"
-	errPortalOrigin       = "PORTAL_ORIGIN must be a fixed HTTPS extension origin"
+	errSubOrigin          = "SUB_ORIGIN must be a fixed HTTPS main-site origin with a canonical ASCII host and unpadded port"
+	errPortalOrigin       = "PORTAL_ORIGIN must be a fixed HTTPS extension origin with a canonical ASCII host and unpadded port"
 	errSameOrigin         = "Portal must use reviewed same-origin main-site routes"
 	errKeyFile            = "PORTAL_KEY_FILE must be an owner-only regular file"
 	errKeyRead            = "encryption key read failed"
@@ -53,9 +53,9 @@ const (
 	errStudioConfig       = "invalid studio config"
 	errStudio             = "studio bindings initialization failed"
 	errStudioAPILabels    = "STUDIO_CUSTOM_API_LABELS must contain at most 16 unique lowercase DNS labels"
-	errStudioURL          = "fixed HTTPS STUDIO_URL required"
+	errStudioURL          = "STUDIO_URL requires a fixed HTTPS page with a canonical ASCII host and port (no Unicode, trailing dot or port padding)"
 	errStudioOrigin       = "STUDIO_URL must use a separate origin so the workbench cannot read Main login storage"
-	errCanvasURL          = "CANVAS_URL requires a fixed HTTPS page on a separate origin"
+	errCanvasURL          = "CANVAS_URL requires a fixed HTTPS page on a separate origin with a canonical ASCII host and port (no Unicode, trailing dot or port padding)"
 	errListener           = "extension HTTP listener unavailable"
 	errServer             = "extension HTTP server failed"
 )
@@ -64,7 +64,7 @@ type startupError string
 
 func (e startupError) Error() string { return string(e) }
 
-// stateOpeners is the only difference between a start and -check-config while
+// stateOpeners is the only difference between a start and -check-config after
 // configuration is validated: the start takes the lock and may create or
 // migrate state; the check reads and validates the same files and writes nothing.
 type stateOpeners struct {
@@ -116,12 +116,6 @@ func checkConfig(getenv func(string) string) error {
 		return err
 	}
 	defer setup.store.Close()
-	// Only binding proves an address; the check verifies its form.
-	if _, port, err := net.SplitHostPort(setup.addr); err != nil {
-		return startupError(errListener)
-	} else if _, err := net.LookupPort("tcp", port); err != nil {
-		return startupError(errListener)
-	}
 	return nil
 }
 
@@ -148,15 +142,15 @@ func serve(getenv func(string) string, logger *log.Logger) int {
 	return 0
 }
 
-// prepare validates the configuration in start-up order and builds the
-// server. On failure it releases the store it opened and returns the message.
+// prepare validates all configuration before opening writable state and builds
+// the server. On failure it releases the store it opened and returns the message.
 func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup, failure error) {
 	fail := func(message string) (*portalSetup, error) { return nil, startupError(message) }
-	sub, err := portal.CanonicalOrigin(getenv("SUB_ORIGIN"))
+	sub, err := canonicalBrowserOrigin(getenv("SUB_ORIGIN"))
 	if err != nil {
 		return fail(errSubOrigin)
 	}
-	public, err := portal.CanonicalOrigin(getenv("PORTAL_ORIGIN"))
+	public, err := canonicalBrowserOrigin(getenv("PORTAL_ORIGIN"))
 	if err != nil {
 		return fail(errPortalOrigin)
 	}
@@ -180,24 +174,10 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 	if dir == "" {
 		return fail(errDataDirRequired)
 	}
-	if open.check {
-		// A start creates a missing directory and would come up with empty state;
-		// in a check that means a wrong mount.
-		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
-			return fail(errDataDirMissing)
-		}
-	}
-	store, err := open.store(dir, key)
-	if err != nil {
-		return fail(errStore)
-	}
-	defer func() {
-		if failure != nil {
-			store.Close()
-		}
-	}()
+	// These constructors only validate configuration or build idle clients.
+	// Attach writable stores only after every environment value is validated.
 	client := portal.BalanceClient()
-	svc := portal.NewService(store, portal.Provider{Client: client})
+	svc := portal.NewService(nil, portal.Provider{Client: client})
 	svc.NotifyClient = portal.PublicClient()
 	if hook := getenv("BALANCE_ALERT_WEBHOOK"); hook != "" {
 		u, err := url.Parse(hook)
@@ -207,26 +187,18 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 		svc.Webhook = hook
 	}
 	server := &portal.Server{Service: svc, SubOrigin: sub, PublicOrigin: public, AuthClient: portal.PublicClient()}
-	intelligenceStore, err := open.intelligenceStore(store)
-	if err != nil {
-		return fail(errIntelligenceStore)
-	}
 	intelligenceProvider, err := portal.CanonicalOrigin(getenv("INTELLIGENCE_PROVIDER_ORIGIN"))
 	if err != nil {
 		return fail(errIntelligenceOrigin)
 	}
-	server.Intelligence, err = open.intelligence(intelligenceStore, sub, intelligenceProvider, getenv("INTELLIGENCE_API_ORIGIN_OVERRIDES"))
-	if err != nil {
+	intelligenceOverrides := getenv("INTELLIGENCE_API_ORIGIN_OVERRIDES")
+	if _, err := portal.CheckIntelligenceService(nil, sub, intelligenceProvider, intelligenceOverrides); err != nil {
 		return fail(errIntelligence)
 	}
-	svc.Intelligence = server.Intelligence
-	if homeDir := getenv("PORTAL_HOME_DIR"); homeDir != "" {
+	homeDir := getenv("PORTAL_HOME_DIR")
+	if homeDir != "" {
 		if info, err := os.Stat(homeDir + "/index.html"); err != nil || !info.Mode().IsRegular() {
 			return fail(errHomeDir)
-		}
-		server.Content, err = portal.OpenContentStore(dir)
-		if err != nil {
-			return fail(errHome)
 		}
 		server.HomeFiles = os.DirFS(homeDir)
 	}
@@ -270,32 +242,41 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 	if labelErr != nil {
 		return fail(errStudioAPILabels)
 	}
+	var caps []portal.StudioCapability
+	var mediaEngineLegacyName string
 	if file := getenv("STUDIO_CONFIG_FILE"); file != "" {
 		b, e := os.ReadFile(file)
 		if e != nil {
 			return fail(errStudioConfigRead)
 		}
-		var caps []portal.StudioCapability
-		if json.Unmarshal(b, &caps) != nil {
+		if json.Unmarshal(b, &caps) != nil || caps == nil {
 			return fail(errStudioConfig)
 		}
 		// Same private setting as Main: the engine value an existing registry
 		// and Studio client already use. Not echoed; it is private configuration.
-		server.Studio, err = portal.OpenStudio(dir, sub, caps, getenv("SOURCES_MEDIA_ENGINE_LEGACY_NAME"), customAPILabels)
-		if err != nil {
+		mediaEngineLegacyName = getenv("SOURCES_MEDIA_ENGINE_LEGACY_NAME")
+		if err := portal.CheckStudioCapabilities(caps, mediaEngineLegacyName); err != nil {
 			return fail(errStudio)
 		}
 		studio, e := url.Parse(getenv("STUDIO_URL"))
 		if e != nil || studio.Scheme != "https" || studio.Host == "" || studio.User != nil || studio.RawQuery != "" || studio.Fragment != "" {
 			return fail(errStudioURL)
 		}
-		if studio.Scheme+"://"+studio.Host == sub {
+		studioOrigin, e := canonicalBrowserOrigin(studio.Scheme + "://" + studio.Host)
+		if e != nil {
+			return fail(errStudioURL)
+		}
+		if studioOrigin == sub {
 			return fail(errStudioOrigin)
 		}
 		server.StudioURL = studio.String()
 		if raw := getenv("CANVAS_URL"); raw != "" {
 			canvas, e := url.Parse(raw)
-			if e != nil || canvas.Scheme != "https" || canvas.Host == "" || canvas.User != nil || canvas.RawQuery != "" || canvas.Fragment != "" || canvas.Scheme+"://"+canvas.Host == sub {
+			if e != nil || canvas.Scheme != "https" || canvas.Host == "" || canvas.User != nil || canvas.RawQuery != "" || canvas.Fragment != "" {
+				return fail(errCanvasURL)
+			}
+			canvasOrigin, e := canonicalBrowserOrigin(canvas.Scheme + "://" + canvas.Host)
+			if e != nil || canvasOrigin == sub {
 				return fail(errCanvasURL)
 			}
 			server.CanvasURL = canvas.String()
@@ -304,6 +285,52 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 	addr := getenv("PORTAL_LISTEN")
 	if addr == "" {
 		addr = "127.0.0.1:18090"
+	}
+	// Only binding proves an address; both modes validate its form before any
+	// lock file, directory or migration can be written.
+	if _, port, err := net.SplitHostPort(addr); err != nil {
+		return fail(errListener)
+	} else if _, err := net.LookupPort("tcp", port); err != nil {
+		return fail(errListener)
+	}
+	if open.check {
+		// A start creates a missing directory and would come up with empty state;
+		// in a check that means a wrong mount. Check this after shared validation
+		// so a configuration error is reported identically even without state.
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			return fail(errDataDirMissing)
+		}
+	}
+	store, err := open.store(dir, key)
+	if err != nil {
+		return fail(errStore)
+	}
+	defer func() {
+		if failure != nil {
+			store.Close()
+		}
+	}()
+	svc.Store = store
+	intelligenceStore, err := open.intelligenceStore(store)
+	if err != nil {
+		return fail(errIntelligenceStore)
+	}
+	server.Intelligence, err = open.intelligence(intelligenceStore, sub, intelligenceProvider, intelligenceOverrides)
+	if err != nil {
+		return fail(errIntelligence)
+	}
+	svc.Intelligence = server.Intelligence
+	if homeDir != "" {
+		server.Content, err = portal.OpenContentStore(dir)
+		if err != nil {
+			return fail(errHome)
+		}
+	}
+	if caps != nil {
+		server.Studio, err = portal.OpenStudio(dir, sub, caps, mediaEngineLegacyName, customAPILabels)
+		if err != nil {
+			return fail(errStudio)
+		}
 	}
 	return &portalSetup{store: store, svc: svc, server: server, addr: addr}, nil
 }
