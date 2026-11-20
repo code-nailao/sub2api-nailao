@@ -279,6 +279,56 @@ test('a stale custom connection offers to open settings on startup', async () =>
   assert.equal(connections(f), before);
 });
 
+test('a failed Studio group poll and the next shell ACK keep stale connection recovery visible', async () => {
+  let pollFails = false;
+  const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID),
+    groupsResponse: () => pollFails ? { ok: false, status: 503 } : undefined,
+    connection: () => ({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }) });
+  await f.integrate();
+  pollFails = true;
+  await [...f.timers.values()].find(({ delay }) => delay === 30000).callback();
+  assert.equal(f.calls.filter(({ path }) => path === '/api/studio/groups').length, 2);
+  await f.ackShell();
+
+  assert.equal(f.loadingPanel.hidden, false);
+  assert.equal(f.frame.hidden, true);
+  assert.match(f.message.textContent, /重新保存自定义连接/);
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  f.retry.onclick();
+  assert.equal(f.settings.at(-1)?.kind, 'custom');
+  assert.equal(connections(f), 1);
+});
+
+test('Studio keeps stale connection recovery through a network error until a new connection succeeds', async () => {
+  let networkFailure = true;
+  const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID),
+    connection: (options, config) => {
+      const id = options.body.group_id;
+      if (id === CUSTOM_ID) return { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } };
+      if (networkFailure) throw Error('连接网络中断');
+      return { ok: true, status: 200, data: config(id) };
+    } });
+  const shell = await f.integrate();
+  const alternate = shell.groups.find(({ id }) => id !== CUSTOM_ID).id;
+  f.send(select(alternate, shell.revision, 'failed-recovery-request'));
+  await flush();
+  assert.match(f.message.textContent, /重新保存自定义连接/);
+  assert.match(f.message.textContent, /连接网络中断/);
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  const refreshedShell = await f.ackShell();
+  assert.equal(f.frame.hidden, true);
+
+  networkFailure = false;
+  f.send(select(alternate, refreshedShell.revision, 'successful-recovery-request'));
+  await flush();
+  assert.equal(f.retry.textContent, '重试连接');
+  await f.ackConnection();
+  await f.ackShell();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.loadingPanel.hidden, true);
+  assert.equal(f.frame.hidden, false);
+});
+
 test('an integrated Studio keeps the resave action visible after a failed switch and shell ACK', async () => {
   const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.group_id === CUSTOM_ID
     ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }

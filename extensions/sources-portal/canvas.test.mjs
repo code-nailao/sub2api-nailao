@@ -170,8 +170,83 @@ test('switching Canvas to a stale connection offers settings and preserves the a
   assert.equal(f.select.value, previous);
 });
 
+test('a failed Canvas group poll after a stale switch keeps the settings action and prior canvas', async () => {
+  let pollFails = false;
+  const f = await fixture({ custom: 'configured',
+    groupsResponse: () => pollFails ? { ok: false, status: 503 } : undefined,
+    connection: (options, config) => options.body.group_id === CUSTOM_ID
+      ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
+      : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.loaded(); await f.ack();
+  const previous = f.select.value;
+  f.select.value = String(CUSTOM_ID);
+  await f.select.onchange();
+  pollFails = true;
+  [...f.timers.values()].find(({ delay }) => delay === 30000).callback();
+  await flush();
+  assert.equal(f.calls.filter(({ path }) => path === '/api/canvas/groups').length, 2);
+
+  const retry = f.elements['#canvas-retry'];
+  retry.onclick();
+  assert.equal(f.settings.at(-1)?.kind, 'custom');
+  assert.equal(retry.textContent, '打开自定义连接');
+  assert.equal(f.elements['#canvas-status'].hidden, false);
+  assert.match(f.elements['#message'].textContent, /重新保存自定义连接/);
+  assert.equal(f.select.value, previous);
+  assert.equal(f.frame.hidden, false);
+  assert.equal(connections(f).length, 2);
+});
+
+test('Canvas keeps stale connection recovery through another failed switch until a connection succeeds', async () => {
+  let networkFailure = false;
+  const f = await fixture({ custom: 'configured', connection: (options, config) => {
+    const id = options.body.group_id;
+    if (id === CUSTOM_ID) return { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } };
+    if (networkFailure) throw Error('连接网络中断');
+    return { ok: true, status: 200, data: config(id) };
+  } });
+  f.loaded(); await f.ack();
+  const previous = f.select.value;
+  const alternate = f.select.children.map(({ value }) => String(value)).find((id) => id !== previous && id !== String(CUSTOM_ID));
+  f.select.value = String(CUSTOM_ID);
+  await f.select.onchange();
+
+  networkFailure = true;
+  f.select.value = alternate;
+  await f.select.onchange();
+  assert.match(f.elements['#message'].textContent, /重新保存自定义连接/);
+  assert.match(f.elements['#message'].textContent, /连接网络中断/);
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+
+  networkFailure = false;
+  f.select.value = alternate;
+  await f.select.onchange();
+  assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
+  assert.equal(f.frame.hidden, true);
+  await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+});
+
+test('saving Canvas settings clears the resave action even if the subsequent group refresh fails', async () => {
+  let saved = false;
+  const f = await fixture({ groups: [], custom: 'configured',
+    groupsResponse: () => saved ? { ok: false, status: 503 } : undefined,
+    connection: () => ({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }) });
+  const retry = f.elements['#canvas-retry'];
+  assert.equal(retry.textContent, '打开自定义连接');
+  retry.onclick();
+  saved = true;
+  f.settings.at(-1).onSaved(true);
+  await flush();
+  assert.equal(retry.textContent, '重试连接');
+  assert.equal(f.elements['#message'].textContent, '授权暂不可用，请稍后重试；不会自动换组或创建新任务。');
+  assert.equal(f.frame.hidden, true);
+});
+
 test('restoring a stale Canvas connection reports the failure and offers settings without opening a dialog', async () => {
-  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only
+  let stale = true;
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only && stale
     ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
     : { ok: true, status: 200, data: config(options.body.group_id) } });
   f.loaded(); await f.ack();
@@ -186,6 +261,17 @@ test('restoring a stale Canvas connection reports the failure and offers setting
   assert.equal(f.settings.length, 0);
   f.elements['#canvas-retry'].onclick();
   assert.equal(f.settings.at(-1)?.kind, 'custom');
+
+  stale = false;
+  const nextRequestId = '00000000-0000-4000-8000-000000000001';
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId, requestId: nextRequestId });
+  await flush();
+  const config = f.last('sub2api:media-studio-config').payload;
+  assert.equal(config.requestId, nextRequestId);
+  assert.equal(config.selectActive, false);
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
+  assert.equal(f.frame.hidden, false);
 });
 
 test('other Canvas connection errors keep their existing hints and do not open settings', async () => {

@@ -39,7 +39,7 @@ export async function createCanvasFixture({ groups = [{ id: 26, name: 'Images' }
   const auth = new vm.SyntheticModule(['authorizedJSON', 'clearSession', 'currentToken'], function () {
     this.setExport('authorizedJSON', async (path, options) => {
       calls.push({ path, options });
-      if (path === '/api/canvas/groups') return groupsResponse ? groupsResponse() : { ok: true, status: 200, data: { user_id: 9, canvas_url: canvasOrigin + '/infinite/canvas', main_origin: origin, groups: state.groups,
+      if (path === '/api/canvas/groups') return groupsResponse?.() ?? { ok: true, status: 200, data: { user_id: 9, canvas_url: canvasOrigin + '/infinite/canvas', main_origin: origin, groups: state.groups,
         custom: { group_id: CUSTOM_ID, enabled: state.custom !== 'off', configured: state.custom === 'configured' }, can_manage: state.admin } };
       return connection ? connection(options, config) : { ok: true, status: 200, data: config(options.body.group_id) };
     });

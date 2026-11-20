@@ -3,6 +3,7 @@ import { openCustomSettings, openGroupSettings } from "./studio-settings.js";
 
 const params = new URLSearchParams(location.search);
 const CUSTOM_CONNECTION_NEEDS_UPDATE = "custom_connection_needs_update";
+const CUSTOM_RESAVE_HINT = "密钥所在的分组已变更，请重新保存自定义连接。";
 const frame = document.querySelector("#studio");
 const select = document.querySelector("#groups");
 const message = document.querySelector("#message");
@@ -26,8 +27,13 @@ const granted = new Map();
 let custom = { groupId: 0, enabled: false, configured: false };
 const validRequestID = (value) => typeof value === "string" && /^[\w-]{16,80}$/.test(value);
 
-function showState(state, text, resave = false) {
-  needsCustomResave = resave;
+function showState(state, text) {
+  const resave = needsCustomResave && !locked;
+  if (resave) {
+    state = "recovery";
+    if (!ack) frame.hidden = true;
+    text = text && text !== CUSTOM_RESAVE_HINT ? `${CUSTOM_RESAVE_HINT} ${text}` : CUSTOM_RESAVE_HINT;
+  }
   document.body.dataset.state = state;
   document.body.setAttribute("aria-busy", String(state === "loading"));
   statusPanel.hidden = state === "ready";
@@ -47,9 +53,9 @@ function notifyHost(ready) {
     requestId: hostConfig.requestId, revision: hostConfig.revision,
     shellMode: hostConfig.shellMode, integrated: ready }, location.origin);
 }
-function recover(text, resave = false) {
+function recover(text) {
   clearTimeout(startupTimer);
-  showState("recovery", text, resave);
+  showState("recovery", text);
 }
 function armStartupTimeout() {
   clearTimeout(startupTimer);
@@ -104,7 +110,7 @@ document.querySelector("#canvas-connection-menu").addEventListener("keydown", (e
 async function api(path, body) {
   const result = await authorizedJSON(path, { method: body ? "POST" : "GET", body });
   if (path === "/api/canvas/connection" && result.status === 409 && result.data?.error === CUSTOM_CONNECTION_NEEDS_UPDATE) {
-    throw Error("密钥所在的分组已变更，请重新保存自定义连接。", { cause: CUSTOM_CONNECTION_NEEDS_UPDATE });
+    throw Error(CUSTOM_RESAVE_HINT, { cause: CUSTOM_CONNECTION_NEEDS_UPDATE });
   }
   if (!result.ok) throw Error(result.status === 401
     ? "登录已失效，请重新登录主站后打开画布。"
@@ -159,10 +165,18 @@ window.addEventListener("message", async (event) => {
       if (current !== generation || target !== frame.contentWindow || locked) return;
       granted.set(connectionId, config);
       target.postMessage({ type: "sub2api:media-studio-config", payload: { ...config, requestId, selectActive: false } }, studioURL.origin);
+      if (needsCustomResave) {
+        needsCustomResave = false;
+        if (ack) showState("ready");
+        else showState("loading", "正在确认画布连接…");
+      }
     } catch (error) {
       if (current !== generation || target !== frame.contentWindow || locked) return;
       target.postMessage({ type: "sub2api:canvas-restore-error", connectionId, requestId }, studioURL.origin);
-      if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) recover(error.message, true);
+      if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) {
+        needsCustomResave = true;
+        recover(error.message);
+      }
     }
     return;
   }
@@ -192,6 +206,10 @@ async function connect() {
   try {
     const config = await api("/api/canvas/connection", { group_id: Number(select.value) });
     if (current !== generation || locked) return false;
+    if (needsCustomResave) {
+      needsCustomResave = false;
+      showState("loading", "正在确认画布连接…");
+    }
     granted.set(config.selectedConnectionId, config);
     configuration = { ...config,
       connections: [...granted.values()].flatMap((item) => item.connections),
@@ -206,7 +224,8 @@ async function connect() {
     ack = previousAck;
     if (previous) select.value = previous.selectedConnectionId.slice(6);
     frame.hidden = !previousAck;
-    recover(error.message, error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE);
+    if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) needsCustomResave = true;
+    recover(error.message);
     return false;
   } finally {
     if (current === generation && !locked) {
@@ -277,8 +296,6 @@ async function reloadGroups(selectId) {
     select.onchange = connect;
     if (selectId || select.value !== previous || !configuration) {
       if (await connect()) watchSession();
-    } else if (needsCustomResave && !custom.configured && ack) {
-      showState("ready");
     }
   } catch (error) {
     if (!locked) recover(error.message);
@@ -291,6 +308,11 @@ function openCustomConnectionSettings() {
   openCustomSettings({ onSaved: (configured) => {
     // A changed or removed connection must not be resent from the earlier grant.
     granted.delete(`group-${custom.groupId}`);
+    if (needsCustomResave) {
+      needsCustomResave = false;
+      if (ack) showState("ready");
+      else showState("loading", "正在更新画布连接…");
+    }
     void reloadGroups(configured ? String(custom.groupId) : "");
   } });
 }

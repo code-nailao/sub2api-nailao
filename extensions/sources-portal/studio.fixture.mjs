@@ -44,8 +44,7 @@ export async function createStudioFixture({ remembered, groupList = initialGroup
   const auth = new vm.SyntheticModule(['authorizedJSON', 'clearSession', 'currentToken'], function () {
     this.setExport('authorizedJSON', async (path, options) => {
       calls.push({ path, options });
-      if (path === '/api/studio/groups' && groupsResponse) return groupsResponse();
-      if (path === '/api/studio/groups') return { ok: true, status: 200, data: { user_id: 9, groups: state.groupList, studio_url: studioOrigin, main_origin: origin, viewer: { displayName: 'Alice', balance: 0 },
+      if (path === '/api/studio/groups') return groupsResponse?.() ?? { ok: true, status: 200, data: { user_id: 9, groups: state.groupList, studio_url: studioOrigin, main_origin: origin, viewer: { displayName: 'Alice', balance: 0 },
         custom: { group_id: CUSTOM_ID, setup_id: SETUP_ID, enabled: state.custom !== 'off', configured: state.custom === 'configured' }, can_manage: state.admin, manage_id: MANAGE_ID } };
       if (connection) return connection(options, config);
       return { ok: true, status: 200, data: config(options.body.group_id) };
