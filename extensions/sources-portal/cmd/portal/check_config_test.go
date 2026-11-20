@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,7 +76,7 @@ func newCheckFixture(t *testing.T) *checkFixture {
 		"PORTAL_KEY_FILE":              filepath.Join(root, "master.key"),
 		"PORTAL_DATA_DIR":              f.dir,
 		"PORTAL_HOME_DIR":              filepath.Join(root, "homeweb"),
-		"PORTAL_LISTEN":                "127.0.0.1:18090",
+		"PORTAL_LISTEN":                net.JoinHostPort(net.IPv4(127, 0, 0, 1).String(), "0"),
 		"INTELLIGENCE_PROVIDER_ORIGIN": "https://detector.example",
 		"SUB_INTERNAL_ORIGIN":          "http://main-internal.example:8080",
 		"WALLET_BRIDGE_KEY_FILE":       filepath.Join(root, "bridge.key"),
@@ -188,7 +189,7 @@ func TestCheckConfigDoesNotModifyStateAStartWouldMigrate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setup.store.Close()
+	setup.close()
 	if after := treeSnapshot(t, f.root); sameTree(before, after) {
 		t.Fatal("fixture does not exercise a start-up migration")
 	}

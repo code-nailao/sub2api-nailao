@@ -1,0 +1,133 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"log"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"syscall"
+	"testing"
+	"time"
+)
+
+func TestStartupListenFailureLeavesStateUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+	}{
+		{"occupied", errListener},
+		{"invalid", errListenAddress},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCheckFixture(t)
+			if tc.name == "occupied" {
+				occupied, err := net.Listen("tcp", f.env["PORTAL_LISTEN"])
+				if err != nil {
+					t.Fatal("could not reserve the test listener")
+				}
+				defer occupied.Close()
+				f.env["PORTAL_LISTEN"] = occupied.Addr().String()
+				if code, _, stderr := runCheck(f); code != 0 {
+					t.Fatalf("read-only check tried to bind the address: %s", stderr)
+				}
+			} else {
+				f.env["PORTAL_LISTEN"] = "invalid-listener"
+			}
+
+			state := filepath.Join(f.dir, "intelligence", "state.json")
+			before, err := os.ReadFile(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tree := treeSnapshot(t, f.dir)
+			var stderr bytes.Buffer
+			if code := serve(f.getenv, log.New(&stderr, "", 0)); code != 1 || stderr.String() != tc.want+"\n" {
+				t.Fatalf("start: code=%d, stderr=%q, want %q", code, stderr.String(), tc.want)
+			}
+			after, err := os.ReadFile(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Error("listener failure changed the detection state bytes")
+			}
+			if !sameTree(tree, treeSnapshot(t, f.dir)) {
+				t.Error("listener failure changed the state tree")
+			}
+		})
+	}
+}
+
+func TestStartupRejectsFileAsDataDirectory(t *testing.T) {
+	f := newCheckFixture(t)
+	file := filepath.Join(f.root, "not-a-directory")
+	writeFile(t, file, "fixture", 0600)
+	f.env["PORTAL_DATA_DIR"] = file
+	before := treeSnapshot(t, f.root)
+
+	if code, stdout, stderr := runCheck(f); code != 1 || stdout != "" || stderr != errDataDirMissing+"\n" {
+		t.Errorf("check: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if !sameTree(before, treeSnapshot(t, f.root)) {
+		t.Error("read-only check changed the fixture")
+	}
+	var stderr bytes.Buffer
+	if code := serve(f.getenv, log.New(&stderr, "", 0)); code != 1 || stderr.String() != errDataDirMissing+"\n" {
+		t.Errorf("start: code=%d stderr=%q", code, stderr.String())
+	}
+	if !sameTree(before, treeSnapshot(t, f.root)) {
+		t.Error("start with invalid data directory changed the fixture")
+	}
+}
+
+func TestStartupRejectsStudioConfigFIFO(t *testing.T) {
+	// Run the entry points in a child so a regression cannot leave the suite
+	// waiting for a writer on the pipe.
+	const modeEnv = "PORTAL_TEST_FIFO_MODE"
+	if mode := os.Getenv(modeEnv); mode != "" {
+		var stdout, stderr bytes.Buffer
+		var code int
+		switch mode {
+		case "start":
+			code = serve(os.Getenv, log.New(&stderr, "", 0))
+		case "check":
+			code = run([]string{checkConfigFlag}, os.Getenv, &stdout, &stderr)
+		default:
+			t.Fatal("invalid child test mode")
+		}
+		if code != 1 || stdout.Len() != 0 || stderr.String() != errStudioConfigRead+"\n" {
+			t.Fatalf("Portal did not report the studio configuration error: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+		return
+	}
+
+	for _, mode := range []string{"start", "check"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newCheckFixture(t)
+			pipe := filepath.Join(f.root, "studio.pipe")
+			if err := syscall.Mkfifo(pipe, 0600); err != nil {
+				t.Fatal("could not create the test pipe")
+			}
+			f.env["STUDIO_CONFIG_FILE"] = pipe
+			before := treeSnapshot(t, f.root)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestStartupRejectsStudioConfigFIFO$")
+			cmd.Env = []string{modeEnv + "=" + mode}
+			for name, value := range f.env {
+				cmd.Env = append(cmd.Env, name+"="+value)
+			}
+			output, err := cmd.CombinedOutput()
+			if ctx.Err() != nil {
+				t.Error("Portal blocked on a named pipe without a writer")
+			} else if err != nil {
+				t.Errorf("Portal config check in the child failed: %v\n%s", err, output)
+			}
+			if !sameTree(before, treeSnapshot(t, f.root)) {
+				t.Error("invalid studio configuration changed the state tree")
+			}
+		})
+	}
+}

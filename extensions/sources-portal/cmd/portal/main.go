@@ -52,7 +52,7 @@ const (
 	errBridgeConfig       = "invalid wallet bridge configuration"
 	errBridgeOwner        = "wallet bridge requires an explicitly reviewed single notification owner"
 	errTrustedProxy       = "invalid trusted proxy CIDR"
-	errStudioConfigRead   = "studio config unavailable"
+	errStudioConfigRead   = "STUDIO_CONFIG_FILE must be a readable regular file"
 	errStudioConfig       = "invalid studio config"
 	errStudio             = "studio bindings initialization failed"
 	errStudioAPILabels    = "STUDIO_CUSTOM_API_LABELS must contain at most 16 unique lowercase DNS labels"
@@ -69,9 +69,9 @@ type startupError string
 
 func (e startupError) Error() string { return string(e) }
 
-// stateOpeners is the only difference between a start and -check-config after
-// configuration is validated: the start takes the lock and may create or
-// migrate state; the check reads and validates the same files and writes nothing.
+// stateOpeners selects the startup mode. A normal start binds the listener,
+// then takes the lock and may create or migrate state. The check only reads
+// and validates state.
 type stateOpeners struct {
 	check             bool
 	store             func(string, []byte) (*portal.Store, error)
@@ -85,10 +85,17 @@ var (
 )
 
 type portalSetup struct {
-	store  *portal.Store
-	svc    *portal.Service
-	server *portal.Server
-	addr   string
+	listener net.Listener
+	store    *portal.Store
+	svc      *portal.Service
+	server   *portal.Server
+}
+
+func (s *portalSetup) close() {
+	if s.listener != nil {
+		_ = s.listener.Close()
+	}
+	_ = s.store.Close()
 }
 
 func main() {
@@ -119,7 +126,7 @@ func checkConfig(getenv func(string) string) error {
 	if err != nil {
 		return err
 	}
-	defer setup.store.Close()
+	defer setup.close()
 	return nil
 }
 
@@ -129,25 +136,21 @@ func serve(getenv func(string) string, logger *log.Logger) int {
 		logger.Print(err)
 		return 1
 	}
-	defer setup.store.Close()
-	httpServer := &http.Server{Addr: setup.addr, Handler: setup.server.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 45 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32768}
+	defer setup.close()
+	httpServer := &http.Server{Handler: setup.server.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 45 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32768}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	listener, err := net.Listen("tcp", setup.addr)
-	if err != nil {
-		logger.Print(errListener)
-		return 1
-	}
 	logger.Print("Sources portal started; no main database connection")
-	if err := runPortal(ctx, httpServer, listener, setup.svc.Run, logger, setup.svc.Intelligence.RoundActive); err != nil {
+	if err := runPortal(ctx, httpServer, setup.listener, setup.svc.Run, logger, setup.svc.Intelligence.RoundActive); err != nil {
 		logger.Print(errServer)
 		return 1
 	}
 	return 0
 }
 
-// prepare validates all configuration before opening writable state and builds
-// the server. On failure it releases the store it opened and returns the message.
+// prepare validates configuration and binds the listener before opening writable
+// state on a normal start. HTTP serving only begins after initialization.
+// On failure prepare closes any listener and store it opened.
 func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup, failure error) {
 	fail := func(message string) (*portalSetup, error) { return nil, startupError(message) }
 	sub, err := canonicalMainSiteOrigin(getenv("SUB_ORIGIN"))
@@ -249,9 +252,9 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 	var caps []portal.StudioCapability
 	var mediaEngineLegacyName string
 	if file := getenv("STUDIO_CONFIG_FILE"); file != "" {
-		b, e := os.ReadFile(file)
+		b, e := readStudioConfig(file)
 		if e != nil {
-			return fail(errStudioConfigRead)
+			return nil, e
 		}
 		if json.Unmarshal(b, &caps) != nil || caps == nil {
 			return fail(errStudioConfig)
@@ -286,13 +289,23 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
 		return fail(errListenAddress)
 	}
-	if open.check {
-		// A start creates a missing directory and would come up with empty state;
-		// in a check that means a wrong mount. Check this after shared validation
-		// so a configuration error is reported identically even without state.
-		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
-			return fail(errDataDirMissing)
+	// A normal start can create a missing directory. The read-only check
+	// requires it to exist, and both modes reject an existing non-directory.
+	info, err = os.Stat(dir)
+	if (err == nil && !info.IsDir()) || (open.check && err != nil) {
+		return fail(errDataDirMissing)
+	}
+	var listener net.Listener
+	if !open.check {
+		listener, err = net.Listen("tcp", addr)
+		if err != nil {
+			return fail(errListener)
 		}
+		defer func() {
+			if failure != nil {
+				_ = listener.Close()
+			}
+		}()
 	}
 	store, err := open.store(dir, key)
 	if err != nil {
@@ -325,7 +338,27 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 			return fail(errStudio)
 		}
 	}
-	return &portalSetup{store: store, svc: svc, server: server, addr: addr}, nil
+	return &portalSetup{listener: listener, store: store, svc: svc, server: server}, nil
+}
+
+func readStudioConfig(path string) ([]byte, error) {
+	// Open without waiting for a FIFO writer, then verify the opened file
+	// before reading. Checking the path first would race with replacement.
+	configErr := startupError(errStudioConfigRead)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, configErr
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, configErr
+	}
+	raw, err := io.ReadAll(f)
+	if err != nil {
+		return nil, configErr
+	}
+	return raw, nil
 }
 
 // The authorized client runs in an iframe of the HTTPS main site.
