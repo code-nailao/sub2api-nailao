@@ -1110,6 +1110,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		if resp.StatusCode >= 400 {
 			respBody := s.readUpstreamErrorBody(resp)
 			_ = resp.Body.Close()
+			if imageIntent && resp.StatusCode == http.StatusRequestTimeout {
+				return stopOpenAIImageSubmissionAfterTimeout(c, resp, s.redactAgentIdentitySensitiveBody(ctx, account, respBody))
+			}
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
 
 			upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))

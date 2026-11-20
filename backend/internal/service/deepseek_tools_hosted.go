@@ -302,7 +302,7 @@ func (s *OpenAIGatewayService) deepSeekModelTurn(ctx context.Context, c *gin.Con
 	if value, ok := child.Get(OpsUpstreamErrorsKey); ok {
 		if events, ok := value.([]*OpsUpstreamErrorEvent); ok && len(events) > len(prior) {
 			last := events[len(events)-1]
-			if last != nil && last.Kind == "failover" {
+			if last != nil && (last.Kind == "failover" || last.UpstreamStatusCode == http.StatusRequestTimeout) {
 				capture.rejectedHTTPStatus = last.UpstreamStatusCode
 			}
 		}
@@ -614,6 +614,12 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 			}
 		}
 		if turnErr != nil {
+			if capture.rejectedHTTPStatus == http.StatusRequestTimeout && len(result.DeepSeekModelTurns) == 0 && snapshot.Cost() == 0 {
+				// A timeout leaves the model submission's outcome unknown. Do
+				// not return a failover signal to the outer account scheduler.
+				c.Header("x-should-retry", "false")
+				return nil, nil, true, fmt.Errorf("DeepSeek tool turn timed out: %v", turnErr)
+			}
 			// One fresh attempt without our optional tools is allowed only for a
 			// definitive HTTP rejection before any model/tool work or public output.
 			if !req.ToolsUnavailable && turn == nil && len(result.DeepSeekModelTurns) == 0 &&

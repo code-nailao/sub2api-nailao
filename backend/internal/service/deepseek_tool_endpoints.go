@@ -139,7 +139,7 @@ func (e *deepSeekToolRejection) Error() string {
 // failover reports a refusal that says the supplier did not do the work on this
 // account (credentials, balance, rate limit, availability, or an upstream
 // without this tool: one account setting enables all five), so another tool
-// account may be tried. Gateway timeouts (502/504) leave the outcome unknown.
+// account may be tried. Timeouts (408/502/504) leave the outcome unknown.
 func (e *deepSeekToolRejection) failover() bool {
 	switch e.status {
 	case 0, http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed,
@@ -390,10 +390,10 @@ func (s *OpenAIGatewayService) failDeepSeekTool(w http.ResponseWriter, reply *de
 	case reply != nil && reply.committed:
 		reply.write(w, deepSeekToolErrorBody("deepseek_tool_error", message, requestID))
 	default:
-		// Only an HTTP error answer says the supplier did not do the work. A lost
-		// connection, a gateway timeout or a 200 whose body was cut short or
-		// unreadable may follow completed, metered work.
-		maybeDone := rejection == nil || rejection.status == http.StatusBadGateway || rejection.status == http.StatusGatewayTimeout
+		// A lost connection, a timeout, or an unreadable success response
+		// may follow completed, metered work.
+		maybeDone := rejection == nil || rejection.status == http.StatusRequestTimeout ||
+			rejection.status == http.StatusBadGateway || rejection.status == http.StatusGatewayTimeout
 		WriteDeepSeekToolError(w, http.StatusBadGateway, "deepseek_tool_error", message, requestID, maybeDone)
 	}
 }

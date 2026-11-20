@@ -63,6 +63,32 @@ func TestProxyOpenAIWSHTTPBridgeTurnLaterTurn429FailsOverBeforeClientWrite(t *te
 	require.Zero(t, writes)
 }
 
+func TestProxyOpenAIWSHTTPBridgeImageSubmissionTimeoutIsTerminal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusRequestTimeout,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"fixture timeout"}}`)),
+	}}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	payload := []byte(`{"type":"response.create","model":"gpt-5","input":"test","tools":[{"type":"image_generation"}]}`)
+	var messages []string
+	result, err := svc.proxyOpenAIWSHTTPBridgeTurn(
+		c.Request.Context(), c, account, "fixture-token", payload, len(payload),
+		"gpt-5", "", "", "", "", 1,
+		func(b []byte) error { messages = append(messages, string(b)); return nil },
+	)
+	require.Nil(t, result)
+	require.Error(t, err)
+	var failover *UpstreamFailoverError
+	require.NotErrorAs(t, err, &failover)
+	require.Len(t, messages, 1)
+	require.Equal(t, "error", gjson.Get(messages[0], "type").String())
+}
+
 func TestProxyOpenAIWSHTTPBridgeTurnLaterTurnDoesNotFailOverAfterDownstreamOutput(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

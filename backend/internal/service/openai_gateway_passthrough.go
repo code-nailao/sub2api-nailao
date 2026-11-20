@@ -392,6 +392,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			// passthrough error handling sees the same response after recovery fails.
 			probeBody := s.readUpstreamErrorBody(resp)
 			_ = resp.Body.Close()
+			if imageIntent && resp.StatusCode == http.StatusRequestTimeout {
+				return stopOpenAIImageSubmissionAfterTimeout(c, resp, s.redactAgentIdentitySensitiveBody(ctx, account, probeBody))
+			}
 			resp.Body = io.NopCloser(bytes.NewReader(probeBody))
 			if rejection := DetectUpstreamRejectionHTTP(account, resp.StatusCode, probeBody); rejection != nil {
 				result := upstreamRejectionForwardResult(resp, reqModel, actualModel, actualModel, reqStream, startTime, rejection)
