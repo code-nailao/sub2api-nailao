@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
@@ -25,33 +27,84 @@ func submissionMayRunHostedTools(body []byte) bool {
 	if gjson.GetBytes(body, "web_search_options").IsObject() {
 		return true // Native Chat Completions can enable web search separately.
 	}
-	tools := gjson.GetBytes(body, "tools")
 	choice := gjson.GetBytes(body, "tool_choice")
-	if choice.String() == "none" || choice.Get("type").String() == "none" || forcesDeclaredClientFunction(choice, tools) {
+	if choice.String() == "none" || choice.Get("type").String() == "none" {
 		return false
 	}
-	if responsesToolsMayRunOnProvider(tools) {
-		return true
-	}
+	toolSets := []gjson.Result{gjson.GetBytes(body, "tools")}
 	for _, item := range gjson.GetBytes(body, "input").Array() {
-		if item.Get("type").String() == openAIAdditionalToolsItemType && responsesToolsMayRunOnProvider(item.Get("tools")) {
+		if item.Get("type").String() == openAIAdditionalToolsItemType {
+			toolSets = append(toolSets, item.Get("tools"))
+		}
+	}
+	if choiceAllowsOnlyDeclaredClientFunctions(choice, toolSets) {
+		return false
+	}
+	for _, tools := range toolSets {
+		if responsesToolsMayRunOnProvider(tools) {
 			return true
 		}
 	}
 	return false
 }
 
-// A flat Responses function choice or a nested Chat function choice is
-// terminal at the client. Other choice shapes can still allow hosted tools.
-func forcesDeclaredClientFunction(choice, tools gjson.Result) bool {
-	if choice.Get("type").String() != "function" || choice.Get("namespace").Exists() || !tools.IsArray() {
+// An explicit function or a restricted list can exclude hosted tools. Every
+// reference must resolve to a declared client-side function in the same scope.
+func choiceAllowsOnlyDeclaredClientFunctions(choice gjson.Result, toolSets []gjson.Result) bool {
+	if choice.Get("type").String() != "allowed_tools" {
+		return isDeclaredClientFunctionChoice(choice, toolSets)
+	}
+	mode := choice.Get("mode").String()
+	allowed := choice.Get("tools")
+	if (mode != "required" && mode != "auto") || !allowed.IsArray() {
 		return false
 	}
-	name := choice.Get("name").String()
-	if name == "" {
-		name = choice.Get("function.name").String()
+	choices := allowed.Array()
+	if len(choices) == 0 {
+		return false
 	}
-	if name == "" {
+	for _, selected := range choices {
+		if !isDeclaredClientFunctionChoice(selected, toolSets) {
+			return false
+		}
+	}
+	return true
+}
+
+func isDeclaredClientFunctionChoice(choice gjson.Result, toolSets []gjson.Result) bool {
+	if choice.Get("type").String() != "function" {
+		return false
+	}
+	name := choice.Get("name")
+	if !name.Exists() {
+		name = choice.Get("function.name")
+	}
+	namespace := choice.Get("namespace")
+	if name.Type != gjson.String || name.Str == "" || (namespace.Exists() && (namespace.Type != gjson.String || namespace.Str == "")) {
+		return false
+	}
+	for _, tools := range toolSets {
+		if !tools.IsArray() {
+			continue
+		}
+		if !namespace.Exists() {
+			if containsClientFunction(tools, name.Str) {
+				return true
+			}
+			continue
+		}
+		for _, declaration := range tools.Array() {
+			if declaration.Get("type").String() == "namespace" && declaration.Get("name").String() == namespace.Str &&
+				containsClientFunction(declaration.Get("tools"), name.Str) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsClientFunction(tools gjson.Result, name string) bool {
+	if !tools.IsArray() {
 		return false
 	}
 	for _, tool := range tools.Array() {
@@ -109,6 +162,37 @@ func stopPaidSubmissionAfterTimeout(c *gin.Context) (*OpenAIForwardResult, error
 	return nil, err
 }
 
+func stopPaidResponsesSubmissionAfterTimeout(c *gin.Context, model string) (*OpenAIForwardResult, error) {
+	StopOpenAICompactSSEKeepaliveCommitted(c)
+	if !c.Writer.Written() || !strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
+		return stopPaidSubmissionAfterTimeout(c)
+	}
+
+	outcomeErr := markPaidSubmissionTimeout(c)
+	MarkOpsStreamFailure(c, "upstream_error", "request_timeout", paidSubmissionTimeoutMessage, http.StatusRequestTimeout)
+	frame, err := apicompat.ResponsesEventToSSE(apicompat.ResponsesStreamEvent{
+		Type: "response.failed",
+		Response: &apicompat.ResponsesResponse{
+			ID:        "resp_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+			Object:    "response",
+			CreatedAt: time.Now().Unix(),
+			Model:     model,
+			Status:    "failed",
+			Output:    []apicompat.ResponsesOutput{},
+			Error:     &apicompat.ResponsesError{Code: "request_timeout", Message: paidSubmissionTimeoutMessage},
+		},
+	})
+	if err == nil {
+		_, err = io.WriteString(c.Writer, frame)
+	}
+	if err != nil {
+		_ = c.Error(err)
+	} else {
+		c.Writer.Flush()
+	}
+	return nil, outcomeErr
+}
+
 // Call before error recovery can send the request again, using the request
 // after protocol conversion and the error format of the original client.
 func stopHostedToolTimeout(c *gin.Context, status int, outbound []byte, inboundProtocol string) error {
@@ -125,6 +209,10 @@ func stopHostedToolTimeout(c *gin.Context, status int, outbound []byte, inboundP
 		if _, writeErr := fmt.Fprint(c.Writer, buildChatStreamErrorSSE("request_timeout", paidSubmissionTimeoutMessage)); writeErr == nil {
 			c.Writer.Flush()
 		}
+		return err
+	}
+	if inboundProtocol == APIProtocolResponses {
+		_, err := stopPaidResponsesSubmissionAfterTimeout(c, gjson.GetBytes(outbound, "model").String())
 		return err
 	}
 	_, err := stopPaidSubmissionAfterTimeout(c)

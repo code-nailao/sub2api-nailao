@@ -173,7 +173,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusRequestTimeout && submissionMayRunHostedTools(patchedBody) {
-		return stopPaidSubmissionAfterTimeout(c)
+		return stopPaidResponsesSubmissionAfterTimeout(c, originalModel)
 	}
 	if resp.StatusCode >= 400 {
 		respBody := s.readUpstreamErrorBody(resp)

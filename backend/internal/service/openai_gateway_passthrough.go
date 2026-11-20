@@ -389,7 +389,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		}
 		if resp.StatusCode == http.StatusRequestTimeout && !imageIntent && submissionMayRunHostedTools(body) {
 			_ = resp.Body.Close()
-			return stopPaidSubmissionAfterTimeout(c)
+			return stopPaidResponsesSubmissionAfterTimeout(c, reqModel)
 		}
 		if resp.StatusCode >= 400 {
 			// Peek only to identify an invalid task. Restore the body so the existing

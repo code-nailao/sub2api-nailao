@@ -3203,8 +3203,8 @@
         "deepseek_in_chat_tool_types",
         "paid_submission_no_replay"
       ],
-      "sha256": "6e24be68997e72271716d8b25001468c8f1741976c9c20c1939dbe3760b00858",
-      "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook. Returns a terminal non-retryable 408 when a Responses image submission may already have been accepted. Handles HTTP 408 from the hosted DeepSeek loop at the gateway boundary so the Chat filtering implementation can stay aligned with main. Stops Responses requests with hosted search tools after HTTP 408 and marks the outcome as unknown. Applies the hosted tool classifier to paid Responses timeouts. Uses the effective hosted-tool classifier for a Responses timeout."
+      "sha256": "247a11a551e3f7492967c56047cb2f116e656440bfe8096efcdf84e9d2e21a01",
+      "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook. Returns a terminal non-retryable 408 when a Responses image submission may already have been accepted. Handles HTTP 408 from the hosted DeepSeek loop at the gateway boundary so the Chat filtering implementation can stay aligned with main. Stops Responses requests with hosted search tools after HTTP 408 and marks the outcome as unknown. Applies the hosted tool classifier to paid Responses timeouts. Uses the effective hosted-tool classifier for a Responses timeout. Emits a terminal Responses event on an already-open SSE stream when a hosted submission returns HTTP 408."
     },
     {
       "path": "backend/internal/service/openai_gateway_grok.go",
@@ -3212,8 +3212,8 @@
         "grok_content_rejection_billing",
         "paid_submission_no_replay"
       ],
-      "sha256": "9e9d0758cecff3fdeb004e7d02309909541ced9fed66125664818e4aec1427e6",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Stops Grok Responses requests with hosted search tools after HTTP 408 without rotating accounts. Applies the hosted tool classifier to Grok Responses collections and connector timeouts. Uses the effective hosted-tool classifier for a Grok Responses timeout."
+      "sha256": "7ba29910b61e0eeaf2a27679a102f584d00525b33e7eb91181997a367c9bc6e3",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Stops Grok Responses requests with hosted search tools after HTTP 408 without rotating accounts. Applies the hosted tool classifier to Grok Responses collections and connector timeouts. Uses the effective hosted-tool classifier for a Grok Responses timeout. Writes hosted timeout failures using the Responses SSE protocol after stream headers have been sent."
     },
     {
       "path": "backend/internal/service/openai_gateway_grok_chat_bridge.go",
@@ -3259,8 +3259,8 @@
         "upstream_022_request_speed_root_upstream_integration",
         "paid_submission_no_replay"
       ],
-      "sha256": "973a5a5fe07431f12693e3af70539a8f01374d600946bdb51862b0d7677777d9",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Returns a terminal non-retryable 408 for image submissions forwarded in passthrough mode. Preserves terminal HTTP 408 handling for paid hosted search in the Responses passthrough path. Applies the hosted tool classifier to passthrough Responses timeouts. Uses the effective hosted-tool classifier for a passthrough Responses timeout."
+      "sha256": "8e9a89ab44e3f6458674bb3781d113f4fcdc153218db887c997b16daade27c6a",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Returns a terminal non-retryable 408 for image submissions forwarded in passthrough mode. Preserves terminal HTTP 408 handling for paid hosted search in the Responses passthrough path. Applies the hosted tool classifier to passthrough Responses timeouts. Uses the effective hosted-tool classifier for a passthrough Responses timeout. Reports a hosted timeout in the Responses SSE protocol after keep-alive output."
     },
     {
       "path": "backend/internal/service/openai_gateway_record_usage_test.go",
@@ -3345,8 +3345,8 @@
       "features": [
         "paid_submission_no_replay"
       ],
-      "sha256": "f5cae53c027f6ac0148e0e814622f17fe6540c3472244ca98e419a3b6c23dd11",
-      "reason": "Recognizes hosted Responses search declarations and reports a terminal HTTP 408 for paid submissions with an unknown outcome. Classifies provider-hosted retrieval and connector tools by category, protects unknown hosted tool types and keeps confirmed client-executed tools separate. Classifies effective hosted tools after protocol conversion, preserves a 408 failover for a forced declared client function and returns a terminal error in the client protocol."
+      "sha256": "362fe89e9d79e7d5ddcb8fc22222c33a214ec748c82ed1bb9be554cf77be538d",
+      "reason": "Recognizes hosted Responses search declarations and reports a terminal HTTP 408 for paid submissions with an unknown outcome. Classifies provider-hosted retrieval and connector tools by category, protects unknown hosted tool types and keeps confirmed client-executed tools separate. Classifies effective hosted tools after protocol conversion, preserves a 408 failover for a forced declared client function and returns a terminal error in the client protocol. Resolves client-only tool restrictions and namespaced function selections before excluding hosted tools. Encodes a terminal response.failed event for a paid timeout after Responses streaming has started."
     },
     {
       "path": "backend/internal/service/openai_gateway_usage.go",
@@ -3386,11 +3386,11 @@
     },
     {
       "path": "backend/internal/service/openai_images_test.go",
-      "sha256": "58bdbf0b3325363683d28a1ff6d9ce3516bd0268a18e5d8755619cae817261cc",
+      "sha256": "ee1f206ef407947c0869d9c033dc1f01e9e9a449d06846798cc296c53a42eb9d",
       "features": [
         "paid_submission_no_replay"
       ],
-      "reason": "Checks the terminal 408 response on API key, OAuth, Responses and passthrough image submissions including the upstream error fixtures. Verifies that OpenAI and Grok hosted search and Grok image generation cannot replay after HTTP 408. Tests terminal 408 handling for OpenAI file search and Grok collection and MCP retrieval. Tests no replay after Chat and Messages hosted searches and continued 408 failover for an explicitly forced Responses client function."
+      "reason": "Checks the terminal 408 response on API key, OAuth, Responses and passthrough image submissions including the upstream error fixtures. Verifies that OpenAI and Grok hosted search and Grok image generation cannot replay after HTTP 408. Tests terminal 408 handling for OpenAI file search and Grok collection and MCP retrieval. Tests no replay after Chat and Messages hosted searches and continued 408 failover for an explicitly forced Responses client function. Verifies allowed tool lists, namespaced function selections and Responses timeout event framing after a heartbeat, including the native Anthropic bridge."
     },
     {
       "path": "backend/internal/service/openai_model_alias.go",

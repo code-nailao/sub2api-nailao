@@ -1074,6 +1074,114 @@ func TestResponses408CanFailOverWhenToolChoiceForcesClientFunction(t *testing.T)
 	require.False(t, IsResponseCommitted(c))
 }
 
+func TestCompat408UsesTheEffectiveToolSelection(t *testing.T) {
+	const function = `{"type":"function","name":"local_lookup","parameters":{"type":"object"}}`
+	const namespace = `{"type":"namespace","name":"local","tools":[` + function + `]}`
+	const fileSearch = `{"type":"file_search","vector_store_ids":["vs_fixture"]}`
+	for _, tc := range []struct {
+		name, path, tools, choice string
+		wantFailover              bool
+	}{
+		{"responses/allowed-one-client", "/v1/responses", function + `,` + fileSearch, `{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"local_lookup"}]}`, true},
+		{"responses/allowed-auto-client", "/v1/responses", function + `,` + fileSearch, `{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"local_lookup"}]}`, true},
+		{"shaped-chat/allowed-one-client", "/v1/chat/completions", function + `,` + fileSearch, `{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"local_lookup"}]}`, true},
+		{"responses/forced-namespaced-client", "/v1/responses", namespace + `,` + fileSearch, `{"type":"function","name":"local_lookup","namespace":"local"}`, true},
+		{"shaped-chat/forced-namespaced-client", "/v1/chat/completions", namespace + `,` + fileSearch, `{"type":"function","name":"local_lookup","namespace":"local"}`, true},
+		{"responses/allowed-namespaced-client", "/v1/responses", namespace + `,` + fileSearch, `{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"local_lookup","namespace":"local"}]}`, true},
+		{"responses/allowed-hosted-also", "/v1/responses", function + `,` + fileSearch, `{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"local_lookup"},{"type":"file_search"}]}`, false},
+		{"responses/allowed-client-missing", "/v1/responses", function + `,` + fileSearch, `{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"absent"}]}`, false},
+		{"responses/forced-wrong-namespace", "/v1/responses", namespace + `,` + fileSearch, `{"type":"function","name":"local_lookup","namespace":"absent"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"gpt-5","input":"fixture","tools":[` + tc.tools + `],"tool_choice":` + tc.choice + `}`)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(body))
+			upstream := &httpUpstreamRecorder{resp: &http.Response{
+				StatusCode: http.StatusRequestTimeout, Header: make(http.Header),
+				Body: io.NopCloser(strings.NewReader(`{"error":{"message":"fixture timeout"}}`)),
+			}}
+			svc := &OpenAIGatewayService{httpUpstream: upstream, cfg: &config.Config{}}
+			account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: map[string]any{"api_key": "fixture-key"}}
+			var result *OpenAIForwardResult
+			var err error
+			if tc.path == "/v1/chat/completions" {
+				result, err = svc.ForwardAsChatCompletions(c.Request.Context(), c, account, body, "", "")
+			} else {
+				result, err = svc.Forward(c.Request.Context(), c, account, body)
+			}
+
+			require.Len(t, upstream.requests, 1)
+			require.JSONEq(t, tc.choice, gjson.GetBytes(upstream.lastBody, "tool_choice").Raw, "the exercise must preserve the restriction on the wire")
+			require.True(t, gjson.GetBytes(upstream.lastBody, `tools.#(type=="file_search")`).Exists())
+			require.Nil(t, result)
+			var failover *UpstreamFailoverError
+			if tc.wantFailover {
+				require.ErrorAs(t, err, &failover)
+				require.Equal(t, http.StatusRequestTimeout, failover.StatusCode)
+				require.False(t, IsResponseCommitted(c))
+			} else {
+				require.NotErrorAs(t, err, &failover)
+				require.Equal(t, http.StatusRequestTimeout, w.Code)
+				require.True(t, IsResponseCommitted(c))
+			}
+		})
+	}
+}
+
+func TestHostedSearch408WritesResponsesFailedAfterSSEHeartbeat(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, model, upstreamPath, tool string
+		account                               *Account
+	}{
+		{"responses", "/v1/responses", "gpt-5", "/v1/responses", "web_search", &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: map[string]any{"api_key": "fixture-key"}}},
+		{"responses-shaped-chat-via-anthropic", "/v1/chat/completions", "minimax-m3", "/v1/messages", "web_search_20250305", &Account{ID: 2, Platform: PlatformOpenCodeGo, Type: AccountTypeAPIKey, Credentials: map[string]any{
+			"api_key": "fixture-key", "account_mode": AccountModeGo, "api_base_urls": map[string]any{APIProtocolAnthropic: "https://anthropic.example"},
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"` + tc.model + `","input":"fixture","stream":true,"tools":[{"type":"web_search"}]}`)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(body))
+			c.Header("Content-Type", "text/event-stream")
+			_, err := c.Writer.WriteString(": ping\n\n")
+			require.NoError(t, err)
+			c.Writer.Flush()
+			upstream := &httpUpstreamRecorder{resp: &http.Response{StatusCode: http.StatusRequestTimeout, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"message":"fixture timeout"}}`))}}
+			svc := &OpenAIGatewayService{httpUpstream: upstream, cfg: &config.Config{}}
+			var result *OpenAIForwardResult
+			if tc.path == "/v1/chat/completions" {
+				result, err = svc.ForwardAsChatCompletions(c.Request.Context(), c, tc.account, body, "", "")
+			} else {
+				result, err = svc.Forward(c.Request.Context(), c, tc.account, body)
+			}
+
+			require.Len(t, upstream.requests, 1)
+			require.Equal(t, tc.upstreamPath, upstream.lastReq.URL.Path)
+			require.Equal(t, tc.tool, gjson.GetBytes(upstream.lastBody, "tools.0.type").String())
+			var failover *UpstreamFailoverError
+			require.NotErrorAs(t, err, &failover)
+			require.Nil(t, result)
+			require.True(t, IsResponseCommitted(c))
+			require.Equal(t, http.StatusOK, w.Code, "the heartbeat already committed the status")
+			const prefix = ": ping\n\nevent: response.failed\ndata: "
+			require.True(t, strings.HasPrefix(w.Body.String(), prefix), "%s", w.Body.String())
+			payload := strings.TrimPrefix(w.Body.String(), prefix)
+			require.True(t, strings.HasSuffix(payload, "\n\n"))
+			require.True(t, gjson.Valid(strings.TrimSuffix(payload, "\n\n")))
+			require.Equal(t, "response.failed", gjson.Get(payload, "type").String())
+			require.True(t, gjson.Get(payload, "sequence_number").Exists())
+			require.NotEmpty(t, gjson.Get(payload, "response.id").String())
+			require.Positive(t, gjson.Get(payload, "response.created_at").Int())
+			require.Equal(t, "[]", gjson.Get(payload, "response.output").Raw)
+			require.Equal(t, "failed", gjson.Get(payload, "response.status").String())
+			require.Equal(t, "request_timeout", gjson.Get(payload, "response.error.code").String())
+			require.Contains(t, gjson.Get(payload, "response.error.message").String(), "result is unknown")
+		})
+	}
+}
+
 func TestPaidGatewaySubmission408IsTerminal(t *testing.T) {
 	for _, tc := range []struct {
 		name, platform, path, body string
