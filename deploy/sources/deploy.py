@@ -77,6 +77,8 @@ ALIAS_DNS_GRACE_SECONDS = 2
 ROUTE_PROBE_PROXY = "proxy_pass http://sources_main_serving/health; # local route verification"
 ROUTE_REVISION = re.compile(r"^\s*add_header X-Sources-Route ([0-9a-f]{32}) always;$", re.MULTILINE)
 
+HOLD_CREATION_LABEL = "com.sources.deploy.hold"
+
 
 class DeployError(Exception):
     """A release operation failed."""
@@ -113,6 +115,18 @@ class SwitchNotRestored(FallbackFailed):
 
 class RoutingUnconfirmed(FallbackFailed):
     """A reload may have routed traffic to the candidate; do not drain it."""
+
+
+class ReloadRejected(RoutingUnconfirmed):
+    """Nginx returned a nonzero status; the loaded route still needs verification."""
+
+    def __init__(self, returncode: int, previous: str | None):
+        super().__init__(f"nginx reload failed with exit status {returncode}")
+        self.previous = previous
+
+
+class ReloadNotApplied(DeployError):
+    """After a rejected reload, the old route was verified and its file restored."""
 
 
 class RoutingRestored(DeployError):
@@ -316,7 +330,7 @@ class Ops:
     def __init__(self, dry_run: bool = False, log: Callable[[str], None] | None = None):
         self.dry_run = dry_run
         self.log = log or (lambda msg: print(msg, flush=True))
-        self.open_runtime = urllib.request.build_opener(NoRuntimeRedirect()).open
+        self.open_runtime = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRuntimeRedirect()).open
 
     # commands ---------------------------------------------------------------
     def run(self, args: list[str], *, mutate: bool, timeout: float = 600,
@@ -564,7 +578,9 @@ def fixed_upstream_routes(text: str) -> dict[str, list[tuple[str, bool, bool]]]:
             parts = shlex.split(directive)
             if len(parts) >= 2 and parts[0] == "server":
                 options = parts[2:]
-                peers.append((parts[1], "backup" in options, "down" in options))
+                host, separator, port = parts[1].partition(":")
+                address = f"127.0.0.1:{port}" if separator and host.lower() == "localhost" else parts[1]
+                peers.append((address, "backup" in options, "down" in options))
         routes[name] = sorted(peers)
     return routes
 
@@ -821,7 +837,7 @@ class Deployer:
         return args
 
     def create(self, target: Target, role: str, *, serving_alias: bool = True,
-               created: dict[str, str] | None = None) -> None:
+               created: dict[str, str] | None = None, hold_creation_id: str | None = None) -> None:
         name = target.containers[role]
         self.prepare_per_container_copies(role, name)
         args = ["docker", "create", "--name", name, "--hostname", name,
@@ -837,6 +853,8 @@ class Deployer:
                 "--label", f"com.sources.deploy.slot={target.slot}",
                 "--label", f"com.sources.deploy.role={role}",
                 "--label", f"com.sources.deploy.created={now()}"]
+        if hold_creation_id:
+            args += ["--label", f"{HOLD_CREATION_LABEL}={hold_creation_id}"]
         args += self.docker_env_args(role)
         args += self.mount_args(self.mounts_for(role, name))
         args.append(target.image_id or target.image)
@@ -907,12 +925,16 @@ class Deployer:
             reloading = True
             if reload_started is not None:
                 reload_started()
-            self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
+            reload = self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True, check=False)
+            if reload.returncode != 0:
+                raise ReloadRejected(reload.returncode, previous)
         except (Exception, KeyboardInterrupt) as err:
             reason = str(err) or type(err).__name__
             if reloading:
                 if recover_reload is not None:
                     recover_reload(previous, err)
+                if isinstance(err, ReloadRejected):
+                    raise
                 raise RoutingUnconfirmed(f"reload outcome is unknown ({reason}). Verify live routing with 'status' "
                                          "and Nginx before changing background ownership") from err
             try:
@@ -1366,9 +1388,19 @@ class Deployer:
                 self._save_progress(state, {**state["in_progress"], "nginx_previous_workers": older})
 
         def confirm_and_record() -> None:
+            rejected = reload_error if isinstance(reload_error, ReloadRejected) else None
+            new_generation = False
             try:
-                self.verify_topology(state, pending, peer if same_serving else active.serving, wait=True, allow_draining=allow_draining)
+                self.verify_topology(state, pending, peer if same_serving else active.serving,
+                                     wait=True, allow_draining=allow_draining, check_health=rejected is None)
+                new_generation = True
+                if rejected:
+                    # A loaded generation may be unhealthy. It still rules
+                    # out handing the background back to the old route here.
+                    self.check_rollback_route(pending, allow_draining=allow_draining)
             except Exception as err:
+                if rejected and not new_generation:
+                    self.restore_rejected_reload(state, active, pending, peer if same_serving else pending.serving, rejected)
                 reason = str(err) or type(err).__name__
                 if reload_error is not None:
                     reason = f"{reload_error}. {reason}"
@@ -1398,6 +1430,23 @@ class Deployer:
             raise
         if reload_error is not None and isinstance(reload_error.__cause__, KeyboardInterrupt):
             raise KeyboardInterrupt
+
+    def restore_rejected_reload(self, state: dict[str, Any], active: MainRoute, pending: MainRoute,
+                                peer: dict[str, Any], rejected: ReloadRejected) -> None:
+        previous = rejected.previous
+        if not active.revision or previous is None or previous != self.route_text(active):
+            return
+        try:
+            # The old background stopped during handoff. Only prove which
+            # workers are answering and that the attempted file is unchanged.
+            self.verify_topology(state, active, peer, disk=pending, check_health=False, wait=True)
+        except DeployError:
+            return
+        try:
+            self.ops.write_file_atomic(self.cfg.upstream_file, previous)
+        except (Exception, KeyboardInterrupt) as err:
+            raise RoutingFileNotRestored(f"{rejected}; old route is still loaded, but its file could not be restored") from err
+        raise ReloadNotApplied(f"{rejected}; previous upstream file restored, routing unchanged") from rejected
 
     def wait_for_nginx_drain(self, state: dict[str, Any], active: MainRoute) -> None:
         if self.ops.dry_run or not active.revision:
@@ -1485,8 +1534,7 @@ class Deployer:
                                     f"({route_err or type(route_err).__name__}). Run 'status' and verify the route "
                                     "before clearing in_progress. Use 'abort' to restore the original route") from route_err
         try:
-            self.retire_and_transfer(state, pending, active.serving, alias_plan=alias_plan, allow_draining=True,
-                                     continuous_alias=True)
+            self.retire_and_transfer(state, pending, active.serving, alias_plan=alias_plan, allow_draining=True)
         except (Exception, KeyboardInterrupt) as retire_err:
             err = DeployError(f"{err}. Serving retirement incomplete ({retire_err or type(retire_err).__name__})")
         raise RollbackIncomplete(f"rollback background unavailable ({err}). Serving uses slot {view['slot']} and admin "
@@ -1539,7 +1587,7 @@ class Deployer:
             if isinstance(err, RoutingUnconfirmed) and (reload_attempted or not handoff_complete):
                 # The degraded rollback can attempt its own reload during handoff.
                 raise
-            if reload_attempted:
+            if reload_attempted and not isinstance(err, (ReloadNotApplied, RoutingFileNotRestored)):
                 # A verified route is saved before leaving this range. A
                 # subsequent state/logging failure is recovered by the caller.
                 proof = (state.get("in_progress") or {}).get("verified_route") or {}
@@ -1554,7 +1602,7 @@ class Deployer:
             if isinstance(err, OSError):
                 reason = f"switch state write or upstream I/O failed ({reason})"
             with contextlib.suppress(OSError, KeyboardInterrupt):
-                self.log("   switch failed before reload; handing the background back")
+                self.log("   switch failed with the original route still loaded; handing the background back")
             try:
                 if not self.background_answering(current):
                     self.hand_back(state, target, current)
@@ -1753,22 +1801,29 @@ class Deployer:
             if hold_before_switch:
                 self.prepare_held_slot(state, target, allow_public_health_failure)
             self.verify_topology(state, active, target.view(), bootstrap=not active.revision)
-            self._mark(state, target, "start serving", publish_aliases_at_create=publish_at_create)
+            # Save an identity for the creation itself, including the window
+            # in which Docker creates a container but does not return its ID.
+            hold_creation_id = os.urandom(16).hex() if hold_before_switch else None
+            self._mark(state, target, "start serving", publish_aliases_at_create=publish_at_create,
+                       hold_creation_id=hold_creation_id)
             with self.step("start serving"):
                 if not hold_before_switch:
                     for role in ROLES:
                         self.ops.run(["docker", "rm", "-f", target.containers[role]], mutate=True, check=False)
                 for role in SERVING_ROLES:
-                    self.create(target, role, serving_alias=publish_at_create, created=created)
+                    self.create(target, role, serving_alias=publish_at_create, created=created,
+                                hold_creation_id=hold_creation_id)
+                    if hold_creation_id:
+                        self._save_progress(state, {**state["in_progress"], "owned": dict(created)})
                     self.ops.run(["docker", "start", target.containers[role]], mutate=True)
                 if not self.ops.dry_run:
                     for role in SERVING_ROLES:
                         self.wait_ready(target.ports[role], self.token_for(target.view(), role), "serving",
                                         self.cfg.ready_timeout, check_health=True)
-            self._save_progress(state, {**state["in_progress"], "owned": dict(created)})
             if hold_before_switch:
                 self._hold(state, target, record, allow_public_health_failure, input_fingerprint)
             else:
+                self._save_progress(state, {**state["in_progress"], "owned": dict(created)})
                 self._finish_switch(state, current, target, record, create_background=True, active=active)
             if skip_check:
                 self.log("note: this dry run did NOT verify the serving and background environment files "
@@ -1871,8 +1926,7 @@ class Deployer:
                                 self.cfg.ready_timeout, container=cid, check_health=True)
 
     def retire_and_transfer(self, state: dict[str, Any], route: MainRoute, retiring: dict[str, Any], *,
-                            alias_plan: dict[str, list[str]] | None = None, allow_draining: bool = False,
-                            continuous_alias: bool = False) -> None:
+                            alias_plan: dict[str, list[str]] | None = None, allow_draining: bool = False) -> None:
         # Fresh reloads can briefly answer on both worker generations.
         self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True)
         if self.ops.dry_run:
@@ -1917,32 +1971,26 @@ class Deployer:
                 self._save_progress(state, progress)
         self.wait_for_nginx_drain(state, route)
         expected_aliases = {(ep.network, ep.network_ref) for ep in new_aliases}
-        if continuous_alias and alias_plan and old_aliases:
-            self._save_progress(state, {**state["in_progress"], "alias_handoff": True})
-            route = self.publish_routed_aliases(state, route, retiring, new_ids, new_aliases, allow_draining=allow_draining)
-            if not expected_aliases.issubset(self.alias_networks(route.serving)):
-                raise FallbackFailed("new serving does not provide the alias on all required networks; old serving was kept")
-            self.ops.sleep(ALIAS_DNS_GRACE_SECONDS)
-            self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True)
-            if not expected_aliases.issubset(self.alias_networks(route.serving)):
-                raise FallbackFailed("the destination alias failed during handoff; old serving was kept")
-            self.wait_for_nginx_drain(state, route)
-            alias_plan = None  # All destination aliases were published with the old providers available.
-        self.retire_serving(retiring, state=state)
-        if old_aliases:
-            # Keep endpoints attached while in-flight requests drain. Publish
-            # the alias only after the old containers have stopped and we have
-            # removed its old configuration so a restart cannot duplicate it.
-            for cid in old_ids.values():
-                self.wait_exit(cid, self.cfg.ready_timeout)
-            self.configure_rollback_aliases(old_target, old_ids, old_aliases, shared=False)
         if alias_plan:
             try:
-                self.publish_routed_aliases(state, route, retiring, new_ids, new_aliases, allow_draining=allow_draining)
+                if old_aliases:
+                    self._save_progress(state, {**state["in_progress"], "alias_handoff": True})
+                route = self.publish_routed_aliases(state, route, retiring, new_ids, new_aliases, allow_draining=allow_draining)
+                if old_aliases:
+                    self.ops.sleep(ALIAS_DNS_GRACE_SECONDS)
+                self.wait_for_nginx_drain(state, route)
+                self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True)
                 if not expected_aliases.issubset(self.alias_networks(route.serving)):
                     raise DeployError("the shared alias is not active on all expected networks")
             except (Exception, KeyboardInterrupt) as err:
                 raise AliasPublicationFailed(str(err) or type(err).__name__) from err
+        self.retire_serving(retiring, state=state)
+        if old_aliases:
+            # Let in-flight requests finish before removing the old alias
+            # configuration, including from stopped containers that can restart.
+            for cid in old_ids.values():
+                self.wait_exit(cid, self.cfg.ready_timeout)
+            self.configure_rollback_aliases(old_target, old_ids, old_aliases, shared=False)
 
     def publish_routed_aliases(self, state: dict[str, Any], route: MainRoute, retiring: dict[str, Any],
                                identities: dict[str, str], endpoints: list[ServingEndpoint], *,
@@ -2496,6 +2544,22 @@ class Deployer:
             raise failure
         raise failure from err
 
+    def recover_held_creates(self, progress: dict[str, Any], target: Target, owned: dict[str, str]) -> None:
+        intent = progress.get("hold_creation_id")
+        if not intent and progress.get("step") != "start serving":
+            return
+        for role in SERVING_ROLES:
+            if role in owned:
+                continue
+            info = self.ops.inspect(target.containers[role])
+            if not info:
+                continue
+            labels = (info.get("Config") or {}).get("Labels") or {}
+            cid = info.get("Id")
+            if not intent or labels.get(HOLD_CREATION_LABEL) != intent or not cid:
+                raise DeployError(f"untracked {role} in the target slot; container ownership is unconfirmed")
+            owned[role] = cid
+
     def abort(self) -> None:
         with release_lock(self.cfg.lock_file, create=not self.ops.dry_run):
             self._abort_hold()
@@ -2542,14 +2606,16 @@ class Deployer:
                 raise RoutingUnconfirmed("the original route did not take traffic")
             self.wait_for_nginx_drain(state, active)
             candidates = state["in_progress"].get("candidate_ids", {})
+            self.recover_held_creates(progress, target, owned)
+            if owned != progress.get("owned", {}) and progress.get("hold_creation_id"):
+                self._save_progress(state, {**state["in_progress"], "owned": owned})
             alias_plan = current.get("withdrawn_serving_alias_networks") if recovering else None
             if alias_plan:
                 for role in SERVING_ROLES:
                     info = self.ops.inspect(target.containers[role]) or {}
                     if info.get("State", {}).get("Running") and info.get("Id") != (owned.get(role) or candidates.get(role)):
                         raise DeployError("candidate serving identity is unconfirmed; keep it outside the restored route")
-                self.retire_and_transfer(state, active, target.view(), alias_plan=alias_plan,
-                                         continuous_alias=bool(progress.get("alias_handoff")))
+                self.retire_and_transfer(state, active, target.view(), alias_plan=alias_plan)
             for role, cid in candidates.items():
                 if role not in owned:
                     self.stop_owned_serving(target, role, cid, allow_missing=True)
@@ -2666,6 +2732,7 @@ class Deployer:
         self.verify_topology(state, active, peer, disk=disk, check_health=False, wait=True)
         route = self.restore_abort_route(state, active, disk, original, target)
         self.verify_topology(state, route, target.view(), wait=True)
+        self.wait_for_nginx_drain(state, route)
         identities = {role: held["containers"][role]["id"] for role in SERVING_ROLES}
         reclaimed = self.rebuild_held_isolation(target, identities, endpoints, held)
         original_endpoints = self.original_serving_endpoints(state)
@@ -2770,8 +2837,7 @@ class Deployer:
                     self.wait_for_nginx_drain(state, route)
                     signalled = self.retire_serving(current, state=state)
                 else:
-                    self.retire_and_transfer(state, route, current, alias_plan=alias_plan,
-                                             continuous_alias=not create_background)
+                    self.retire_and_transfer(state, route, current, alias_plan=alias_plan)
             except AliasPublicationFailed as err:
                 if held is None or endpoints is None:
                     raise FallbackFailed(f"shared alias publication incomplete ({err}); inspect 'status' or retry 'abort'") from err
@@ -2800,7 +2866,7 @@ class Deployer:
         self.log(f"done: slot {target.slot} serving {target.image}")
 
     def _mark(self, state: dict[str, Any], target: Target, step: str, *, held: dict[str, Any] | None = None,
-              publish_aliases_at_create: bool = False) -> None:
+              publish_aliases_at_create: bool = False, hold_creation_id: str | None = None) -> None:
         prior = state.get("in_progress") or {}
         original = prior.get("origin") or {"current": state.get("current"), "previous": state.get("previous")}
         recorded = prior.get("target") or target.view()
@@ -2813,6 +2879,8 @@ class Deployer:
                 progress[key] = prior[key]
         if publish_aliases_at_create or prior.get("publish_aliases_at_create"):
             progress["publish_aliases_at_create"] = True
+        if hold_creation_id or prior.get("hold_creation_id"):
+            progress["hold_creation_id"] = hold_creation_id or prior["hold_creation_id"]
         hold = held or prior.get("hold")
         if hold:
             progress["hold"] = hold
@@ -2864,6 +2932,8 @@ class Deployer:
             return
         if step in ("start serving", "background handoff", "switch"):
             try:
+                if progress.get("hold_creation_id"):
+                    self.recover_held_creates(progress, target, owned)
                 if owned:
                     route = self.current_route(state, state["current"], target.view())
                     self.verify_topology(state, route, target.view())

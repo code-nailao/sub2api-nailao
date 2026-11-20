@@ -107,6 +107,9 @@ class FakeOps(deploy.Ops):
             self.add(name, port, running=False, image=args[-1] if "oneoff" not in name else "x")
             out = self.containers[name]["Id"] + "\n"
             self.containers[name]["role"] = role
+            self.containers[name]["Config"]["Labels"] = dict(
+                args[i + 1].split("=", 1) for i, arg in enumerate(args) if arg == "--label"
+            )
             network = self.network_name(args[args.index("--network") + 1])
             aliases = [args[i + 1] for i, arg in enumerate(args) if arg == "--network-alias"]
             self.containers[name]["NetworkSettings"]["Networks"] = {network: {"Aliases": aliases}}
@@ -1328,6 +1331,78 @@ class DeployTest(unittest.TestCase):
         self.assert_live_release(self.state()["current"])
         self.assertIsNone(self.state()["in_progress"])
 
+    def test_main_accepts_localhost_peers_in_adopted_fixed_upstreams(self):
+        self.load_fixture_route(LEGACY, proof=False)
+        text = self.ops.loaded_upstreams.replace("server 127.0.0.1:", "server localhost:")
+        self.ops.loaded_upstreams = self.ops.files[self.cfg.upstream_file] = text
+        self.deploy()
+        self.assertEqual("a", self.state()["current"]["slot"])
+        self.assert_live_release(self.state()["current"])
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_abort_removes_candidate_after_hold_process_dies_in_docker_start(self):
+        target = self.cfg.slot_view("a")
+        primary = target["containers"]["serving"]
+        run = self.ops.run
+
+        class ProcessKilled(BaseException):
+            pass
+
+        def lose_process(args, **kw):
+            result = run(args, **kw)
+            if args == ["docker", "start", primary]:
+                raise ProcessKilled
+            return result
+
+        with mock.patch.object(self.ops, "run", lose_process):
+            with self.assertRaises(ProcessKilled):
+                self.hold()
+        self.assertTrue(self.ops.inspect(primary)["State"]["Running"])
+        self.assertEqual("deploying", self.state()["in_progress"]["phase"])
+        deploy.Deployer(self.cfg, self.ops).abort()
+        self.assertIsNone(self.ops.inspect(primary))
+        self.assert_live_release(LEGACY)
+        self.assertIsNone(self.state()["in_progress"])
+
+    def assert_abort_recovers_hold_during_create(self, *, unrelated=False):
+        target = self.cfg.slot_view("a")
+        primary = target["containers"]["serving"]
+        run = self.ops.run
+
+        class ProcessKilled(BaseException):
+            pass
+
+        def lose_process(args, **kw):
+            result = run(args, **kw)
+            if args[:2] == ["docker", "create"] and args[args.index("--name") + 1] == primary:
+                if unrelated:
+                    self.ops.containers[primary]["Config"]["Labels"] = {}
+                raise ProcessKilled
+            return result
+
+        with mock.patch.object(self.ops, "run", lose_process):
+            with self.assertRaises(ProcessKilled):
+                self.hold()
+        candidate = self.ops.inspect(primary)
+        self.assertFalse(candidate["State"]["Running"])
+        self.assertNotIn("serving", self.state()["in_progress"].get("owned", {}))
+        if unrelated:
+            with self.assertRaisesRegex(deploy.DeployError, "ownership is unconfirmed"):
+                deploy.Deployer(self.cfg, self.ops).abort()
+            self.assertEqual(candidate, self.ops.inspect(primary))
+            self.assertEqual("aborting", self.state()["in_progress"]["phase"])
+        else:
+            deploy.Deployer(self.cfg, self.ops).abort()
+            self.assertIsNone(self.ops.inspect(primary))
+            self.assertIsNone(self.state()["in_progress"])
+        self.assert_live_release(LEGACY)
+
+    def test_abort_finds_held_candidate_created_before_docker_returns_id(self):
+        self.assert_abort_recovers_hold_during_create()
+
+    def test_abort_preserves_untracked_container_without_the_hold_creation_label(self):
+        self.assert_abort_recovers_hold_during_create(unrelated=True)
+
     def test_abort_can_recover_resume_abandoned_at_background_handoff(self):
         held = self.hold()
         runner = deploy.Deployer(self.cfg, self.ops)
@@ -1621,31 +1696,40 @@ class DeployTest(unittest.TestCase):
             self.assertEqual(target["slot"], self.state()["current"]["slot"])
         self.assertIsNone(self.state()["in_progress"])
 
-    def test_resume_keeps_one_live_shared_alias_owner_during_second_release(self):
+    def test_resume_continuously_provides_the_shared_alias_on_each_network(self):
         self.deploy()
         source = self.state()["current"]
         target = self.hold()["target"]
         run = self.ops.run
-        owners = []
 
-        def check(args, **kw):
-            result = run(args, **kw)
-            active = set()
+        def alias_owners():
+            owners = {net: set() for net in self.cfg.networks}
             for view in (source, target):
                 for role in deploy.SERVING_ROLES:
                     info = self.ops.inspect(view["containers"][role]) or {}
-                    endpoints = info.get("NetworkSettings", {}).get("Networks", {})
-                    if info.get("State", {}).get("Running") and any(self.cfg.serving_alias in ep.get("Aliases", ())
-                                                                     for ep in endpoints.values()):
-                        active.add(view["slot"])
-            owners.append(active)
+                    if info.get("State", {}).get("Running"):
+                        for net, ep in info["NetworkSettings"]["Networks"].items():
+                            if self.cfg.serving_alias in ep.get("Aliases", ()):
+                                owners[net].add(view["slot"])
+            return owners
+
+        samples = []
+
+        def sample(args, **kw):
+            result = run(args, **kw)
+            samples.append((args[:3], alias_owners()))
             return result
 
-        with mock.patch.object(self.ops, "run", check):
+        self.assertEqual({net: {source["slot"]} for net in self.cfg.networks}, alias_owners())
+        with mock.patch.object(self.ops, "run", sample):
             deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertTrue(all(len(owner) <= 1 for owner in owners))
-        self.assertEqual({target["slot"]}, owners[-1])
-        self.assert_live_release(self.state()["current"])
+        for args, owners in samples:
+            self.assertTrue(all(owners.values()), (args, owners))
+        self.assertTrue(any(all(slots == {source["slot"], target["slot"]} for slots in owners.values())
+                            for _, owners in samples))
+        self.assertEqual({net: {target["slot"]} for net in self.cfg.networks}, alias_owners())
+        self.assert_live_release(target)
+        self.assertIsNone(self.state()["in_progress"])
 
     def test_abort_reconnects_original_endpoint_after_failed_alias_withdrawal(self):
         self.deploy()
@@ -3186,6 +3270,72 @@ class DeployTest(unittest.TestCase):
         self.assertEqual("a", self.state()["current"]["slot"])
         self.assertIsNone(self.state()["in_progress"])
 
+    def test_main_accepts_a_verified_route_after_a_nonzero_reload(self):
+        run = self.ops.run
+
+        def fail_after_reload(args, **kw):
+            result = run(args, **kw)
+            if args == [self.cfg.nginx_bin, "-s", "reload"]:
+                return subprocess.CompletedProcess(args, 1, "", "fixture reload failed after applying")
+            return result
+
+        with mock.patch.object(self.ops, "run", fail_after_reload):
+            self.deploy()
+        self.assertEqual("a", self.state()["current"]["slot"])
+        self.assert_live_release(self.state()["current"])
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_main_rejected_reload_restores_background_when_old_route_is_confirmed(self):
+        self.deploy()
+        original = self.state()["current"]
+        previous_file = self.ops.loaded_upstreams
+        run = self.ops.run
+
+        def reject(args, **kw):
+            if args == [self.cfg.nginx_bin, "-s", "reload"]:
+                if kw.get("check", True):
+                    raise deploy.DeployError("fixture reload rejected")
+                return subprocess.CompletedProcess(args, 1, "", "fixture reload rejected")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", reject):
+            with self.assertRaises(deploy.DeployError):
+                self.deploy(image="fixture:second")
+        self.assert_live_release(original)
+        self.assertEqual(previous_file, self.ops.files[self.cfg.upstream_file])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual("failed", self.history()[-1]["result"])
+        for role in deploy.SERVING_ROLES:
+            self.assertIsNone(self.ops.inspect(self.cfg.slot_view("b")["containers"][role]))
+
+    def test_main_rejected_reload_with_no_route_proof_keeps_both_serving_pairs(self):
+        self.deploy()
+        original = self.state()["current"]
+        target = self.cfg.slot_view("b")
+        run = self.ops.run
+        probe = self.ops.probe_nginx_serving
+        rejected = False
+
+        def reject(args, **kw):
+            nonlocal rejected
+            if args == [self.cfg.nginx_bin, "-s", "reload"]:
+                rejected = True
+                return subprocess.CompletedProcess(args, 1, "", "fixture reload rejected")
+            return run(args, **kw)
+
+        def missing_probe(*args):
+            return (0, None, None) if rejected else probe(*args)
+
+        with mock.patch.object(self.ops, "run", reject), \
+                mock.patch.object(self.ops, "probe_nginx_serving", missing_probe):
+            with self.assertRaises(deploy.RoutingUnconfirmed):
+                self.deploy(image="fixture:second")
+        for view in (original, target):
+            for role in deploy.SERVING_ROLES:
+                self.assertTrue(self.ops.inspect(view["containers"][role])["State"]["Running"])
+        self.assertEqual(original, self.state()["current"])
+        self.assert_release_failure("failed", "nginx reload failed with exit status 1")
+
     def test_main_failed_retirement_keeps_new_release_live_and_blocks_rollback(self):
         run = self.ops.run
 
@@ -3963,6 +4113,25 @@ class DeployTest(unittest.TestCase):
             self.assertEqual((200, {}), ops.http_json(runtime))
         self.assertEqual([(runtime, "GET", f"Bearer {token}"), (drain, "POST", f"Bearer {token}"),
                           (runtime, "GET", None), (redirected, "GET", None)], requests)
+
+    def test_http_json_runtime_token_bypasses_process_proxy(self):
+        request = deploy.urllib.request
+        runtime = "http://localhost/internal/sources/runtime"
+        addresses = []
+        build_opener = request.build_opener
+
+        class FixtureHTTP(request.HTTPHandler):
+            def http_open(self, req):
+                addresses.append(req.host)
+                response = addinfourl(io.BytesIO(b"{}"), Message(), req.full_url, 200)
+                response.msg = "OK"
+                return response
+
+        with mock.patch.object(request, "getproxies", return_value={"http": "http://proxy.invalid"}), \
+                mock.patch.object(request, "proxy_bypass", return_value=False), \
+                mock.patch.object(request, "build_opener", side_effect=lambda *h: build_opener(*h, FixtureHTTP())):
+            self.assertEqual((200, {}), deploy.Ops().http_json(runtime, token="FIXTURE_RUNTIME_TOKEN"))
+        self.assertEqual(["localhost"], addresses)
 
     def test_http_json_treats_a_reply_cut_off_mid_way_as_no_reply(self):
         # Real sockets: a process that exits while answering leaves one of these.
