@@ -82,7 +82,7 @@ func TestBrowserFixture(t *testing.T) {
 				t.Fatal("fixture API origin must be a fixed HTTPS origin")
 			}
 		}
-		s.Studio, err = OpenStudio(t.TempDir(), apiOrigin, []StudioCapability{{GroupID: 26, Engine: "sub2api", Models: []string{"gpt-image-1"}}, {GroupID: 74, Engine: "sub2api", Models: []string{"gpt-image-1"}}}, "")
+		s.Studio, err = OpenStudio(t.TempDir(), apiOrigin, []StudioCapability{{GroupID: 26, Engine: "sub2api", Models: []string{"gpt-image-1"}}, {GroupID: 74, Engine: "sub2api", Models: []string{"gpt-image-1"}}}, "", []string{"api", "api2"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -201,6 +201,10 @@ func TestBrowserFixture(t *testing.T) {
 					b, _ := json.Marshal(map[string]any{"id": id, "name": key.Name})
 					return reply(200, `{"code":0,"data":`+string(b)+`}`), nil
 				}
+				key.Group = &struct {
+					Name     string `json:"name"`
+					Platform string `json:"platform"`
+				}{Name: "图片分组", Platform: platforms[key.GroupID]}
 				b, _ := json.Marshal(key)
 				return reply(200, `{"code":0,"data":`+string(b)+`}`), nil
 			}

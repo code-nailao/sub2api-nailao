@@ -19,6 +19,10 @@ var ErrConflict = errors.New("source_changed_refresh_page")
 var ErrBusy = errors.New("refresh_in_progress_or_rate_limited")
 var ErrSourceDeletionReservation = errors.New("source_deletion_reservation_required")
 
+// Only a read interrupted by the service lifetime cancellation has this cause.
+// Request deadlines and upstream failures keep their existing error handling.
+var errBalanceShutdown = errors.New("balance_query_stopped_for_shutdown")
+
 type SourceInput struct {
 	Name          string `json:"name"`
 	Origin        string `json:"origin"`
@@ -55,8 +59,8 @@ type Service struct {
 }
 
 func NewService(s *Store, p Provider) *Service {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Service{asyncCtx: ctx, asyncCancel: cancel, asyncJobs: map[string]*balanceAsyncJob{}, Store: s, Provider: p, Interval: 5 * time.Minute, inflight: map[string]bool{}, last: map[string]time.Time{}, gate: make(chan struct{}, balanceConcurrency), sites: map[string]int{}}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	return &Service{asyncCtx: ctx, asyncCancel: func() { cancel(errBalanceShutdown) }, asyncJobs: map[string]*balanceAsyncJob{}, Store: s, Provider: p, Interval: 5 * time.Minute, inflight: map[string]bool{}, last: map[string]time.Time{}, gate: make(chan struct{}, balanceConcurrency), sites: map[string]int{}}
 }
 func (s *Service) List() []Source {
 	out := []Source{}
@@ -216,9 +220,27 @@ func (s *Service) Refresh(ctx context.Context, id string) (Source, error) {
 	if err != nil {
 		return Source{}, ErrCredential
 	}
-	ctx, cancel := context.WithTimeout(ctx, balanceOperationTimeout)
-	defer cancel()
+	ctx, deadlineCancel := context.WithTimeout(ctx, balanceOperationTimeout)
+	defer deadlineCancel()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	// Balance probes are read-only and can stop at process shutdown, including
+	// synchronous HTTP refreshes whose request context is still alive.
+	stop := context.AfterFunc(s.asyncCtx, func() { cancel(errBalanceShutdown) })
+	defer stop()
+	if s.asyncCtx.Err() != nil {
+		cancel(errBalanceShutdown)
+	}
 	balance, probeErr := s.Provider.Probe(ctx, rec.Source.Origin, token, rec.Source.AccountID)
+	if errors.Is(probeErr, errBalanceShutdown) {
+		// A handoff is not an upstream failure. Leave the snapshot, schedule
+		// and notification outbox untouched, including concurrent edits.
+		current, ok := s.Store.snapshot()[id]
+		if !ok {
+			return Source{}, ErrNotFound
+		}
+		return current.Source, nil
+	}
 	var result Source
 	err = s.Store.change(func(rows map[string]record) error {
 		current, ok := rows[id]
@@ -330,6 +352,9 @@ func (s *Service) balanceDue(src Source, now time.Time) bool {
 
 func (s *Service) Run(ctx context.Context) {
 	defer s.StopAsync()
+	// Do not wait for the intelligence worker before cancelling balance reads.
+	stop := context.AfterFunc(ctx, s.asyncCancel)
+	defer stop()
 	var workers sync.WaitGroup
 	if s.Bridge != nil {
 		workers.Add(1)
@@ -351,7 +376,7 @@ func (s *Service) Run(ctx context.Context) {
 			go func() {
 				defer balanceWorkers.Done()
 				for id := range jobs {
-					_, _ = s.Refresh(ctx, id)
+					_, _ = s.Refresh(s.asyncCtx, id)
 				}
 			}()
 		}

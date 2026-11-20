@@ -216,6 +216,8 @@ func TestInvalidStartupConfigDoesNotModifyState(t *testing.T) {
 		{"bridge format", file("WALLET_BRIDGE_KEY_FILE", "not-a-key", 0600), errBridgeConfig},
 		{"bridge notification owner", set("BALANCE_ALERT_WEBHOOK", "https://alerts.example/hook"), errBridgeOwner},
 		{"trusted proxies", set("PORTAL_TRUSTED_PROXIES", "invalid-prefix"), errTrustedProxy},
+		{"custom API labels invalid", set("STUDIO_CUSTOM_API_LABELS", "api,API"), errStudioAPILabels},
+		{"custom API labels duplicate", set("STUDIO_CUSTOM_API_LABELS", "api,api"), errStudioAPILabels},
 		{"studio config unavailable", func(_ *testing.T, f *checkFixture) {
 			f.env["STUDIO_CONFIG_FILE"] = filepath.Join(f.root, "missing.json")
 		}, errStudioConfigRead},

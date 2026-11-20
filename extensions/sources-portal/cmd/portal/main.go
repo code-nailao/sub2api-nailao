@@ -52,6 +52,7 @@ const (
 	errStudioConfigRead   = "studio config unavailable"
 	errStudioConfig       = "invalid studio config"
 	errStudio             = "studio bindings initialization failed"
+	errStudioAPILabels    = "STUDIO_CUSTOM_API_LABELS must contain at most 16 unique lowercase DNS labels"
 	errStudioURL          = "STUDIO_URL requires a fixed HTTPS page with a canonical ASCII host and port (no Unicode, trailing dot or port padding)"
 	errStudioOrigin       = "STUDIO_URL must use a separate origin so the workbench cannot read Main login storage"
 	errCanvasURL          = "CANVAS_URL requires a fixed HTTPS page on a separate origin with a canonical ASCII host and port (no Unicode, trailing dot or port padding)"
@@ -134,7 +135,7 @@ func serve(getenv func(string) string, logger *log.Logger) int {
 		return 1
 	}
 	logger.Print("Sources portal started; no main database connection")
-	if err := runPortal(ctx, httpServer, listener, setup.svc.Run); err != nil {
+	if err := runPortal(ctx, httpServer, listener, setup.svc.Run, logger, setup.svc.Intelligence.RoundActive); err != nil {
 		logger.Print(errServer)
 		return 1
 	}
@@ -237,6 +238,10 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 		}
 		server.TrustedProxies = append(server.TrustedProxies, p)
 	}
+	customAPILabels, labelErr := portal.ParseStudioCustomAPILabels(getenv("STUDIO_CUSTOM_API_LABELS"))
+	if labelErr != nil {
+		return fail(errStudioAPILabels)
+	}
 	var caps []portal.StudioCapability
 	var mediaEngineLegacyName string
 	if file := getenv("STUDIO_CONFIG_FILE"); file != "" {
@@ -322,7 +327,7 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 		}
 	}
 	if caps != nil {
-		server.Studio, err = portal.OpenStudio(dir, sub, caps, mediaEngineLegacyName)
+		server.Studio, err = portal.OpenStudio(dir, sub, caps, mediaEngineLegacyName, customAPILabels)
 		if err != nil {
 			return fail(errStudio)
 		}
