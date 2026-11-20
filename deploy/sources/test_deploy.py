@@ -144,7 +144,8 @@ class FakeOps(deploy.Ops):
         elif args[:2] == ["docker", "update"]:
             c = self.containers.get(name)
             if c:
-                c["HostConfig"]["RestartPolicy"]["Name"] = args[2].split("=", 1)[1]
+                policy, _, retries = args[2].split("=", 1)[1].partition(":")
+                c["HostConfig"]["RestartPolicy"] = {"Name": policy, "MaximumRetryCount": int(retries or 0)}
         elif args[:3] == ["docker", "network", "disconnect"]:
             self.containers[name]["NetworkSettings"]["Networks"].pop(self.network_name(args[-2]), None)
         elif args[:3] == ["docker", "network", "connect"]:
@@ -1154,6 +1155,42 @@ class DeployTest(unittest.TestCase):
                                 for network in self.cfg.networks))
         self.assert_no_shared_serving(self.cfg.slot_view("b"))
 
+    def test_watch_ignores_expected_overlap_during_main_release_and_retirement(self):
+        self.deploy()
+        previous = self.state()["current"]
+        previous_primary = previous["containers"]["serving"]
+        self.ops.drain_seconds[previous_primary] = 5
+        target = self.cfg.slot_view("b")
+        primary = target["containers"]["serving"]
+        pid = os.getpid()
+        stat = f"/proc/{pid}/stat"
+        process = f"{pid} (release) R " + "0 " * 20
+        self.ops.files["/proc/sys/kernel/random/boot_id"] = "fixture-boot\n"
+        self.ops.files[stat] = process
+        run = self.ops.run
+        active, interrupted = [], []
+
+        def sample_after_start(args, **kw):
+            result = run(args, **kw)
+            if args == ["docker", "start", primary]:
+                active.extend(deploy.watch_once(self.cfg, self.ops, {}))
+                self.ops.files.pop(stat)
+                try:
+                    interrupted.extend(deploy.watch_once(self.cfg, self.ops, {}))
+                finally:
+                    self.ops.files[stat] = process
+            return result
+
+        with mock.patch.object(self.ops, "run", sample_after_start):
+            self.deploy(image="fixture@sha256:second")
+        self.assertNotIn(["shared_alias_conflict"], [item["alert"] for item in active])
+        self.assertIn(["shared_alias_conflict"], [item["alert"] for item in interrupted])
+        self.assertIn(["release_incomplete"], [item["alert"] for item in interrupted])
+        self.assertTrue(self.ops.inspect(previous_primary)["State"]["Running"])
+        self.assertNotIn(["shared_alias_conflict"], [item["alert"] for item in deploy.watch_once(self.cfg, self.ops, {})])
+        run(["docker", "start", previous_primary], mutate=True)
+        self.assertIn(["shared_alias_conflict"], [item["alert"] for item in deploy.watch_once(self.cfg, self.ops, {})])
+
     def test_resume_keeps_one_live_shared_alias_owner_during_second_release(self):
         self.deploy()
         source = self.state()["current"]
@@ -1681,6 +1718,51 @@ class DeployTest(unittest.TestCase):
         self.assertEqual("failed", self.state()["in_progress"]["phase"])
         self.assertTrue(self.state()["in_progress"]["reason"])
 
+    def test_main_asset_command_timeout_records_failure_and_preserves_rollback(self):
+        self.deploy()
+        self.deploy(image="fixture@sha256:second")
+        before = self.state()
+        run = self.ops.run
+
+        def timeout_install(args, **kw):
+            if args[0] == "install":
+                self.assertEqual("deploying", self.state()["in_progress"]["phase"])
+                with mock.patch.object(deploy.subprocess, "run", side_effect=subprocess.TimeoutExpired(args, kw.get("timeout", 600))):
+                    return deploy.Ops.run(self.ops, args, **kw)
+            return run(args, **kw)
+
+        self.ops.commands.clear()
+        with mock.patch.object(self.ops, "run", timeout_install):
+            with self.assertRaisesRegex(deploy.DeployError, "timed out.*install"):
+                self.deploy(image="fixture@sha256:third")
+        self.assertEqual(before, self.state())
+        self.assert_live_release(before["current"])
+        for container in before["previous"]["containers"].values():
+            self.assertIsNotNone(self.ops.inspect(container))
+        failed = self.history()[-1]
+        self.assertEqual("failed", failed["result"])
+        self.assertIn("timed out", failed["error"])
+        self.assertFalse(self.created())
+
+    def test_main_migration_timeout_cleans_one_off_and_records_failure(self):
+        run = self.ops.run
+
+        def timeout_migration(args, **kw):
+            if (args[:3] == ["docker", "start", "--attach"]
+                    and self.ops.containers[args[-1]]["cmd"][0] == "-migrate-only"):
+                raise subprocess.TimeoutExpired(args, kw["timeout"])
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", timeout_migration):
+            with self.assertRaisesRegex(deploy.DeployError, "timed out"):
+                self.deploy()
+        self.assertIsNone(self.state()["in_progress"])
+        self.assert_live_release(LEGACY)
+        self.assertFalse(any("oneoff" in name for name in self.ops.containers))
+        failed, = self.history()
+        self.assertEqual("failed", failed["result"])
+        self.assertIn("timed out", failed["error"])
+
     def test_hold_records_preparation_timeout_and_interrupt_after_progress_is_written(self):
         run = self.ops.run
         initial = self.state()
@@ -1698,11 +1780,15 @@ class DeployTest(unittest.TestCase):
                         self.deploy(hold_before_switch=True)
                 self.assert_live_release(LEGACY)
                 self.assertEqual(LEGACY, self.state()["current"])
-                self.assertIn(type(failure).__name__, self.state()["in_progress"]["reason"])
+                reason = "timed out" if isinstance(failure, subprocess.TimeoutExpired) else "KeyboardInterrupt"
+                self.assertIn(reason, self.state()["in_progress"]["reason"])
                 self.assertEqual("failed", self.history()[-1]["result"])
                 self.assertFalse(self.created())
 
     def test_watch_detects_abandoned_deploy_and_rejects_reused_process_identity(self):
+        class ProcessKilled(BaseException):
+            pass
+
         pid = os.getpid()
         stat = f"/proc/{pid}/stat"
         boot = "/proc/sys/kernel/random/boot_id"
@@ -1719,11 +1805,11 @@ class DeployTest(unittest.TestCase):
                 self.assertEqual("deploying", self.state()["in_progress"]["phase"])
                 self.assertTrue(deploy.status(self.cfg, self.ops)["in_progress"]["process_running"])
                 self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
-                raise subprocess.TimeoutExpired(args, 1)
+                raise ProcessKilled
             return run(args, **kw)
 
         with mock.patch.object(self.ops, "run", interrupt_after_mark):
-            with self.assertRaises(subprocess.TimeoutExpired):
+            with self.assertRaises(ProcessKilled):
                 self.deploy()
         progress = self.state()["in_progress"]
         self.assertEqual("deploying", progress["phase"])
@@ -2896,6 +2982,9 @@ class DeployTest(unittest.TestCase):
         self.assertIsNone(self.state()["in_progress"])
 
     def test_main_handoff_create_failure_restores_old_background_restart_policy(self):
+        old = self.ops.containers[LEGACY["containers"]["background"]]
+        policy = {"Name": "on-failure", "MaximumRetryCount": 3}
+        old["HostConfig"]["RestartPolicy"] = dict(policy)
         real = self.ops.run
 
         def fail_create(args, **kw):
@@ -2906,9 +2995,56 @@ class DeployTest(unittest.TestCase):
         with mock.patch.object(self.ops, "run", fail_create):
             with self.assertRaises(deploy.DeployError):
                 self.deploy()
-        old = self.ops.containers["old-bg"]
         self.assertTrue(old["State"]["Running"])
-        self.assertEqual("unless-stopped", old["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertEqual(policy, old["HostConfig"]["RestartPolicy"])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assert_live_release(LEGACY)
+
+    def test_main_handoff_readiness_failure_restores_original_retry_limit(self):
+        old = self.ops.containers[LEGACY["containers"]["background"]]
+        policy = {"Name": "on-failure", "MaximumRetryCount": 3}
+        old["HostConfig"]["RestartPolicy"] = dict(policy)
+        self.ops.unready_ports.add(self.cfg.slots["a"]["background"])
+        with self.assertRaisesRegex(deploy.DeployError, "is running again"):
+            self.deploy()
+        self.assertEqual(policy, old["HostConfig"]["RestartPolicy"])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assert_live_release(LEGACY)
+
+    def test_main_switch_failure_restores_original_background_restart_policy(self):
+        old = self.ops.containers[LEGACY["containers"]["background"]]
+        policy = {"Name": "on-failure", "MaximumRetryCount": 3}
+        old["HostConfig"]["RestartPolicy"] = dict(policy)
+        self.ops.nginx_test_rc = 1
+        with self.assertRaisesRegex(deploy.DeployError, "nginx -t rejected"):
+            self.deploy()
+        self.assertEqual(policy, old["HostConfig"]["RestartPolicy"])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assert_live_release(LEGACY)
+
+    def test_abort_restores_original_policy_after_handoff_recovery_fails(self):
+        name = LEGACY["containers"]["background"]
+        old = self.ops.containers[name]
+        policy = {"Name": "on-failure", "MaximumRetryCount": 3}
+        old["HostConfig"]["RestartPolicy"] = dict(policy)
+        candidate = self.cfg.slot_view("a")["containers"]["background"]
+        run = self.ops.run
+
+        def fail(args, **kw):
+            if args[:2] == ["docker", "create"] and args[args.index("--name") + 1] == candidate:
+                raise deploy.DeployError("fixture create failure")
+            if args == ["docker", "update", "--restart=on-failure:3", name]:
+                raise deploy.DeployError("fixture restart policy update failure")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", fail):
+            with self.assertRaises(deploy.FallbackFailed):
+                self.deploy()
+        self.assert_live_release(LEGACY)
+        self.assertEqual("no", old["HostConfig"]["RestartPolicy"]["Name"])
+        self.assert_release_failure("failed", "restart policy update failure")
+        deploy.Deployer(self.cfg, self.ops).abort()
+        self.assertEqual(policy, old["HostConfig"]["RestartPolicy"])
         self.assertIsNone(self.state()["in_progress"])
         self.assert_live_release(LEGACY)
 

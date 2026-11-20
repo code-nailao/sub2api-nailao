@@ -172,8 +172,8 @@ class PortalOps(deploy.Ops):
         DeployError so the handover falls back instead of ending in a traceback."""
         try:
             return super().run(args, mutate=mutate, timeout=timeout, check=check)
-        except subprocess.TimeoutExpired:
-            raise DeployError(f"command timed out after {int(timeout)}s: {shlex.join(args[:4])} ...") from None
+        except subprocess.TimeoutExpired as err:
+            raise deploy.CommandTimedOut(err) from None
         except OSError as err:
             raise DeployError(f"command could not run: {shlex.join(args[:4])} ...: {err.strerror or err}") from None
 

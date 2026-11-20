@@ -21,7 +21,7 @@
 - **新版本总是发到“非当前”槽位。** 那里原有的容器是上上个版本，发布时直接删除重建；上一个版本留在另一个槽位，停止后保留，用于回滚。所以任何时候只保留一个可回滚的上一版本。
 - **Nginx 只引用两个固定 upstream 名**：`sources_main_serving`（主 + 备，备用 `backup`）和 `sources_main_admin`（后台）。切流时只重写一个由脚本生成的 upstream 文件，其他 Nginx 配置不再变化。预检会拒绝仍在引用按版本命名的 upstream 的配置。
 - **静态资源放在一个固定目录。** 文件名带内容哈希，新版本的资源追加复制进去，不删除也不覆盖，所以切换后仍停留在旧页面的浏览器能继续加载旧资源。
-- **内部调用方使用固定别名。** 稳定别名（默认 `sources-main-serving`）只由一个槽位的主备提供。旧槽位已经提供别名时，候选先隔离启动，守护通过后等旧主备排空退出并撤下别名，再由新槽位接手。该过程可能短暂没有别名提供方。内部服务（如 Portal）应使用稳定别名。
+- **内部调用方使用 `serving_alias`。** 普通 `main` 在创建主备和接网时登记别名，从候选启动到旧主备排空退出，两槽位可以短暂共用。暂停候选保持隔离。如果旧槽位提供别名，`resume` 确认新路由生效并通过守护后才排空旧主备，撤下旧别名后再交给新槽位。`rollback` 先隔离回退目标，确认回退路由生效及目标能提供别名后，再排空原主备并交接。单槽位交接可能短暂没有别名提供方。回退目标缺少别名时保留原提供方并告警。
 - Main 状态文件记录当前槽位、上一槽位、镜像和进行中的步骤。历史文件记录发布结果与耗时。追加历史失败时只告警一次，命令结果以状态和操作结果为准。演练（`--dry-run`）不写历史。
 
 ## 进程角色与唯一后台
@@ -161,9 +161,9 @@ Main 的状态集中在 `in_progress`。空闲时该字段为 `null`。其它阶
 | 容器操作结束但状态写入失败 | 命令报错。用 `status` 查看磁盘上最后保存的阶段。`held` 可继续或放弃，`aborting` 可重试放弃，`failed` 或进程已经退出的 `deploying` 需人工核查。状态已清除时先核对当前版本再决定后续操作 |
 | 状态已保存，追加历史失败 | 只输出一次警告，保留已保存的状态和本次命令的退出结果。成功暂停时仍会提示 `resume` 或 `abort`。修复历史文件后按 `status` 继续操作 |
 
-`watch` 报告 `phase=failed` 或发布进程已退出的 `phase=deploying`，告警为 `release_incomplete`。清理未完成且进程不在运行时报告 `abort_incomplete`，即使进程被强制终止而来不及写入 `reason`。健康暂停不触发发布故障告警。发现两个槽位都持有共享别名时，`watch` 报告 `shared_alias_conflict`。普通发布会保留原有的别名重叠期，从新主备启动到旧主备排空退出。暂停继续和手动回滚按单槽位交接别名。检测进程时核对 PID、Linux 启动标识和该进程的启动时刻，避免 PID 被复用时误判。Docker 查询失败时 `status` 显示 `unknown`，`watch` 报告 `docker_inspect_failed`。
+`watch` 报告 `phase=failed` 或发布进程已退出的 `phase=deploying`，告警为 `release_incomplete`。清理未完成且进程不在运行时报告 `abort_incomplete`，即使进程被强制终止而来不及写入 `reason`。健康暂停不触发发布故障告警。发现两个槽位意外共用别名时，`watch` 报告 `shared_alias_conflict`。活跃的普通发布所记录的槽位，以及发布完成后已收到 SIGTERM 且未重启的旧实例，允许在交接和排空期间共用别名。发布失败、进程消失或旧实例重启后，仍检查别名冲突。检测进程时核对 PID、Linux 启动标识和该进程的启动时刻，避免 PID 被复用时误判。Docker 查询失败时 `status` 显示 `unknown`，`watch` 报告 `docker_inspect_failed`。
 
-Main 命令遇到未处理的异常时会以非零状态退出，并输出一行错误及下一步。提示以磁盘上的状态为准。配置或状态文件不可读时，先检查文件再重试。
+Main 准备阶段的命令超时会记录失败历史。普通发布在尚未进行槽位操作时清除进度，保留原路由、后台与回滚槽。容器或路由操作的结果不明时保留故障记录供核查。Main 命令遇到未处理的异常时会以非零状态退出，并输出一行错误及下一步。提示以磁盘上的状态为准。配置或状态文件不可读时，先检查文件再重试。
 
 `--dry-run` 是全局参数。`main <IMAGE_DIGEST> --hold-before-switch` 和普通 `main` 的演练一样，本地缺少镜像时会真实拉取。它会真实创建、运行、删除一次性容器来列出待迁移项，无待迁移项时也会运行一次性启动检查。有待迁移项时只打印迁移计划，跳过启动检查。迁移、资源导出、发布槽位容器操作和 Nginx 修改只打印计划。普通发布和暂停发布的演练仍会运行 `nginx -T` 做预检。`resume` 和 `abort` 演练读取现场并打印计划，不创建锁文件，不写状态、历史或修改容器。`resume` 演练只打印 `nginx -T`，因为运行该命令时 Nginx 会打开配置所引用的文件。
 
@@ -199,7 +199,7 @@ Main 命令遇到未处理的异常时会以非零状态退出，并输出一行
 
 1. 暂停其他发布操作。运行 `deploy.py --config <MAIN_CONFIG> status`、`docker ps -a` 和 `docker logs <CONTAINER>`，核对 `current`、`in_progress.target`、两槽位后台状态和 upstream 配置。若 reload 结果不明，从实际入口核对路由，单看磁盘上的配置不足以判定生效结果。
 2. 选择要服务的槽位。正向发布或 `rollback` 在切流前超时时，恢复交接前的后台。若状态提示用户与管理流量分处两槽，先核对仍在应答的后台，再决定完成回退或恢复到同一槽位。必要时先把非目标后台设为不自动重启（`docker update --restart=no <OTHER_BACKGROUND>`），如果后台仍在运行且尚未收到停止信号，发送 `docker kill --signal=TERM <OTHER_BACKGROUND>`。单独调用排空接口不会令进程退出。用 `docker inspect <OTHER_BACKGROUND>` 等它退出。排空中的目标后台也要等其退出后再启动。
-3. 对选定的后台运行 `docker update --restart=unless-stopped <BACKGROUND>` 和 `docker start <BACKGROUND>`。确认 `/health` 返回 200，并通过 `/internal/sources/runtime` 核对 `role=background`、`ready=true` 和 `owns_background=true`。如果路由需要修复，先核对两个 serving 端口也在应答，再更新 upstream，执行 `nginx -t` 成功后 reload，检查用户入口和管理入口。
+3. 从 `status` 的 `in_progress.background_restart_policies` 或现有部署配置查到选定后台的原重启策略，包含 `on-failure` 的重试上限。用 `docker update --restart=<ORIGINAL_POLICY> <BACKGROUND>` 恢复策略，再用 `docker start <BACKGROUND>` 启动。确认 `/health` 返回 200，并通过 `/internal/sources/runtime` 核对 `role=background`、`ready=true` 和 `owns_background=true`。如果路由需要修复，先核对两个 serving 端口也在应答，再更新 upstream，执行 `nginx -t` 成功后 reload，检查用户入口和管理入口。
 4. 排空未选中槽位的 serving，等待退出后再做必要的移除。这些实例即使不在 Nginx 路由中，也可能通过共享别名接过请求。确认实际路由与持锁后台一致后备份状态文件。若决定保留已切流的新版本，完成旧 serving 退役，把 `in_progress.target` 记为 `current`，原 `current` 记为 `previous`。恢复到原版本时保留原 `current`、`previous`。最后将 `in_progress` 改为 `null`，复查 `status`。
 
 ## 已知取舍

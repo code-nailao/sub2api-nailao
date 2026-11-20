@@ -79,6 +79,15 @@ class DeployError(Exception):
     """A release operation failed."""
 
 
+class CommandTimedOut(DeployError):
+    """A subprocess may have had side effects before its client timed out."""
+
+    def __init__(self, err: subprocess.TimeoutExpired):
+        args = err.cmd
+        command = shlex.join(args[:2]) if isinstance(args, (list, tuple)) else "subprocess"
+        super().__init__(f"command timed out after {err.timeout:g}s: {command}")
+
+
 class FallbackFailed(DeployError):
     """Restoring the previous release failed too; needs a person."""
 
@@ -308,7 +317,10 @@ class Ops:
         if self.dry_run and mutate:
             self.log("DRY-RUN " + shlex.join(args))
             return subprocess.CompletedProcess(args, 0, "", "")
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as err:
+            raise CommandTimedOut(err) from None
         if check and proc.returncode != 0:
             tail = (proc.stderr or proc.stdout).strip().splitlines()[-5:]
             raise DeployError(f"command failed ({proc.returncode}): {shlex.join(args[:4])} ...: " + " | ".join(tail))
@@ -620,6 +632,15 @@ class MainRoute:
     serving: dict[str, Any]
     admin: dict[str, Any]
     revision: str = field(default_factory=lambda: os.urandom(16).hex())
+
+
+def planned_alias_overlap(progress: dict[str, Any], current: dict[str, Any], peer: dict[str, Any]) -> bool:
+    if not progress.get("publish_aliases_at_create"):
+        return False
+    pair = ((progress.get("origin") or {}).get("current"), progress.get("target"))
+    containers = {view["slot"]: view["containers"] for view in pair if view}
+    return (containers.get(current["slot"]) == current["containers"]
+            and containers.get(peer["slot"]) == peer["containers"])
 
 
 class Deployer:
@@ -935,7 +956,7 @@ class Deployer:
         except Exception:  # noqa: BLE001 - a progress note must never end the wait
             return None
 
-    def stuck_owner(self, current: dict[str, Any], target: Target, timeout: int) -> FallbackFailed:
+    def stuck_owner(self, current: dict[str, Any], target: Target, timeout: int, restart: str) -> FallbackFailed:
         """The old owner did not exit in time. Say which slot serves traffic,
         what is left running and which background a person has to start."""
         old = current["containers"]["background"]
@@ -947,11 +968,11 @@ class Deployer:
             f"Traffic is on slot {traffic}. {old} is set not to restart, so once it exits no background owner runs. "
             f"Serving containers left outside the Nginx route: {', '.join(idle) or 'none'}. "
             f"Wait for {old} to exit (docker ps -a), then start the background of slot {traffic}: "
-            f"'docker update --restart=unless-stopped {old}' and 'docker start {old}'; check 'status', "
+            f"'docker update --restart={restart} {old}' and 'docker start {old}'; check 'status', "
             "then clear in_progress. Do not deploy again before that")
 
-    def handoff_background(self, current: dict[str, Any], target: Target, create: bool,
-                           *, check_health: bool = False) -> None:
+    def handoff_background(self, state: dict[str, Any], current: dict[str, Any], target: Target,
+                           create: bool, *, check_health: bool = False) -> None:
         """Move background ownership from current to target. The old owner gets
         one SIGTERM and finishes in-flight work; the kernel lock passes when it
         exits. If the new owner does not become ready, the old one restarts.
@@ -960,23 +981,51 @@ class Deployer:
         old = current["containers"]["background"]
         new = target.containers["background"]
         before = self.owner_runtime(current)  # read-only, also in a dry run
-        source = self.ops.inspect(old) if check_health and not self.ops.dry_run else None
+        source = self.ops.inspect(old) if not self.ops.dry_run else None
         old_running = not check_health or self.ops.dry_run or bool((source or {}).get("State", {}).get("Running"))
+        progress = state.get("in_progress") or {}
+        policies = progress.get("background_restart_policies", {})
+        if source and old not in policies:
+            policy = source.get("HostConfig", {}).get("RestartPolicy")
+            if policy is None:
+                raise DeployError("cannot read the original background restart policy")
+            name = policy.get("Name") or "no"
+            retries = policy.get("MaximumRetryCount")
+            if name == "on-failure" and retries:
+                name = f"{name}:{retries}"
+            policies = {**policies, old: name}
+            # Retain the original policy through switch failure and abort.
+            self._save_progress(state, {**progress, "background_restart_policies": policies})
+        old_restart = policies.get(old, "unless-stopped")
         if not create:
             # Prepare the stopped rollback container before changing the active owner.
-            self.ops.run(["docker", "update", "--restart=unless-stopped", new], mutate=True)
-        if old_running or source:
-            self.ops.run(["docker", "update", "--restart=no", old], mutate=True)
-        if create:
-            self.create(target, "background")
-        if old_running:
-            self.log(f"   TERM {old}; waiting for it to finish in-flight work (no SIGKILL)")
-            if (before or {}).get("admin_during_drain") == "read-only":
-                self.log(f"   while {old} drains it answers admin reads and refuses admin writes with 503; "
-                         "the admin API is down only from its exit until the new background is ready")
-            else:
-                self.log(f"   the admin API is unavailable until the new background is ready "
-                         f"({old} does not report read-only draining)")
+            self.ops.run(["docker", "update", f"--restart={policies.get(new, 'unless-stopped')}", new], mutate=True)
+        try:
+            if old_running or source:
+                self.ops.run(["docker", "update", "--restart=no", old], mutate=True)
+            if create:
+                self.create(target, "background")
+            if old_running:
+                self.log(f"   TERM {old}; waiting for it to finish in-flight work (no SIGKILL)")
+                if (before or {}).get("admin_during_drain") == "read-only":
+                    self.log(f"   while {old} drains it answers admin reads and refuses admin writes with 503; "
+                             "the admin API is down only from its exit until the new background is ready")
+                else:
+                    self.log(f"   the admin API is unavailable until the new background is ready "
+                             f"({old} does not report read-only draining)")
+        except (Exception, KeyboardInterrupt) as err:
+            if self.ops.dry_run or not old_running:
+                raise
+            try:
+                owner = self.owner_runtime(current) or {}
+                candidate = self.owner_runtime(target.view()) or {}
+                if not owner.get("ready") or not owner.get("owns_background") or candidate.get("owns_background"):
+                    raise DeployError("previous background ownership is unconfirmed")
+                self.ops.run(["docker", "update", f"--restart={old_restart}", old], mutate=True)
+            except (Exception, KeyboardInterrupt) as restore_err:
+                raise FallbackFailed(f"background handoff failed ({err}); recovery is unconfirmed ({restore_err}); "
+                                     "inspect status and restore the previous background") from restore_err
+            raise DeployError(str(err) or "background handoff interrupted; previous background is ready") from err
         old_exited = not old_running
         try:
             if old_running:
@@ -991,7 +1040,7 @@ class Deployer:
                     if check_health:
                         raise FallbackFailed(f"{old} is still draining; {new} was not started. "
                                              "Wait for the current owner to exit before restoring a background") from err
-                    raise self.stuck_owner(current, target, timeout) from err
+                    raise self.stuck_owner(current, target, timeout, old_restart) from err
                 old_exited = True
                 self.log(f"   {old} exited with code {code}")
             self.ops.run(["docker", "start", new], mutate=True)
@@ -1018,7 +1067,7 @@ class Deployer:
                     if (self.ops.inspect(new) or {}).get("State", {}).get("Running"):
                         self.ops.run(["docker", "kill", "--signal=TERM", new], mutate=True)
                         self.wait_exit(new, 120, poll=HANDOFF_POLL_SECONDS)
-                self.ops.run(["docker", "update", "--restart=unless-stopped", old], mutate=True)
+                self.ops.run(["docker", "update", f"--restart={old_restart}", old], mutate=True)
                 self.ops.run(["docker", "start", old], mutate=True)
                 self.wait_ready(current["ports"]["background"], self.token_for(current, "background"), "background",
                                 self.cfg.background_ready_timeout, container=old, poll=HANDOFF_POLL_SECONDS,
@@ -1108,7 +1157,7 @@ class Deployer:
         text = render_upstreams(ports["serving"], ports["standby"], route.admin["ports"]["background"])
         return text + render_serving_probe(self.route_probe_path(), route.revision) if route.revision else text
 
-    def alias_networks(self, view: dict[str, Any]) -> set[tuple[str, str]]:
+    def alias_networks(self, view: dict[str, Any], *, retiring: dict[str, Any] | None = None) -> set[tuple[str, str]]:
         if not view or not self.cfg.serving_alias:
             return set()
         advertised = set()
@@ -1117,6 +1166,10 @@ class Deployer:
             state = info.get("State", {})
             if not (state.get("Running") or state.get("Restarting")):
                 continue
+            if retiring and retiring.get(role) == {"id": info.get("Id"), "started_at": state.get("StartedAt")}:
+                policy = (info.get("HostConfig") or {}).get("RestartPolicy") or {}
+                if not state.get("Restarting") and policy.get("Name") == "no":
+                    continue
             for network, endpoint in info.get("NetworkSettings", {}).get("Networks", {}).items():
                 if endpoint.get("EndpointID", network) and self.cfg.serving_alias in (endpoint.get("Aliases") or ()):
                     advertised.add((network, endpoint.get("NetworkID") or network))
@@ -1148,14 +1201,7 @@ class Deployer:
                 raise DeployError("upstream file does not match the expected topology")
             if peer and peer["slot"] != route.serving["slot"]:
                 if self.alias_networks(route.serving) and self.alias_networks(peer):
-                    progress = state.get("in_progress") or {}
-                    # Ordinary deploy has always published aliases at create
-                    # time. Only its recorded release pair may overlap.
-                    pair = ((progress.get("origin") or {}).get("current"), progress.get("target"))
-                    containers = {view["slot"]: view["containers"] for view in pair if view}
-                    if (not progress.get("publish_aliases_at_create")
-                            or containers.get(route.serving["slot"]) != route.serving["containers"]
-                            or containers.get(peer["slot"]) != peer["containers"]):
+                    if not planned_alias_overlap(state.get("in_progress") or {}, route.serving, peer):
                         raise DeployError("the shared alias is active on both slots")
             if not bootstrap:
                 addresses = {f"127.0.0.1:{route.serving['ports'][role]}" for role in SERVING_ROLES}
@@ -1291,7 +1337,7 @@ class Deployer:
                     if not info.get("State", {}).get("Running") and not self.ops.port_free(target.ports["background"]):
                         raise DeployError("rollback background port is already in use")
                 preparing = False
-                self.handoff_background(current, target, create=False, check_health=True)
+                self.handoff_background(state, current, target, create=False, check_health=True)
             except (Exception, KeyboardInterrupt) as err:
                 if self.ops.dry_run or (preparing and not recovery):
                     raise
@@ -1339,10 +1385,10 @@ class Deployer:
         except (Exception, KeyboardInterrupt) as err:
             raise FallbackFailed(f"guard failed ({reason}) and switching back failed ({err or type(err).__name__})") from err
 
-    def hand_back(self, target: Target, previous: dict[str, Any]) -> None:
+    def hand_back(self, state: dict[str, Any], target: Target, previous: dict[str, Any]) -> None:
         """Restore the background that was serving before a failed switch."""
         try:
-            self.handoff_background(target.view(), Target.from_view(previous, self.cfg.runtime_token_file),
+            self.handoff_background(state, target.view(), Target.from_view(previous, self.cfg.runtime_token_file),
                                     create=False, check_health=True)
         except FallbackFailed:
             raise
@@ -1391,7 +1437,7 @@ class Deployer:
                 self.log("   switch failed before reload; handing the background back")
             try:
                 if not self.background_answering(current):
-                    self.hand_back(target, current)
+                    self.hand_back(state, target, current)
                 if not self.background_answering(current):
                     raise DeployError("the original background did not confirm health and ownership")
             except (Exception, KeyboardInterrupt) as restore_err:
@@ -1424,7 +1470,8 @@ class Deployer:
                     count += 1
         return count
 
-    def retire_serving(self, view: dict[str, Any]) -> None:
+    def retire_serving(self, view: dict[str, Any]) -> dict[str, dict[str, str]]:
+        signalled = {}
         for role in SERVING_ROLES:
             name = view["containers"].get(role)
             if not name:
@@ -1443,6 +1490,10 @@ class Deployer:
             # TERM without waiting: the process finishes requests already routed
             # to it (streams included) and exits by itself.
             self.ops.run(["docker", "kill", "--signal=TERM", name], mutate=True)
+            started = info["State"].get("StartedAt")
+            if info.get("Id") and started:
+                signalled[role] = {"id": info["Id"], "started_at": started}
+        return signalled
 
     def stop_owned_serving(self, target: Target, role: str, cid: str, *, allow_missing: bool = False,
                            wait: bool = True) -> bool:
@@ -1597,7 +1648,11 @@ class Deployer:
             if skip_check:
                 self.log("note: this dry run did NOT verify the serving and background environment files "
                          "(startup check skipped because migrations are pending)")
-        except DeployError as err:
+        except (DeployError, subprocess.TimeoutExpired) as caught:
+            err = CommandTimedOut(caught) if isinstance(caught, subprocess.TimeoutExpired) else caught
+            progress = state.get("in_progress") or {}
+            if isinstance(err, CommandTimedOut) and (hold_before_switch or progress.get("step") not in (None, "migrate")):
+                self._unexpected(err, record, owned=created, hold=progress.get("hold"))
             record.update(result="failed", error=str(err), steps=self.timings, finished_at=now())
             if isinstance(err, RoutingUnconfirmed) and not state.get("in_progress") and not self.ops.dry_run:
                 self._mark(state, target, "preflight")
@@ -1605,6 +1660,8 @@ class Deployer:
                 state["in_progress"]["owned"] = dict(created)
             self._abort(state, target, err, created, retry_preparation=preparation if preparation else None)
             self._record_history(record)
+            if err is not caught:
+                raise err from None
             raise
         except (OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
             step = (state.get("in_progress") or {}).get("step")
@@ -2362,14 +2419,25 @@ class Deployer:
                 self.wait_ready(restore.ports[role], self.token_for(original, role), "serving", self.cfg.ready_timeout,
                                 container=cid, check_health=True)
         self.check_rollback_serving(original)
+        old_name = restore.containers["background"]
         if not self.background_answering(original):
-            old_name = restore.containers["background"]
             old = self.ops.inspect(old_name) or {}
             if not old.get("Id"):
                 raise DeployError("the original background is missing; recover it before retrying 'abort'")
             if old.get("State", {}).get("Running"):
                 self.wait_exit(old["Id"], self.cfg.background_exit_timeout, poll=HANDOFF_POLL_SECONDS)
-            self.hand_back(target, original)
+            self.hand_back(state, target, original)
+        else:
+            restart = state["in_progress"].get("background_restart_policies", {}).get(old_name)
+            if restart and restart != "no":
+                old = self.ops.inspect(old_name) or {}
+                policy = (old.get("HostConfig") or {}).get("RestartPolicy")
+                if policy is None:
+                    raise DeployError("cannot verify the restored background restart policy")
+                if (policy.get("Name") or "no") == "no":
+                    # The previous recovery may have restored ownership but
+                    # failed to undo the temporary restart policy.
+                    self.ops.run(["docker", "update", f"--restart={restart}", old_name], mutate=True)
         needs_reload = (not active.revision or active.serving["slot"] != restore.slot
                         or active.admin["slot"] != restore.slot or active != disk)
         if needs_reload:
@@ -2380,7 +2448,8 @@ class Deployer:
 
     def _unexpected(self, err: BaseException, record: dict[str, Any], *, owned: dict[str, str] | None = None,
                     hold: dict[str, Any] | None = None) -> None:
-        failure = FallbackFailed(f"operation interrupted or command outcome unknown ({type(err).__name__}); inspect 'status', "
+        detail = str(err) if isinstance(err, CommandTimedOut) else type(err).__name__
+        failure = FallbackFailed(f"operation interrupted or command outcome unknown ({detail}); inspect 'status', "
                                  "restore routing/background manually before clearing in_progress")
         if not self.ops.dry_run:
             # The last atomic write may have failed: the persisted state is
@@ -2424,7 +2493,8 @@ class Deployer:
                 self._mark(state, target, "background handoff")
                 if not self.ops.dry_run:
                     self.check_rollback_serving(target.view())
-                route = self.handoff_and_switch(state, active, target, lambda: self.handoff_for_deploy(current, target))
+                route = self.handoff_and_switch(state, active, target,
+                                                lambda: self.handoff_background(state, current, target, create=True))
             else:
                 route = self.rollback_to(state, active, target, alias_plan=alias_plan)
             if not self.ops.dry_run:
@@ -2445,13 +2515,14 @@ class Deployer:
                               "background again; the new serving containers are draining or stopped and kept "
                               "for inspection") from err
         self._mark(state, target, "retire previous serving")
+        signalled = {}
         with self.step("retire previous serving"):
             try:
                 if create_background and held is None:
                     self.verify_topology(state, route, current)
                     if not self.ops.dry_run and not self.alias_networks(current).issubset(self.alias_networks(route.serving)):
                         raise DeployError("new serving does not provide the shared alias on all required networks")
-                    self.retire_serving(current)
+                    signalled = self.retire_serving(current)
                 else:
                     self.retire_and_transfer(state, route, current, alias_plan=alias_plan)
             except (Exception, KeyboardInterrupt) as err:
@@ -2459,31 +2530,17 @@ class Deployer:
                                      "inspect status or retry 'abort'") from err
         view = target.view()
         view["deployed_at"] = now()
+        if signalled and (state.get("in_progress") or {}).get("publish_aliases_at_create"):
+            # A successful ordinary release does not wait for old streams to
+            # finish. Watch may still see these exact instances on the alias.
+            state["retiring_serving"] = {"slot": current["slot"], "containers": signalled}
+        else:
+            state.pop("retiring_serving", None)
         state.update(previous=current, current=view)
         self._save_progress(state, None)
         record.update(result="ok", steps=self.timings, finished_at=now())
         self._record_history(record)
         self.log(f"done: slot {target.slot} serving {target.image}")
-
-    def handoff_for_deploy(self, current: dict[str, Any], target: Target) -> None:
-        try:
-            self.handoff_background(current, target, create=True)
-        except FallbackFailed:
-            raise
-        except (Exception, KeyboardInterrupt) as err:
-            if self.ops.dry_run:
-                raise
-            try:
-                owner = self.owner_runtime(current) or {}
-                new = self.owner_runtime(target.view()) or {}
-                if not owner.get("ready") or not owner.get("owns_background") or new.get("owns_background"):
-                    raise DeployError("previous background ownership is unconfirmed")
-                self.ops.run(["docker", "update", "--restart=unless-stopped", current["containers"]["background"]],
-                             mutate=True)
-            except (Exception, KeyboardInterrupt) as restore_err:
-                raise FallbackFailed(f"background handoff failed ({err}); recovery is unconfirmed ({restore_err}); "
-                                     "inspect status and restore the previous background") from restore_err
-            raise DeployError(str(err) or "background handoff interrupted; previous background is ready") from err
 
     def _mark(self, state: dict[str, Any], target: Target, step: str, *, held: dict[str, Any] | None = None,
               publish_aliases_at_create: bool = False) -> None:
@@ -2492,7 +2549,8 @@ class Deployer:
         recorded = prior.get("target") or target.view()
         progress = {"phase": "deploying", "target": target.view() if recorded["slot"] == target.slot else recorded,
                     "step": step, "since": now(), "origin": original}
-        for key in ("verified_route", "pending_route", "owned", "candidate_ids", "original_endpoints"):
+        for key in ("verified_route", "pending_route", "owned", "candidate_ids", "original_endpoints",
+                    "background_restart_policies"):
             if key in prior:
                 progress[key] = prior[key]
         if publish_aliases_at_create or prior.get("publish_aliases_at_create"):
@@ -2637,9 +2695,10 @@ def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]
     alerts = []
     progress = state.get("in_progress") or {}
     phase = progress.get("phase")
+    active_release = phase in ("deploying", "aborting") and release_running(ops, progress) is True
     if phase == "failed":
         alerts.append({"alert": ["release_incomplete"], "at": now(), "in_progress": progress})
-    elif phase in ("deploying", "aborting") and release_running(ops, progress) is not True:
+    elif phase in ("deploying", "aborting") and not active_release:
         # Avoid an alert if the sampled process just completed and saved a new phase.
         if load_main_state(cfg).get("in_progress") == progress:
             alert = "release_incomplete" if phase == "deploying" else "abort_incomplete"
@@ -2652,9 +2711,13 @@ def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]
     if not peer or peer["slot"] == current["slot"]:
         peer = state.get("previous")
     if peer and peer["slot"] != current["slot"]:
-        with contextlib.suppress(DeployError, OSError, subprocess.SubprocessError):
-            if deployer.alias_networks(current) and deployer.alias_networks(peer):
-                alerts.append({"alert": ["shared_alias_conflict"], "at": now(), "slots": [current["slot"], peer["slot"]]})
+        overlap_expected = phase == "deploying" and active_release and planned_alias_overlap(progress, current, peer)
+        retired = state.get("retiring_serving") or {}
+        retiring = retired.get("containers") if not progress and retired.get("slot") == peer["slot"] else None
+        if not overlap_expected:
+            with contextlib.suppress(DeployError, OSError, subprocess.SubprocessError):
+                if deployer.alias_networks(current) and deployer.alias_networks(peer, retiring=retiring):
+                    alerts.append({"alert": ["shared_alias_conflict"], "at": now(), "slots": [current["slot"], peer["slot"]]})
     t = ops.monotonic()
     for role, name in current["containers"].items():
         token = None
