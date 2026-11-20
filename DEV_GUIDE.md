@@ -95,3 +95,5 @@ PR_BODY="$(cat <正文文件>)" python3 scripts/sources_extensions/check_pr_issu
 ## 发布
 
 发布由维护者执行，不是开发步骤。合并到 `main` 不自动发版；版本号、CHANGELOG 和 tag 由发布负责人更新。打 tag 后 CI 构建并发布镜像，部署使用 `deploy/sources/deploy.py`，设计与步骤见[发布与部署](docs/sources/DEPLOY.md)。
+
+CHANGELOG 用中文写，面向用户，参考原版 sub2api 的发布说明格式：每个版本一条短总述，条目按「新增功能」「优化改进」「Bug 修复」「破坏性变更」归类，没有的类别不写。写清楚用户能感知到什么变化，不写内部实现细节和纯工程改动。
