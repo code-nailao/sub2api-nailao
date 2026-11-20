@@ -1025,6 +1025,13 @@ class DeployTest(unittest.TestCase):
         self.assert_release_failure("failed", "route unconfirmed")
 
     def test_failed_main_abort_restores_original_route_even_if_the_written_config_disagrees(self):
+        self.assert_abort_after_ignored_main_reload()
+
+    def test_failed_first_main_abort_restores_route_without_previous_probe(self):
+        self.load_fixture_route(LEGACY, proof=False)
+        self.assert_abort_after_ignored_main_reload()
+
+    def assert_abort_after_ignored_main_reload(self):
         self.cfg.serving_alias = ""
         target = self.cfg.slot_view("a")
         run = self.ops.run
@@ -1040,22 +1047,117 @@ class DeployTest(unittest.TestCase):
         self.assert_release_failure("failed", "route unconfirmed")
         self.assertEqual(self.upstreams_for(target), self.upstreams_only(self.ops.files[self.cfg.upstream_file]))
         self.assertEqual(self.upstreams_for(LEGACY), self.upstreams_only(self.ops.loaded_upstreams))
+        for view in (LEGACY, target):
+            for role in deploy.SERVING_ROLES:
+                self.assertTrue(self.ops.inspect(view["containers"][role])["State"]["Running"])
         deploy.Deployer(self.cfg, self.ops).abort()
         self.assert_live_release(LEGACY)
         self.assertIsNone(self.state()["in_progress"])
         for role in deploy.SERVING_ROLES:
             self.assertIsNone(self.ops.inspect(target["containers"][role]))
 
-    def test_main_keeps_one_live_shared_alias_owner_during_second_release(self):
-        self.assert_next_release_keeps_one_alias_owner(held=False)
+    def test_main_reuses_switch_reload_to_install_probe_on_first_release(self):
+        self.load_fixture_route(LEGACY, proof=False)
+        self.deploy()
+        self.assertEqual([[self.cfg.nginx_bin, flag] for flag in ("-T", "-t")]
+                         + [[self.cfg.nginx_bin, "-s", "reload"]],
+                         [args for args in self.ops.commands if args[0] == self.cfg.nginx_bin])
+        self.assert_live_release(self.state()["current"])
 
-    def test_resume_keeps_one_live_shared_alias_owner_during_second_release(self):
-        self.assert_next_release_keeps_one_alias_owner(held=True)
-
-    def assert_next_release_keeps_one_alias_owner(self, *, held):
+    def test_main_second_release_publishes_alias_at_create_using_baseline_commands(self):
         self.deploy()
         source = self.state()["current"]
-        target = self.hold()["target"] if held else self.cfg.slot_view("b")
+        target = self.cfg.slot_view("b")
+        self.ops.commands.clear()
+        self.deploy(image="another@sha256:3")
+        roles = deploy.SERVING_ROLES
+        names = {target["containers"][role] for role in roles}
+        previous_names = {source["containers"][role] for role in roles}
+        endpoints = set(target["containers"].values()) | previous_names
+        endpoints |= {self.ops.inspect(name)["Id"] for name in endpoints}
+        sequence = []
+        for args in self.ops.commands:
+            if args[:2] == ["docker", "create"] and args[args.index("--name") + 1] in names:
+                aliases = [args[i + 1] for i, arg in enumerate(args) if arg == "--network-alias"]
+                sequence.append(["docker", "create", args[args.index("--name") + 1], *aliases])
+            elif ((args[:3] in (["docker", "network", "connect"], ["docker", "network", "disconnect"])
+                   and args[-1] in endpoints)
+                  or (args[:2] == ["docker", "start"] and args[-1] in names)
+                  or (args[0] == self.cfg.nginx_bin and args[1:] in (["-t"], ["-s", "reload"]))
+                  or (args[-1] in previous_names and args[:2] in (["docker", "update"], ["docker", "kill"]))):
+                sequence.append(args)
+        expected = []
+        for role in roles:
+            name = target["containers"][role]
+            alias = self.cfg.serving_alias
+            expected.append(["docker", "create", name, name, alias])
+            expected.extend(["docker", "network", "connect", "--alias", name, "--alias", alias, network, name]
+                            for network in self.cfg.networks[1:])
+            expected.append(["docker", "start", name])
+        expected.append(["docker", "network", "connect", "--alias", target["containers"]["background"],
+                         self.cfg.networks[1], target["containers"]["background"]])
+        expected.extend(([self.cfg.nginx_bin, "-t"], [self.cfg.nginx_bin, "-s", "reload"]))
+        for role in roles:
+            name = source["containers"][role]
+            expected.extend((["docker", "update", "--restart=no", name], ["docker", "kill", "--signal=TERM", name]))
+        self.assertEqual(expected, sequence)
+        self.assert_live_release(target)
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_main_guard_can_restore_original_release_during_expected_alias_overlap(self):
+        self.deploy()
+        previous = self.state()["current"]
+        self.ops.public_status_after_reload = 503
+        with self.assertRaisesRegex(deploy.DeployError, "guard failed.*previous release serves traffic"):
+            self.deploy(image="another@sha256:3")
+        self.assert_live_release(previous)
+        self.assertEqual(previous, self.state()["current"])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assert_no_shared_serving(self.cfg.slot_view("b"))
+
+    def test_main_keeps_original_alias_provider_on_uncovered_network(self):
+        self.deploy()
+        previous = self.state()["current"]
+        networks = self.ops.containers[previous["containers"]["serving"]]["NetworkSettings"]["Networks"]
+        networks["fixture-extra-network"] = {"Aliases": [self.cfg.serving_alias]}
+        with self.assertRaisesRegex(deploy.FallbackFailed, "shared alias on all required networks"):
+            self.deploy(image="another@sha256:3")
+        self.assert_live_release(self.cfg.slot_view("b"))
+        self.assertTrue(self.ops.inspect(previous["containers"]["serving"])["State"]["Running"])
+        self.assert_release_failure("failed", "shared alias on all required networks")
+
+    def test_abort_restores_original_alias_after_ordinary_retirement_fails(self):
+        self.deploy()
+        previous = self.state()["current"]
+        primary = previous["containers"]["serving"]
+        standby = previous["containers"]["standby"]
+        run = self.ops.run
+
+        def fail(args, **kw):
+            if args == ["docker", "kill", "--signal=TERM", standby]:
+                raise deploy.DeployError("fixture standby retirement failed")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", fail):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "retirement incomplete"):
+                self.deploy(image="another@sha256:3")
+        self.assert_live_release(self.cfg.slot_view("b"))
+        self.assertFalse(self.ops.inspect(primary)["State"]["Running"])
+        self.assert_release_failure("failed", "retirement incomplete")
+        deploy.Deployer(self.cfg, self.ops).abort()
+        self.assert_live_release(previous)
+        self.assertEqual(previous, self.state()["current"])
+        self.assertIsNone(self.state()["in_progress"])
+        for name in (primary, standby):
+            endpoints = self.ops.inspect(name)["NetworkSettings"]["Networks"]
+            self.assertTrue(all(self.cfg.serving_alias in endpoints[network]["Aliases"]
+                                for network in self.cfg.networks))
+        self.assert_no_shared_serving(self.cfg.slot_view("b"))
+
+    def test_resume_keeps_one_live_shared_alias_owner_during_second_release(self):
+        self.deploy()
+        source = self.state()["current"]
+        target = self.hold()["target"]
         run = self.ops.run
         owners = []
 
@@ -1073,10 +1175,7 @@ class DeployTest(unittest.TestCase):
             return result
 
         with mock.patch.object(self.ops, "run", check):
-            if held:
-                deploy.Deployer(self.cfg, self.ops).resume()
-            else:
-                self.deploy(image="another@sha256:3")
+            deploy.Deployer(self.cfg, self.ops).resume()
         self.assertTrue(all(len(owner) <= 1 for owner in owners))
         self.assertEqual({target["slot"]}, owners[-1])
         self.assert_live_release(self.state()["current"])
@@ -1084,6 +1183,7 @@ class DeployTest(unittest.TestCase):
     def test_abort_reconnects_original_endpoint_after_failed_alias_withdrawal(self):
         self.deploy()
         source = self.state()["current"]
+        self.hold()
         primary = source["containers"]["serving"]
         cid = self.ops.inspect(primary)["Id"]
         run = self.ops.run
@@ -1096,7 +1196,7 @@ class DeployTest(unittest.TestCase):
 
         with mock.patch.object(self.ops, "run", fail):
             with self.assertRaisesRegex(deploy.FallbackFailed, "alias removal reconnect failed"):
-                self.deploy(image="another@sha256:3")
+                deploy.Deployer(self.cfg, self.ops).resume()
         self.assertNotIn(network, self.ops.inspect(primary)["NetworkSettings"]["Networks"])
         self.assert_release_failure("failed")
         deploy.Deployer(self.cfg, self.ops).abort()
@@ -2710,34 +2810,56 @@ class DeployTest(unittest.TestCase):
         self.assertTrue(self.ops.containers["sources-main-a-serving"]["State"]["Running"])
         self.assertFalse(self.ops.switched)
 
-    def assert_recovery_after_first_hold_write_fails(self, command):
+    def assert_recovery_after_hold_write_fails(self, command, *, checkpoint):
         save = deploy.save_state
+        failures = []
 
-        def fail_first_hold(cfg, state):
-            if (state.get("in_progress") or {}).get("phase") == "held":
-                raise OSError("fixture first hold write failure")
+        def fail_hold(cfg, state):
+            progress = state.get("in_progress") or {}
+            recording_hold = progress.get("phase") == "deploying" and progress.get("step") == "save held release"
+            if not failures and (recording_hold if checkpoint else progress.get("phase") == "held"):
+                failures.append(progress)
+                raise OSError("fixture hold write failure")
             save(cfg, state)
 
-        with mock.patch.object(deploy, "save_state", fail_first_hold):
-            with self.assertRaises(deploy.DeployError):
+        with mock.patch.object(deploy, "save_state", fail_hold):
+            with self.assertRaises(deploy.DeployError) as failure:
                 self.hold()
+        self.assertEqual(1, len(failures))
         self.assert_loaded_interfaces(LEGACY, LEGACY)
+        self.assertEqual(LEGACY, self.state()["current"])
         target = self.cfg.slot_view("a")
         self.assert_no_shared_serving(target)
-        getattr(deploy.Deployer(self.cfg, self.ops), command)()
+        ids = {role: self.ops.inspect(target["containers"][role])["Id"] for role in deploy.SERVING_ROLES}
+        progress = self.state()["in_progress"]
+        runner = deploy.Deployer(self.cfg, self.ops)
+        getattr(runner, command)()
         if command == "resume":
             self.assert_loaded_interfaces(target, target)
+            self.assertEqual(target["slot"], self.state()["current"]["slot"])
+            self.assertEqual(ids, {role: self.ops.inspect(target["containers"][role])["Id"] for role in deploy.SERVING_ROLES})
         else:
             self.assert_loaded_interfaces(LEGACY, LEGACY)
+            self.assertEqual(LEGACY, self.state()["current"])
             for role in deploy.SERVING_ROLES:
                 self.assertIsNone(self.ops.inspect(target["containers"][role]))
         self.assertIsNone(self.state()["in_progress"])
+        held = progress.get("hold") or progress
+        self.assertEqual(ids, {role: entry["id"] for role, entry in held.get("containers", {}).items()})
+        self.assertEqual(LEGACY, held["current"])
+        self.assertIn("'resume' or 'abort'", str(failure.exception))
+
+    def test_resume_recovers_after_hold_checkpoint_write_fails(self):
+        self.assert_recovery_after_hold_write_fails("resume", checkpoint=True)
+
+    def test_abort_recovers_after_hold_checkpoint_write_fails(self):
+        self.assert_recovery_after_hold_write_fails("abort", checkpoint=True)
 
     def test_resume_recovers_after_first_held_write_fails(self):
-        self.assert_recovery_after_first_hold_write_fails("resume")
+        self.assert_recovery_after_hold_write_fails("resume", checkpoint=False)
 
     def test_abort_recovers_after_first_held_write_fails(self):
-        self.assert_recovery_after_first_hold_write_fails("abort")
+        self.assert_recovery_after_hold_write_fails("abort", checkpoint=False)
 
     def test_resume_cannot_mutate_until_pause_consumption_is_saved(self):
         paused = self.hold()
