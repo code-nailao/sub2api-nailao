@@ -375,7 +375,7 @@ test('Studio can choose an ordinary group from the shell after a remembered cust
 
   const shell = await f.integrate();
   assert.equal(f.frame.hidden, false);
-  assert.equal(f.select.disabled, true, 'the acknowledged shell now owns group selection');
+  assert.equal(f.select.disabled, false, 'the native group menu remains usable during recovery');
   assert.equal(f.document.body.dataset.state, 'recovery');
   assert.equal(f.retry.textContent, '打开自定义连接');
   assert.equal(shell.selectedGroupId, null);
@@ -385,6 +385,41 @@ test('Studio can choose an ordinary group from the shell after a remembered cust
   assert.equal(f.calls.at(-1).options.body.group_id, alternate);
   await f.ackConnection();
   assert.equal((await f.ackShell()).selectedGroupId, alternate);
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+});
+
+test('Studio can select an ordinary group from the native menu after the recovery shell ACK times out', async () => {
+  const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID),
+    connection: (options, config) => options.body.group_id === CUSTOM_ID
+      ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
+      : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.host();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  const oldShell = f.last('sub2api:image-studio-shell-config');
+  assert.ok(oldShell);
+  const timer = [...f.timers.values()].find(({ delay }) => delay === 500);
+  for (let i = 0; i < 31; i++) timer.callback();
+  assert.equal(f.frame.hidden, true);
+  assert.equal(f.connectionBar.hidden, false);
+  assert.equal(f.select.disabled, false);
+  assert.equal(f.retry.textContent, '打开自定义连接');
+
+  const previousPeer = f.frame.contentWindow;
+  const alternate = f.select.children.find(({ value }) => value && value !== String(CUSTOM_ID)).value;
+  f.select.value = alternate;
+  f.select.onchange();
+  await flush();
+  assert.equal(f.calls.at(-1).options.body.group_id, Number(alternate));
+  const connection = f.last('sub2api:image-studio-config');
+  assert.ok(connection);
+  assert.notEqual(f.frame.contentWindow, previousPeer, 'a peer that received shell config may reject a legacy switch');
+  f.send({ type: 'sub2api:image-studio-shell-config-applied', version: 1, requestId: oldShell.requestId, revision: oldShell.revision }, { from: previousPeer });
+  await flush();
+  assert.equal(f.frame.hidden, true);
+  await f.ackConnection();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  assert.equal((await f.ackShell()).selectedGroupId, Number(alternate));
   assert.equal(f.document.body.dataset.state, 'ready');
   assert.equal(f.frame.hidden, false);
 });

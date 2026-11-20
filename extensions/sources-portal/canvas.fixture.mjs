@@ -75,10 +75,10 @@ export async function createCanvasFixture({ groups = [{ id: 26, name: 'Images' }
   // Use real settings and session code for tests that provide dialog HTTP responses.
   const dialogs = settingsRequest ? new vm.SourceTextModule(settingsSource, { context })
     : new vm.SyntheticModule(['openCustomSettings', 'openGroupSettings'], function () {
-      this.setExport('openCustomSettings', ({ getGeneration, onSaved }) => {
+      this.setExport('openCustomSettings', ({ captureConnection, onSaved }) => {
         const beginSave = () => {
-          const generation = getGeneration?.();
-          return (configured) => onSaved(configured, generation);
+          const current = captureConnection();
+          return (configured) => { if (current()) onSaved(configured); };
         };
         settings.push({ kind: 'custom', beginSave, onSaved: (configured) => beginSave()(configured) });
       });

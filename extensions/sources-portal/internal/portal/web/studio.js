@@ -1,6 +1,6 @@
 import { authorizedJSON, clearSession, currentToken } from "./session.js";
 import { openCustomSettings, openGroupSettings } from "./studio-settings.js";
-import { requestRounds } from "./request-round.js";
+import { connectionRounds, requestRounds } from "./request-round.js";
 
 let frame = document.querySelector("#studio");
 const select = document.querySelector("#groups");
@@ -31,18 +31,20 @@ let shellReady = false, integrated = false, locked = false, selectionUncertain =
 let connectionPending, shellPending, connectionTimer, shellTimer, checkTimer;
 let connectionApplied = false, initialGroupId = null;
 let bootstrapRound, compatibilityTimer, expiredLegacyAttempt, needsCustomResave = false;
-const rounds = requestRounds();
+const rounds = connectionRounds();
 const metadata = requestRounds();
-const isCurrent = (round) => !locked && rounds.current === round;
+const isCurrent = (started) => !locked && rounds.isCurrent(started);
 const isConnecting = () => rounds.isWaiting() && connectionPending?.round === rounds.current;
 const isBootstrapping = () => rounds.isWaiting() && bootstrapRound === rounds.current;
+const ordinaryGroups = () => groups.filter(({ id }) => id !== custom.groupId);
 // A shell that acknowledged its menu can offer another group before this
 // connection is authorized. It has no configuration for the failed group.
-const canShowRecoveryFrame = () => connectionApplied || (integrated && groups.some(({ id }) => id !== custom.groupId));
+const canShowRecoveryFrame = () => connectionApplied || (integrated && ordinaryGroups().length > 0);
 const connectionTimeout = "连接用时较长。可以重试连接，或稍后从主站重新进入。已有作品与草稿会保留。";
 
 function updateControls() {
-  select.disabled = locked || isConnecting() || isBootstrapping() || !groups.length || shellRevision > 0;
+  const canSelect = needsCustomResave ? ordinaryGroups().length > 0 : groups.length > 0 && shellRevision === 0;
+  select.disabled = locked || isConnecting() || isBootstrapping() || !canSelect;
   reconnect.hidden = locked || integrated || shellRevision === 0;
   reconnect.disabled = locked || isConnecting() || selectionUncertain;
   retry.hidden = locked;
@@ -77,9 +79,9 @@ function recoverView(text) {
 }
 function waitForCompatibleShell() {
   clearTimeout(compatibilityTimer);
-  const round = rounds.current;
+  const started = rounds.capture();
   const timer = setTimeout(() => {
-    if (timer === compatibilityTimer && isCurrent(round) && !integrated) recoverView(connectionTimeout);
+    if (timer === compatibilityTimer && isCurrent(started) && !integrated) recoverView(connectionTimeout);
   }, 20000);
   compatibilityTimer = timer;
 }
@@ -120,6 +122,7 @@ function lock(text) {
   clearInterval(checkTimer);
   clearTimeout(compatibilityTimer);
   setIntegrated(false);
+  rounds.newDocument();
   frame.src = "about:blank";
   frame.hidden = true;
   select.disabled = true;
@@ -148,20 +151,22 @@ function normalizeGroups(value) {
     .map(({ id, name }) => ({ id, name }));
 }
 function renderLegacyGroups() {
+  const choices = needsCustomResave ? ordinaryGroups() : groups;
+  const selected = choices.some(({ id }) => id === selectedGroupId) ? selectedGroupId : null;
   select.replaceChildren();
-  if (selectedGroupId === null) {
+  if (selected === null) {
     const placeholder = document.createElement("option");
     placeholder.value = "";
-    placeholder.textContent = groups.length ? "请选择生图分组" : "暂无可用分组";
+    placeholder.textContent = choices.length ? "请选择生图分组" : "暂无可用分组";
     select.append(placeholder);
   }
-  for (const group of groups) {
+  for (const group of choices) {
     const option = document.createElement("option");
     option.value = String(group.id);
     option.textContent = group.name;
     select.append(option);
   }
-  select.value = selectedGroupId === null ? "" : String(selectedGroupId);
+  select.value = selected === null ? "" : String(selected);
   updateControls();
 }
 function normalizeCustom(value) {
@@ -184,8 +189,8 @@ function openSettings(kind) {
     openGroupSettings({ onSaved: () => void refreshMetadata() });
     return;
   }
-  openCustomSettings({ getGeneration: () => rounds.generation, onSaved: (configured, started) => {
-    if (locked || started !== rounds.generation) return;
+  openCustomSettings({ captureConnection: rounds.captureConnection, onSaved: (configured) => {
+    if (locked) return;
     rounds.advance();
     connectionPending = shellPending = null;
     bootstrapRound = undefined;
@@ -257,13 +262,13 @@ function publishShell() {
     theme: hostConfig?.theme || (params.get("theme") === "dark" ? "dark" : "light"),
     lang: hostConfig?.lang || params.get("lang") || "zh",
   };
-  const pending = shellPending = { config, round: rounds.current };
+  const pending = shellPending = { config, started: rounds.capture() };
   renderLegacyGroups();
   postStudio(config);
   let attempts = 0;
   shellTimer = setInterval(() => {
     if (shellPending !== pending) return;
-    if (!isCurrent(pending.round)) {
+    if (!isCurrent(pending.started)) {
       clearInterval(shellTimer);
       shellPending = null;
       return;
@@ -287,7 +292,7 @@ function selectionResult(pending, status, text = "", reconnectRequired = false) 
     ...(text === null ? { message: "" } : text ? { message: text } : {}), reconnectRequired });
 }
 function sendConnection(pending) {
-  if (!pending?.config || connectionPending !== pending || !rounds.isWaiting(pending.round)) return;
+  if (!pending?.config || connectionPending !== pending || !isCurrent(pending.started) || !rounds.isWaiting(pending.round)) return;
   pending.target = frame.contentWindow;
   if (!pending.target) return;
   postStudio({ type: "sub2api:image-studio-config", payload: pending.config,
@@ -297,16 +302,19 @@ function bindFrameLoad(target) {
   target.addEventListener("load", () => {
     if (locked || frame !== target) return;
     sendConnection(connectionPending);
-    publishShell();
+    if (shellPending && isCurrent(shellPending.started)) postStudio(shellPending.config);
+    else if (!integrated) publishShell();
   });
 }
-function replaceExpiredLegacyFrame() {
-  // The legacy ACK has only a profile ID. A new WindowProxy keeps an ACK for
-  // the expired attempt from matching a retry for that same profile.
+function replaceFrame() {
   const previous = frame;
   frame = previous.cloneNode(false);
+  rounds.newDocument();
   frame.hidden = true;
   shellReady = false;
+  shellRevision = appliedShellRevision = 0;
+  connectionApplied = false;
+  if (integrated) setIntegrated(false);
   bindFrameLoad(frame);
   previous.replaceWith(frame);
 }
@@ -330,7 +338,8 @@ async function connect(groupId, request) {
   clearTimeout(compatibilityTimer);
   const expired = expiredLegacyAttempt;
   expiredLegacyAttempt = undefined;
-  if (!pending.requestId && expired?.target) replaceExpiredLegacyFrame();
+  const replacePeer = !pending.requestId && (expired?.target || (needsCustomResave && shellRevision > 0));
+  const authorizing = rounds.capture();
   // Retry custom connections through Portal so it checks the Key's current group.
   const cached = !pending.requestId && !needsCustomResave && groupId !== custom.groupId && expired?.groupId === groupId
     ? expired.config : undefined;
@@ -339,12 +348,17 @@ async function connect(groupId, request) {
   if (needsCustomResave) recoverView(connectingText);
   else message.textContent = connectingText;
   updateControls();
-  const waiting = () => !locked && connectionPending === pending && rounds.isWaiting(pending.round);
+  const waiting = (started) => isCurrent(started) && connectionPending === pending && rounds.isWaiting(pending.round);
+  const authorizationCurrent = () => waiting(authorizing);
   try {
     let config = cached;
     if (config) await currentToken();
-    else config = await api("/api/studio/connection", waiting, { group_id: groupId, ...(pending.restoreOnly ? { restore_only: true } : {}) });
-    if (!waiting()) return;
+    else config = await api("/api/studio/connection", authorizationCurrent, { group_id: groupId, ...(pending.restoreOnly ? { restore_only: true } : {}) });
+    if (!authorizationCurrent()) return;
+    // A peer that saw the shell may reject a legacy selection even if its ACK
+    // never arrived. A new frame also isolates retries from old legacy ACKs.
+    if (replacePeer) replaceFrame();
+    pending.started = rounds.capture();
     if (needsCustomResave) {
       needsCustomResave = false;
       recoverView("已收到工作台连接配置，正在等待确认…");
@@ -353,7 +367,7 @@ async function connect(groupId, request) {
     sendConnection(pending);
     let attempts = 0;
     const timer = setInterval(() => {
-      if (!waiting() || timer !== connectionTimer) return;
+      if (!waiting(pending.started) || timer !== connectionTimer) return;
       if (++attempts > 30) {
         rounds.advance();
         connectionTimedOut(pending, "连接尚未确认，请重新选择分组。");
@@ -364,7 +378,7 @@ async function connect(groupId, request) {
     connectionTimer = timer;
     updateControls();
   } catch (error) {
-    if (!waiting()) return;
+    if (!authorizationCurrent()) return;
     rounds.finish(pending.round);
     connectionPending = null;
     selectionResult(pending, "error", error.message);
@@ -405,9 +419,9 @@ window.addEventListener("message", async (event) => {
   }
   if (data.type === "sub2api:image-studio-shell-config-applied" && data.version === 1) {
     const pending = shellPending;
-    if (!pending || !isCurrent(pending.round) || data.requestId !== pending.config.requestId || data.revision !== pending.config.revision) return;
+    if (!pending || !isCurrent(pending.started) || data.requestId !== pending.config.requestId || data.revision !== pending.config.revision) return;
     try { await currentToken(); } catch { return; }
-    if (locked || shellPending !== pending || !isCurrent(pending.round)) return;
+    if (shellPending !== pending || !isCurrent(pending.started)) return;
     shellPending = null;
     clearInterval(shellTimer);
     appliedShellRevision = pending.config.revision;
@@ -437,11 +451,11 @@ window.addEventListener("message", async (event) => {
   }
   if (data.type !== "sub2api:image-studio-config-applied" || data.payload?.status !== "applied") return;
   const pending = connectionPending;
-  if (!pending?.config || !isConnecting() || pending.target !== event.source) return;
+  if (!pending?.config || !isCurrent(pending.started) || !isConnecting() || pending.target !== event.source) return;
   if (!pending.restoreOnly && data.payload.profileId !== `sub2api-image-studio-group-${pending.groupId}`) return;
   if (pending.requestId && (data.payload.requestId !== pending.requestId || data.payload.revision !== pending.revision)) return;
   try { await currentToken(); } catch { return; }
-  if (locked || connectionPending !== pending || pending.target !== frame.contentWindow || !rounds.finish(pending.round)) return;
+  if (!isCurrent(pending.started) || connectionPending !== pending || pending.target !== frame.contentWindow || !rounds.finish(pending.round)) return;
   clearInterval(connectionTimer);
   connectionPending = null;
   selectionUncertain = false;
@@ -466,8 +480,8 @@ if (window.parent !== window) window.parent.postMessage({ type: "sources:studio-
 
 async function refreshMetadata() {
   if (locked || isConnecting() || isBootstrapping()) return;
-  const pageRound = rounds.current, refresh = metadata.advance();
-  const current = () => isCurrent(pageRound) && refresh === metadata.current;
+  const started = rounds.capture(), refresh = metadata.advance();
+  const current = () => isCurrent(started) && refresh === metadata.current;
   try {
     const fresh = await api("/api/studio/groups", current);
     if (!current()) return;
@@ -490,7 +504,8 @@ async function bootstrap() {
     bootstrapRound = undefined;
     recoverView(connectionTimeout);
   });
-  const waiting = () => !locked && rounds.isWaiting(round);
+  const started = rounds.capture();
+  const waiting = () => isCurrent(started) && rounds.isWaiting(round);
   try {
     const data = await api("/api/studio/groups", waiting);
     if (!waiting()) return;
@@ -512,10 +527,12 @@ async function bootstrap() {
     const initial = remembered ? groups.find((group) => group.id === Number(remembered)) : groups[0];
     initialGroupId = initial?.id ?? null;
     select.onchange = () => {
-      if (shellRevision > 0) { recoverShell(); return; }
       const id = Number(select.value);
+      if (needsCustomResave && id === custom.groupId) return;
+      if (shellRevision > 0 && !needsCustomResave) { recoverShell(); return; }
       if (id > 0) void connect(id);
     };
+    rounds.newDocument();
     frame.src = studioURL.href;
     if (initial) void connect(initial.id);
     else recoverView(groups.length ? "上次使用的分组已不可用，请重新选择。"
@@ -527,7 +544,7 @@ async function bootstrap() {
       if (document.visibilityState === "visible") await refreshMetadata();
     }, 30000);
   } catch (error) {
-    if (!rounds.finish(round)) return;
+    if (!waiting() || !rounds.finish(round)) return;
     bootstrapRound = undefined;
     recoverView(error.message);
   }

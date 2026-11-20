@@ -45,3 +45,19 @@ export function requestRounds() {
 
   return { get current() { return current; }, get generation() { return generation; }, advance, start, markApplied, isWaiting, finish, deadline };
 }
+
+export function connectionRounds() {
+  const rounds = requestRounds();
+  let docEpoch = 0;
+  const capture = () => ({ round: rounds.current, generation: rounds.generation, docEpoch });
+  const sameDocument = (started) => started.docEpoch === docEpoch;
+  const sameConnection = (started) => sameDocument(started) && started.generation === rounds.generation;
+  const isCurrent = (started) => sameConnection(started) && started.round === rounds.current;
+  const captureConnection = () => {
+    const started = capture();
+    return () => sameConnection(started);
+  };
+  // Call only where the parent navigates or replaces the iframe.
+  const newDocument = () => { docEpoch++; };
+  return Object.assign(rounds, { capture, sameConnection, isCurrent, captureConnection, newDocument });
+}

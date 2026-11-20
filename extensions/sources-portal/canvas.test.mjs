@@ -197,6 +197,38 @@ test('Canvas reload during a failed switch must rehandshake the previous grant b
   assert.equal(connections(f).length, 2);
 });
 
+test('Canvas load after ready preserves the pending grant and in-flight restore', async () => {
+  const restore = Promise.withResolvers();
+  const f = await fixture({ connection: (options, config) => {
+    const result = { ok: true, status: 200, data: config(options.body.group_id) };
+    return options.body.restore_only ? restore.promise.then(() => result) : result;
+  } });
+  f.host();
+  f.send({ type: 'sub2api:canvas-ready' });
+  const activeGrant = f.last('sub2api:media-studio-config').payload;
+  const connectionId = `group-${f.select.children.at(-1).value}`;
+  const requestId = '00000000-0000-4000-8000-000000000024';
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId, requestId });
+  await flush();
+  assert.equal(connections(f).length, 2);
+
+  f.loaded();
+  assert.equal(f.last('sub2api:media-studio-config').payload.requestId, activeGrant.requestId);
+  restore.resolve();
+  await flush();
+  const restored = f.last('sub2api:media-studio-config').payload;
+  assert.equal(restored.requestId, requestId);
+  assert.equal(restored.selectedConnectionId, connectionId);
+  assert.equal(restored.selectActive, false);
+  assert.equal(f.frame.hidden, true);
+  assert.equal(f.parentMessages.some(({ integrated }) => integrated === true), false);
+
+  await f.ack({ requestId: activeGrant.requestId, profileId: `sub2api-media-studio-${activeGrant.selectedConnectionId}` });
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.parentMessages.at(-1).integrated, true);
+  assert.equal(connections(f).length, 2);
+});
+
 test('Canvas ignores a late restore conflict after a newer restore of the same grant succeeds', async () => {
   const first = Promise.withResolvers(), second = Promise.withResolvers();
   const restores = [first, second];
@@ -596,6 +628,42 @@ for (const status of [503, 401]) {
     assert.equal(f.locked, false);
     assert.equal(f.document.body.dataset.state, 'ready');
     assert.equal(f.elements['#message'].textContent, before);
+    assert.equal(f.frame.hidden, false);
+  });
+}
+
+for (const status of [503, 401]) {
+  test(`Canvas drops a group settings refresh returning ${status} after a new connection ACK`, async () => {
+    const refreshResult = Promise.withResolvers();
+    let groupsReply;
+    const f = await fixture({ admin: true, useSessionTransport: true, groupsResponse: () => groupsReply });
+    const groupReads = () => f.calls.filter(({ path }) => path === '/api/canvas/groups').length;
+    f.host(); f.loaded(); await f.ack();
+    const alternate = String(f.select.children.at(-1).value);
+    f.select.value = alternate;
+    await f.select.onchange();
+    groupsReply = { ok: false, status: 503 };
+    await [...f.timers.values()].find(({ delay }) => delay === 30000).callback();
+    assert.equal(f.document.body.dataset.state, 'recovery');
+    assert.equal(f.elements['#canvas-manage'].hidden, false);
+    f.elements['#canvas-manage'].onclick();
+    groupsReply = refreshResult.promise;
+    f.settings.at(-1).onSaved();
+    await flush();
+    assert.equal(groupReads(), 3);
+
+    await f.ack();
+    assert.equal(f.document.body.dataset.state, 'ready');
+    const before = f.elements['#message'].textContent;
+    refreshResult.resolve({ ok: false, status, data: status === 401 ? { error: 'admin_login_required' } : {} });
+    await flush();
+
+    assert.equal(f.parentMessages.some(({ type }) => type === 'sub2api:session-check'), false);
+    assert.equal(groupReads(), 3);
+    assert.equal(f.locked, false);
+    assert.equal(f.document.body.dataset.state, 'ready');
+    assert.equal(f.elements['#message'].textContent, before);
+    assert.equal(f.select.value, alternate);
     assert.equal(f.frame.hidden, false);
   });
 }

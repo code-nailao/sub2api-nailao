@@ -384,7 +384,7 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
 }
 
 /** Any user: connect with one of their own API keys. */
-export function openCustomSettings({ getGeneration = () => undefined, onSaved = () => {} } = {}) {
+export function openCustomSettings({ captureConnection = () => () => true, onSaved = () => {} } = {}) {
   const view = openDialog("自定义连接", "用你在本站已有的 API 密钥连接图片工作台和无限画布，费用照常从余额扣除。域名固定为本站，可以选择 API 子域名；路径由系统自动拼接。");
   const messages = {
     invalid_custom_connection: "API 地址、接口或模型不符合要求，请检查后重试。",
@@ -393,13 +393,13 @@ export function openCustomSettings({ getGeneration = () => undefined, onSaved = 
   };
   view.actions.append(button("关闭", view.close));
   function persistBinding(configured, options) {
-    const generation = getGeneration();
+    const currentConnection = captureConnection();
     return busy(view, configured ? "正在保存…" : "正在删除…", async (current) => {
       await request("/api/studio/custom", { ...options, isCurrent: current }, messages);
       if (!current()) return;
       view.close();
-      onSaved(configured, generation);
-    }, () => generation === getGeneration());
+      onSaved(configured);
+    }, currentConnection);
   }
   function show(data) {
     if (data.enabled !== true) { view.body.append(el("p", { text: messages.custom_connection_disabled })); return; }

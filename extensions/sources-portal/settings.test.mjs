@@ -37,7 +37,10 @@ test('only the latest open custom dialog accepts overlapping successful saves', 
         binding: { key_id: 1, protocol: 'openai_images', models: ['image-fixture'] } } };
     });
     const openAndSave = async (name) => {
-      openCustomSettings({ getGeneration: () => generation, onSaved: () => { results.push(name); generation++; } });
+      openCustomSettings({ captureConnection: () => {
+        const started = generation;
+        return () => started === generation;
+      }, onSaved: () => { results.push(name); generation++; } });
       await flush();
       const [dialog] = body.querySelectorAll('dialog');
       const save = dialog.querySelectorAll('button').find((button) => button.textContent === '保存并连接');
