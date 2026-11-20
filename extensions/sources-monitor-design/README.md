@@ -12,6 +12,18 @@ node extensions/sources-monitor-design/preview.mjs
 
 构建检查：`node extensions/sources-monitor-design/preview.mjs --build`。
 
+## 主站导航
+
+在 `extensions/sources-monitor-design/.env.local` 中为 `VITE_MONITOR_PREVIEW_MAIN_ORIGIN` 填入主站源。地址需包含 `http://` 或 `https://`，可以带端口和末尾斜杠。路径、查询参数、片段和凭据会使导航保持禁用。该文件已被 Git 忽略。
+
+Vite 在启动预览或静态构建时读取这项配置，两种模式共用同一份配置。修改后重启预览或重新构建。配置为空或无效时，导航入口保留并显示「未配置主站地址」。配置有效时，链接会在新标签页打开对应的主站页面。填入真实地址的构建产物仅供本机使用。
+
+在仓库根目录运行导航回归测试：
+
+```sh
+pnpm --dir frontend exec vitest run --config ../extensions/sources-monitor-design/vite.config.mjs
+```
+
 ## 可交互内容
 
 - OpenAI、Anthropic、Grok、Gemini、国模、其他分类，搜索、只看需关注、时间范围和深浅色。
