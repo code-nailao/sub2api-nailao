@@ -14,7 +14,7 @@
     },
     {
       "path": "backend/cmd/server/VERSION",
-      "sha256": "bfc5d8f311fd47f8a89a901c343efb9d31d4de68e72e507e665cbfc05b39f029",
+      "sha256": "26c953728b3e47eb392b79742f8dc3172e0865a74ce04ef425097eb292c7c377",
       "reason": "Adds a default-off setting that hands usage-log retention to an external owner; while it is on, native usage cleanup refuses to run, and deduplication, audit and other maintenance continue. Keeps compact per-group usage statistics for the admin dashboard after detailed usage rows are removed by retention, so admin history survives log cleanup; this touches the dashboard aggregation and rollup repositories and adds a migration. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Marks the fork version that carried the embedded Studio changes. Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds to the admin V1 channel-monitor list the billing group that each probe key currently belongs to, resolved in one bounded batch from local API keys and returned as null when unknown, without exposing key material. Marks the fork version that made the optional image ledger and pending-hold interfaces safe to construct at start-up and made start-up diagnostics visible regardless of log level. This file holds the fork's own version number, which does not follow upstream.",
       "features": [
         "external_log_cleanup_owner",
@@ -699,6 +699,14 @@
       "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages."
     },
     {
+      "path": "backend/internal/handler/deepseek_chat_tool_filter_test.go",
+      "features": [
+        "deepseek_in_chat_tool_types"
+      ],
+      "sha256": "68a9b0f5c681068d909522add9e8964754fc01ecb1af1843414f4c16b358e01a",
+      "reason": "Verifies a parseable Chat SSE validation error frame after a queue heartbeat and verifies that local 400 responses, cancellations and deadlines at account slot acquisition create no advanced scheduler account samples."
+    },
+    {
       "path": "backend/internal/handler/dto/deepseek_tools_test.go",
       "features": [
         "deepseek_builtin_tools",
@@ -841,8 +849,8 @@
         "grok_content_rejection_billing",
         "deepseek_builtin_tools"
       ],
-      "sha256": "a7f39b8e1bd439c37fefa2c10c6563b98c2b2732a64c2d81434d0a6ee04fe17c",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks."
+      "sha256": "5c57fefb9524bf11db01caba65bf1dda193f237056fafd171c2f234dd8b8d201",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Excludes local DeepSeek Chat tool validation rejections from account failure samples."
     },
     {
       "path": "backend/internal/handler/openai_deepseek_tools.go",
@@ -2524,6 +2532,14 @@
       "sha256": "6198937316ad5697ba417065789fa284b75582f515c14a647eaeb7bc2ed6c5d9"
     },
     {
+      "path": "backend/internal/service/deepseek_request_json.go",
+      "features": [
+        "deepseek_in_chat_tool_types"
+      ],
+      "sha256": "9185a4e8a3f545aabe06730d09de5e2bc1c7d46132d9f3f407a31c17c9a7e935",
+      "reason": "Scans the Chat request envelope once for groups with tools turned off. Filters web tools by type prefix and rejects duplicates only in the tool fields. Adds the unavailable notice to the last messages field or to input for raw Responses-shaped requests. Normalizes tool choices by type and name, gives explicitly named surviving tools priority, and downgrades choices for removed tools and bare tool or function selectors. Preserves unrelated bytes and drops required when filtering empties the tool list."
+    },
+    {
       "path": "backend/internal/service/deepseek_stream_timing_test.go",
       "features": [
         "deepseek_builtin_tools"
@@ -2623,8 +2639,8 @@
         "deepseek_tool_endpoints",
         "deepseek_in_chat_tool_types"
       ],
-      "reason": "Serves a DeepSeek request on the ordinary path when the group has the web tools off, or when tools the gateway adds on its own cannot be set up, instead of failing the request; a request that names a server tool itself still gets the error. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook. Tests for this behaviour.",
-      "sha256": "2422cbc33e1e6786430989e716c8468258029b9393f61cd8bb0633939f4cbd2f"
+      "reason": "Tests optional DeepSeek tool setup fallback and the disabled-group Chat path, including removal of declared web tools and the unavailable notice.",
+      "sha256": "dbbf8eb706729b1d1108b9e35f577e3613469395f40c315c739565d7076afd8e"
     },
     {
       "path": "backend/internal/service/deepseek_tools_failures_test.go",
@@ -2642,16 +2658,16 @@
         "deepseek_tool_compat",
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "9fa91499150b8ce4be14f7d8efcdba158201553614fac129502231f4cc49506b",
-      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Serves a DeepSeek request on the ordinary path when the group has the web tools off, or when tools the gateway adds on its own cannot be set up, instead of failing the request; a request that names a server tool itself still gets the error. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook."
+      "sha256": "0ff94253dfef90d49fc63689469879aaf32ca0832d19564cc3c2affabf1af102",
+      "reason": "Runs optional hosted search and fetch with existing eligibility, streaming and usage checkpoint rules. Routes disabled-group Chat requests, including Responses-shaped bodies on fixed Chat accounts, through the bounded web-tool filter. Marks local validation rejections and interruptions so they do not count as account failures. Optional setup failures use ordinary forwarding after removing unavailable declarations and adding a notice."
     },
     {
       "path": "backend/internal/service/deepseek_tools_in_chat_test.go",
       "features": [
         "deepseek_in_chat_tool_types"
       ],
-      "sha256": "9517acc5a839a920c9acb296bc219ebefcce8b5381e7c4d9750991e1bd746282",
-      "reason": "Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook. Tests for this behaviour."
+      "sha256": "716177dc5d2ff2f42816d7ac6d20f19c3889a3984440440e4c8a1b89c04f15a0",
+      "reason": "Tests stream and non-stream forwarding, prefix matching without separators, Responses-shaped requests on fixed Chat accounts, notice placement in the last messages field, all tool choice shapes, surviving name collisions, empty filtered tool lists, billing parity, bypassed protocols, bounded validation and preservation of context errors."
     },
     {
       "path": "backend/internal/service/deepseek_tools_incremental.go",
