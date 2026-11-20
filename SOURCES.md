@@ -33,6 +33,7 @@
 | 图片任务自动收尾 | 可选的恢复策略：有上游任务号只查询；超期且无成功证据时按原冻结释放客户余额，供应结果仍标为未知；不重新生成 | 媒体引擎恢复器、`features/sources/ImageTaskReview.vue` |
 | USDT 支付保护 | 原生 BEpusdt provider、主动查单、唯一付款凭证、旧订单配置版本、迟到与重复回调、跨实例读取配置 | 原支付服务与 provider；[支付实施](docs/sources/PAYMENT-IMPLEMENTATION.md) |
 | 工作台 / Canvas 授权 | 内嵌会话恢复；为用户发放普通、可见、可撤销的 Key；原生“使用密钥”与“导入到 CCS”保留；登记的原生 Gemini 分组可用于工作台；管理员可在页面内在线登记原生分组；用户可用自己的 Key 建立域名固定为本站的自定义连接 | 前端挂接、Portal；[Portal 说明](extensions/sources-portal/README.md) |
+| Portal 启动校验 | 正常启动与只读检查共用配置校验；全部环境变量校验先于状态写入；工作台与画布按规范化后的源拒绝主站同源地址；登记文件拒绝 `null`，保留空数组 `[]` | `extensions/sources-portal/cmd/portal`；[Portal 说明](extensions/sources-portal/README.md) |
 | 智商检测计划 | Portal 内的定时模型检测：管理员写、用户只读，可见性、排序、删除；兼容不限期、不限总额的 Key；Key 失效时可暂停计划 | `extensions/sources-portal` |
 | serving / 唯一后台 | 进程分为接流（serving）和后台（background）两种角色，后台唯一性由文件锁保证；正常排空；`-migrate-only` 迁移入口；管理 MCP 与 OAuth 回调归后台；后台退出时等待在途 OAuth 刷新保存；后台交接期间旧后台只读排空，停后台服务时仍应答管理读请求（写、MCP、WebSocket 升级返回 503），最后才关闭监听；探测类任务快速取消且不记假失败；启动致命错误直接写 stderr；发布用一次性命令 `-list-pending-migrations`、`-check-startup`、`-export-web-assets` | `internal/processrole`、`cmd/server/sources_*.go`；[发布与部署](docs/sources/DEPLOY.md) |
 | 日志保留归属 | 外部日志保留归属开关（默认关闭）；开启后拒绝原生用量清理；管理员统计在明细删除后仍保留汇总 | `external_log_cleanup.go`、retention 统计；开关只表示归属，不会触发删除 |

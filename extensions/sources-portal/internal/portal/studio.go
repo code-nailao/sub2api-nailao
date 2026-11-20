@@ -93,28 +93,43 @@ type studioKey struct {
 	ExpiresAt *time.Time `json:"expires_at"`
 }
 
-// OpenStudio accepts either the neutral or the legacy media engine value in
-// capabilities; mediaEngineLegacyName is "" on a fresh install.
-func OpenStudio(dir, origin string, capabilities []StudioCapability, mediaEngineLegacyName string) (*StudioService, error) {
+// CheckStudioCapabilities validates registration configuration without loading
+// bindings, so startup can reject invalid environment values before writing state.
+func CheckStudioCapabilities(capabilities []StudioCapability, mediaEngineLegacyName string) error {
+	_, _, err := prepareStudioCapabilities(capabilities, mediaEngineLegacyName)
+	return err
+}
+
+func prepareStudioCapabilities(capabilities []StudioCapability, mediaEngineLegacyName string) ([]StudioCapability, string, error) {
 	mediaEngine, err := studioMediaEngineSelector(mediaEngineLegacyName)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	// Copy before canonicalizing so the caller's configuration is not rewritten.
 	capabilities = append([]StudioCapability(nil), capabilities...)
-	s := &StudioService{path: filepath.Join(dir, "studio-bindings.json"), registryPath: filepath.Join(dir, "studio-registry.json"), customPath: filepath.Join(dir, "studio-custom.json"), bindings: map[string]StudioBinding{}, custom: map[string]StudioCustomBinding{}, locks: map[string]chan struct{}{}, APIOrigin: origin, Capabilities: capabilities, mediaEngine: mediaEngine}
 	seen := map[int64]bool{}
 	for i, c := range capabilities {
 		if c.Engine == studioMediaEngineNeutral || c.Engine == mediaEngine {
 			capabilities[i].Engine = mediaEngine
 		} else if c.Engine != "sub2api" {
-			return nil, errors.New("invalid_studio_config_or_engine_not_integrated")
+			return nil, "", errors.New("invalid_studio_config_or_engine_not_integrated")
 		}
 		if c.GroupID < 1 || c.GroupID >= studioReservedGroupID || seen[c.GroupID] || len(c.Models) == 0 || len(c.Models) > 32 {
-			return nil, errors.New("invalid_studio_config_or_engine_not_integrated")
+			return nil, "", errors.New("invalid_studio_config_or_engine_not_integrated")
 		}
 		seen[c.GroupID] = true
 	}
+	return capabilities, mediaEngine, nil
+}
+
+// OpenStudio accepts either the neutral or the legacy media engine value in
+// capabilities; mediaEngineLegacyName is "" on a fresh install.
+func OpenStudio(dir, origin string, capabilities []StudioCapability, mediaEngineLegacyName string) (*StudioService, error) {
+	capabilities, mediaEngine, err := prepareStudioCapabilities(capabilities, mediaEngineLegacyName)
+	if err != nil {
+		return nil, err
+	}
+	s := &StudioService{path: filepath.Join(dir, "studio-bindings.json"), registryPath: filepath.Join(dir, "studio-registry.json"), customPath: filepath.Join(dir, "studio-custom.json"), bindings: map[string]StudioBinding{}, custom: map[string]StudioCustomBinding{}, locks: map[string]chan struct{}{}, APIOrigin: origin, Capabilities: capabilities, mediaEngine: mediaEngine}
 	b, e := os.ReadFile(s.path)
 	if e == nil {
 		if json.Unmarshal(b, &s.bindings) != nil || s.bindings == nil {
