@@ -8,17 +8,25 @@ import (
 type deepSeekToolHistoryMessage struct {
 	span     deepSeekChatSpan
 	calls    []deepSeekToolHistoryCall
-	results  []deepSeekChatSpan
 	tool     bool
 	resultID string
-	owner    int // message index of the assistant call, or -1
 }
 
 type deepSeekToolHistoryCall struct {
-	id     string
-	rawID  deepSeekChatSpan
-	owner  int
-	paired bool
+	id      string
+	rawID   deepSeekChatSpan
+	owner   int
+	nextUse int  // index of the next assistant message using this ID, or zero
+	reused  bool // an earlier assistant message used this ID
+	result  *deepSeekChatSpan
+}
+
+func (call *deepSeekToolHistoryCall) canPairDisplacedResult(index int) bool {
+	if !call.reused && call.nextUse == 0 {
+		// A globally unique ID can also identify a result before its call.
+		return true
+	}
+	return index > call.owner && (call.nextUse == 0 || index < call.nextUse)
 }
 
 // normalizeDeepSeekChatToolPairing repairs tool message adjacency using only
@@ -38,9 +46,10 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 		return nil, err
 	}
 
-	// Preserve existing adjacent matches first, even if different turns reused
-	// an ID.
-	adjacent := make(map[string]*deepSeekToolHistoryCall)
+	// Preserve adjacent matches and record which assistant message starts
+	// each use of an ID.
+	latestByID := make(map[string]*deepSeekToolHistoryCall)
+	adjacentOwner := -1
 	changed := false
 	for i := range messages {
 		if err := ctx.Err(); err != nil {
@@ -48,22 +57,26 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 		}
 		message := &messages[i]
 		if message.tool {
-			if call := adjacent[message.resultID]; call != nil {
-				message.owner, call.paired = call.owner, true
-				delete(adjacent, call.id)
+			if call := latestByID[message.resultID]; call != nil && call.owner == adjacentOwner && call.result == nil {
+				call.result = &message.span
 			} else {
 				changed = true
 			}
 			continue
 		}
-		clear(adjacent)
+		adjacentOwner = i
 		for j := range message.calls {
 			call := &message.calls[j]
-			if call.id == "" || adjacent[call.id] != nil {
+			previous := latestByID[call.id]
+			if call.id == "" || (previous != nil && previous.owner == i) {
 				// Unusable IDs inside a call batch cannot be repaired by pairing.
 				return body, nil
 			}
-			adjacent[call.id] = call
+			if previous != nil {
+				previous.nextUse = i
+				call.reused = true
+			}
+			latestByID[call.id] = call
 		}
 	}
 
@@ -76,7 +89,7 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 		}
 		for j := range messages[i].calls {
 			call := &messages[i].calls[j]
-			if call.paired {
+			if call.result != nil {
 				continue
 			}
 			if _, exists := unpairedByID[call.id]; exists {
@@ -97,14 +110,11 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 		if !message.tool {
 			continue
 		}
-		if message.owner < 0 {
-			if call := unpairedByID[message.resultID]; call != nil && !call.paired {
-				message.owner, call.paired = call.owner, true
-			}
-		}
-		if message.owner >= 0 {
-			owner := &messages[message.owner]
-			owner.results = append(owner.results, message.span)
+		// Calls with adjacent results are excluded from unpairedByID. For
+		// reused IDs the occurrence bounds also exclude results of other calls.
+		call := unpairedByID[message.resultID]
+		if call != nil && call.result == nil && call.canPairDisplacedResult(i) {
+			call.result = &message.span
 		}
 	}
 	return writeDeepSeekToolHistory(ctx, body, span, messages)
@@ -116,7 +126,7 @@ func scanDeepSeekToolHistory(ctx context.Context, body []byte, span deepSeekChat
 	err := s.scanDeepSeekChatItems(']', func() error {
 		var role string
 		var calls, resultID deepSeekChatSpan
-		message := deepSeekToolHistoryMessage{span: deepSeekChatSpan{start: s.pos}, owner: -1}
+		message := deepSeekToolHistoryMessage{span: deepSeekChatSpan{start: s.pos}}
 		if err := s.scanDeepSeekChatObject(func(name string, value deepSeekChatSpan) {
 			switch name {
 			case "role":
@@ -225,11 +235,14 @@ func writeDeepSeekToolHistory(ctx context.Context, body []byte, span deepSeekCha
 	const suffix = `,"content":""}`
 	capacity := len(body) - (span.end - span.start) + 2
 	for _, message := range messages {
-		if !message.tool || message.owner >= 0 {
-			capacity += message.span.end - message.span.start + 1
+		if message.tool {
+			continue
 		}
+		capacity += message.span.end - message.span.start + 1
 		for _, call := range message.calls {
-			if !call.paired {
+			if call.result != nil {
+				capacity += call.result.end - call.result.start + 1
+			} else {
 				capacity += len(prefix) + call.rawID.end - call.rawID.start + len(suffix) + 1
 			}
 		}
@@ -258,13 +271,11 @@ func writeDeepSeekToolHistory(ctx context.Context, body []byte, span deepSeekCha
 		if err := appendMessage(message.span); err != nil {
 			return nil, err
 		}
-		for _, result := range message.results {
-			if err := appendMessage(result); err != nil {
-				return nil, err
-			}
-		}
 		for _, call := range message.calls {
-			if call.paired {
+			if call.result != nil {
+				if err := appendMessage(*call.result); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			separator()

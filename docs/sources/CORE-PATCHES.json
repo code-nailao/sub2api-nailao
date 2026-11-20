@@ -2520,16 +2520,16 @@
       "features": [
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Repairs native DeepSeek Chat history by removing orphan tool results, moving displaced results with a unique remaining call after preserving adjacent pairs, and supplying empty results for unanswered calls. Keeps valid history unchanged and copies retained messages from their original byte spans.",
-      "sha256": "2794aa45e4b7a4b5f31c11bd8ffba77014c3c2938d2e677c7a527065009c46ec"
+      "reason": "Repairs native DeepSeek Chat tool history. Preserves adjacent pairs, and limits displaced results to the matching occurrence of a reused ID. Writes results and empty placeholders in tool call order when rebuilding history, copying retained messages from their original byte spans. Passes through complete adjacent history byte for byte.",
+      "sha256": "d35166ae8a868a8d45dc6524220a8c936a521034eae65e379d37453da8901f60"
     },
     {
       "path": "backend/internal/service/deepseek_chat_tool_pairing_test.go",
       "features": [
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Checks outgoing stream and buffered Chat payloads for orphan, missing, and displaced tool messages, byte preservation, reused call IDs and Responses-shaped input on the Chat endpoint.",
-      "sha256": "fb21028ecc710b1c943d1a6b7288cb36d562a58f21bc7012e6461b452275b2c5"
+      "reason": "Checks outgoing stream and buffered Chat payloads for orphan, missing, and displaced tool messages, duplicate results across reused IDs, parallel call order, byte preservation and Responses-shaped input on the Chat endpoint.",
+      "sha256": "dc4ec10b46cb3c68300a516848388bf7901be0bf2a2f54cf84f16dc9da67add0"
     },
     {
       "path": "backend/internal/service/deepseek_forced_tool_choice.go",

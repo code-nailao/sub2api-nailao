@@ -19,7 +19,9 @@ func TestDeepSeekChatPairsToolMessagesBeforeForwarding(t *testing.T) {
 		callAB   = `{"role":"assistant","content":"Checking","reasoning_content":"Keep the original reasoning","tool_calls":[{"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{}"}},{"id":"call_b","type":"function","function":{"name":"lookup","arguments":"{}"}}]}`
 		resultA  = `{ "role":"t\u006fol", "tool_call_id":"call_\u0061", "content":"Result A [}\"" }`
 		resultB  = `{"role":"tool","tool_call_id":"call_b","content":"Result B"}`
+		secondA  = `{"role":"tool","tool_call_id":"call_a","content":"Second result for A"}`
 		orphan   = `{"role":"tool","tool_call_id":"unmatched","content":"Orphan"}`
+		missingA = `{"role":"tool","tool_call_id":"call_a","content":""}`
 		missingB = `{"role":"tool","tool_call_id":"call_b","content":""}`
 	)
 	cases := []struct {
@@ -27,9 +29,21 @@ func TestDeepSeekChatPairsToolMessagesBeforeForwarding(t *testing.T) {
 	}{
 		{"orphan", user + "," + orphan + "," + callA + "," + resultA + "," + followup, user + "," + callA + "," + resultA + "," + followup},
 		{"missing", user + "," + callAB + "," + resultA + "," + followup, user + "," + callAB + "," + resultA + "," + missingB + "," + followup},
-		{"out_of_order", resultB + "," + user + "," + callAB + "," + followup + "," + resultA, user + "," + callAB + "," + resultB + "," + resultA + "," + followup},
+		{"out_of_order", resultB + "," + user + "," + callAB + "," + followup + "," + resultA, user + "," + callAB + "," + resultA + "," + resultB + "," + followup},
+		{"parallel_first_result_missing", callAB + "," + resultB + "," + followup, callAB + "," + missingA + "," + resultB + "," + followup},
+		{"parallel_first_result_displaced", callAB + "," + resultB + "," + followup + "," + resultA, callAB + "," + resultA + "," + resultB + "," + followup},
 		{"already_paired", user + ",\n  " + callAB + ", \t" + resultB + ",\n\t" + resultA + ", " + followup, ""},
 		{"reused_id_already_paired", user + "," + callA + ", " + resultA + "," + followup + "," + callA + ",\n" + resultA, ""},
+		{
+			"reused_id_ignores_duplicate_from_previous_call",
+			callA + "," + resultA + "," + resultA + "," + callA + "," + followup + "," + secondA,
+			callA + "," + resultA + "," + callA + "," + secondA + "," + followup,
+		},
+		{
+			"reused_id_ignores_duplicate_from_later_call",
+			callA + "," + user + "," + callA + "," + secondA + "," + followup + "," + secondA,
+			callA + "," + missingA + "," + user + "," + callA + "," + secondA + "," + followup,
+		},
 	}
 	for _, stream := range []bool{false, true} {
 		for _, tc := range cases {

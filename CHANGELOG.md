@@ -8,7 +8,7 @@
 ### Bug 修复
 
 - 关闭联网工具的 DeepSeek 分组在转发前移除 `web_search`、`web_fetch`、`deepseek_web_search`、`deepseek_read_url` 家族的条目，包括带版本或 preview 后缀的写法，也覆盖发送到固定 Chat 账号的 Responses 形状请求。显式指定仍然存在的工具的选择保留；指向被移除工具的选择（含只写 `tool` 或 `function` 的写法）在还有工具时改为 `auto`，工具删空时连同 `tools` 一起移除，`required` 一并删除，`auto` 和 `none` 保持不变。需要提示时写进最后一个 `messages`，Responses 形状写进 `input`。不含这些工具的请求保持原字节；工具字段的重复键和超限在转发前拒绝。
-- DeepSeek 原生 Chat 转发前先保留相邻的工具调用和结果，再按 ID 修复剩余的错位结果。即使 ID 被复用，只要剩余调用能唯一匹配，真实结果也会保留。孤立结果会移除，缺失结果补空字符串，正确配对的历史保留原字节。Responses 形状的请求沿用原有转换。
+- 修复 DeepSeek 原生 Chat 的工具历史。调用 ID 复用时会丢弃上一轮的重复结果，保留下轮能匹配的真实结果。需要修复的并行调用按原调用顺序排列结果，移除孤立结果，缺失结果补空字符串。完整相邻的历史逐字节透传，Responses 形状的请求沿用原有转换。
 
 ## Main / Portal 0.2.82 — 2026-11-20
 
