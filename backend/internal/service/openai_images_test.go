@@ -1002,6 +1002,78 @@ func TestOpenAIGatewayServiceForwardImages_OAuthUpstreamHTTPErrorSurfacesRealErr
 	require.Contains(t, gjson.Get(rec.Body.String(), "error.message").String(), "Invalid value for 'size'")
 }
 
+func TestCompatHostedSearch408DoesNotAllowAccountReplay(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, body string
+	}{
+		{"chat", "/v1/chat/completions", `{"model":"gpt-5","messages":[{"role":"user","content":"fixture"}],"tools":[{"type":"web_search"}]}`},
+		{"responses-shaped-chat", "/v1/chat/completions", `{"model":"gpt-5","input":"fixture","tools":[{"type":"web_search"}]}`},
+		{"messages", "/v1/messages", `{"model":"gpt-5","max_tokens":256,"messages":[{"role":"user","content":"fixture"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(tc.body)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			upstream := &httpUpstreamRecorder{resp: &http.Response{
+				StatusCode: http.StatusRequestTimeout,
+				Header:     http.Header{"Content-Type": {"application/json"}, "X-Should-Retry": {"true"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"fixture timeout"}}`)),
+			}}
+			svc := &OpenAIGatewayService{httpUpstream: upstream, cfg: &config.Config{}}
+			account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
+				Credentials: map[string]any{"api_key": "fixture-key"}}
+			var result *OpenAIForwardResult
+			var err error
+			if tc.path == "/v1/messages" {
+				result, err = svc.ForwardAsAnthropic(c.Request.Context(), c, account, body, "", "")
+			} else {
+				result, err = svc.ForwardAsChatCompletions(c.Request.Context(), c, account, body, "", "")
+			}
+
+			require.Len(t, upstream.requests, 1)
+			require.Equal(t, "web_search", gjson.GetBytes(upstream.lastBody, "tools.0.type").String(), "the hosted tool must reach the upstream")
+			var failover *UpstreamFailoverError
+			require.NotErrorAs(t, err, &failover, "the scheduler must not replay a hosted search after a 408")
+			require.Nil(t, result)
+			require.Equal(t, http.StatusRequestTimeout, w.Code)
+			require.Equal(t, "false", w.Header().Get("X-Should-Retry"))
+			require.True(t, IsResponseCommitted(c))
+			if tc.path == "/v1/messages" {
+				require.Equal(t, "error", gjson.GetBytes(w.Body.Bytes(), "type").String())
+			} else {
+				require.False(t, gjson.GetBytes(w.Body.Bytes(), "type").Exists())
+			}
+			require.Contains(t, gjson.GetBytes(w.Body.Bytes(), "error.message").String(), "result is unknown")
+		})
+	}
+}
+
+func TestResponses408CanFailOverWhenToolChoiceForcesClientFunction(t *testing.T) {
+	body := []byte(`{"model":"gpt-5","input":"fixture","tools":[{"type":"file_search","vector_store_ids":["vs_fixture"]},{"type":"function","name":"local_lookup","parameters":{"type":"object"}}],"tool_choice":{"type":"function","name":"local_lookup"}}`)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusRequestTimeout, Header: make(http.Header),
+		Body: io.NopCloser(strings.NewReader(`{"error":{"message":"fixture timeout"}}`)),
+	}}
+	svc := &OpenAIGatewayService{httpUpstream: upstream, cfg: &config.Config{}}
+	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: map[string]any{"api_key": "fixture-key"}}
+
+	result, err := svc.Forward(c.Request.Context(), c, account, body)
+
+	require.Len(t, upstream.requests, 1)
+	require.Equal(t, "local_lookup", gjson.GetBytes(upstream.lastBody, "tool_choice.name").String())
+	require.Equal(t, "file_search", gjson.GetBytes(upstream.lastBody, "tools.0.type").String())
+	var failover *UpstreamFailoverError
+	require.ErrorAs(t, err, &failover, "an explicitly unselected hosted tool does not make the submission costly")
+	require.Equal(t, http.StatusRequestTimeout, failover.StatusCode)
+	require.Nil(t, result)
+	require.False(t, IsResponseCommitted(c))
+}
+
 func TestPaidGatewaySubmission408IsTerminal(t *testing.T) {
 	for _, tc := range []struct {
 		name, platform, path, body string

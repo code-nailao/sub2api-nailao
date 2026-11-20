@@ -636,7 +636,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		}
 		// A paid tool submission may already have been accepted before a 408.
 		timedOutSubmission := resp.StatusCode == http.StatusRequestTimeout &&
-			(IsImageGenerationIntentForPlatform(openAIResponsesEndpoint, originalModel, body, account.Platform) || responsesSubmissionMayRunHostedTools(body))
+			(IsImageGenerationIntentForPlatform(openAIResponsesEndpoint, originalModel, body, account.Platform) || submissionMayRunHostedTools(body))
 		shouldFailover := !timedOutSubmission && s.shouldFailoverOpenAIUpstreamResponse(account, resp.StatusCode, upstreamMsg, respBody)
 		if account.Platform == PlatformGrok {
 			shouldFailover = !timedOutSubmission && s.shouldFailoverGrokUpstreamError(resp.StatusCode, respBody)

@@ -19,18 +19,43 @@ import (
 	"go.uber.org/zap"
 )
 
-// responsesSubmissionMayRunHostedTools examines tool declarations, excluding
-// historical search results. An unrecognized tool is treated conservatively
-// because the gateway cannot tell whether the provider executes it.
-func responsesSubmissionMayRunHostedTools(body []byte) bool {
-	if gjson.GetBytes(body, "tool_choice").String() == "none" {
+// submissionMayRunHostedTools examines the request sent to the provider and
+// ignores historical search results. Unknown tools are treated conservatively.
+func submissionMayRunHostedTools(body []byte) bool {
+	if gjson.GetBytes(body, "web_search_options").IsObject() {
+		return true // Native Chat Completions can enable web search separately.
+	}
+	tools := gjson.GetBytes(body, "tools")
+	choice := gjson.GetBytes(body, "tool_choice")
+	if choice.String() == "none" || choice.Get("type").String() == "none" || forcesDeclaredClientFunction(choice, tools) {
 		return false
 	}
-	if responsesToolsMayRunOnProvider(gjson.GetBytes(body, "tools")) {
+	if responsesToolsMayRunOnProvider(tools) {
 		return true
 	}
 	for _, item := range gjson.GetBytes(body, "input").Array() {
 		if item.Get("type").String() == openAIAdditionalToolsItemType && responsesToolsMayRunOnProvider(item.Get("tools")) {
+			return true
+		}
+	}
+	return false
+}
+
+// A flat Responses function choice or a nested Chat function choice is
+// terminal at the client. Other choice shapes can still allow hosted tools.
+func forcesDeclaredClientFunction(choice, tools gjson.Result) bool {
+	if choice.Get("type").String() != "function" || choice.Get("namespace").Exists() || !tools.IsArray() {
+		return false
+	}
+	name := choice.Get("name").String()
+	if name == "" {
+		name = choice.Get("function.name").String()
+	}
+	if name == "" {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		if tool.Get("type").String() == "function" && (tool.Get("name").String() == name || tool.Get("function.name").String() == name) {
 			return true
 		}
 	}
@@ -66,17 +91,44 @@ func responsesToolsMayRunOnProvider(tools gjson.Result) bool {
 	return false
 }
 
+const paidSubmissionTimeoutMessage = "The upstream timed out and the result is unknown. The request was not retried."
+
 // The upstream may have accepted a paid submission before returning HTTP 408.
-// A terminal response prevents both the account scheduler and SDKs from replaying it.
-func stopPaidSubmissionAfterTimeout(c *gin.Context) (*OpenAIForwardResult, error) {
-	const message = "The upstream timed out and the result is unknown. The request was not retried."
-	setOpsUpstreamError(c, http.StatusRequestTimeout, message, "")
+func markPaidSubmissionTimeout(c *gin.Context) error {
+	setOpsUpstreamError(c, http.StatusRequestTimeout, paidSubmissionTimeoutMessage, "")
 	c.Header("x-should-retry", "false")
 	MarkResponseCommitted(c)
+	return fmt.Errorf("upstream submission outcome unknown: HTTP %d", http.StatusRequestTimeout)
+}
+
+func stopPaidSubmissionAfterTimeout(c *gin.Context) (*OpenAIForwardResult, error) {
+	err := markPaidSubmissionTimeout(c)
 	c.JSON(http.StatusRequestTimeout, gin.H{"error": gin.H{
-		"type": "upstream_error", "code": "request_timeout", "message": message,
+		"type": "upstream_error", "code": "request_timeout", "message": paidSubmissionTimeoutMessage,
 	}})
-	return nil, fmt.Errorf("upstream submission outcome unknown: HTTP %d", http.StatusRequestTimeout)
+	return nil, err
+}
+
+// Call before error recovery can send the request again, using the request
+// after protocol conversion and the error format of the original client.
+func stopHostedToolTimeout(c *gin.Context, status int, outbound []byte, inboundProtocol string) error {
+	if status != http.StatusRequestTimeout || !submissionMayRunHostedTools(outbound) {
+		return nil
+	}
+	if inboundProtocol == APIProtocolAnthropic {
+		err := markPaidSubmissionTimeout(c)
+		writeAnthropicError(c, status, "api_error", paidSubmissionTimeoutMessage)
+		return err
+	}
+	if inboundProtocol == APIProtocolChatCompletions && c.Writer.Written() && strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
+		err := markPaidSubmissionTimeout(c)
+		if _, writeErr := fmt.Fprint(c.Writer, buildChatStreamErrorSSE("request_timeout", paidSubmissionTimeoutMessage)); writeErr == nil {
+			c.Writer.Flush()
+		}
+		return err
+	}
+	_, err := stopPaidSubmissionAfterTimeout(c)
+	return err
 }
 
 func logOpenAIInstructionsRequiredDebug(

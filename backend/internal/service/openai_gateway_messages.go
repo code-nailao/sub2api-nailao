@@ -510,6 +510,10 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if err := stopHostedToolTimeout(c, resp.StatusCode, responsesBody, APIProtocolAnthropic); err != nil {
+		return nil, err
+	}
+
 	// 8. Handle error response with failover
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)

@@ -77,6 +77,51 @@ func TestManager_SearchWithBestProvider_UsesFirstAvailable(t *testing.T) {
 	require.Equal(t, "from brave", resp.Results[0].Snippet)
 }
 
+func TestManagerTestSearchOnlyFallsBackBeforeSubmission(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		sent   bool
+	}{
+		{name: "408", status: http.StatusRequestTimeout, sent: true},
+		{name: "disconnected-after-write", sent: true},
+		{name: "confirmed-preconnect-failure"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := NewManager([]ProviderConfig{{Type: ProviderTypeExa, APIKey: "fixture-first"}, {Type: ProviderTypeTavily, APIKey: "fixture-backup"}}, nil)
+			calls := 0
+			manager.clientCache[""] = &http.Client{Transport: exaRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if calls == 1 {
+					trace := httptrace.ContextClientTrace(req.Context())
+					trace.GetConn(req.URL.Host)
+					if tc.sent {
+						trace.WroteRequest(httptrace.WroteRequestInfo{})
+					}
+					if tc.status == 0 {
+						return nil, io.ErrUnexpectedEOF
+					}
+					return &http.Response{StatusCode: tc.status, Header: make(http.Header), Body: http.NoBody}, nil
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"results":[]}`))}, nil
+			})}
+
+			result, provider, err := manager.TestSearch(t.Context(), SearchRequest{Query: "fixture"})
+
+			if tc.sent {
+				require.Equal(t, 1, calls, "admin search must not reach the backup after an ambiguous submission")
+				require.ErrorIs(t, err, ErrSearchOutcomeUnknown)
+				require.Nil(t, result)
+				require.Empty(t, provider)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, 2, calls)
+				require.Equal(t, ProviderTypeTavily, provider)
+			}
+		})
+	}
+}
+
 func TestManagerDoesNotReplaySearchAfterHTTP408(t *testing.T) {
 	for _, first := range []string{"exa", "brave", "tavily"} {
 		t.Run(first, func(t *testing.T) {

@@ -423,6 +423,10 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 		_ = resp.Body.Close()
 	}()
 
+	if err := stopHostedToolTimeout(c, resp.StatusCode, responsesBody, APIProtocolChatCompletions); err != nil {
+		return nil, err
+	}
+
 	// 8. Handle error response with failover
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg, completeErrorBody := s.readOpenAIUpstreamErrorWithCompleteness(resp)

@@ -132,6 +132,10 @@ func (s *OpenAIGatewayService) forwardResponsesViaNativeAnthropic(
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if err := stopHostedToolTimeout(c, resp.StatusCode, forwardedBody, APIProtocolResponses); err != nil {
+		return nil, err
+	}
+
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
 		if foErr := s.failoverOpenAIUpstreamHTTPError(ctx, c, account, resp, respBody, upstreamMsg, upstreamModel); foErr != nil {
