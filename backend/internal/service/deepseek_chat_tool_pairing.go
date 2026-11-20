@@ -1,7 +1,9 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 )
 
@@ -10,23 +12,17 @@ type deepSeekToolHistoryMessage struct {
 	calls    []deepSeekToolHistoryCall
 	tool     bool
 	resultID string
+	content  deepSeekChatSpan
 }
 
 type deepSeekToolHistoryCall struct {
-	id      string
-	rawID   deepSeekChatSpan
-	owner   int
-	nextUse int  // index of the next assistant message using this ID, or zero
-	reused  bool // an earlier assistant message used this ID
-	result  *deepSeekChatSpan
-}
-
-func (call *deepSeekToolHistoryCall) canPairDisplacedResult(index int) bool {
-	if !call.reused && call.nextUse == 0 {
-		// A globally unique ID can also identify a result before its call.
-		return true
-	}
-	return index > call.owner && (call.nextUse == 0 || index < call.nextUse)
+	id           string
+	rawID        deepSeekChatSpan
+	owner        int
+	reused       bool // an earlier assistant message used this ID
+	adjacent     bool // the first candidate was adjacent to the call
+	result       *deepSeekToolHistoryMessage
+	alternatives []*deepSeekToolHistoryMessage
 }
 
 // normalizeDeepSeekChatToolPairing repairs tool message adjacency using only
@@ -46,78 +42,121 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 		return nil, err
 	}
 
-	// Preserve adjacent matches and record which assistant message starts
-	// each use of an ID.
+	// A result belongs to the most recent call with the same ID. A result
+	// before the first call can only be matched later if that ID is unique.
 	latestByID := make(map[string]*deepSeekToolHistoryCall)
+	beforeFirstCall := make(map[string]*deepSeekToolHistoryMessage)
+	competingIDs := make(map[string]bool)
 	adjacentOwner := -1
+	missingResults := 0
 	changed := false
 	for i := range messages {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		message := &messages[i]
-		if message.tool {
-			if call := latestByID[message.resultID]; call != nil && call.owner == adjacentOwner && call.result == nil {
-				call.result = &message.span
-			} else {
-				changed = true
+		if !message.tool {
+			adjacentOwner = i
+			for j := range message.calls {
+				call := &message.calls[j]
+				previous := latestByID[call.id]
+				if call.id == "" || (previous != nil && previous.owner == i) {
+					// Unusable IDs inside a call batch cannot be repaired by pairing.
+					return body, nil
+				}
+				call.reused = previous != nil
+				latestByID[call.id] = call
+				missingResults++
 			}
 			continue
 		}
-		adjacentOwner = i
-		for j := range message.calls {
-			call := &message.calls[j]
-			previous := latestByID[call.id]
-			if call.id == "" || (previous != nil && previous.owner == i) {
-				// Unusable IDs inside a call batch cannot be repaired by pairing.
-				return body, nil
+
+		call := latestByID[message.resultID]
+		switch {
+		case call == nil:
+			changed = true
+			if message.resultID != "" && beforeFirstCall[message.resultID] == nil {
+				beforeFirstCall[message.resultID] = message
 			}
-			if previous != nil {
-				previous.nextUse = i
-				call.reused = true
+		case call.result == nil:
+			call.result = message
+			call.adjacent = call.owner == adjacentOwner
+			missingResults--
+			changed = changed || !call.adjacent
+		default:
+			changed = true
+			if call.reused {
+				call.alternatives = append(call.alternatives, message)
+				competingIDs[call.id] = true
 			}
-			latestByID[call.id] = call
 		}
 	}
+	if !changed && missingResults == 0 {
+		return body, ctx.Err()
+	}
 
-	// Only calls still missing a result can own a displaced result. Multiple
-	// unmatched calls with the same ID leave that result ambiguous.
-	unpairedByID := make(map[string]*deepSeekToolHistoryCall)
+	previousResults := make(map[deepSeekToolResultIdentity]struct{})
 	for i := range messages {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		for j := range messages[i].calls {
 			call := &messages[i].calls[j]
-			if call.result != nil {
-				continue
+			if !call.reused && latestByID[call.id] == call && !call.adjacent {
+				if early := beforeFirstCall[call.id]; early != nil {
+					call.result = early
+				}
 			}
-			if _, exists := unpairedByID[call.id]; exists {
-				unpairedByID[call.id] = nil
-			} else {
-				unpairedByID[call.id] = call
+			if call.result != nil && competingIDs[call.id] {
+				if err := call.preferNewResult(ctx, body, previousResults); err != nil {
+					return nil, err
+				}
 			}
-		}
-	}
-	if !changed && len(unpairedByID) == 0 {
-		return body, ctx.Err()
-	}
-	for i := range messages {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		message := &messages[i]
-		if !message.tool {
-			continue
-		}
-		// Calls with adjacent results are excluded from unpairedByID. For
-		// reused IDs the occurrence bounds also exclude results of other calls.
-		call := unpairedByID[message.resultID]
-		if call != nil && call.result == nil && call.canPairDisplacedResult(i) {
-			call.result = &message.span
 		}
 	}
 	return writeDeepSeekToolHistory(ctx, body, span, messages)
+}
+
+type deepSeekToolResultIdentity struct {
+	id   string
+	text bool
+	sum  [sha256.Size]byte
+}
+
+func deepSeekToolResultKey(body []byte, result *deepSeekToolHistoryMessage) deepSeekToolResultIdentity {
+	content := body[result.content.start:result.content.end]
+	key := deepSeekToolResultIdentity{id: result.resultID}
+	if len(content) >= 2 && content[0] == '"' {
+		key.text = true
+		if bytes.IndexByte(content, '\\') >= 0 {
+			key.sum = sha256.Sum256([]byte(deepSeekToolJSONString(content)))
+			return key
+		}
+		content = content[1 : len(content)-1]
+	}
+	key.sum = sha256.Sum256(content)
+	return key
+}
+
+// Only break a tie between candidates. A sole result can legitimately repeat
+// the content of a previous call, and ties retain the first candidate.
+func (call *deepSeekToolHistoryCall) preferNewResult(ctx context.Context, body []byte, previous map[deepSeekToolResultIdentity]struct{}) error {
+	key := deepSeekToolResultKey(body, call.result)
+	if _, seen := previous[key]; seen {
+		for _, candidate := range call.alternatives {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			candidateKey := deepSeekToolResultKey(body, candidate)
+			if _, seen := previous[candidateKey]; !seen {
+				call.result = candidate
+				key = candidateKey
+				break
+			}
+		}
+	}
+	previous[key] = struct{}{}
+	return nil
 }
 
 func scanDeepSeekToolHistory(ctx context.Context, body []byte, span deepSeekChatSpan) ([]deepSeekToolHistoryMessage, error) {
@@ -125,7 +164,7 @@ func scanDeepSeekToolHistory(ctx context.Context, body []byte, span deepSeekChat
 	s := deepSeekChatCursor{ctx: ctx, body: body[:span.end], pos: span.start + 1}
 	err := s.scanDeepSeekChatItems(']', func() error {
 		var role string
-		var calls, resultID deepSeekChatSpan
+		var calls, resultID, content deepSeekChatSpan
 		message := deepSeekToolHistoryMessage{span: deepSeekChatSpan{start: s.pos}}
 		if err := s.scanDeepSeekChatObject(func(name string, value deepSeekChatSpan) {
 			switch name {
@@ -135,6 +174,8 @@ func scanDeepSeekToolHistory(ctx context.Context, body []byte, span deepSeekChat
 				calls = value
 			case "tool_call_id":
 				resultID = value
+			case "content":
+				content = value
 			}
 		}); err != nil {
 			return err
@@ -143,6 +184,7 @@ func scanDeepSeekToolHistory(ctx context.Context, body []byte, span deepSeekChat
 		switch role {
 		case "tool":
 			message.tool = true
+			message.content = content
 			message.resultID = deepSeekToolJSONString(body[resultID.start:resultID.end])
 		case "assistant":
 			if calls.end > calls.start && body[calls.start] == '[' {
@@ -241,7 +283,7 @@ func writeDeepSeekToolHistory(ctx context.Context, body []byte, span deepSeekCha
 		capacity += message.span.end - message.span.start + 1
 		for _, call := range message.calls {
 			if call.result != nil {
-				capacity += call.result.end - call.result.start + 1
+				capacity += call.result.span.end - call.result.span.start + 1
 			} else {
 				capacity += len(prefix) + call.rawID.end - call.rawID.start + len(suffix) + 1
 			}
@@ -273,7 +315,7 @@ func writeDeepSeekToolHistory(ctx context.Context, body []byte, span deepSeekCha
 		}
 		for _, call := range message.calls {
 			if call.result != nil {
-				if err := appendMessage(*call.result); err != nil {
+				if err := appendMessage(call.result.span); err != nil {
 					return nil, err
 				}
 				continue

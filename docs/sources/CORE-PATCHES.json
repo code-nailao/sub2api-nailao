@@ -2529,16 +2529,16 @@
       "features": [
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Repairs native DeepSeek Chat tool history. Preserves adjacent pairs, and limits displaced results to the matching occurrence of a reused ID. Writes results and empty placeholders in tool call order when rebuilding history, copying retained messages from their original byte spans. Passes through complete adjacent history byte for byte.",
-      "sha256": "d35166ae8a868a8d45dc6524220a8c936a521034eae65e379d37453da8901f60"
+      "reason": "Repairs native DeepSeek Chat tool history. Matches reused IDs within each call occurrence and prefers content absent from earlier results for the same ID when candidates compete. Writes results and empty placeholders in tool call order using retained message bytes. Passes through complete adjacent history byte for byte.",
+      "sha256": "c3abf3458109945b17921bd27086f0cae863f62ff7b899f101017c95523810b9"
     },
     {
       "path": "backend/internal/service/deepseek_chat_tool_pairing_test.go",
       "features": [
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Checks outgoing stream and buffered Chat payloads for orphan, missing, and displaced tool messages, duplicate results across reused IDs, parallel call order, byte preservation and Responses-shaped input on the Chat endpoint.",
-      "sha256": "dc4ec10b46cb3c68300a516848388bf7901be0bf2a2f54cf84f16dc9da67add0"
+      "reason": "Checks streaming and buffered Chat payloads for orphan, missing, and displaced tool messages, displaced results in independent occurrences of a reused ID, competing copies and legitimate repeated content, parallel call order, byte preservation and Responses-shaped input on the Chat endpoint.",
+      "sha256": "08e9cdfde6f38f0ad3002f78242b4427c25c3b5cc219f0eccb74f404cd7945a6"
     },
     {
       "path": "backend/internal/service/deepseek_forced_tool_choice.go",

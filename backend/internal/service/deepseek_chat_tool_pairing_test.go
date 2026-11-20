@@ -18,6 +18,7 @@ func TestDeepSeekChatPairsToolMessagesBeforeForwarding(t *testing.T) {
 		callA    = `{ "role": "assistant", "content":null,"reasoning_content":"Keep the original reasoning","tool_calls":[{"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{\"query\":\"a\"}"}}] }`
 		callAB   = `{"role":"assistant","content":"Checking","reasoning_content":"Keep the original reasoning","tool_calls":[{"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{}"}},{"id":"call_b","type":"function","function":{"name":"lookup","arguments":"{}"}}]}`
 		resultA  = `{ "role":"t\u006fol", "tool_call_id":"call_\u0061", "content":"Result A [}\"" }`
+		copyOfA  = `{"content":"Result \u0041 [}\u0022","tool_call_id":"call_a","role":"tool"}`
 		resultB  = `{"role":"tool","tool_call_id":"call_b","content":"Result B"}`
 		secondA  = `{"role":"tool","tool_call_id":"call_a","content":"Second result for A"}`
 		orphan   = `{"role":"tool","tool_call_id":"unmatched","content":"Orphan"}`
@@ -38,6 +39,31 @@ func TestDeepSeekChatPairsToolMessagesBeforeForwarding(t *testing.T) {
 			"reused_id_ignores_duplicate_from_previous_call",
 			callA + "," + resultA + "," + resultA + "," + callA + "," + followup + "," + secondA,
 			callA + "," + resultA + "," + callA + "," + secondA + "," + followup,
+		},
+		{
+			"reused_id_cross_boundary_duplicate",
+			callA + "," + resultA + "," + callA + "," + resultA + "," + secondA,
+			callA + "," + resultA + "," + callA + "," + secondA,
+		},
+		{
+			"reused_id_displaced_cross_boundary_duplicate",
+			callA + "," + resultA + "," + callA + "," + user + "," + copyOfA + "," + followup + "," + secondA,
+			callA + "," + resultA + "," + callA + "," + secondA + "," + user + "," + followup,
+		},
+		{
+			"reused_id_keeps_new_result_before_old_copy",
+			callA + "," + resultA + "," + callA + "," + secondA + "," + copyOfA,
+			callA + "," + resultA + "," + callA + "," + secondA,
+		},
+		{
+			"reused_id_keeps_sole_displaced_result_with_same_content",
+			callA + "," + resultA + "," + callA + "," + followup + "," + copyOfA,
+			callA + "," + resultA + "," + callA + "," + copyOfA + "," + followup,
+		},
+		{
+			"reused_id_both_displaced",
+			callA + "," + user + "," + resultA + "," + callA + "," + followup + "," + secondA,
+			callA + "," + resultA + "," + user + "," + callA + "," + secondA + "," + followup,
 		},
 		{
 			"reused_id_ignores_duplicate_from_later_call",
