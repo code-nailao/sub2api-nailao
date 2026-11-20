@@ -288,6 +288,11 @@ def release_lock(path: str, *, create: bool = True) -> Iterator[None]:
 # Side effects (overridden in tests)
 
 
+class NoRuntimeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class Ops:
     """Every command and request goes through here. In dry-run mode
     mutating commands are printed instead of executed."""
@@ -295,6 +300,7 @@ class Ops:
     def __init__(self, dry_run: bool = False, log: Callable[[str], None] | None = None):
         self.dry_run = dry_run
         self.log = log or (lambda msg: print(msg, flush=True))
+        self.open_runtime = urllib.request.build_opener(NoRuntimeRedirect()).open
 
     # commands ---------------------------------------------------------------
     def run(self, args: list[str], *, mutate: bool, timeout: float = 600,
@@ -325,8 +331,10 @@ class Ops:
             req.add_header("Authorization", f"Bearer {token}")
         if data is not None:
             req.add_header("Content-Type", "application/json")
+        # The runtime bearer token is scoped to the original listener.
+        open_url = self.open_runtime if token else urllib.request.urlopen
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed loopback/config URLs
+            with open_url(req, timeout=timeout) as resp:  # noqa: S310 - fixed loopback/config URLs
                 raw = resp.read()
                 return resp.status, json.loads(raw) if raw.strip().startswith(b"{") else raw.decode(errors="replace")
         except urllib.error.HTTPError as err:
@@ -1189,7 +1197,6 @@ class Deployer:
         if progress and progress.get("origin") and not self.ops.dry_run:
             self._save_progress(state, {**progress, "verified_route": asdict(active), "pending_route": asdict(pending)})
         attempted = False
-        interrupted = False
         reload_error = None
         same_serving = active.serving["slot"] == pending.serving["slot"]
 
@@ -1199,32 +1206,42 @@ class Deployer:
             if reload_started is not None:
                 reload_started()
 
-        try:
-            self.install_upstreams(self.route_text(pending),
-                                   before_reload=lambda: self.verify_topology(active, peer if same_serving else pending.serving,
-                                                                             disk=pending, ready=pending,
-                                                                             check_health=False, allow_draining=allow_draining,
-                                                                             bootstrap=not active.revision),
-                                   reload_started=start_reload)
-        except RoutingUnconfirmed as err:
-            if not attempted:
-                raise
-            reload_error = err
-        if self.ops.dry_run:
-            return
-        try:
+        def check_before_reload() -> None:
+            self.verify_topology(active, peer if same_serving else pending.serving, disk=pending, ready=pending,
+                                 check_health=False, allow_draining=allow_draining, bootstrap=not active.revision)
+
+        def confirm_and_record() -> None:
             try:
                 self.verify_topology(pending, peer if same_serving else active.serving, wait=True, allow_draining=allow_draining)
-            except KeyboardInterrupt:
-                interrupted = True
-                self.verify_topology(pending, peer if same_serving else active.serving, wait=True, allow_draining=allow_draining)
-        except (Exception, KeyboardInterrupt) as err:
-            reason = str(err) or type(err).__name__
-            if reload_error is not None:
-                reason = f"{reload_error}. {reason}"
-            raise RoutingUnconfirmed(f"serving route unconfirmed ({reason}). Both serving pairs were kept") from err
-        self.record_live_route(state, pending)
-        if interrupted or (reload_error is not None and isinstance(reload_error.__cause__, KeyboardInterrupt)):
+            except Exception as err:
+                reason = str(err) or type(err).__name__
+                if reload_error is not None:
+                    reason = f"{reload_error}. {reason}"
+                raise RoutingUnconfirmed(f"serving route unconfirmed ({reason}). Both serving pairs were kept") from err
+            self.record_live_route(state, pending)
+
+        try:
+            try:
+                self.install_upstreams(self.route_text(pending), before_reload=check_before_reload,
+                                       reload_started=start_reload)
+            except RoutingUnconfirmed as err:
+                if not attempted:
+                    raise
+                reload_error = err
+            if self.ops.dry_run:
+                return
+            confirm_and_record()
+        except KeyboardInterrupt:
+            # A signal may arrive after the probe succeeded but before the
+            # proof reached state. Recheck once so the caller can roll back.
+            proof = (state.get("in_progress") or {}).get("verified_route") or {}
+            if attempted and not self.ops.dry_run and proof.get("revision") != pending.revision:
+                try:
+                    confirm_and_record()
+                except KeyboardInterrupt as err:
+                    raise RoutingUnconfirmed("serving route verification interrupted again. Both serving pairs were kept") from err
+            raise
+        if reload_error is not None and isinstance(reload_error.__cause__, KeyboardInterrupt):
             raise KeyboardInterrupt
 
     def record_live_route(self, state: dict[str, Any], route: MainRoute) -> None:

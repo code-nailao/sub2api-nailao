@@ -11,8 +11,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from email.message import Message
 from pathlib import Path
 from unittest import mock
+from urllib.response import addinfourl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import deploy  # noqa: E402
@@ -1045,9 +1047,15 @@ class DeployTest(unittest.TestCase):
             self.assertIsNone(self.ops.inspect(target["containers"][role]))
 
     def test_main_keeps_one_live_shared_alias_owner_during_second_release(self):
+        self.assert_next_release_keeps_one_alias_owner(held=False)
+
+    def test_resume_keeps_one_live_shared_alias_owner_during_second_release(self):
+        self.assert_next_release_keeps_one_alias_owner(held=True)
+
+    def assert_next_release_keeps_one_alias_owner(self, *, held):
         self.deploy()
         source = self.state()["current"]
-        target = self.cfg.slot_view("b")
+        target = self.hold()["target"] if held else self.cfg.slot_view("b")
         run = self.ops.run
         owners = []
 
@@ -1065,7 +1073,10 @@ class DeployTest(unittest.TestCase):
             return result
 
         with mock.patch.object(self.ops, "run", check):
-            self.deploy(image="another@sha256:3")
+            if held:
+                deploy.Deployer(self.cfg, self.ops).resume()
+            else:
+                self.deploy(image="another@sha256:3")
         self.assertTrue(all(len(owner) <= 1 for owner in owners))
         self.assertEqual({target["slot"]}, owners[-1])
         self.assert_live_release(self.state()["current"])
@@ -1838,6 +1849,55 @@ class DeployTest(unittest.TestCase):
         self.assert_no_shared_serving(target)
         self.assert_release_failure("failed", "KeyboardInterrupt")
         self.assertEqual(LEGACY, self.state()["current"])
+
+    def test_resume_switch_exit_interrupt_restores_original_release(self):
+        self.deploy()
+        original = self.state()["current"]
+        target = self.hold()["target"]
+        runner = deploy.Deployer(self.cfg, self.ops)
+        step = runner.step
+        observed = []
+
+        @contextlib.contextmanager
+        def interrupt_on_exit(name):
+            with step(name):
+                yield
+            if name == "switch" and not observed:
+                self.assert_loaded_interfaces(target, target)
+                observed.append(self.state()["current"]["slot"])
+                raise KeyboardInterrupt
+
+        with mock.patch.object(runner, "step", interrupt_on_exit):
+            with self.assertRaises(deploy.DeployError):
+                runner.resume()
+        self.assert_live_release(original)
+        self.assertEqual([target["slot"]], observed)
+        self.assertEqual(original, self.state()["current"])
+        self.assert_release_failure("failed", "KeyboardInterrupt")
+
+    def test_resume_interrupt_after_route_proof_before_record_restores_original_release(self):
+        self.deploy()
+        original = self.state()["current"]
+        target = self.hold()["target"]
+        runner = deploy.Deployer(self.cfg, self.ops)
+        record = runner.record_live_route
+        interrupted = []
+
+        def interrupt_before_record(state, route):
+            if route.serving["slot"] == target["slot"] and not interrupted:
+                self.assert_loaded_interfaces(target, target)
+                self.assertEqual(original, self.state()["current"])
+                interrupted.append(route.revision)
+                raise KeyboardInterrupt
+            record(state, route)
+
+        with mock.patch.object(runner, "record_live_route", interrupt_before_record):
+            with self.assertRaises(deploy.DeployError):
+                runner.resume()
+        self.assertTrue(interrupted)
+        self.assert_live_release(original)
+        self.assertEqual(original, self.state()["current"])
+        self.assert_release_failure("failed", "KeyboardInterrupt")
 
     def test_resume_failed_current_write_restores_verified_original_route(self):
         self.cfg.serving_alias = ""
@@ -3180,6 +3240,41 @@ class DeployTest(unittest.TestCase):
         self.assertEqual((200, "ok"), (status, body))
         self.assertEqual(deploy.USER_AGENT, seen[0].get_header("User-agent"))
         self.assertNotIn("urllib", seen[0].get_header("User-agent"))
+
+    def test_http_json_does_not_follow_redirect_with_a_runtime_token(self):
+        request = deploy.urllib.request
+        runtime = "http://runtime.invalid/internal/sources/runtime"
+        drain = "http://runtime.invalid/internal/sources/drain"
+        redirected = "http://other.invalid/"
+        token = "FIXTURE_RUNTIME_TOKEN"
+        requests = []
+
+        class FixtureHTTP(request.HTTPHandler):
+            def http_open(self, req):
+                requests.append((req.full_url, req.get_method(), req.get_header("Authorization")))
+                headers = Message()
+                if req.full_url == redirected:
+                    response = addinfourl(io.BytesIO(b"{}"), headers, req.full_url, 200)
+                    response.msg = "OK"
+                else:
+                    headers["Location"] = redirected
+                    response = addinfourl(io.BytesIO(), headers, req.full_url, 302)
+                    response.msg = "Found"
+                return response
+
+        build_opener = request.build_opener
+
+        def fixture_opener(*handlers):
+            return build_opener(*handlers, FixtureHTTP(), request.ProxyHandler({}))
+
+        with mock.patch.object(request, "build_opener", side_effect=fixture_opener), \
+                mock.patch.object(request, "urlopen", fixture_opener().open):
+            ops = deploy.Ops()
+            self.assertEqual((302, None), ops.http_json(runtime, token=token))
+            self.assertEqual((302, None), ops.http_json(drain, token=token, method="POST", body={"instance_id": "fixture"}))
+            self.assertEqual((200, {}), ops.http_json(runtime))
+        self.assertEqual([(runtime, "GET", f"Bearer {token}"), (drain, "POST", f"Bearer {token}"),
+                          (runtime, "GET", None), (redirected, "GET", None)], requests)
 
     def test_http_json_treats_a_reply_cut_off_mid_way_as_no_reply(self):
         # Real sockets: a process that exits while answering leaves one of these.
