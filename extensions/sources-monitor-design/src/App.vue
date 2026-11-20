@@ -5,21 +5,7 @@ import Icon from './Icon.vue'
 import ChannelCard from './ChannelCard.vue'
 import { brands, demoCards, realCards, labels, percent, seconds, time, type Brand, type Card, type Point, type Range, type Snapshot } from './model'
 
-function readMainOrigin(value: string | undefined) {
-  if (!value?.trim()) return undefined
-
-  try {
-    const url = new URL(value.trim())
-    // Accept only an HTTP(S) origin. Credentials and extra URL parts are invalid.
-    if ((url.protocol === 'https:' || url.protocol === 'http:') && url.href === `${url.origin}/`) {
-      return url.origin
-    }
-  } catch {
-    return undefined
-  }
-}
-
-const mainOrigin = readMainOrigin(import.meta.env.VITE_MONITOR_PREVIEW_MAIN_ORIGIN)
+const mainOrigin = import.meta.env.VITE_MONITOR_PREVIEW_MAIN_ORIGIN
 const mainOriginHint = '未配置主站地址'
 const mainOriginHintId = 'preview-main-origin-hint'
 

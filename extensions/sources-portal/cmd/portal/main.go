@@ -289,8 +289,7 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
 		return fail(errListenAddress)
 	}
-	// Both modes require an existing directory before opening any state.
-	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+	if !validDataDirectory(dir, !open.check) {
 		return fail(errDataDirMissing)
 	}
 	var listener net.Listener
@@ -337,6 +336,33 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 		}
 	}
 	return &portalSetup{listener: listener, store: store, svc: svc, server: server}, nil
+}
+
+// validDataDirectory checks the path without creating it. A normal start lets
+// OpenStore create missing directories after the listener binds.
+func validDataDirectory(dir string, allowCreate bool) bool {
+	for {
+		info, err := os.Stat(dir)
+		if err == nil {
+			return info.IsDir()
+		}
+		if !allowCreate || !os.IsNotExist(err) {
+			return false
+		}
+
+		// Stat also returns ENOENT for a dangling symlink. Check each missing
+		// component to distinguish a creatable path from an invalid symlink.
+		dir = strings.TrimRight(dir, string(os.PathSeparator))
+		if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+			return false
+		}
+		// Preserve the raw prefix so the kernel resolves symlink/.. correctly.
+		separator := strings.LastIndexByte(dir, os.PathSeparator)
+		if separator <= 0 {
+			return true
+		}
+		dir = dir[:separator]
+	}
 }
 
 func readStudioConfig(path string) ([]byte, error) {

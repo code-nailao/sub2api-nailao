@@ -60,26 +60,74 @@ func TestStartupListenFailureLeavesStateUnchanged(t *testing.T) {
 	}
 }
 
+func TestStartupCreatesMissingDataDirectoryOnlyAfterBinding(t *testing.T) {
+	for _, relative := range []string{"fresh-state", filepath.Join("new-parent", "state")} {
+		t.Run(relative, func(t *testing.T) {
+			f := newCheckFixture(t)
+			f.env["PORTAL_DATA_DIR"] = filepath.Join(f.root, relative)
+			before := treeSnapshot(t, f.root)
+			if code, stdout, stderr := runCheck(f); code != 1 || stdout != "" || stderr != errDataDirMissing+"\n" {
+				t.Fatalf("check: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+			}
+			if !sameTree(before, treeSnapshot(t, f.root)) {
+				t.Fatal("read-only check created the data directory")
+			}
+
+			addr := f.env["PORTAL_LISTEN"]
+			occupied, err := net.Listen("tcp", addr)
+			if err != nil {
+				t.Fatal("could not reserve the test listener")
+			}
+			defer occupied.Close()
+			f.env["PORTAL_LISTEN"] = occupied.Addr().String()
+			setup, err := prepare(f.getenv, startState)
+			if setup != nil {
+				setup.close()
+			}
+			if err != startupError(errListener) {
+				t.Errorf("occupied listener: got %v, want %q", err, errListener)
+			}
+			if !sameTree(before, treeSnapshot(t, f.root)) {
+				t.Error("binding failure created the data directory")
+			}
+
+			f.env["PORTAL_LISTEN"] = addr
+			setup, err = prepare(f.getenv, startState)
+			if err != nil {
+				t.Fatalf("first startup: %v", err)
+			}
+			defer setup.close()
+			if info, err := os.Stat(filepath.Join(f.env["PORTAL_DATA_DIR"], "portal.lock")); err != nil || !info.Mode().IsRegular() {
+				t.Fatal("first startup did not create the state directory and lock file")
+			}
+		})
+	}
+}
+
 func TestStartupRejectsInvalidDataDirectory(t *testing.T) {
-	for _, name := range []string{"file", "file-with-trailing-slash", "missing", "fifo", "dangling-symlink", "symlink-loop"} {
+	for _, name := range []string{"file", "file-with-trailing-slash", "child-of-file", "fifo", "dangling-symlink", "child-of-dangling-symlink", "symlink-loop"} {
 		t.Run(name, func(t *testing.T) {
 			f := newCheckFixture(t)
 			candidate := filepath.Join(f.root, "candidate")
 			switch name {
-			case "file", "file-with-trailing-slash":
+			case "file", "file-with-trailing-slash", "child-of-file":
 				writeFile(t, candidate, "fixture", 0600)
 				if name == "file-with-trailing-slash" {
 					candidate += string(os.PathSeparator)
 				}
-			case "missing":
-				candidate = filepath.Join(candidate, "state")
+				if name == "child-of-file" {
+					candidate = filepath.Join(candidate, "state")
+				}
 			case "fifo":
 				if err := syscall.Mkfifo(candidate, 0600); err != nil {
 					t.Fatal(err)
 				}
-			case "dangling-symlink":
+			case "dangling-symlink", "child-of-dangling-symlink":
 				if err := os.Symlink("missing", candidate); err != nil {
 					t.Fatal(err)
+				}
+				if name == "child-of-dangling-symlink" {
+					candidate = filepath.Join(candidate, "state")
 				}
 			case "symlink-loop":
 				if err := os.Symlink(filepath.Base(candidate), candidate); err != nil {

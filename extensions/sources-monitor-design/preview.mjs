@@ -1,7 +1,7 @@
 import { createServer, build } from '../../frontend/node_modules/vite/dist/node/index.js'
-import config from './vite.config.mjs'
+import { fileURLToPath } from 'node:url'
 
-const options = { ...config, configFile: false }
+const options = { configFile: fileURLToPath(new URL('./vite.config.mjs', import.meta.url)) }
 
 if (process.argv.includes('--build')) await build(options)
 else {
