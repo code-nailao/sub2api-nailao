@@ -724,6 +724,40 @@ class DeployTest(unittest.TestCase):
         self.assert_no_shared_serving(previous)
         self.assert_release_failure("failed", "serving-only switch interrupted")
 
+    def test_rollback_drains_each_serving_before_reconnecting_aliases(self):
+        self.deploy()
+        self.deploy(image="fixture:second")
+        before = self.state()
+        destination, retiring = before["previous"], before["current"]
+        run = self.ops.run
+        names = {view["containers"][role]: (view, role)
+                 for view in (destination, retiring) for role in deploy.SERVING_ROLES}
+        identities = {self.ops.inspect(name)["Id"]: name for name in names}
+        detached = []
+        for name in names:
+            self.ops.drain_seconds[name] = 3
+
+        def reconnect(args, **kwargs):
+            if args[:3] == ["docker", "network", "disconnect"]:
+                name = identities[args[-1]]
+                view, role = names[name]
+                info = self.ops.inspect(name)
+                self.assertFalse(info["State"]["Running"], name)
+                if view == destination and self.upstreams_only(self.ops.loaded_upstreams) != self.upstreams_for(retiring):
+                    serving = self.upstreams_only(self.ops.loaded_upstreams).split("upstream sources_main_admin")[0]
+                    port = view["ports"][role]
+                    self.assertNotIn(f":{port} ", serving)
+                    code, _, _ = self.ops.probe_nginx_serving("", 1)
+                    self.assertEqual(200, code)
+                    detached.append(role)
+            return run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "run", reconnect):
+            deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertEqual(set(deploy.SERVING_ROLES), set(detached))
+        self.assert_live_release(destination)
+        self.assertIsNone(self.state()["in_progress"])
+
     def test_rollback_alias_publication_failure_keeps_the_verified_route(self):
         self.deploy()
         self.deploy(image="another@sha256:3")
@@ -746,7 +780,13 @@ class DeployTest(unittest.TestCase):
             with self.assertRaisesRegex(deploy.DeployError, "alias connect did not report success"):
                 deploy.Deployer(self.cfg, self.ops).rollback()
         self.assertTrue(failed)
-        self.assert_loaded_interfaces(previous, previous)
+        checked = self.state()["in_progress"]["verified_route"]
+        self.assertEqual("standby", checked["excluded_serving"])
+        runner = deploy.Deployer(self.cfg, self.ops)
+        self.assertEqual(runner.route_text(deploy.MainRoute(**checked)), self.ops.loaded_upstreams)
+        self.assertTrue(runner.health(previous["ports"]["serving"]))
+        self.assertTrue(runner.background_answering(previous))
+        self.assertFalse(self.ops.inspect(standby)["State"]["Running"])
         self.assert_no_shared_serving(current)
         self.assertEqual(previous["slot"], self.state()["current"]["slot"])
         self.assert_release_failure("failed", "alias connect did not report success")
@@ -758,20 +798,27 @@ class DeployTest(unittest.TestCase):
         self.assert_no_shared_serving(previous)
         self.assertIsNone(self.state()["in_progress"])
 
-    def test_rollback_publishes_aliases_only_after_both_serving_roles_and_background_answer(self):
+    def test_rollback_publishes_aliases_only_after_verifying_routes_and_removing_old_aliases(self):
         self.deploy()
         self.deploy(image="another@sha256:3")
         previous = self.state()["previous"]
         run = self.ops.run
         runner = deploy.Deployer(self.cfg, self.ops)
         published = []
+        identities = {self.ops.inspect(previous["containers"][role])["Id"]: role for role in deploy.SERVING_ROLES}
 
         def check(args, **kw):
             if args[:3] == ["docker", "network", "connect"] and self.cfg.serving_alias in args:
-                for role in deploy.SERVING_ROLES:
-                    self.assertTrue(runner.health(previous["ports"][role]))
+                cid = args[-1]
+                stopped_role = identities[cid]
+                self.assertFalse(self.ops.inspect(cid)["State"]["Running"])
+                live_role = next(role for role in deploy.SERVING_ROLES if role != stopped_role)
+                status, _, address = self.ops.probe_nginx_serving("", 1)
+                self.assertEqual(200, status)
+                self.assertTrue(address.endswith(f":{previous['ports'][live_role]}"))
                 self.assertTrue(runner.background_answering(previous))
-                published.append(args[-1])
+                self.assertFalse(runner.alias_networks(self.state()["previous"]))
+                published.append(cid)
             return run(args, **kw)
 
         with mock.patch.object(self.ops, "run", check):
@@ -1018,6 +1065,7 @@ class DeployTest(unittest.TestCase):
         run, probe = self.ops.run, self.ops.probe_nginx_serving
         old_route_proof = None
         after_reload = 0
+        retirement_samples = []
 
         def change_route(args, **kw):
             nonlocal old_route_proof
@@ -1025,20 +1073,23 @@ class DeployTest(unittest.TestCase):
                 raise deploy.DeployError("fixture original background failed")
             if args == [self.cfg.nginx_bin, "-s", "reload"] and self.ops.switched:
                 old_route_proof = probe("", 1)
+            if args == ["docker", "kill", "--signal=TERM", target["containers"]["serving"]]:
+                retirement_samples.append(after_reload)
             return run(args, **kw)
 
         def reply(path, timeout):
             nonlocal after_reload
             if old_route_proof is not None:
                 after_reload += 1
-                if after_reload == 2:
+                if after_reload in (2, 4):
                     return old_route_proof
             return probe(path, timeout)
 
         with mock.patch.object(self.ops, "run", change_route), mock.patch.object(self.ops, "probe_nginx_serving", reply):
             with self.assertRaises(deploy.RollbackIncomplete):
                 self.deploy()
-        self.assertGreaterEqual(after_reload, 3)
+        self.assertTrue(retirement_samples)
+        self.assertGreaterEqual(retirement_samples[0], 6)
         self.assert_loaded_interfaces(LEGACY, target)
         self.assert_no_shared_serving(target)
         self.assert_release_failure("failed", "rollback background unavailable")
@@ -1396,7 +1447,7 @@ class DeployTest(unittest.TestCase):
             if (args[:3] == ["docker", "network", "connect"] and args[-1] in ids
                     and self.ops.network_name(args[-2]) == self.cfg.networks[1]
                     and (self.cfg.serving_alias in args or persistent)):
-                activated = self.upstreams_only(self.ops.loaded_upstreams) == self.upstreams_for(target)
+                activated = self.state()["current"]["slot"] == target["slot"]
                 if only_after_switch and not activated:
                     return run(args, **kw)
                 attempted.append(activated)
