@@ -22,7 +22,14 @@ const manageButton = document.querySelector("#canvas-manage");
 const ownKeyButton = document.querySelector("#canvas-own-key");
 let studioURL, connection, attempt, hostConfig, savedGroupToReconnect;
 let locked = false, needsCustomResave = false;
+// Where the resave action came from. A restore result answers one child
+// document and ends with it; a failed authorization is a page decision that
+// stays until a connection succeeds.
+let resaveConnectionId, resaveDocument;
 let sendTimer, checkTimer, acknowledgment;
+// The child said it started this document (canvas-ready); the load that follows
+// is that document's load, not another navigation.
+let announced = false;
 const rounds = connectionRounds();
 const groupRefresh = requestRounds();
 const groupPoll = requestRounds();
@@ -33,6 +40,7 @@ const granted = new Map();
 let custom = { groupId: 0, enabled: false, configured: false };
 const validRequestID = (value) => typeof value === "string" && /^[\w-]{16,80}$/.test(value);
 const isCurrent = (started) => !locked && rounds.isCurrent(started);
+const isPageCurrent = (started) => !locked && rounds.samePage(started);
 const isWaiting = (operation) => !locked && attempt === operation && rounds.isWaiting(operation.round);
 const readingOrAuthorizing = () => rounds.isWaiting() && ["bootstrap", "authorize"].includes(attempt?.phase);
 const confirmed = () => Boolean(acknowledgment && acknowledgment.payload === connection?.payload &&
@@ -40,13 +48,26 @@ const confirmed = () => Boolean(acknowledgment && acknowledgment.payload === con
 
 function waitingFor(operation) {
   const started = rounds.capture();
-  return () => isWaiting(operation) && isCurrent(started);
+  return () => isWaiting(operation) && isPageCurrent(started);
 }
 
-function navigateFrame(src) {
+function clearResave() {
+  needsCustomResave = false;
+  resaveConnectionId = resaveDocument = undefined;
+}
+// Every new child document: answers and page state that belonged to the
+// previous one are void. The connection the page holds is re-addressed to the
+// new document; it is not authorized again.
+function startDocument() {
   rounds.newDocument();
   acknowledgment = undefined;
   restoreRounds.clear();
+  if (resaveDocument !== undefined) clearResave();
+  if (connection) connection = { ...connection, started: rounds.capture() };
+  frame.hidden = true;
+}
+function navigateFrame(src) {
+  startDocument();
   frame.src = src;
 }
 
@@ -218,26 +239,48 @@ function repeatConfirmation() {
 }
 function rehandshake() {
   const wasConfirmed = confirmed();
-  // A child asking for configuration can be a new document on the same
-  // WindowProxy. Renew the handshake without guessing from a load event.
-  acknowledgment = undefined;
-  restoreRounds.clear();
-  frame.hidden = true;
+  // A child asking for configuration is a new document on the same
+  // WindowProxy. Its answers and any restore verdict it got are void.
+  startDocument();
+  announced = true;
   if (wasConfirmed) notifyHost(false);
+  // The new document is answered from scratch; a resave that still applies
+  // keeps the recovery state instead.
+  if (!needsCustomResave) showState("loading", "正在重新连接画布…");
   if (needsCustomResave || readingOrAuthorizing() || savedGroupToReconnect !== undefined || connection.invalid) return;
   if (attempt?.phase === "confirm") confirm(attempt, connection.grant);
   else repeatConfirmation();
 }
-frame.addEventListener("load", () => startSending(attempt));
+frame.addEventListener("load", () => {
+  if (announced) announced = false;
+  // A frame that had confirmed a connection and loads again without saying so
+  // was reloaded: the previous document's answers must not reach this one.
+  else if (acknowledgment) {
+    startDocument();
+    showState("loading", "正在重新连接画布…");
+  }
+  startSending(attempt);
+});
 
-function requireResave(connectionId) {
+function requireResave(connectionId, started) {
   needsCustomResave = true;
-  granted.delete(connectionId);
+  resaveConnectionId = connectionId;
   const invalidate = (candidate) => candidate?.grant.selectedConnectionId === connectionId
     ? { ...candidate, invalid: true }
     : candidate;
-  if (attempt) attempt.previous = invalidate(attempt.previous);
-  connection = invalidate(connection);
+  let held = false;
+  if (attempt) {
+    const previous = invalidate(attempt.previous);
+    held = previous !== attempt.previous;
+    attempt.previous = previous;
+  }
+  const next = invalidate(connection);
+  held = held || next !== connection;
+  connection = next;
+  // Losing the running connection is a page decision: it needs a resave, not
+  // an answer that ends with the document that happened to report it.
+  resaveDocument = held ? undefined : started?.document;
+  granted.delete(connectionId);
 }
 async function restoreConnection(connectionId, requestId, target) {
   const started = rounds.capture(), restoreRound = ++nextRestoreRound;
@@ -252,7 +295,7 @@ async function restoreConnection(connectionId, requestId, target) {
     if (!current()) return;
     restoreRounds.delete(connectionId);
     if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) {
-      requireResave(connectionId);
+      requireResave(connectionId, started);
       if (attempt?.phase === "confirm") finish(attempt);
       showState("recovery", error.message);
       if (!confirmed()) notifyHost(false);
@@ -264,8 +307,9 @@ async function restoreConnection(connectionId, requestId, target) {
   restoreRounds.delete(connectionId);
   granted.set(connectionId, config);
   target.postMessage({ type: "sub2api:media-studio-config", payload: { ...config, requestId, selectActive: false } }, studioURL.origin);
-  if (needsCustomResave) {
-    needsCustomResave = false;
+  // A fresh answer supersedes the verdict about this connection only.
+  if (needsCustomResave && resaveConnectionId === connectionId) {
+    clearResave();
     if (connection?.invalid && connection.grant.selectedConnectionId === connectionId) {
       repeatConfirmation();
       return;
@@ -322,7 +366,7 @@ async function authorize(operation, groupId) {
   try {
     const config = await api("/api/canvas/connection", waiting, { group_id: groupId });
     if (!waiting()) return;
-    needsCustomResave = false;
+    clearResave();
     granted.set(config.selectedConnectionId, config);
     confirm(operation, config);
     watchSession();
@@ -381,7 +425,7 @@ function renderGroups(data, keep) {
 async function refreshGroups(updateMenu = false) {
   const reads = updateMenu ? groupRefresh : groupPoll;
   const started = rounds.capture(), read = reads.advance();
-  const current = () => isCurrent(started) && read === reads.current;
+  const current = () => isPageCurrent(started) && read === reads.current;
   try {
     const data = await api("/api/canvas/groups", current);
     if (!current() || !updateMenu) return;
@@ -434,7 +478,7 @@ function openCustomConnectionSettings() {
       connection = undefined;
       frame.hidden = true;
     }
-    needsCustomResave = false;
+    clearResave();
     void reconnectSavedGroup(configured ? String(custom.groupId) : "");
   } });
 }

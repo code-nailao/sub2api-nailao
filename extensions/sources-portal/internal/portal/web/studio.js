@@ -34,6 +34,9 @@ let bootstrapRound, compatibilityTimer, expiredLegacyAttempt, needsCustomResave 
 const rounds = connectionRounds();
 const metadata = requestRounds();
 const isCurrent = (started) => !locked && rounds.isCurrent(started);
+// The page's own reads survive the child starting a new document; its answers
+// (acknowledgements) do not.
+const isPageCurrent = (started) => !locked && rounds.samePage(started);
 const isConnecting = () => rounds.isWaiting() && connectionPending?.round === rounds.current;
 const isBootstrapping = () => rounds.isWaiting() && bootstrapRound === rounds.current;
 const ordinaryGroups = () => groups.filter(({ id }) => id !== custom.groupId);
@@ -346,7 +349,7 @@ async function connect(groupId, request) {
   if (needsCustomResave) recoverView(connectingText);
   else message.textContent = connectingText;
   updateControls();
-  const waiting = (started) => isCurrent(started) && connectionPending === pending && rounds.isWaiting(pending.round);
+  const waiting = (started) => isPageCurrent(started) && connectionPending === pending && rounds.isWaiting(pending.round);
   const authorizationCurrent = () => waiting(authorizing);
   try {
     let config = cached;
@@ -480,7 +483,7 @@ if (window.parent !== window) window.parent.postMessage({ type: "sources:studio-
 async function refreshMetadata() {
   if (locked || isConnecting() || isBootstrapping()) return;
   const started = rounds.capture(), refresh = metadata.advance();
-  const current = () => isCurrent(started) && refresh === metadata.current;
+  const current = () => isPageCurrent(started) && refresh === metadata.current;
   try {
     const fresh = await api("/api/studio/groups", current);
     if (!current()) return;
@@ -504,7 +507,7 @@ async function bootstrap() {
     recoverView(connectionTimeout);
   });
   const started = rounds.capture();
-  const waiting = () => isCurrent(started) && rounds.isWaiting(round);
+  const waiting = () => isPageCurrent(started) && rounds.isWaiting(round);
   try {
     const data = await api("/api/studio/groups", waiting);
     if (!waiting()) return;

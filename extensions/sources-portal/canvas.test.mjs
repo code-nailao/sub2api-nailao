@@ -279,6 +279,123 @@ test('Canvas ignores a late restore conflict after a newer restore of the same g
   assert.equal(f.frame.hidden, false);
 });
 
+test('a Canvas restore conflict from before a reload neither changes the page nor blocks the new document', async () => {
+  const restore = Promise.withResolvers();
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only
+    ? restore.promise.then((result) => result ?? { ok: true, status: 200, data: config(options.body.group_id) })
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.host(); f.loaded(); await f.ack();
+  const connectionId = `group-${CUSTOM_ID}`;
+  const requestId = '00000000-0000-4000-8000-000000000026';
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId, requestId });
+  await flush();
+  assert.equal(connections(f).at(-1).options.body.restore_only, true);
+
+  // An ordinary group becomes the accepted connection, then the child reloads.
+  const alternate = f.select.children.find(({ value }) => String(value) !== f.select.value && value !== CUSTOM_ID).value;
+  f.select.value = String(alternate);
+  await f.select.onchange();
+  await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+
+  // The old restore's conflict arrives before the new document says it is ready.
+  f.loaded();
+  restore.resolve({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } });
+  await flush();
+  assert.equal(f.last('sub2api:canvas-restore-error'), undefined);
+  assert.doesNotMatch(f.elements['#message'].textContent, /重新保存自定义连接/);
+  assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
+  assert.notEqual(f.document.body.dataset.state, 'recovery');
+
+  // The new document is answered instead of being held by the resave state.
+  f.send({ type: 'sub2api:canvas-ready' });
+  assert.equal(f.document.body.dataset.state, 'loading');
+  assert.equal(f.last('sub2api:media-studio-config').payload.selectedConnectionId, `group-${alternate}`);
+  await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+});
+
+test('a Canvas document that asks again gets its own resave verdict', async () => {
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only
+    ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.host(); f.loaded(); await f.ack();
+  const connectionId = `group-${CUSTOM_ID}`;
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId, requestId: '00000000-0000-4000-8000-000000000027' });
+  await flush();
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+
+  // Reloading withdraws the verdict made for the previous document...
+  f.loaded();
+  f.send({ type: 'sub2api:canvas-ready' });
+  assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
+  await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+
+  // ...and the same answer for the new document is applied to it.
+  const nextRequestId = '00000000-0000-4000-8000-000000000028';
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId, requestId: nextRequestId });
+  await flush();
+  assert.equal(f.last('sub2api:canvas-restore-error').requestId, nextRequestId);
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+});
+
+test('a Canvas acknowledgement from before a reload cannot confirm the new document', async () => {
+  const f = await fixture();
+  f.host(); f.loaded(); await f.ack();
+  const original = f.last('sub2api:media-studio-config').payload;
+  f.loaded();
+  assert.equal(f.frame.hidden, true);
+  f.send({ type: 'sub2api:media-studio-config-applied', payload: { status: 'applied',
+    profileId: `sub2api-media-studio-${original.selectedConnectionId}`, requestId: original.requestId } });
+  await flush();
+  assert.equal(f.frame.hidden, true);
+  assert.equal(f.document.body.dataset.state, 'loading');
+
+  f.send({ type: 'sub2api:canvas-ready' });
+  await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+});
+
+test('the first load of the Canvas frame is not a reload', async () => {
+  const f = await fixture();
+  f.host();
+  f.loaded();
+  assert.equal(f.document.body.dataset.state, 'loading');
+  await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+});
+
+test('a Canvas restore remains an answer to its document across another group acknowledgement', async () => {
+  const restore = Promise.withResolvers();
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only
+    ? restore.promise.then((result) => result ?? { ok: true, status: 200, data: config(options.body.group_id) })
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.host(); f.loaded(); await f.ack();
+  const connectionId = `group-${CUSTOM_ID}`;
+  const requestId = '00000000-0000-4000-8000-000000000029';
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId, requestId });
+  await flush();
+
+  const alternate = f.select.children.find(({ value }) => String(value) !== f.select.value && value !== CUSTOM_ID).value;
+  f.select.value = String(alternate);
+  await f.select.onchange();
+  await f.ack();
+  restore.resolve();
+  await flush();
+
+  const restored = f.last('sub2api:media-studio-config').payload;
+  assert.equal(restored.requestId, requestId);
+  assert.equal(restored.selectedConnectionId, connectionId);
+  assert.equal(restored.selectActive, false);
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+});
+
 test('Canvas keeps the resave action usable before and after a different group authorization times out', async () => {
   const hung = Promise.withResolvers();
   let switching = false;
