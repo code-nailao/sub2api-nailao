@@ -244,6 +244,105 @@ test('saving Canvas settings clears the resave action even if the subsequent gro
   assert.equal(f.frame.hidden, true);
 });
 
+test('a late Canvas ACK cannot reveal a connection after a restore conflict', async () => {
+  for (const validateBeforeConflict of [false, true]) {
+    const validation = Promise.withResolvers();
+    const f = await fixture({ groups: [], custom: 'configured', session: () => validation.promise,
+      connection: (options, config) => options.body.restore_only
+        ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
+        : { ok: true, status: 200, data: config(options.body.group_id) } });
+    f.host();
+    f.loaded();
+    if (validateBeforeConflict) await f.ack();
+    f.send({ type: 'sub2api:canvas-restore-connection', connectionId: `group-${CUSTOM_ID}`,
+      requestId: '00000000-0000-4000-8000-000000000010' });
+    await flush();
+    assert.equal(f.frame.hidden, true);
+    assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+
+    validation.resolve();
+    if (validateBeforeConflict) await flush();
+    else await f.ack();
+    assert.equal(f.frame.hidden, true);
+    assert.equal(f.document.body.dataset.state, 'recovery');
+    assert.match(f.elements['#message'].textContent, /重新保存自定义连接/);
+    assert.equal(f.parentMessages.some(({ integrated }) => integrated === true), false);
+  }
+});
+
+test('a hung Canvas group refresh after saving exposes a usable retry', async () => {
+  const hungGroups = Promise.withResolvers();
+  let saved = false;
+  let waitForGroups = false;
+  const f = await fixture({ groups: [], custom: 'configured',
+    groupsResponse: () => waitForGroups ? hungGroups.promise : undefined,
+    connection: (options, config) => saved
+      ? { ok: true, status: 200, data: config(options.body.group_id) }
+      : { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } } });
+  const retry = f.elements['#canvas-retry'];
+  retry.onclick();
+  saved = waitForGroups = true;
+  f.settings.at(-1).onSaved(true);
+  assert.equal(f.frame.hidden, true);
+  assert.equal(f.elements['#canvas-recovery'].hidden, false);
+  const timeout = [...f.timers.values()].find(({ delay }) => delay === 20000);
+  assert.ok(timeout, 'saving should arm the startup timeout during the group refresh');
+  timeout.callback();
+  assert.match(f.elements['#message'].textContent, /连接用时较长/);
+  assert.equal(retry.textContent, '重试连接');
+  assert.equal(retry.disabled, false);
+
+  waitForGroups = false;
+  retry.onclick();
+  await flush();
+  assert.equal(f.calls.filter(({ path }) => path === '/api/canvas/groups').length, 3);
+  f.loaded(); await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  hungGroups.resolve({ ok: false, status: 503 });
+  await flush();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+});
+
+test('Canvas discards a group poll failure from an earlier connection generation', async () => {
+  const oldPoll = Promise.withResolvers();
+  let pollPending = false;
+  const f = await fixture({ groupsResponse: () => pollPending ? oldPoll.promise : undefined });
+  f.loaded(); await f.ack();
+  pollPending = true;
+  [...f.timers.values()].find(({ delay }) => delay === 30000).callback();
+  f.select.value = String(f.select.children.at(-1).value);
+  await f.select.onchange();
+  await f.ack();
+  const message = f.elements['#message'].textContent;
+
+  oldPoll.resolve({ ok: false, status: 503 });
+  await flush();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.elements['#message'].textContent, message);
+  assert.equal(f.frame.hidden, false);
+});
+
+test('Canvas ignores a settings save result after a newer group connection', async () => {
+  const f = await fixture({ custom: 'configured' });
+  f.loaded(); await f.ack();
+  f.elements['#canvas-custom'].onclick();
+  const finishSave = f.settings.at(-1).beginSave();
+
+  const alternate = String(f.select.children.find(({ value }) => String(value) !== f.select.value).value);
+  f.select.value = alternate;
+  await f.select.onchange();
+  await f.ack();
+  const before = f.calls.length;
+
+  finishSave(true);
+  await flush();
+  assert.equal(f.calls.length, before);
+  assert.equal(f.select.value, alternate);
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+});
+
 test('restoring a stale Canvas connection reports the failure and offers settings without opening a dialog', async () => {
   let stale = true;
   const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only && stale

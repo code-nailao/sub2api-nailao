@@ -358,7 +358,7 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
 }
 
 /** Any user: connect with one of their own API keys. */
-export function openCustomSettings({ onSaved = () => {} } = {}) {
+export function openCustomSettings({ getGeneration = () => undefined, onSaved = () => {} } = {}) {
   const view = openDialog("自定义连接", "用你在本站已有的 API 密钥连接图片工作台和无限画布，费用照常从余额扣除。域名固定为本站，可以选择 API 子域名；路径由系统自动拼接。");
   const messages = {
     invalid_custom_connection: "API 地址、接口或模型不符合要求，请检查后重试。",
@@ -366,6 +366,20 @@ export function openCustomSettings({ onSaved = () => {} } = {}) {
     custom_connection_disabled: "管理员已关闭自定义连接。",
   };
   view.actions.append(button("关闭", view.close));
+  function persistBinding(configured, options) {
+    const generation = getGeneration();
+    return busy(view, configured ? "正在保存…" : "正在删除…", async () => {
+      try {
+        await request("/api/studio/custom", options, messages);
+      } catch (error) {
+        if (getGeneration() === generation) throw error;
+        return;
+      }
+      if (getGeneration() !== generation) return;
+      view.close();
+      onSaved(configured, generation);
+    });
+  }
   function show(data) {
     if (data.enabled !== true) { view.body.append(el("p", { text: messages.custom_connection_disabled })); return; }
     const keys = Array.isArray(data.keys) ? data.keys : [];
@@ -430,17 +444,9 @@ export function openCustomSettings({ onSaved = () => {} } = {}) {
     const save = () => {
       const { body, error } = customRequest({ keyId: Number(keySelect.value), protocol: protocolSelect.value, apiLabel: labelSelect.value, platform: selectedKey().platform, models: picker.value });
       if (error) { say(view, error, "error"); return; }
-      void busy(view, "正在保存…", async () => {
-        await request("/api/studio/custom", { method: "PUT", body }, messages);
-        view.close();
-        onSaved(true);
-      });
+      void persistBinding(true, { method: "PUT", body });
     };
-    if (data.binding) view.actions.append(button("删除自定义连接", () => void busy(view, "正在删除…", async () => {
-      await request("/api/studio/custom", { method: "DELETE" }, messages);
-      view.close();
-      onSaved(false);
-    })));
+    if (data.binding) view.actions.append(button("删除自定义连接", () => void persistBinding(false, { method: "DELETE" })));
     view.actions.append(button("保存并连接", save, "portal-primary"));
     // The list is fetched as soon as the dialog opens.
     void picker.refresh();

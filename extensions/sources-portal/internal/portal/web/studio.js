@@ -166,7 +166,9 @@ function openSettings(kind) {
     openGroupSettings({ onSaved: () => void refreshMetadata() });
     return;
   }
-  openCustomSettings({ onSaved: (configured) => {
+  openCustomSettings({ getGeneration: () => generation, onSaved: (configured, current) => {
+    if (locked || current !== generation) return;
+    generation++;
     // The client changes group only on its own request, so the page starts
     // again on the saved connection. Drafts and submitted tasks are kept.
     try {
@@ -221,7 +223,7 @@ function updateMetadata(data) {
 function publishShell() {
   if (!shellReady || !studioURL || !mainOrigin || locked || connectionPending || selectionUncertain) return;
   clearInterval(shellTimer);
-  shellPending = {
+  const config = {
     type: "sub2api:image-studio-shell-config", version: 1,
     requestId: crypto.randomUUID(), revision: ++shellRevision,
     shellMode: hostConfig?.shellMode || (window.parent === window ? "standalone" : "embedded"),
@@ -230,12 +232,17 @@ function publishShell() {
     theme: hostConfig?.theme || (params.get("theme") === "dark" ? "dark" : "light"),
     lang: hostConfig?.lang || params.get("lang") || "zh",
   };
-  const pending = shellPending;
+  const pending = shellPending = { config, generation };
   renderLegacyGroups();
-  postStudio(pending);
+  postStudio(config);
   let attempts = 0;
   shellTimer = setInterval(() => {
     if (shellPending !== pending) return;
+    if (pending.generation !== generation || locked) {
+      clearInterval(shellTimer);
+      shellPending = null;
+      return;
+    }
     if (++attempts > 30) {
       clearInterval(shellTimer);
       shellPending = null;
@@ -243,7 +250,7 @@ function publishShell() {
       recoverView("连接暂未确认，请点击“恢复连接”重试。");
       return;
     }
-    postStudio(pending);
+    postStudio(config);
   }, 500);
 }
 // text null sends an empty message: the client then shows no notice at all,
@@ -256,7 +263,7 @@ function selectionResult(pending, status, text = "", reconnectRequired = false) 
 }
 function sendConnection() {
   const pending = connectionPending;
-  if (!pending?.config) return;
+  if (!pending?.config || pending.generation !== generation) return;
   postStudio({ type: "sub2api:image-studio-config", payload: pending.config,
     ...(pending.requestId ? { requestId: pending.requestId, revision: pending.revision } : {}) });
 }
@@ -271,7 +278,7 @@ async function connect(groupId, request) {
   else message.textContent = connectingText;
   try {
     const config = await api("/api/studio/connection", { group_id: groupId, ...(pending.restoreOnly ? { restore_only: true } : {}) });
-    if (locked || connectionPending !== pending) return;
+    if (locked || connectionPending !== pending || pending.generation !== generation) return;
     if (needsCustomResave) {
       needsCustomResave = false;
       recoverView("已收到工作台连接配置，正在等待确认…");
@@ -282,6 +289,11 @@ async function connect(groupId, request) {
     let attempts = 0;
     connectionTimer = setInterval(() => {
       if (connectionPending !== pending) return;
+      if (pending.generation !== generation || locked) {
+        clearInterval(connectionTimer);
+        connectionPending = null;
+        return;
+      }
       if (++attempts > 30) {
         clearInterval(connectionTimer);
         connectionPending = null;
@@ -297,7 +309,7 @@ async function connect(groupId, request) {
       sendConnection();
     }, 500);
   } catch (error) {
-    if (locked || connectionPending !== pending) return;
+    if (locked || connectionPending !== pending || pending.generation !== generation) return;
     connectionPending = null;
     selectionResult(pending, "error", error.message);
     if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) needsCustomResave = true;
@@ -337,12 +349,12 @@ window.addEventListener("message", async (event) => {
   }
   if (data.type === "sub2api:image-studio-shell-config-applied" && data.version === 1) {
     const pending = shellPending;
-    if (!pending || data.requestId !== pending.requestId || data.revision !== pending.revision) return;
+    if (!pending || pending.generation !== generation || data.requestId !== pending.config.requestId || data.revision !== pending.config.revision) return;
     try { await currentToken(); } catch { return; }
-    if (locked || shellPending !== pending) return;
+    if (locked || shellPending !== pending || pending.generation !== generation) return;
     shellPending = null;
     clearInterval(shellTimer);
-    appliedShellRevision = pending.revision;
+    appliedShellRevision = pending.config.revision;
     if (!needsCustomResave || connectionApplied) frame.hidden = false;
     if (!needsCustomResave) message.textContent = "";
     setIntegrated(true);
@@ -370,7 +382,7 @@ window.addEventListener("message", async (event) => {
   }
   if (data.type !== "sub2api:image-studio-config-applied" || data.payload?.status !== "applied") return;
   const pending = connectionPending;
-  if (!pending?.config) return;
+  if (!pending?.config || pending.generation !== generation) return;
   if (!pending.restoreOnly && data.payload.profileId !== `sub2api-image-studio-group-${pending.groupId}`) return;
   if (pending.requestId && (data.payload.requestId !== pending.requestId || data.payload.revision !== pending.revision)) return;
   try { await currentToken(); } catch { return; }
@@ -401,13 +413,14 @@ if (window.parent !== window) window.parent.postMessage({ type: "sources:studio-
 
 async function refreshMetadata() {
   if (locked || connectionPending) return;
+  const current = generation;
   try {
     const fresh = await api("/api/studio/groups");
-    if (locked) return;
+    if (locked || current !== generation) return;
     updateMetadata(fresh);
     publishShell();
   } catch (error) {
-    if (locked) return;
+    if (locked || current !== generation) return;
     viewer = { displayName: viewer.displayName, balance: null };
     if (needsCustomResave) recoverView(error.message);
     else message.textContent = error.message;

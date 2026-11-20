@@ -329,6 +329,44 @@ test('Studio keeps stale connection recovery through a network error until a new
   assert.equal(f.frame.hidden, false);
 });
 
+test('Studio discards a group poll failure from an earlier connection generation', async () => {
+  const oldPoll = Promise.withResolvers();
+  let pollPending = false;
+  const f = await fixture({ groupsResponse: () => pollPending ? oldPoll.promise : undefined });
+  const shell = await f.integrate();
+  pollPending = true;
+  const pending = [...f.timers.values()].find(({ delay }) => delay === 30000).callback();
+  f.send(select(shell.groups.at(-1).id, shell.revision, 'new-generation-request'));
+  await flush();
+  await f.ackConnection();
+  const selected = await f.ackShell();
+  assert.equal(f.document.body.dataset.state, 'ready');
+
+  oldPoll.resolve({ ok: false, status: 503 });
+  await pending;
+  assert.equal(f.last('sub2api:image-studio-shell-config'), selected);
+  assert.equal(f.message.textContent, '');
+  assert.equal(f.frame.hidden, false);
+});
+
+test('Studio ignores a settings save result after a newer group connection', async () => {
+  const f = await fixture({ custom: 'configured' });
+  const shell = await f.integrate();
+  f.customButton.onclick();
+  const finishSave = f.settings.at(-1).beginSave();
+
+  const alternate = shell.groups.find(({ id }) => id !== shell.selectedGroupId && id !== CUSTOM_ID && id !== SETUP_ID).id;
+  f.send(select(alternate, shell.revision, 'after-settings-save-request'));
+  await flush();
+  await f.ackConnection();
+  await f.ackShell();
+
+  finishSave(true);
+  assert.equal(f.state.reloads, 0);
+  assert.equal(f.select.value, String(alternate));
+  assert.equal(f.document.body.dataset.state, 'ready');
+});
+
 test('an integrated Studio keeps the resave action visible after a failed switch and shell ACK', async () => {
   const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.group_id === CUSTOM_ID
     ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }

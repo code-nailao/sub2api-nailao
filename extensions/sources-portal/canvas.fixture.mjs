@@ -48,7 +48,13 @@ export async function createCanvasFixture({ groups = [{ id: 26, name: 'Images' }
   }, { context });
   // The dialogs need a real DOM; here they only record that they were opened.
   const dialogs = new vm.SyntheticModule(['openCustomSettings', 'openGroupSettings'], function () {
-    this.setExport('openCustomSettings', (options) => settings.push({ kind: 'custom', ...options }));
+    this.setExport('openCustomSettings', ({ getGeneration, onSaved }) => {
+      const beginSave = () => {
+        const generation = getGeneration?.();
+        return (configured) => onSaved(configured, generation);
+      };
+      settings.push({ kind: 'custom', beginSave, onSaved: (configured) => beginSave()(configured) });
+    });
     this.setExport('openGroupSettings', (options) => settings.push({ kind: 'manage', ...options }));
   }, { context });
   const module = new vm.SourceTextModule(source, { context }); await module.link((specifier) => specifier === './session.js' ? auth : dialogs); await module.evaluate(); await flush();

@@ -54,7 +54,13 @@ export async function createStudioFixture({ remembered, groupList = initialGroup
   }, { context });
   // The dialogs need a real DOM; here they only record that they were opened.
   const dialogs = new vm.SyntheticModule(['openCustomSettings', 'openGroupSettings'], function () {
-    this.setExport('openCustomSettings', (options) => settings.push({ kind: 'custom', ...options }));
+    this.setExport('openCustomSettings', ({ getGeneration, onSaved }) => {
+      const beginSave = () => {
+        const generation = getGeneration?.();
+        return (configured) => onSaved(configured, generation);
+      };
+      settings.push({ kind: 'custom', beginSave, onSaved: (configured) => beginSave()(configured) });
+    });
     this.setExport('openGroupSettings', (options) => settings.push({ kind: 'manage', ...options }));
   }, { context });
   const module = new vm.SourceTextModule(source, { context });
