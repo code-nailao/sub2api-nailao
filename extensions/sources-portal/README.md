@@ -40,6 +40,8 @@
 
 ## 构建/运行
 
+Portal 镜像标签沿用仓库的发布版本，来源为 [`backend/cmd/server/VERSION`](../../backend/cmd/server/VERSION)，不维护独立版本文件。
+
 Go 1.26+、Node和pnpm 9.15.9；外部首页采用已锁定的 Vue/Vite，色板来自 `../sources-brand`。从仓库根执行：
 
 ```sh
