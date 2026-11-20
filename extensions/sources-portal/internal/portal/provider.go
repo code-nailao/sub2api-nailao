@@ -124,6 +124,10 @@ func BalanceClient() *http.Client {
 var ErrQueryTimeout = errors.New("upstream_timeout")
 
 func balanceQueryError(ctx context.Context, err, fallback error) error {
+	if errors.Is(context.Cause(ctx), errBalanceShutdown) &&
+		(errors.Is(err, context.Canceled) || errors.Is(err, errBalanceShutdown)) {
+		return errBalanceShutdown
+	}
 	var timeout net.Error
 	if !errors.Is(ctx.Err(), context.Canceled) && (errors.Is(ctx.Err(), context.DeadlineExceeded) ||
 		errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout()) {
