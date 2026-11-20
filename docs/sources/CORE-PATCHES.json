@@ -711,8 +711,8 @@
       "features": [
         "deepseek_chat_transport_safety"
       ],
-      "sha256": "83115bf5f4186a334ce0f3480d65c411df8d381392bca372165add6ee9a13f48",
-      "reason": "Exercises streaming and non-streaming DeepSeek Chat requests through two simulated accounts. A disconnect after reading the whole request stops failover, records the selected account failure and leaves usage and billing untouched. Failures before connection keep failover and ordinary billing."
+      "sha256": "ed4194605848435633b913986fb632e94b291b3756708cfd8b696634d2b536e3",
+      "reason": "Exercises streaming and non-streaming DeepSeek Chat requests through two simulated accounts. A disconnect after reading the whole request stops failover, records the selected account failure and leaves usage and billing untouched. Dial, DNS and a full client cache before connection keep failover and ordinary billing."
     },
     {
       "path": "backend/internal/handler/dto/deepseek_tools_test.go",
@@ -1562,10 +1562,11 @@
       "path": "backend/internal/repository/http_upstream.go",
       "features": [
         "account_wallet_refresh",
+        "deepseek_chat_transport_safety",
         "upstream_022_request_speed_root_upstream_integration"
       ],
-      "sha256": "631a4280d5a7e38e27b1b8384fe2470f718c4520cbf4a84dba80b64167346bec",
-      "reason": "Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour."
+      "sha256": "c9b3409a4e9105ff23815a97c44465d55425a8c97cc7d5f4afd11d2c52c04df7",
+      "reason": "Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Starts delivery observation before host validation and client acquisition so an observed request that never obtains a connection or attempts a write is eligible for failover."
     },
     {
       "path": "backend/internal/repository/http_upstream_wallet_test.go",
@@ -2889,6 +2890,14 @@
       "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Tests for this behaviour."
     },
     {
+      "path": "backend/internal/service/http_upstream_port.go",
+      "features": [
+        "deepseek_chat_transport_safety"
+      ],
+      "sha256": "f69818b24d9de26437f4047cd5728d02cadda5b124e5b6278275715ffdef229a",
+      "reason": "Shares the connection and write trace between the HTTP transport and the caller so a send failure can be classified even if it stops before the HTTP client is invoked."
+    },
+    {
       "path": "backend/internal/service/http_upstream_profile.go",
       "features": [
         "account_wallet_refresh"
@@ -2975,8 +2984,8 @@
         "deepseek_chat_transport_safety",
         "deepseek_tool_compat"
       ],
-      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point. For DeepSeek groups with tools off, a Chat transport error permits failover only when the first request is known to have failed before obtaining a connection.",
-      "sha256": "69de97f9e6b0c071b9c9b6f18301743e5de2fed847645a54302cf5cd68fd98af"
+      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point. For DeepSeek groups with tools off, a Chat transport error permits failover only when delivery tracking confirms the request did not obtain a connection or write request bytes.",
+      "sha256": "733d5d89e3a1b5e77963dc678e271a8bff5674ae749575b16406c2fe05bb638c"
     },
     {
       "path": "backend/internal/service/openai_gateway_chat_completions.go",
@@ -3196,6 +3205,22 @@
       ],
       "sha256": "e355f43cde78c734840d9e8e5aa0f34dc69f37343f2e045fafee23bd112169fa",
       "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. This file tests that content-rejection evidence and upstream's pre-output idle failover apply to different account types and cannot meet."
+    },
+    {
+      "path": "backend/internal/service/openai_upstream_transport_error_handle_test.go",
+      "features": [
+        "deepseek_chat_transport_safety"
+      ],
+      "sha256": "5356da3d3fab2390adf78677fa986d4c6f4c77c236c195d45553a698f1bb2ade",
+      "reason": "Uses documentation addresses and placeholders in the proxy failure and account cooldown fixture."
+    },
+    {
+      "path": "backend/internal/service/openai_upstream_transport_error_test.go",
+      "features": [
+        "deepseek_chat_transport_safety"
+      ],
+      "sha256": "a238625f3f257d1d79987cb8da2395a9c5999f4eb45c4e8084a3bf57b35508f0",
+      "reason": "Uses documentation addresses and placeholders in proxy error fixtures for transport failure classification."
     },
     {
       "path": "backend/internal/service/openai_ws_forwarder_ingress.go",
