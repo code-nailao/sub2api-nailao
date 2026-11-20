@@ -3,6 +3,7 @@ import hashlib
 import http.client
 import io
 import json
+import multiprocessing
 import os
 import re
 import socketserver
@@ -254,6 +255,9 @@ class FakeOps(deploy.Ops):
         address = upstream[1]
         status, _ = self.http_json(f"http://{address}/health", timeout=timeout)
         return status, revision[1], address
+
+    def nginx_workers(self, path, *, shutting_down=False):
+        return []
 
     def write_file_atomic(self, path, text, mode=0o644):
         if self.dry_run:
@@ -580,7 +584,7 @@ class DeployTest(unittest.TestCase):
             target = self.cfg.slot_view("a")
         current = self.state()["current"]
         target_bg, current_bg = (view["containers"]["background"] for view in (target, current))
-        run, read, save, log = self.ops.run, self.ops.read_text, deploy.save_state, self.ops.log
+        run, read, save, log = self.ops.run, self.ops.read_bytes, deploy.save_state, self.ops.log
         injected = False
 
         def fail_save(cfg, state):
@@ -615,7 +619,7 @@ class DeployTest(unittest.TestCase):
             log(message)
 
         self.ops.commands.clear()
-        with mock.patch.object(deploy, "save_state", fail_save), mock.patch.object(self.ops, "read_text", interrupt_read), \
+        with mock.patch.object(deploy, "save_state", fail_save), mock.patch.object(self.ops, "read_bytes", interrupt_read), \
                 mock.patch.object(self.ops, "run", fail_restore), mock.patch.object(self.ops, "log", interrupt_switch_log):
             with self.assertRaises(deploy.DeployError) as outcome:
                 if command == "main":
@@ -724,6 +728,69 @@ class DeployTest(unittest.TestCase):
         self.assert_no_shared_serving(previous)
         self.assert_release_failure("failed", "serving-only switch interrupted")
 
+    def test_manual_rollback_keeps_alias_reachable_on_each_network_during_transfer(self):
+        self.deploy()
+        self.deploy(image="fixture:second")
+        before = self.state()
+        runner = deploy.Deployer(self.cfg, self.ops)
+        command = self.ops.run
+        coverage = set(runner.alias_networks(before["current"]))
+        self.assertEqual(len(self.cfg.networks), len(coverage))
+
+        def sample(args, **kwargs):
+            result = command(args, **kwargs)
+            alive = runner.alias_networks(before["current"]) | runner.alias_networks(before["previous"])
+            self.assertTrue(coverage.issubset(alive), f"shared alias unavailable after {args[:3]}")
+            return result
+
+        with mock.patch.object(self.ops, "run", sample):
+            runner.rollback()
+        self.assertEqual(coverage, runner.alias_networks(before["previous"]))
+        self.assertFalse(runner.alias_networks(before["current"]))
+        self.assert_live_release(before["previous"])
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_degraded_rollback_waits_for_old_worker_before_signalling_serving(self):
+        self.deploy()
+        self.deploy(image="fixture:second")
+        before = self.state()
+        original, destination = before["current"], before["previous"]
+        worker_id = {"pid": 43, "boot_id": "fixture-boot", "started_at_tick": "fixture-start"}
+        calls = []
+        run, sleep = self.ops.run, self.ops.sleep
+        retire_name = original["containers"]["serving"]
+        pid_stat = f"/proc/{worker_id['pid']}/stat"
+        self.ops.files["/proc/sys/kernel/random/boot_id"] = worker_id["boot_id"]
+        self.ops.files[pid_stat] = "43 (nginx) S 0 " + "0 " * 17 + worker_id["started_at_tick"]
+        worker_exit_at = None
+
+        def track_workers(path, *, shutting_down=False):
+            return [worker_id] if pid_stat in self.ops.files else []
+
+        def wait(seconds):
+            sleep(seconds)
+            if worker_exit_at is not None and self.ops.clock >= worker_exit_at:
+                self.ops.files.pop(pid_stat, None)
+
+        def run_with_old_request(args, **kwargs):
+            nonlocal worker_exit_at
+            if args == ["docker", "start", destination["containers"]["background"]]:
+                raise deploy.DeployError("fixture rollback background fails")
+            if args == [self.cfg.nginx_bin, "-s", "reload"] and worker_exit_at is None:
+                worker_exit_at = self.ops.clock + 2.5
+            if args == ["docker", "kill", "--signal=TERM", retire_name]:
+                self.assertNotIn(pid_stat, self.ops.files, "old Nginx worker still handles a request body")
+                calls.append(args)
+            return run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "nginx_workers", track_workers, create=True), \
+                mock.patch.object(self.ops, "sleep", wait), mock.patch.object(self.ops, "run", run_with_old_request):
+            with self.assertRaises(deploy.RollbackIncomplete):
+                deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertTrue(calls)
+        self.assert_loaded_interfaces(destination, original)
+        self.assert_release_failure("failed", "rollback background unavailable")
+
     def test_rollback_drains_each_serving_before_reconnecting_aliases(self):
         self.deploy()
         self.deploy(image="fixture:second")
@@ -787,7 +854,7 @@ class DeployTest(unittest.TestCase):
         self.assertTrue(runner.health(previous["ports"]["serving"]))
         self.assertTrue(runner.background_answering(previous))
         self.assertFalse(self.ops.inspect(standby)["State"]["Running"])
-        self.assert_no_shared_serving(current)
+        self.assertTrue(runner.alias_networks(current))
         self.assertEqual(previous["slot"], self.state()["current"]["slot"])
         self.assert_release_failure("failed", "alias connect did not report success")
         deploy.Deployer(self.cfg, self.ops).abort()
@@ -798,7 +865,7 @@ class DeployTest(unittest.TestCase):
         self.assert_no_shared_serving(previous)
         self.assertIsNone(self.state()["in_progress"])
 
-    def test_rollback_publishes_aliases_only_after_verifying_routes_and_removing_old_aliases(self):
+    def test_rollback_publishes_aliases_after_verifying_routes_while_old_aliases_serve(self):
         self.deploy()
         self.deploy(image="another@sha256:3")
         previous = self.state()["previous"]
@@ -817,7 +884,7 @@ class DeployTest(unittest.TestCase):
                 self.assertEqual(200, status)
                 self.assertTrue(address.endswith(f":{previous['ports'][live_role]}"))
                 self.assertTrue(runner.background_answering(previous))
-                self.assertFalse(runner.alias_networks(self.state()["previous"]))
+                self.assertTrue(runner.alias_networks(self.state()["previous"]))
                 published.append(cid)
             return run(args, **kw)
 
@@ -1240,6 +1307,81 @@ class DeployTest(unittest.TestCase):
         self.deploy(image="fixture:retry")
         self.assert_live_release(self.state()["current"])
 
+    def test_first_hold_without_probe_keeps_upstream_and_loaded_route_unchanged(self):
+        self.load_fixture_route(LEGACY, proof=False)
+        original = self.ops.loaded_upstreams
+        self.hold()
+        self.assertEqual(original, self.ops.files[self.cfg.upstream_file])
+        self.assertEqual(original, self.ops.loaded_upstreams)
+        self.assertFalse(any(args[0] == self.cfg.nginx_bin and args[1:] in (["-t"], ["-s", "reload"])
+                             for args in self.ops.commands))
+        deploy.Deployer(self.cfg, self.ops).resume()
+        self.assert_live_release(self.state()["current"])
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_main_accepts_keepalive_in_adopted_fixed_upstreams(self):
+        self.load_fixture_route(LEGACY, proof=False)
+        text = self.ops.loaded_upstreams.replace("zone sources_main_serving 64k;",
+                                                "zone sources_main_serving 64k;\n    keepalive 16;")
+        self.ops.loaded_upstreams = self.ops.files[self.cfg.upstream_file] = text
+        self.deploy()
+        self.assert_live_release(self.state()["current"])
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_abort_can_recover_resume_abandoned_at_background_handoff(self):
+        held = self.hold()
+        runner = deploy.Deployer(self.cfg, self.ops)
+
+        class ProcessKilled(BaseException):
+            pass
+
+        with mock.patch.object(runner, "handoff_background", side_effect=ProcessKilled):
+            with self.assertRaises(ProcessKilled):
+                runner.resume()
+        self.assertEqual("deploying", self.state()["in_progress"]["phase"])
+        self.assertIn(["release_incomplete"], [item["alert"] for item in deploy.watch_once(self.cfg, self.ops, {})])
+        runner.abort()
+        self.assert_live_release(LEGACY)
+        self.assertIsNone(self.state()["in_progress"])
+        for role in deploy.SERVING_ROLES:
+            self.assertIsNone(self.ops.inspect(held["target"]["containers"][role]))
+
+    def test_abort_rejects_fifo_without_holding_release_lock(self):
+        self.cfg.upstream_file = self.ops.upstream_file = str(self.tmp / "upstreams.conf")
+        self.load_fixture_route(LEGACY)
+        self.hold()
+        os.mkfifo(self.cfg.upstream_file)
+        read_text = self.ops.read_text
+        read_bytes = self.ops.read_bytes
+
+        def text_input(path):
+            return deploy.Ops.read_text(self.ops, path) if path == self.cfg.upstream_file else read_text(path)
+
+        def bytes_input(path):
+            return deploy.Ops.read_bytes(self.ops, path) if path == self.cfg.upstream_file else read_bytes(path)
+
+        def abort():
+            try:
+                deploy.Deployer(self.cfg, self.ops).abort()
+            except deploy.DeployError as err:
+                if "regular file" not in str(err):
+                    raise
+            else:
+                raise AssertionError("abort accepted a FIFO")
+
+        with mock.patch.object(self.ops, "read_text", text_input), mock.patch.object(self.ops, "read_bytes", bytes_input):
+            child = multiprocessing.get_context("fork").Process(target=abort)
+            child.start()
+            try:
+                child.join(2)
+                self.assertEqual(0, child.exitcode)
+                with deploy.release_lock(self.cfg.lock_file):
+                    self.assertIsNotNone(self.state()["in_progress"])
+            finally:
+                if child.is_alive():
+                    child.terminate()
+                child.join(3)
+
     def test_main_reuses_switch_reload_to_install_probe_on_first_release(self):
         self.load_fixture_route(LEGACY, proof=False)
         self.deploy()
@@ -1429,7 +1571,7 @@ class DeployTest(unittest.TestCase):
     def test_resume_failed_second_alias_network_with_existing_provider_returns_to_hold(self):
         self.assert_resume_second_alias_network_failure(persistent=False)
 
-    def test_resume_persistent_second_network_failure_with_existing_provider_leaves_abortable_hold(self):
+    def test_resume_repairs_isolation_after_persistent_second_network_failure_clears(self):
         self.assert_resume_second_alias_network_failure(persistent=True)
 
     def test_resume_alias_network_failure_after_switch_attempts_to_restore_hold(self):
@@ -1471,8 +1613,8 @@ class DeployTest(unittest.TestCase):
             self.assertTrue(all(self.cfg.serving_alias in endpoints[net]["Aliases"] for net in self.cfg.networks))
         if persistent:
             self.assertIn("network restoration is incomplete", self.state()["in_progress"]["reason"])
-            deploy.Deployer(self.cfg, self.ops).abort()
-            self.assert_live_release(original)
+            deploy.Deployer(self.cfg, self.ops).resume()
+            self.assert_live_release(target)
         else:
             deploy.Deployer(self.cfg, self.ops).resume()
             self.assert_live_release(self.state()["current"])
@@ -3153,14 +3295,14 @@ class DeployTest(unittest.TestCase):
         self.assertIsNone(self.state()["in_progress"])
 
     def test_main_unreadable_upstream_keeps_routing_and_returns_background(self):
-        read = self.ops.read_text
+        read = self.ops.read_bytes
 
         def unreadable(path):
             if path == self.cfg.upstream_file:
                 raise PermissionError("simulated upstream read failure")
             return read(path)
 
-        with mock.patch.object(self.ops, "read_text", unreadable):
+        with mock.patch.object(self.ops, "read_bytes", unreadable):
             with self.assertRaisesRegex(deploy.DeployError, "cannot read the previous upstream file"):
                 self.deploy()
         self.assertFalse(self.ops.switched)

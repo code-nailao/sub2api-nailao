@@ -41,6 +41,7 @@ import shlex
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -71,6 +72,8 @@ HANDOFF_POLL_SECONDS = 0.5
 HANDOFF_FIRST_NOTE_SECONDS = 5
 FINGERPRINT_TIMEOUT = 10
 ROUTE_PROBE_TIMEOUT = 5
+# Give local DNS caches time to see the destination before withdrawing the old addresses.
+ALIAS_DNS_GRACE_SECONDS = 2
 ROUTE_PROBE_PROXY = "proxy_pass http://sources_main_serving/health; # local route verification"
 ROUTE_REVISION = re.compile(r"^\s*add_header X-Sources-Route ([0-9a-f]{32}) always;$", re.MULTILINE)
 
@@ -376,6 +379,27 @@ class Ops:
             finally:
                 connection.close()
 
+    def nginx_workers(self, path: str, *, shutting_down: bool = False) -> list[dict[str, Any]]:
+        """Identify the workers of the master that owns our Nginx probe socket."""
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(1)
+            probe.connect(path)
+            pid, _, _ = struct.unpack("3i", probe.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        if pid <= 0 or not self.read_text(f"/proc/{pid}/cmdline").startswith("nginx: master process"):
+            raise DeployError("cannot identify the Nginx master serving the local probe")
+        children = self.read_text(f"/proc/{pid}/task/{pid}/children").split()
+        workers = []
+        for child in children:
+            try:
+                name = self.read_text(f"/proc/{child}/cmdline").rstrip("\0").strip()
+            except FileNotFoundError:
+                continue
+            if name.startswith("nginx: worker process") and (not shutting_down or "shutting down" in name):
+                process = release_process(self, int(child))
+                if process:
+                    workers.append(process)
+        return workers
+
     # filesystem / time ------------------------------------------------------------
     def read_text(self, path: str) -> str:
         return Path(path).read_text()
@@ -528,6 +552,23 @@ server {{
 LEGACY_UPSTREAM = re.compile(r"sources_main_\d{3}_serving")
 
 
+def fixed_upstream_routes(text: str) -> dict[str, list[tuple[str, bool, bool]]]:
+    """Read just the peers and their primary/backup roles in an adopted file."""
+    text = re.sub(r"#[^\n]*", "", text)
+    routes = {}
+    for name, body in re.findall(r"\bupstream\s+(sources_main_serving|sources_main_admin)\s*\{([^{}]*)\}", text):
+        if name in routes:
+            raise DeployError("duplicate fixed upstream")
+        peers = []
+        for directive in body.split(";"):
+            parts = shlex.split(directive)
+            if len(parts) >= 2 and parts[0] == "server":
+                options = parts[2:]
+                peers.append((parts[1], "backup" in options, "down" in options))
+        routes[name] = sorted(peers)
+    return routes
+
+
 def nginx_ready_for_fixed_upstreams(nginx_dump: str) -> list[str]:
     """Problems that block switching via the fixed upstream file."""
     # The local verification listener is not the user-facing proxy.
@@ -649,7 +690,7 @@ class MainRoute:
 
 
 def planned_alias_overlap(progress: dict[str, Any], current: dict[str, Any], peer: dict[str, Any]) -> bool:
-    if not progress.get("publish_aliases_at_create"):
+    if not (progress.get("publish_aliases_at_create") or progress.get("alias_handoff")):
         return False
     pair = ((progress.get("origin") or {}).get("current"), progress.get("target"))
     containers = {view["slot"]: view["containers"] for view in pair if view}
@@ -850,7 +891,7 @@ class Deployer:
                           reload_started: Callable[[], None] | None = None,
                           recover_reload: Callable[[str | None, BaseException], NoReturn] | None = None) -> None:
         try:
-            previous = self.ops.read_text(self.cfg.upstream_file)
+            previous = self.read_upstream()
         except FileNotFoundError:
             previous = None
         except OSError as err:
@@ -1224,14 +1265,10 @@ class Deployer:
             return
         observed = {} if observed is None else observed
         expected = self.route_text(disk or route)
+        bootstrap = bootstrap or not route.revision
         try:
             if bootstrap and disk is None:
-                # Existing installs may have written the same fixed upstreams
-                # by hand. Ignore comments and formatting during adoption.
-                def tokens(text: str) -> list[str]:
-                    return re.findall(r"[^\s{};]+|[{};]", re.sub(r"#[^\n]*", "", text))
-
-                matches = tokens(self.ops.read_text(self.cfg.upstream_file)) == tokens(expected)
+                matches = fixed_upstream_routes(self.read_upstream()) == fixed_upstream_routes(expected)
             else:
                 matches = self.upstream_fingerprint() == hashlib.sha256(expected.encode()).hexdigest()
             if not matches:
@@ -1284,7 +1321,7 @@ class Deployer:
         if self.ops.dry_run:
             return MainRoute(current, current)
         try:
-            text = self.ops.read_text(self.cfg.upstream_file)
+            text = self.read_upstream()
         except OSError as err:
             raise RoutingUnconfirmed("cannot read the previous upstream file; routing unchanged") from err
         marker = ROUTE_REVISION.search(text)
@@ -1320,6 +1357,13 @@ class Deployer:
         def check_before_reload() -> None:
             self.verify_topology(state, active, peer if same_serving else pending.serving, disk=pending, ready=pending,
                                  check_health=False, allow_draining=allow_draining, bootstrap=not active.revision)
+            if active.revision and progress and progress.get("origin"):
+                older = list(progress.get("nginx_previous_workers", ()))
+                for worker in self.ops.nginx_workers(self.route_probe_path()):
+                    marked = {**worker, "revision": active.revision}
+                    if marked not in older:
+                        older.append(marked)
+                self._save_progress(state, {**state["in_progress"], "nginx_previous_workers": older})
 
         def confirm_and_record() -> None:
             try:
@@ -1354,6 +1398,26 @@ class Deployer:
             raise
         if reload_error is not None and isinstance(reload_error.__cause__, KeyboardInterrupt):
             raise KeyboardInterrupt
+
+    def wait_for_nginx_drain(self, state: dict[str, Any], active: MainRoute) -> None:
+        if self.ops.dry_run or not active.revision:
+            return
+        deadline = self.ops.monotonic() + self.cfg.ready_timeout
+        progress = state.get("in_progress") or {}
+        retiring = [{key: value for key, value in worker.items() if key != "revision"}
+                    for worker in progress.get("nginx_previous_workers", ()) if worker["revision"] != active.revision]
+        while True:
+            # Include earlier workers still serving existing connections, even
+            # when the first release started without a probe or a prior process
+            # was interrupted before it could record a generation.
+            shutting_down = self.ops.nginx_workers(self.route_probe_path(), shutting_down=True)
+            if not any(release_running(self.ops, {"process": worker}) is not False for worker in retiring + shutting_down):
+                break
+            if self.ops.monotonic() >= deadline:
+                raise DrainTimeout("previous Nginx workers still have connections; serving retirement did not start")
+            self.ops.sleep(HANDOFF_POLL_SECONDS)
+        if "nginx_previous_workers" in progress:
+            self._save_progress(state, {key: value for key, value in progress.items() if key != "nginx_previous_workers"})
 
     def record_live_route(self, state: dict[str, Any], route: MainRoute) -> None:
         progress = state.get("in_progress")
@@ -1421,7 +1485,8 @@ class Deployer:
                                     f"({route_err or type(route_err).__name__}). Run 'status' and verify the route "
                                     "before clearing in_progress. Use 'abort' to restore the original route") from route_err
         try:
-            self.retire_and_transfer(state, pending, active.serving, alias_plan=alias_plan, allow_draining=True)
+            self.retire_and_transfer(state, pending, active.serving, alias_plan=alias_plan, allow_draining=True,
+                                     continuous_alias=True)
         except (Exception, KeyboardInterrupt) as retire_err:
             err = DeployError(f"{err}. Serving retirement incomplete ({retire_err or type(retire_err).__name__})")
         raise RollbackIncomplete(f"rollback background unavailable ({err}). Serving uses slot {view['slot']} and admin "
@@ -1662,7 +1727,7 @@ class Deployer:
             self._mark(state, target, "migrate")
             # Ordinary deployment rechecks both slots just before reusing one.
             peer = target.view() if hold_before_switch else {}
-            active = self.current_route(state, current, peer, install_probe=hold_before_switch)
+            active = self.current_route(state, current, peer, install_probe=False)
             publish_at_create = not hold_before_switch and bool(self.cfg.serving_alias)
             if pending:
                 with self.step("migrate"):
@@ -1806,7 +1871,8 @@ class Deployer:
                                 self.cfg.ready_timeout, container=cid, check_health=True)
 
     def retire_and_transfer(self, state: dict[str, Any], route: MainRoute, retiring: dict[str, Any], *,
-                            alias_plan: dict[str, list[str]] | None = None, allow_draining: bool = False) -> None:
+                            alias_plan: dict[str, list[str]] | None = None, allow_draining: bool = False,
+                            continuous_alias: bool = False) -> None:
         # Fresh reloads can briefly answer on both worker generations.
         self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True)
         if self.ops.dry_run:
@@ -1849,7 +1915,20 @@ class Deployer:
                 progress.setdefault("original_endpoints", [asdict(endpoint) for endpoint in old_aliases])
                 progress.setdefault("original_serving_ids", old_ids)
                 self._save_progress(state, progress)
-        self.retire_serving(retiring)
+        self.wait_for_nginx_drain(state, route)
+        expected_aliases = {(ep.network, ep.network_ref) for ep in new_aliases}
+        if continuous_alias and alias_plan and old_aliases:
+            self._save_progress(state, {**state["in_progress"], "alias_handoff": True})
+            route = self.publish_routed_aliases(state, route, retiring, new_ids, new_aliases, allow_draining=allow_draining)
+            if not expected_aliases.issubset(self.alias_networks(route.serving)):
+                raise FallbackFailed("new serving does not provide the alias on all required networks; old serving was kept")
+            self.ops.sleep(ALIAS_DNS_GRACE_SECONDS)
+            self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True)
+            if not expected_aliases.issubset(self.alias_networks(route.serving)):
+                raise FallbackFailed("the destination alias failed during handoff; old serving was kept")
+            self.wait_for_nginx_drain(state, route)
+            alias_plan = None  # All destination aliases were published with the old providers available.
+        self.retire_serving(retiring, state=state)
         if old_aliases:
             # Keep endpoints attached while in-flight requests drain. Publish
             # the alias only after the old containers have stopped and we have
@@ -1860,7 +1939,6 @@ class Deployer:
         if alias_plan:
             try:
                 self.publish_routed_aliases(state, route, retiring, new_ids, new_aliases, allow_draining=allow_draining)
-                expected_aliases = {(ep.network, ep.network_ref) for ep in new_aliases}
                 if not expected_aliases.issubset(self.alias_networks(route.serving)):
                     raise DeployError("the shared alias is not active on all expected networks")
             except (Exception, KeyboardInterrupt) as err:
@@ -1868,9 +1946,9 @@ class Deployer:
 
     def publish_routed_aliases(self, state: dict[str, Any], route: MainRoute, retiring: dict[str, Any],
                                identities: dict[str, str], endpoints: list[ServingEndpoint], *,
-                               allow_draining: bool = False) -> None:
+                               allow_draining: bool = False) -> MainRoute:
         self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True)
-        if self.alias_networks(retiring):
+        if self.alias_networks(retiring) and not planned_alias_overlap(state["in_progress"], route.serving, retiring):
             raise RoutingUnconfirmed("the shared alias was not withdrawn from the old slot")
         target = Target.from_view(route.serving, self.cfg.runtime_token_file)
         active = route
@@ -1888,6 +1966,7 @@ class Deployer:
                 remaining = MainRoute(route.serving, route.admin, excluded_serving=role)
                 self.apply_route(state, active, remaining, retiring, allow_draining=allow_draining)
                 active = remaining
+            self.wait_for_nginx_drain(state, active)
             cid = identities[role]
             # Let the routed peer accept new work; this instance still has all
             # its endpoints until the requests already on it finish.
@@ -1898,7 +1977,10 @@ class Deployer:
                             container=cid, check_health=True)
             self.ops.run(["docker", "update", "--restart=unless-stopped", cid], mutate=True)
         if active.excluded_serving is not None:
-            self.apply_route(state, active, MainRoute(route.serving, route.admin), retiring, allow_draining=allow_draining)
+            complete = MainRoute(route.serving, route.admin)
+            self.apply_route(state, active, complete, retiring, allow_draining=allow_draining)
+            active = complete
+        return active
 
     def configure_rollback_aliases(self, target: Target, identities: dict[str, str],
                                    endpoints: list[ServingEndpoint], *, shared: bool) -> None:
@@ -2039,6 +2121,12 @@ class Deployer:
             raise DeployError("environment files changed, inherited environment changed, or mounted configuration changed during pause; "
                               "abort and prepare a new hold")
 
+    def read_upstream(self) -> str:
+        def text() -> str:
+            return self.ops.read_bytes(self.cfg.upstream_file).decode().replace("\r\n", "\n").replace("\r", "\n")
+
+        return self.fingerprint_with_timeout(text, "upstream")
+
     def upstream_fingerprint(self) -> str:
         def digest() -> str:
             # Match the newline handling of the original text fingerprint.
@@ -2131,6 +2219,7 @@ class Deployer:
         if self.ops.inspect(target.containers["background"]):
             raise DeployError("unexpected target background container; inspect and resolve before resuming")
         serving = {}
+        repair = held.get("isolated_endpoints")
         for role in SERVING_ROLES:
             info = self.ops.inspect(target.containers[role]) or {}
             endpoints = info.get("NetworkSettings", {}).get("Networks", {})
@@ -2140,6 +2229,11 @@ class Deployer:
             if info.get("Id") != identity["id"] or info.get("Image") != identity["image_id"]:
                 raise DeployError(f"held {role} is missing or its identity/image changed; restore it or abort")
             serving[role] = info
+            status = info.get("State", {})
+            if repair:
+                if status.get("Running") or status.get("Restarting"):
+                    raise DeployError(f"{role} must be stopped to restore its recorded isolation")
+                continue
             runtime = self.wait_ready(target.ports[role], self.token_for(target.view(), role), "serving",
                                       self.cfg.ready_timeout, container=target.containers[role])
             if runtime.get("owns_background") or runtime.get("draining"):
@@ -2160,6 +2254,12 @@ class Deployer:
         if problems:
             raise DeployError("resume preflight failed:\n  - " + "\n  - ".join(problems))
         networks = self.inspect_held_networks()
+        if repair:
+            endpoints = self.load_serving_endpoints(repair)
+            expected = {(role, name, ref) for role in SERVING_ROLES for name, ref in networks.items()}
+            if {(ep.role, ep.network, ep.network_ref) for ep in endpoints} != expected:
+                raise DeployError("recorded isolation networks changed; inspect the held release or abort")
+            return endpoints
         endpoints = []
         for role, info in serving.items():
             if not self.has_expected_held_networks(info, networks, shared=False):
@@ -2312,7 +2412,8 @@ class Deployer:
             if not isolated:
                 raise FallbackFailed(f"{reason}; shared alias withdrawal is unconfirmed. Inspect 'status', "
                                      "wait for both held serving containers to drain and verify their networks") from err
-            return {**held, "reason": f"{reason}; run 'abort' or repair and verify the held containers before resuming"}
+            return {**held, "isolated_endpoints": [asdict(endpoint) for endpoint in endpoints],
+                    "reason": f"{reason}; retry 'resume' once the networks are available or run 'abort'"}
         if not self.held_aliases_withdrawn(target, identities, self.cfg.serving_alias):
             raise FallbackFailed("the paused candidates still advertise the shared alias")
         return held
@@ -2345,9 +2446,7 @@ class Deployer:
         record = {"started_at": now(), "action": "resume", "image": target.image, "slot": target.slot,
                   "paused_at": held["held_at"]}
         try:
-            active = self.current_route(state, state["current"], target.view())
-            if not self.ops.dry_run and held["upstream_fingerprint"] != self.upstream_fingerprint():
-                held = {**held, "upstream_fingerprint": self.upstream_fingerprint()}
+            active = self.current_route(state, state["current"], target.view(), install_probe=False)
             self._finish_switch(state, state["current"], target, record, create_background=True,
                                 active=active, held=held, endpoints=endpoints)
         except (Exception, KeyboardInterrupt) as err:
@@ -2411,7 +2510,9 @@ class Deployer:
                                       "slot": progress["target"]["slot"], "result": "ok", "finished_at": now()})
             self.log("aborted hold preparation before creating serving containers")
             return
-        if progress.get("phase") not in ("held", "failed", "aborting"):
+        phase = progress.get("phase")
+        abandoned = phase == "deploying" and release_running(self.ops, progress) is False
+        if phase not in ("held", "failed", "aborting") and not abandoned:
             raise DeployError("no paused release or failed release to abort")
         held = progress.get("hold") or (progress if "held_at" in progress else {})
         target = Target.from_view(progress["target"], self.cfg.runtime_token_file)
@@ -2420,7 +2521,7 @@ class Deployer:
         if (not current or target.slot == current["slot"] or set(target.containers.values()) & set(current["containers"].values())
                 or set(target.ports.values()) & set(current["ports"].values())):
             raise DeployError("held containers overlap the current release; inspect status before manual recovery")
-        recovering = progress["phase"] == "failed" or progress.get("abort_recovery", False)
+        recovering = abandoned or phase == "failed" or progress.get("abort_recovery", False)
         if not recovering and state["current"] != current:
             raise DeployError("held containers overlap the current release or the recorded layout changed")
         if not recovering and self.ops.inspect(target.containers["background"]):
@@ -2439,6 +2540,7 @@ class Deployer:
             self.verify_topology(state, active, target.view())
             if active.serving["slot"] != current["slot"] or active.admin["slot"] != current["slot"]:
                 raise RoutingUnconfirmed("the original route did not take traffic")
+            self.wait_for_nginx_drain(state, active)
             candidates = state["in_progress"].get("candidate_ids", {})
             alias_plan = current.get("withdrawn_serving_alias_networks") if recovering else None
             if alias_plan:
@@ -2446,7 +2548,8 @@ class Deployer:
                     info = self.ops.inspect(target.containers[role]) or {}
                     if info.get("State", {}).get("Running") and info.get("Id") != (owned.get(role) or candidates.get(role)):
                         raise DeployError("candidate serving identity is unconfirmed; keep it outside the restored route")
-                self.retire_and_transfer(state, active, target.view(), alias_plan=alias_plan)
+                self.retire_and_transfer(state, active, target.view(), alias_plan=alias_plan,
+                                         continuous_alias=bool(progress.get("alias_handoff")))
             for role, cid in candidates.items():
                 if role not in owned:
                     self.stop_owned_serving(target, role, cid, allow_missing=True)
@@ -2470,10 +2573,10 @@ class Deployer:
     def abort_routes(self, state: dict[str, Any], original: dict[str, Any], candidate: dict[str, Any]) -> tuple[MainRoute, MainRoute]:
         progress = state["in_progress"]
         routes = [MainRoute(**progress[key]) for key in ("verified_route", "pending_route") if progress.get(key)]
-        text = self.ops.read_text(self.cfg.upstream_file)
+        text = self.read_upstream()
         marker = ROUTE_REVISION.search(text)
         if not marker:
-            route = self.current_route(state, original, candidate)
+            route = self.current_route(state, original, candidate, install_probe=False)
             return route, route
         if not routes:
             routes = [MainRoute(original, original, marker[1])]
@@ -2548,9 +2651,12 @@ class Deployer:
         return active
 
     @staticmethod
-    def original_serving_endpoints(state: dict[str, Any]) -> list[ServingEndpoint]:
+    def load_serving_endpoints(saved: list[dict[str, Any]]) -> list[ServingEndpoint]:
         return [ServingEndpoint(ep["role"], ep["network"], ep["network_ref"], tuple(ep["aliases"]), tuple(ep["options"]))
-                for ep in state["in_progress"].get("original_endpoints", ())]
+                for ep in saved]
+
+    def original_serving_endpoints(self, state: dict[str, Any]) -> list[ServingEndpoint]:
+        return self.load_serving_endpoints(state["in_progress"].get("original_endpoints", []))
 
     def restore_held_after_alias_failure(self, state: dict[str, Any], target: Target,
                                          held: dict[str, Any], endpoints: list[ServingEndpoint]) -> None:
@@ -2661,9 +2767,11 @@ class Deployer:
                         old_aliases = self.alias_networks(current, observed=observed)
                         if not old_aliases.issubset(self.alias_networks(route.serving, observed=observed)):
                             raise DeployError("new serving does not provide the shared alias on all required networks")
+                    self.wait_for_nginx_drain(state, route)
                     signalled = self.retire_serving(current, state=state)
                 else:
-                    self.retire_and_transfer(state, route, current, alias_plan=alias_plan)
+                    self.retire_and_transfer(state, route, current, alias_plan=alias_plan,
+                                             continuous_alias=not create_background)
             except AliasPublicationFailed as err:
                 if held is None or endpoints is None:
                     raise FallbackFailed(f"shared alias publication incomplete ({err}); inspect 'status' or retry 'abort'") from err
@@ -2699,7 +2807,8 @@ class Deployer:
         progress = {"phase": "deploying", "target": target.view() if recorded["slot"] == target.slot else recorded,
                     "step": step, "since": now(), "origin": original}
         for key in ("verified_route", "pending_route", "owned", "candidate_ids", "original_endpoints",
-                    "background_restart_policies", "held_background_id", "original_serving_ids"):
+                    "background_restart_policies", "held_background_id", "original_serving_ids", "nginx_previous_workers",
+                    "alias_handoff"):
             if key in prior:
                 progress[key] = prior[key]
         if publish_aliases_at_create or prior.get("publish_aliases_at_create"):
