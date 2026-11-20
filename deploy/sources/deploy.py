@@ -62,6 +62,8 @@ HANDOFF_POLL_SECONDS = 0.5
 # First progress note after TERM, then one per minute while the old owner drains.
 HANDOFF_FIRST_NOTE_SECONDS = 5
 HANDOFF_TERM_CONFIRM_SECONDS = 30
+DOCKER_STATUS_TIMEOUT_SECONDS = 30
+RUNTIME_STATUS_TIMEOUT_SECONDS = 5
 # A backup can still be cleaning up an interrupted upload at its own deadline.
 BACKUP_FINISH_GRACE_SECONDS = 180
 BACKUP_STATUS_POLL_SECONDS = 10
@@ -241,18 +243,18 @@ class Ops:
             raise DeployError(f"command failed ({proc.returncode}): {shlex.join(args[:4])} ...: " + " | ".join(tail))
         return proc
 
-    def inspect(self, name: str) -> dict[str, Any] | None:
-        proc = self.run(["docker", "inspect", name], mutate=False, check=False, timeout=30)
+    def inspect(self, name: str, *, timeout: float = DOCKER_STATUS_TIMEOUT_SECONDS) -> dict[str, Any] | None:
+        proc = self.run(["docker", "inspect", name], mutate=False, check=False, timeout=timeout)
         if proc.returncode != 0:
             return None
         data = json.loads(proc.stdout)
         return data[0] if data else None
 
-    def container_missing(self, name: str) -> bool:
+    def container_missing(self, name: str, *, timeout: float = DOCKER_STATUS_TIMEOUT_SECONDS) -> bool:
         # Inspect can fail while Docker is unavailable. Only a successful
         # listing that omits the exact name confirms removal.
         proc = self.run(["docker", "container", "ls", "--all", "--format", "{{.Names}}"],
-                        mutate=False, check=False, timeout=30)
+                        mutate=False, check=False, timeout=timeout)
         return proc.returncode == 0 and name not in proc.stdout.splitlines()
 
     # http ---------------------------------------------------------------------
@@ -439,8 +441,8 @@ class Deployer:
         path = (view.get("runtime_token_files") or {}).get(role) or self.cfg.runtime_token_file
         return self.ops.read_text(path).strip()
 
-    def runtime(self, port: int, token: str) -> dict[str, Any] | None:
-        status, body = self.ops.http_json(f"http://127.0.0.1:{port}/internal/sources/runtime", token=token)
+    def runtime(self, port: int, token: str, *, timeout: float = RUNTIME_STATUS_TIMEOUT_SECONDS) -> dict[str, Any] | None:
+        status, body = self.ops.http_json(f"http://127.0.0.1:{port}/internal/sources/runtime", token=token, timeout=timeout)
         return body if status == 200 and isinstance(body, dict) else None
 
     def wait_ready(self, port: int, token: str, role: str, timeout: int,
@@ -464,22 +466,34 @@ class Deployer:
             self.ops.sleep(poll)
         raise DeployError(f"port {port} not ready as {role} within {timeout}s (last runtime: {json.dumps(last)[:300]})")
 
-    def background_container(self, name: str) -> tuple[dict[str, Any] | None, bool]:
+    def background_container(self, name: str, *, deadline: float | None = None) -> tuple[dict[str, Any] | None, bool]:
         """Return Docker's inspection and whether Docker confirmed removal."""
+        timeout = DOCKER_STATUS_TIMEOUT_SECONDS
+        if deadline is not None:
+            timeout = min(timeout, deadline - self.ops.monotonic())
+            if timeout <= 0:
+                return None, False
         with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
-            info = self.ops.inspect(name)
+            info = self.ops.inspect(name, timeout=timeout)
             if info is not None:
                 return info, False
+        if deadline is not None:
+            timeout = min(DOCKER_STATUS_TIMEOUT_SECONDS, deadline - self.ops.monotonic())
+            if timeout <= 0:
+                return None, False
         with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
-            return None, self.ops.container_missing(name)
+            return None, self.ops.container_missing(name, timeout=timeout)
         return None, False
 
     def wait_exit(self, name: str, timeout: int | None, poll: float = 2, first_note: float = 60,
-                  read_runtime: Callable[[], dict[str, Any] | None] | None = None,
+                  read_runtime: Callable[[float | None], dict[str, Any] | None] | None = None,
                   initial_runtime: dict[str, Any] | None = None, allow_backup_wait: bool = True) -> int | None:
         """Return the exit code or None if Docker confirms that the owner was removed."""
         started = self.ops.monotonic()
         deadline = None if timeout is None else started + timeout
+        # A failed TERM has a fixed confirmation budget. A confirmed drain
+        # keeps the ordinary wait and can extend it for a scheduled backup.
+        confirm_deadline = None if allow_backup_wait else deadline
         next_note = started + first_note
         next_probe = next_note
         cutoff_probed = False
@@ -491,7 +505,7 @@ class Deployer:
         backup_running = remaining is not None
 
         while True:
-            info, removed = self.background_container(name)
+            info, removed = self.background_container(name, deadline=confirm_deadline)
             if removed:
                 return None
             state = (info or {}).get("State") or {}
@@ -499,10 +513,12 @@ class Deployer:
                 return int(state.get("ExitCode", 0))
 
             seen_at = self.ops.monotonic()
+            if confirm_deadline is not None and seen_at >= confirm_deadline:
+                raise BackgroundExitTimeout(f"could not confirm exit of {name} within {timeout}s")
             at_cutoff = deadline is not None and seen_at >= deadline
             if read_runtime and (seen_at >= next_probe or (at_cutoff and not cutoff_probed)):
                 cutoff_probed = cutoff_probed or at_cutoff
-                runtime = read_runtime()
+                runtime = read_runtime(confirm_deadline)
                 seen_at = self.ops.monotonic()
                 remaining = self.scheduled_backup_remaining(runtime)
                 if (allow_backup_wait and runtime is not None and remaining is None
@@ -539,9 +555,10 @@ class Deployer:
                 detail = self.drain_progress(runtime)
                 self.log(f"   {name} still finishing in-flight work" + (f": {detail}" if detail else " ..."))
                 next_note += 60
-            self.ops.sleep(poll)
+            delay = poll if confirm_deadline is None else min(poll, max(0, confirm_deadline - seen_at))
+            self.ops.sleep(delay)
 
-    def wait_recovery_exit(self, name: str, read_runtime: Callable[[], dict[str, Any] | None] | None = None) -> int | None:
+    def wait_recovery_exit(self, name: str, read_runtime: Callable[[float | None], dict[str, Any] | None] | None = None) -> int | None:
         while True:
             try:
                 return self.wait_exit(name, None, read_runtime=read_runtime)
@@ -709,13 +726,19 @@ class Deployer:
         # Union into the served directory: never delete, never overwrite.
         self.ops.run(["cp", "-Rn", staging + "/.", self.cfg.assets_dir + "/"], mutate=True)
 
-    def owner_runtime(self, view: dict[str, Any]) -> dict[str, Any] | None:
+    def owner_runtime(self, view: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any] | None:
         """Runtime of a slot's background owner, or None when it cannot be read.
         A failed read may change how soon we retry. Only Docker's exit status
         confirms that the old process has released ownership."""
         try:
-            return self.runtime(view["ports"]["background"], self.token_for(view, "background"))
-        except Exception:  # noqa: BLE001 - informational read inside the handoff
+            token = self.token_for(view, "background")
+            timeout = RUNTIME_STATUS_TIMEOUT_SECONDS
+            if deadline is not None:
+                timeout = min(timeout, deadline - self.ops.monotonic())
+                if timeout <= 0:
+                    return None
+            return self.runtime(view["ports"]["background"], token, timeout=timeout)
+        except Exception:  # noqa: BLE001 - read failures do not prove shutdown
             return None
 
     @staticmethod
@@ -833,10 +856,13 @@ class Deployer:
             except (DeployError, OSError, subprocess.SubprocessError) as err:
                 raise FallbackFailed(f"SIGTERM to {old} could not be confirmed and its restart policy could not be restored: {err}") from err
 
-        def read_runtime() -> dict[str, Any] | None:
+        def read_runtime(deadline: float | None) -> dict[str, Any] | None:
             nonlocal term_confirmed, before
-            runtime = self.owner_runtime(current)
-            if runtime and runtime.get("draining") is True:
+            runtime = self.owner_runtime(current, deadline=deadline)
+            # The drain endpoint can make an owner read-only without shutting
+            # it down. Only the shutdown cleanup reports stopping services.
+            stopping = (runtime or {}).get("stopping")
+            if isinstance(stopping, list) and stopping:
                 term_confirmed = True
                 before = runtime
             if (not term_confirmed and runtime and runtime.get("ready") is True
@@ -864,12 +890,8 @@ class Deployer:
                                           initial_runtime=before)
         except (BackgroundExitTimeout, KeyboardInterrupt) as err:
             if not term_confirmed:
-                # Docker may confirm removal between the final wait poll and
-                # this timeout path. Only restore a policy for a remaining owner.
-                _, removed = self.background_container(old)
-                if removed:
-                    self.log(f"   {old} was removed. Starting the prepared background {successor}.")
-                    return
+                # The confirmation budget is spent. Restore the policy and
+                # leave the unresolved handoff recorded without another probe.
                 restore_restart_policy()
                 raise FallbackFailed(f"could not confirm SIGTERM or exit of {old}. Its restart policy was restored. "
                                      f"Verify that it has exited before starting {successor}.") from err

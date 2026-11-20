@@ -32,7 +32,7 @@ ssh <host> 'sudo -n journalctl -fu sources-deploy'
 | 启动检查 | `-check-startup`：用生产配置构造全部依赖 | 退出，没有创建任何容器 |
 | 静态资源 | `-export-web-assets`：把新版本资源追加到固定目录（不删除、不覆盖） | 退出 |
 | 启动新 serving | 目标槽位的主、备两个容器，等待就绪 | 删除新容器，退出 |
-| 后台交接 | 旧后台收到一次 SIGTERM，排空期间管理接口只读。工具定期复查定时备份状态，查询失败时退避重试。Docker 确认旧后台退出或容器已移除后，新后台才启动并持锁就绪 | 发送 SIGTERM 返回失败后限时确认排空或退出。仍未确认时尝试恢复原重启策略，记录交接失败并释放发布锁。已确认排空的进程超过等待期限后继续跟踪至退出 |
+| 后台交接 | 旧后台收到一次 SIGTERM，排空期间管理接口只读。工具定期复查定时备份状态，查询失败时退避重试。Docker 确认旧后台退出或容器已移除后，新后台才启动并持锁就绪 | 发送 SIGTERM 返回失败后，Docker 和运行态查询共用 30 秒确认窗口。若到期仍未确认关闭服务或容器退出，则尝试恢复原重启策略，记录交接失败并释放发布锁 |
 | 切流 | 重写 `00-sources-main-upstreams.conf`，`nginx -t`，reload 一次 | `nginx -t` 失败：恢复原文件，把后台交还旧版本 |
 | 守护 | 5 分钟：新主实例就绪、无重启和 OOM、内存不超过上限 70% 且 30 秒内涨幅不超过 4GiB、公网健康、Nginx 连不上新端口的次数 | 流量切回旧槽位，后台交还旧版本，新 serving 停止并保留供排查 |
 | 退役 | 旧 serving 重启策略改为 `no`，排空，发 SIGTERM，不等待 | — |
@@ -57,7 +57,7 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 
 如果某次运行没有走完（`status` 里 `in_progress` 不为空），下一次 `main` 会拒绝执行。先用 `status` 和 `docker ps` 看清现场，处理完后再把 `state.json` 的 `in_progress` 清空。`FAILED AND NOT RESTORED` 时原因写在 `in_progress.failed`；`status` 里的 `restart_policy` 可用来确认容器的重启策略。
 
-已确认 SIGTERM 发送成功或进程开始排空后，若后台超过 `background_exit_timeout` 和适用的备份等待期，发布工具继续持有发布锁。恢复等待时按 Ctrl-C 会记录中断，工具仍会确认旧后台退出，然后恢复后台。旧容器已被移除时，工具继续交接给准备好的目标后台。详见 [发布与部署](../../docs/sources/DEPLOY.md)。
+若 Docker 确认发送成功或进程报告正在关闭服务，后台超过 `background_exit_timeout` 和适用的备份等待期后，发布工具继续持有发布锁。恢复等待时按 Ctrl-C 会记录中断，工具仍会确认旧后台退出，然后恢复后台。旧容器已被移除时，工具继续交接给准备好的目标后台。详见 [发布与部署](../../docs/sources/DEPLOY.md)。
 
 ## 首次接入
 

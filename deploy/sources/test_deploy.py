@@ -148,7 +148,7 @@ class FakeOps(deploy.Ops):
             c.pop("draining_until")
             c["State"].update(Running=False, Status="exited", ExitCode=0)
 
-    def inspect(self, name):
+    def inspect(self, name, *, timeout=30):
         c = self.containers.get(name)
         self.settle_drain(c)
         return json.loads(json.dumps(c, default=str)) if c else None
@@ -737,6 +737,112 @@ class DeployTest(unittest.TestCase):
         self.assertNotIn(["docker", "start", successor], self.ops.commands)
         self.assertFalse(self.ops.switched)
 
+    def test_rejected_term_to_already_draining_background_stays_bounded(self):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        successor = self.cfg.container("a", "background")
+        self.cfg.background_exit_timeout = 2
+        self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"] = "always"
+        original_run = self.ops.run
+        original_http = self.ops.http_json
+        original_sleep = self.ops.sleep
+        term_at = None
+
+        def run(args, **kwargs):
+            nonlocal term_at
+            if args == ["docker", "kill", "--signal=TERM", old]:
+                term_at = self.ops.clock
+                return subprocess.CompletedProcess(args, 1, "", "signal rejected")
+            return original_run(args, **kwargs)
+
+        def http_json(*args, **kwargs):
+            status, body = original_http(*args, **kwargs)
+            if isinstance(body, dict) and body.get("instance_id") == self.ops.containers[old]["Id"]:
+                # The internal drain endpoint has already made this instance
+                # read-only. It stays running because TERM was rejected.
+                body.update(ready=False, draining=True)
+            return status, body
+
+        def sleep(seconds):
+            if term_at is not None:
+                self.assertLess(self.ops.clock - term_at, 7200, "existing drain state must not acknowledge SIGTERM")
+            original_sleep(seconds)
+
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "http_json", http_json), \
+                mock.patch.object(self.ops, "sleep", sleep), deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "SIGTERM"):
+                self.deploy()
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertEqual(current, self.state()["current"])
+        self.assertIsNotNone(term_at)
+        self.assertLess(self.ops.clock - term_at, 60)
+        self.assertTrue(self.state()["in_progress"]["failed"])
+        self.assertEqual("always", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertNotIn(["docker", "start", successor], self.ops.commands)
+
+    def test_term_confirmation_spends_one_deadline_across_docker_and_runtime_queries(self):
+        for inspect_delay, list_delay, expected_probes in (
+            (30, 30, ["inspect"]),
+            (18, 30, ["inspect", "container"]),
+            (28, 0, ["inspect", "container", "runtime"]),
+        ):
+            with self.subTest(inspect_delay=inspect_delay, list_delay=list_delay), tempfile.TemporaryDirectory() as tmp:
+                cfg = make_config(Path(tmp))
+                ops = FakeOps(Path(tmp))
+                for role, name in LEGACY["containers"].items():
+                    ops.add(name, LEGACY["ports"][role])
+                    ops.containers[name]["role"] = "background" if role == "background" else "serving"
+                deploy.save_state(cfg, {"current": LEGACY, "previous": None, "in_progress": None})
+                old = LEGACY["containers"]["background"]
+                successor = cfg.container("a", "background")
+                original_inspect = ops.inspect
+                original_run = ops.run
+                original_http = ops.http_json
+                term_at = None
+                probes = []
+
+                def inspect(name, *args, **kwargs):
+                    if name == old and term_at is not None:
+                        return deploy.Ops.inspect(ops, name, *args, **kwargs)
+                    return original_inspect(name, *args, **kwargs)
+
+                def run(args, **kwargs):
+                    nonlocal term_at
+                    if args == ["docker", "kill", "--signal=TERM", old]:
+                        term_at = ops.clock
+                        return subprocess.CompletedProcess(args, 1, "", "signal rejected")
+                    if term_at is not None and (args == ["docker", "inspect", old] or args[:3] == ["docker", "container", "ls"]):
+                        timeout = kwargs["timeout"]
+                        probes.append((args[1], ops.clock - term_at, timeout))
+                        delay = inspect_delay if args[1] == "inspect" else list_delay
+                        if not delay:
+                            return subprocess.CompletedProcess(args, 1, "", "Docker unavailable")
+                        ops.clock += min(delay, timeout)
+                        raise subprocess.TimeoutExpired(args, min(delay, timeout))
+                    return original_run(args, **kwargs)
+
+                def http_json(*args, **kwargs):
+                    if term_at is not None:
+                        timeout = kwargs.get("timeout", 5)
+                        probes.append(("runtime", ops.clock - term_at, timeout))
+                        ops.clock += timeout
+                        return 0, None
+                    return original_http(*args, **kwargs)
+
+                with mock.patch.object(ops, "inspect", inspect), mock.patch.object(ops, "run", run), \
+                        mock.patch.object(ops, "http_json", http_json), deploy.release_lock(cfg.lock_file):
+                    with self.assertRaisesRegex(deploy.FallbackFailed, "SIGTERM"):
+                        deploy.Deployer(cfg, ops).deploy("fixture-image")
+                with deploy.release_lock(cfg.lock_file):
+                    self.assertTrue(deploy.load_state(cfg)["in_progress"]["failed"])
+                self.assertEqual(expected_probes, [probe for probe, _, _ in probes])
+                for probe, started, timeout in probes:
+                    self.assertLess(started, deploy.HANDOFF_TERM_CONFIRM_SECONDS, probe)
+                    self.assertLessEqual(started + timeout, deploy.HANDOFF_TERM_CONFIRM_SECONDS + 0.25, probe)
+                self.assertLess(ops.clock - term_at, deploy.HANDOFF_TERM_CONFIRM_SECONDS + 1)
+                self.assertEqual("unless-stopped", ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
+                self.assertNotIn(["docker", "start", successor], ops.commands)
+
     def test_failed_term_to_unready_candidate_releases_publish_lock(self):
         current = self.state()["current"]
         old = current["containers"]["background"]
@@ -777,7 +883,8 @@ class DeployTest(unittest.TestCase):
 
     def test_failed_term_response_can_still_be_followed_by_drain(self):
         old = self.state()["current"]["containers"]["background"]
-        self.ops.drain_seconds[old] = 6
+        self.cfg.background_exit_timeout = 2
+        self.ops.drain_seconds[old] = deploy.HANDOFF_TERM_CONFIRM_SECONDS + 8
         original_run = self.ops.run
         original_http = self.ops.http_json
         term_at = None
@@ -792,8 +899,12 @@ class DeployTest(unittest.TestCase):
 
         def http_json(*args, **kwargs):
             status, body = original_http(*args, **kwargs)
-            if term_at is not None and self.ops.clock - term_at < 1 and isinstance(body, dict) and body.get("draining"):
-                body.update(ready=True, draining=False)
+            if term_at is not None and isinstance(body, dict) and body.get("draining"):
+                if self.ops.clock - term_at < 1:
+                    body.update(ready=True, draining=False)
+                else:
+                    remaining = self.ops.containers[old]["draining_until"] - self.ops.clock
+                    body.update(stopping=["BackupService"], scheduled_backup_remaining_seconds=max(0, int(remaining)))
             return status, body
 
         with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "http_json", http_json):
@@ -812,7 +923,7 @@ class DeployTest(unittest.TestCase):
         missing_since = None
         failed_list = False
 
-        def inspect(name):
+        def inspect(name, *, timeout=30):
             nonlocal missing_since
             info = original_inspect(name)
             if name == old and info and not info["State"]["Running"]:
@@ -861,7 +972,7 @@ class DeployTest(unittest.TestCase):
                 original_inspect = ops.inspect
                 original_sleep = ops.sleep
 
-                def inspect(name):
+                def inspect(name, *, timeout=30):
                     nonlocal removed_at
                     info = original_inspect(name)
                     if name == old:
