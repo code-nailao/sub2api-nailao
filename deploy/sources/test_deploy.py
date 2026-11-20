@@ -335,6 +335,299 @@ class DeployTest(unittest.TestCase):
         self.assertEqual([view["containers"]["background"]], [n for n, r in roles if r.get("owns_background")])
         self.assertTrue(dict(roles)[view["containers"]["background"]]["ready"])
 
+    def assert_release_failure(self, phase, reason=None):
+        progress = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertIsNotNone(progress)
+        self.assertEqual(phase, progress["phase"])
+        if reason is not None:
+            self.assertIn(reason, progress["reason"])
+        self.assertEqual(phase == "failed", any(
+            "release_incomplete" in sample["alert"] for sample in deploy.watch_once(self.cfg, self.ops, {})))
+
+    def assert_no_shared_serving(self, view, roles=None):
+        for role in roles or deploy.SERVING_ROLES:
+            info = self.ops.inspect(view["containers"][role]) or {}
+            if info.get("State", {}).get("Running"):
+                endpoints = info["NetworkSettings"]["Networks"]
+                self.assertFalse(any(self.cfg.serving_alias in (ep.get("Aliases") or []) for ep in endpoints.values()),
+                                 f"{role} is still reachable through the shared alias")
+
+    def assert_loaded_interfaces(self, serving, admin, *, admin_healthy=True):
+        route = deploy.render_upstreams(*(serving["ports"][role] for role in deploy.SERVING_ROLES),
+                                        admin["ports"]["background"])
+        self.assertEqual(route, self.ops.loaded_upstreams)
+        runner = deploy.Deployer(self.cfg, self.ops)
+        for role in deploy.SERVING_ROLES:
+            self.assertTrue(runner.health(serving["ports"][role]))
+        self.assertEqual(admin_healthy, runner.background_answering(admin))
+        self.assertEqual(admin_healthy, runner.health(admin["ports"]["background"]))
+
+    def assert_resume_rejects_mount_edit(self, *, explicit):
+        data = self.tmp / "mounted-data"
+        data.mkdir()
+        configured = data / ("selected-input" if explicit else "config.yaml")
+        configured.write_text("fixture: before\n")
+        (data / "mutable-data.db").write_text("before")
+        self.cfg.mounts["background"] = [deploy.Mount(str(data), "/inputs", readonly=False)]
+        # Exercise the effective Docker environment, including a CLI override.
+        self.ops.files[self.cfg.env_files["background"]] = "CONFIG_FILE=/inputs/unused\n"
+        self.cfg.extra_env["background"] = ({"CONFIG_FILE": "/inputs/selected-input"} if explicit
+                                            else {"CONFIG_FILE": ""})
+        extra = self.tmp / "another-input"
+        extra.write_text("before")
+        self.cfg.mounts["background"].append(deploy.Mount(str(extra), "/inputs/another-input"))
+        held = self.hold()
+        (configured if explicit else extra).write_text("fixture: after\n")
+        self.ops.commands.clear()
+        with self.assertRaisesRegex(deploy.DeployError, "abort and prepare a new hold"):
+            deploy.Deployer(self.cfg, self.ops).resume()
+        self.assertEqual([], self.ops.commands)
+        self.assert_no_shared_serving(held["target"])
+        self.assert_loaded_interfaces(LEGACY, LEGACY)
+        self.assert_release_failure("held")
+
+    def test_resume_rejects_changed_config_file_under_directory_mount(self):
+        self.assert_resume_rejects_mount_edit(explicit=True)
+
+    def test_resume_rejects_changed_single_file_bind_mount(self):
+        self.assert_resume_rejects_mount_edit(explicit=False)
+
+    def test_resume_rechecks_mounted_config_after_alias_activation(self):
+        config = self.tmp / "runtime.yaml"
+        config.write_text("fixture: before\n")
+        self.cfg.mounts["background"] = [deploy.Mount(str(config), "/inputs/runtime.yaml")]
+        self.ops.files[self.cfg.env_files["background"]] = "CONFIG_FILE=/inputs/runtime.yaml\n"
+        held = self.hold()
+        run = self.ops.run
+
+        def edit_after_start(args, **kw):
+            result = run(args, **kw)
+            if args == ["docker", "start", held["containers"]["standby"]["id"]]:
+                config.write_text("fixture: changed during activation\n")
+            return result
+
+        with mock.patch.object(self.ops, "run", edit_after_start):
+            with self.assertRaisesRegex(deploy.DeployError, "abort and prepare a new hold"):
+                deploy.Deployer(self.cfg, self.ops).resume()
+        self.assert_loaded_interfaces(LEGACY, LEGACY)
+        self.assert_no_shared_serving(held["target"])
+        self.assert_release_failure("held")
+
+    def test_resume_isolation_timeout_still_drains_standby_and_alerts(self):
+        held = self.hold()
+        view = held["target"]
+        run, sleep = self.ops.run, self.ops.sleep
+        primary = view["containers"]["serving"]
+
+        def busy_after_activation(args, **kw):
+            result = run(args, **kw)
+            if args == ["docker", "start", held["containers"]["standby"]["id"]] and (
+                    self.cfg.serving_alias in self.ops.inspect(args[-1])["NetworkSettings"]["Networks"]
+                    [self.cfg.networks[0]]["Aliases"]):
+                self.ops.busy_ports.add(view["ports"]["background"])
+                self.ops.drain_seconds[view["containers"]["serving"]] = float("inf")
+            return result
+
+        def check_while_waiting(seconds):
+            if "draining_until" in self.ops.containers[primary]:
+                self.assert_no_shared_serving(view, roles=("standby",))
+            sleep(seconds)
+
+        with mock.patch.object(self.ops, "run", busy_after_activation), \
+                mock.patch.object(self.ops, "sleep", check_while_waiting):
+            with self.assertRaises(deploy.DeployError):
+                deploy.Deployer(self.cfg, self.ops).resume()
+        self.assert_loaded_interfaces(LEGACY, LEGACY)
+        self.assert_no_shared_serving(view, roles=("standby",))
+        self.assertTrue(self.ops.inspect(view["containers"]["serving"])["State"]["Running"])
+        self.assert_release_failure("failed", "still draining")
+
+    def assert_failure_before_reload(self, command, failure, *, restores_owner=True):
+        if command == "rollback":
+            self.deploy()
+            self.deploy(image="another@sha256:3")
+            target = self.state()["previous"]
+        elif command == "resume":
+            target = self.hold()["target"]
+        else:
+            target = self.cfg.slot_view("a")
+        current = self.state()["current"]
+        target_bg, current_bg = (view["containers"]["background"] for view in (target, current))
+        run, read, save = self.ops.run, self.ops.read_text, deploy.save_state
+        injected = False
+
+        def fail_save(cfg, state):
+            nonlocal injected
+            progress = state.get("in_progress") or {}
+            if failure == "state" and progress.get("step") == "switch" and progress["phase"] == "deploying":
+                self.assertTrue(self.ops.inspect(target_bg)["State"]["Running"])
+                injected = True
+                raise OSError("fixture switch state write failed")
+            return save(cfg, state)
+
+        def interrupt_read(path):
+            nonlocal injected
+            if (failure == "read" and not injected and path == self.cfg.upstream_file
+                    and (self.ops.inspect(target_bg) or {}).get("State", {}).get("Running")):
+                injected = True
+                raise KeyboardInterrupt
+            return read(path)
+
+        def fail_restore(args, **kw):
+            if not restores_owner and injected and args == ["docker", "start", current_bg]:
+                raise deploy.DeployError("fixture original background cannot start")
+            return run(args, **kw)
+
+        self.ops.commands.clear()
+        with mock.patch.object(deploy, "save_state", fail_save), mock.patch.object(self.ops, "read_text", interrupt_read), \
+                mock.patch.object(self.ops, "run", fail_restore):
+            with self.assertRaises(deploy.DeployError) as outcome:
+                if command == "main":
+                    self.deploy()
+                else:
+                    getattr(deploy.Deployer(self.cfg, self.ops), command)()
+        self.assertTrue(injected)
+        self.assert_loaded_interfaces(current, current, admin_healthy=restores_owner)
+        self.assert_no_shared_serving(target)
+        self.assertNotIn([self.cfg.nginx_bin, "-s", "reload"], self.ops.commands)
+        if command == "main":
+            self.assertIsNone(self.state()["in_progress"])
+            self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
+        else:
+            self.assert_release_failure("failed", "state write" if failure == "state" else "KeyboardInterrupt")
+        if not restores_owner:
+            self.assertIn("docker start", str(outcome.exception))
+            self.assertIn("ownership", str(outcome.exception))
+            self.assertTrue(deploy.Deployer(self.cfg, self.ops).background_answering(target))
+            self.assertIn("original background cannot start", deploy.status(self.cfg, self.ops)["in_progress"]["reason"])
+
+    def test_resume_switch_state_write_failure_restores_original_background(self):
+        self.assert_failure_before_reload("resume", "state")
+
+    def test_resume_upstream_read_interrupt_restores_original_background(self):
+        self.assert_failure_before_reload("resume", "read")
+
+    def test_rollback_switch_state_write_failure_restores_original_background(self):
+        self.assert_failure_before_reload("rollback", "state")
+
+    def test_rollback_upstream_read_interrupt_restores_original_background(self):
+        self.assert_failure_before_reload("rollback", "read")
+
+    def test_main_switch_state_write_failure_restores_original_background(self):
+        self.assert_failure_before_reload("main", "state")
+
+    def test_main_upstream_read_interrupt_restores_original_background(self):
+        self.assert_failure_before_reload("main", "read")
+
+    def test_resume_reports_manual_recovery_if_original_background_cannot_restart(self):
+        self.assert_failure_before_reload("resume", "read", restores_owner=False)
+
+    def test_rollback_reports_manual_recovery_if_original_background_cannot_restart(self):
+        self.assert_failure_before_reload("rollback", "read", restores_owner=False)
+
+    def assert_rollback_preparation_failure(self, *, missing_background):
+        self.deploy()
+        self.deploy(image="another@sha256:3")
+        before = self.state()
+        previous = before["previous"]
+        if missing_background:
+            del self.ops.containers[previous["containers"]["background"]]
+            reason = "rollback background container is missing"
+        else:
+            self.ops.unready_ports.add(previous["ports"]["standby"])
+            reason = "not ready as serving"
+        original_start = self.ops.run
+
+        def verify_isolated_start(args, **kw):
+            result = original_start(args, **kw)
+            if args[:2] == ["docker", "start"]:
+                self.assert_no_shared_serving(previous)
+            return result
+
+        with mock.patch.object(self.ops, "run", verify_isolated_start):
+            with self.assertRaisesRegex(deploy.DeployError, reason):
+                deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assert_loaded_interfaces(before["current"], before["current"])
+        self.assert_no_shared_serving(previous)
+        self.assert_release_failure("failed", reason)
+
+    def test_rollback_missing_background_keeps_current_routes_and_alerts(self):
+        self.assert_rollback_preparation_failure(missing_background=True)
+
+    def test_rollback_standby_timeout_keeps_current_routes_and_alerts(self):
+        self.assert_rollback_preparation_failure(missing_background=False)
+
+    def test_rollback_keeps_serving_if_a_degraded_reload_might_have_succeeded(self):
+        self.deploy()
+        self.deploy(image="another@sha256:3")
+        before = self.state()
+        current, previous = before["current"], before["previous"]
+        run = self.ops.run
+
+        def fail(args, **kw):
+            if args == ["docker", "start", previous["containers"]["background"]]:
+                raise deploy.DeployError("fixture rollback background would not start")
+            result = run(args, **kw)
+            if args == [self.cfg.nginx_bin, "-s", "reload"]:
+                raise KeyboardInterrupt
+            return result
+
+        with mock.patch.object(self.ops, "run", fail):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "reload outcome is unknown"):
+                deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assert_loaded_interfaces(previous, current)
+        self.assert_no_shared_serving(previous)
+        self.assert_release_failure("failed", "reload outcome is unknown")
+
+    def test_rollback_alias_publication_failure_drains_candidates_and_restores_admin(self):
+        self.deploy()
+        self.deploy(image="another@sha256:3")
+        before = self.state()
+        current, previous = before["current"], before["previous"]
+        standby = self.ops.inspect(previous["containers"]["standby"])["Id"]
+        run = self.ops.run
+        failed = False
+
+        def fail(args, **kw):
+            nonlocal failed
+            result = run(args, **kw)
+            if (not failed and args[:3] == ["docker", "network", "connect"]
+                    and self.cfg.serving_alias in args and args[-1] == standby):
+                failed = True
+                raise deploy.DeployError("fixture alias connect did not report success")
+            return result
+
+        with mock.patch.object(self.ops, "run", fail):
+            with self.assertRaisesRegex(deploy.DeployError, "alias connect did not report success"):
+                deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertTrue(failed)
+        self.assert_loaded_interfaces(current, current)
+        self.assert_no_shared_serving(previous)
+        self.assert_release_failure("failed", "alias connect did not report success")
+
+    def test_rollback_publishes_aliases_only_after_both_serving_roles_and_background_answer(self):
+        self.deploy()
+        self.deploy(image="another@sha256:3")
+        previous = self.state()["previous"]
+        run = self.ops.run
+        runner = deploy.Deployer(self.cfg, self.ops)
+        published = []
+
+        def check(args, **kw):
+            if args[:3] == ["docker", "network", "connect"] and self.cfg.serving_alias in args:
+                for role in deploy.SERVING_ROLES:
+                    self.assertTrue(runner.health(previous["ports"][role]))
+                self.assertTrue(runner.background_answering(previous))
+                published.append(args[-1])
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", check):
+            runner.rollback()
+        self.assertEqual({self.ops.inspect(previous["containers"][r])["Id"] for r in deploy.SERVING_ROLES}, set(published))
+        self.assert_loaded_interfaces(previous, previous)
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
+
     def assert_rollback_waits_for_background(self, *, manual):
         target = self.cfg.slot_view("a")
         if manual:
@@ -521,6 +814,32 @@ class DeployTest(unittest.TestCase):
             deploy.Deployer(self.cfg, self.ops).resume()
         self.assertEqual(before, self.ops.commands)
         self.assertEqual(held, self.state()["in_progress"])
+        self.assert_loaded_interfaces(LEGACY, LEGACY)
+        self.assert_no_shared_serving(held["target"])
+        self.assert_release_failure("held")
+
+    def test_resume_retry_preparation_failure_keeps_healthy_routes_and_alerts(self):
+        target = self.cfg.slot_view("a")
+        name = target["containers"]["background"]
+        self.ops.add(name, target["ports"]["background"], running=False)
+        run = self.ops.run
+
+        def fail_remove(args, **kw):
+            if args == ["docker", "rm", self.ops.inspect(name)["Id"]]:
+                raise deploy.DeployError("fixture slot cleanup failed")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", fail_remove):
+            with self.assertRaisesRegex(deploy.DeployError, "held slot cleanup failed"):
+                self.hold()
+        self.ops.check_fails = True
+        with self.assertRaises(deploy.DeployError):
+            deploy.Deployer(self.cfg, self.ops).resume()
+        self.assert_loaded_interfaces(LEGACY, LEGACY)
+        self.assert_no_shared_serving(target)
+        self.assert_release_failure("failed")
+        deploy.Deployer(self.cfg, self.ops).abort()
+        self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
         self.assert_live_release(LEGACY)
 
     def assert_rollback_degrades_on_late_background_exit(self, *, manual):
@@ -557,10 +876,8 @@ class DeployTest(unittest.TestCase):
         self.assertEqual([expected] if manual else [self.upstreams_for(source), expected], reloads)
         self.assertEqual(expected, self.ops.loaded_upstreams)
         self.assertEqual(expected, self.ops.files[self.cfg.upstream_file])
-        self.assertTrue(deploy.Deployer(self.cfg, self.ops).background_answering(source))
-        progress = self.state()["in_progress"]
-        self.assertEqual("failed", progress["phase"])
-        self.assertIn("not answering health checks", progress["reason"])
+        self.assert_loaded_interfaces(LEGACY, source)
+        self.assert_release_failure("failed", "not answering health checks")
         self.assertEqual("failed", self.history()[-1]["result"])
 
     def test_manual_rollback_background_exit_before_reload_rolls_back_serving_only(self):
@@ -701,7 +1018,12 @@ class DeployTest(unittest.TestCase):
                             self.deploy()
                 self.assert_live_release(LEGACY)
                 self.assertEqual(LEGACY, self.state()["current"])
-                self.assertIsNone(self.state()["in_progress"])
+                if held:
+                    self.assert_no_shared_serving(target)
+                    self.assert_release_failure("failed", "simulated port binding failure")
+                    deploy.save_state(self.cfg, {**self.state(), "in_progress": None})
+                else:
+                    self.assertIsNone(self.state()["in_progress"])
                 info = self.ops.inspect(LEGACY["containers"]["background"])
                 self.assertEqual("unless-stopped", info["HostConfig"]["RestartPolicy"]["Name"])
 
@@ -1016,13 +1338,14 @@ class DeployTest(unittest.TestCase):
         self.assert_live_release(self.state()["current"])
         self.assertIsNone(self.state()["in_progress"])
 
-    def test_resume_background_failure_restores_old_owner_and_clears_pause(self):
-        self.hold()
+    def test_resume_background_failure_restores_old_owner_and_alerts(self):
+        target = self.hold()["target"]
         self.ops.unready_ports.add(self.cfg.slots["a"]["background"])
         with self.assertRaisesRegex(deploy.DeployError, "previous background .* running again"):
             deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertIsNone(self.state()["in_progress"])
-        self.assert_live_release(LEGACY)
+        self.assert_loaded_interfaces(LEGACY, LEGACY)
+        self.assert_no_shared_serving(target)
+        self.assert_release_failure("failed", "not ready as background")
         self.assertFalse(self.ops.switched)
 
     def test_resume_guard_failure_restores_traffic_and_background(self):
@@ -1030,10 +1353,10 @@ class DeployTest(unittest.TestCase):
         self.ops.memory_after_switch = 20 * GIB
         with self.assertRaisesRegex(deploy.DeployError, "guard failed"):
             deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertIsNone(self.state()["in_progress"])
+        self.assert_release_failure("failed", "guard failed")
         self.assertEqual(LEGACY, self.state()["current"])
-        self.assertFalse(self.ops.containers["sources-main-a-serving"]["State"]["Running"])
-        self.assert_live_release(LEGACY)
+        self.assert_loaded_interfaces(LEGACY, LEGACY)
+        self.assert_no_shared_serving(self.cfg.slot_view("a"))
 
     def test_resume_unrestored_failure_is_never_reported_as_a_pause(self):
         self.hold()
@@ -1400,12 +1723,14 @@ class DeployTest(unittest.TestCase):
             self.assertTrue(all(self.cfg.serving_alias in endpoint["Aliases"] for endpoint in networks_after.values()))
 
     def test_resume_nginx_failure_hands_background_back(self):
-        self.hold()
+        target = self.hold()["target"]
         self.ops.nginx_test_rc = 1
         with self.assertRaisesRegex(deploy.DeployError, "owns the background again"):
             deploy.Deployer(self.cfg, self.ops).resume()
         self.assert_live_release(LEGACY)
-        self.assertIsNone(self.state()["in_progress"])
+        self.assert_loaded_interfaces(LEGACY, LEGACY)
+        self.assert_no_shared_serving(target)
+        self.assert_release_failure("failed", "nginx -t rejected")
 
     def test_resume_partial_alias_activation_drains_and_restores_pause(self):
         paused = self.hold()
@@ -1508,6 +1833,9 @@ class DeployTest(unittest.TestCase):
                 deploy.Deployer(self.cfg, self.ops).resume()
         self.assert_live_release(LEGACY)
         self.assertEqual(paused, self.state()["in_progress"])
+        self.assert_loaded_interfaces(LEGACY, LEGACY)
+        self.assert_no_shared_serving(paused["target"])
+        self.assert_release_failure("held")
 
     def test_abort_command_errors_and_interruptions_keep_retryable_cleanup(self):
         self.hold()
@@ -1533,7 +1861,8 @@ class DeployTest(unittest.TestCase):
         endpoint["Aliases"].append(self.cfg.serving_alias)
         with self.assertRaisesRegex(deploy.DeployError, "network isolation changed"):
             deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertEqual("held", self.state()["in_progress"]["phase"])
+        self.assert_loaded_interfaces(LEGACY, LEGACY)
+        self.assert_release_failure("failed", "shared alias isolation is unconfirmed")
 
     def test_resume_refuses_a_changed_current_release_or_unexpected_background(self):
         self.hold()
@@ -1670,7 +1999,9 @@ class DeployTest(unittest.TestCase):
             self.assertEqual("held", progress["phase"])
             self.assertEqual(held["containers"], progress["containers"])
             self.assertTrue(progress["reason"])
-            self.assert_live_release(LEGACY)
+            self.assert_loaded_interfaces(LEGACY, LEGACY)
+            self.assert_no_shared_serving(held["target"])
+            self.assert_release_failure("held")
             deploy.Deployer(self.cfg, self.ops).abort()
         self.assertIsNone(self.state()["in_progress"])
 

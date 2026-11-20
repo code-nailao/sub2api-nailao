@@ -55,7 +55,7 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py rollback'
 ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 ```
 
-回滚复用上一槽位仍存在的容器，依次启动、交接后台、切流、守护和退役。准备暂停的目标槽位也会删除槽位里原来的容器。即使之后成功 `abort`，先前的回滚目标也可能已经不存在。
+回滚先确认上一槽位的后台容器仍在，隔离并启动主备，随后交接后台、切流、守护和退役。准备失败保留当前路由并告警。准备暂停的目标槽位也会删除槽位里原来的容器。即使之后成功 `abort`，先前的回滚目标也可能已经不存在。
 
 查看 `status` 的 `in_progress.phase` 区分暂停、正在发布和故障。若为 `held`，用 `resume` 或 `abort`。若为 `aborting`，重试 `abort`。若失败步骤为 `prepare held slot`，可用 `resume` 重试准备，或用 `abort` 放弃。其它失败或发布进程已退出时，先用 `status` 和 `docker ps` 核对现场，恢复后再清除 `in_progress`。失败位置和原因分别记录在 `failed_step` 与 `reason`。容器的 `restart_policy` 为 `no` 时，退出后不会自动重启。通过日志和运行时状态确认它是否已收到 SIGTERM。
 
@@ -84,9 +84,9 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 
 ## 内部调用方使用稳定别名
 
-`deploy.py` 创建的每个 serving 容器（主和备）都在它所在的每个网络上带一个固定别名 `sources-main-serving`（`main.json` 的 `serving_alias`），后台容器没有。旧版本容器退役停止后，会自动从这个名字的解析结果里消失，所以同一 Docker 网络内的调用方（例如 Portal）应使用 `http://sources-main-serving:8080`，不要写死某个容器的 IP 或名称，否则那个容器就无法退役。
+主备 serving 通过 `main.json` 中的 `serving_alias` 提供稳定的内部入口。暂停实例在继续之前保持隔离。手动回滚到带共享别名的槽位时，先隔离启动主备，确认主备和目标后台均就绪后才恢复别名。旧容器停止后会从别名解析结果中消失。同一 Docker 网络内的调用方使用共享别名访问 serving，避免依赖某台容器的地址。
 
-注意：Docker 只能在创建容器时附加网络别名。`adopt` 记录的旧容器没有这个别名，只有经 `deploy.py` 发布后的容器才有；调用方应在第一次正式发版之后再切换到别名，并在确认旧地址不再有连接后再退役旧容器。
+`adopt` 记录的旧容器可能已有其它网络别名。首次正式发布后，确认新版本已提供配置中的共享别名，再将内部调用方切过去。
 
 ## Portal
 
