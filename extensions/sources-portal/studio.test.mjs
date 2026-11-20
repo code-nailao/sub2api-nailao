@@ -364,8 +364,33 @@ const connections = (f) => f.calls.filter((call) => call.path.endsWith('/connect
 // Messages are built in the page's realm; copy the IDs before comparing them.
 const ids = (groups) => Array.from(groups, (group) => group.id);
 
-test('a stale custom connection offers to open settings on startup', async () => {
+test('Studio can choose an ordinary group from the shell after a remembered custom connection returns 409', async () => {
   const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID),
+    connection: (options, config) => options.body.group_id === CUSTOM_ID
+      ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
+      : { ok: true, status: 200, data: config(options.body.group_id) } });
+  assert.equal(f.select.disabled, false, 'legacy peers can still select a group outside the iframe');
+  assert.equal(f.frame.hidden, true);
+  assert.equal(f.last('sub2api:image-studio-config'), undefined);
+
+  const shell = await f.integrate();
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.select.disabled, true, 'the acknowledged shell now owns group selection');
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  assert.equal(shell.selectedGroupId, null);
+  const alternate = shell.groups.find(({ id }) => id !== CUSTOM_ID && id !== SETUP_ID).id;
+  f.send(select(alternate, shell.revision, 'ordinary-group-after-custom-conflict'));
+  await flush();
+  assert.equal(f.calls.at(-1).options.body.group_id, alternate);
+  await f.ackConnection();
+  assert.equal((await f.ackShell()).selectedGroupId, alternate);
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+});
+
+test('a stale custom connection offers to open settings when no ordinary group is available', async () => {
+  const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID), groupList: [],
     connection: () => ({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }) });
   assert.match(f.message.textContent, /重新保存自定义连接/);
   assert.equal(f.document.body.dataset.state, 'recovery');
@@ -394,10 +419,12 @@ test('a failed Studio group poll and the next shell ACK keep stale connection re
   pollFails = true;
   await [...f.timers.values()].find(({ delay }) => delay === 30000).callback();
   assert.equal(f.calls.filter(({ path }) => path === '/api/studio/groups').length, 2);
+  assert.equal(f.frame.hidden, false, 'the acknowledged menu remains visible while metadata is unavailable');
   await f.ackShell();
 
   assert.equal(f.loadingPanel.hidden, false);
-  assert.equal(f.frame.hidden, true);
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.last('sub2api:image-studio-config'), undefined);
   assert.match(f.message.textContent, /重新保存自定义连接/);
   assert.equal(f.retry.textContent, '打开自定义连接');
   f.retry.onclick();
@@ -422,7 +449,8 @@ test('Studio keeps stale connection recovery through a network error until a new
   assert.match(f.message.textContent, /连接网络中断/);
   assert.equal(f.retry.textContent, '打开自定义连接');
   const refreshedShell = await f.ackShell();
-  assert.equal(f.frame.hidden, true);
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.last('sub2api:image-studio-config'), undefined);
 
   networkFailure = false;
   f.send(select(alternate, refreshedShell.revision, 'successful-recovery-request'));

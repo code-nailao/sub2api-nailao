@@ -23,6 +23,7 @@ const ownKeyButton = document.querySelector("#canvas-own-key");
 let studioURL, connection, attempt, hostConfig, savedGroupToReconnect;
 let locked = false, needsCustomResave = false;
 let sendTimer, checkTimer;
+let frameGeneration = 0;
 const rounds = requestRounds();
 const groupRefresh = requestRounds();
 const groupPoll = requestRounds();
@@ -35,7 +36,7 @@ const validRequestID = (value) => typeof value === "string" && /^[\w-]{16,80}$/.
 const isCurrent = (round) => !locked && round === rounds.current;
 const isWaiting = (operation) => !locked && attempt === operation && rounds.isWaiting(operation.round);
 const readingOrAuthorizing = () => rounds.isWaiting() && ["bootstrap", "authorize"].includes(attempt?.phase);
-const confirmed = () => Boolean(connection?.acknowledged && !connection.invalid);
+const confirmed = () => connection?.acknowledgedFrame === frameGeneration && !connection.invalid;
 
 function updateControls() {
   select.disabled = locked || !select.children.length || readingOrAuthorizing();
@@ -182,7 +183,7 @@ function confirm(operation, grant) {
     connections: [...granted.values()].flatMap((item) => item.connections),
     capabilities: [...granted.values()].flatMap((item) => item.capabilities),
     requestId: crypto.randomUUID() };
-  connection = { grant, payload, round: operation.round, acknowledged: false };
+  connection = { grant, payload, round: operation.round };
   frame.hidden = true;
   if (!frame.getAttribute("src")) frame.src = studioURL.href;
   else startSending(operation);
@@ -193,13 +194,26 @@ function repeatConfirmation() {
   const operation = begin("confirm", "loading", "正在确认画布连接…");
   confirm(operation, grant);
 }
-frame.addEventListener("load", () => { if (attempt) startSending(attempt); });
+function reconnectFrame() {
+  if (locked || !connection || !frame.getAttribute("src")) return;
+  const wasConfirmed = confirmed();
+  // Navigation can keep the same WindowProxy. A rollback must not reuse the
+  // previous document's ACK, even if it reuses that connection's grant.
+  frameGeneration++;
+  restoreRounds.clear();
+  frame.hidden = true;
+  if (wasConfirmed) notifyHost(false);
+  if (needsCustomResave || readingOrAuthorizing() || savedGroupToReconnect !== undefined || connection.invalid) return;
+  if (attempt?.phase === "confirm") confirm(attempt, connection.grant);
+  else repeatConfirmation();
+}
+frame.addEventListener("load", reconnectFrame);
 
 function requireResave(connectionId) {
   needsCustomResave = true;
   granted.delete(connectionId);
   const invalidate = (candidate) => candidate?.grant.selectedConnectionId === connectionId
-    ? { ...candidate, invalid: true, acknowledged: false }
+    ? { ...candidate, invalid: true }
     : candidate;
   if (attempt) attempt.previous = invalidate(attempt.previous);
   connection = invalidate(connection);
@@ -256,8 +270,7 @@ window.addEventListener("message", async (event) => {
   }
   if (locked || event.source !== frame.contentWindow || event.origin !== studioURL?.origin || !connection) return;
   if (data?.type === "sub2api:canvas-ready") {
-    restoreRounds.clear();
-    if (!needsCustomResave && !readingOrAuthorizing() && savedGroupToReconnect === undefined && !connection.invalid) repeatConfirmation();
+    reconnectFrame();
     return;
   }
   if (data?.type === "sub2api:canvas-restore-connection") {
@@ -271,10 +284,12 @@ window.addEventListener("message", async (event) => {
   const candidate = connection;
   if (!pending || !isWaiting(pending) || pending.phase !== "confirm" || candidate.round !== pending.round || candidate.invalid || needsCustomResave) return;
   if (data.payload.requestId !== candidate.payload.requestId || data.payload.profileId !== `sub2api-media-studio-${candidate.payload.selectedConnectionId}`) return;
+  const acknowledgedFrame = frameGeneration;
   try { await currentToken(); } catch { return; }
-  if (!isWaiting(pending) || connection !== candidate || needsCustomResave || event.source !== frame.contentWindow) return;
+  if (!isWaiting(pending) || connection !== candidate || needsCustomResave ||
+      event.source !== frame.contentWindow || acknowledgedFrame !== frameGeneration) return;
   finish(pending);
-  connection = { ...candidate, acknowledged: true };
+  connection = { ...candidate, acknowledgedFrame };
   rounds.markApplied();
   showReady();
 });
@@ -317,8 +332,8 @@ function watchSession() {
   clearInterval(checkTimer);
   checkTimer = setInterval(async () => {
     if (locked || document.visibilityState !== "visible") return;
-    const pageRound = rounds.current, poll = groupPoll.advance();
-    const current = () => isCurrent(pageRound) && poll === groupPoll.current;
+    const pageRound = rounds.current, pageGeneration = rounds.generation, poll = groupPoll.advance();
+    const current = () => isCurrent(pageRound) && pageGeneration === rounds.generation && poll === groupPoll.current;
     try {
       await api("/api/canvas/groups", current);
     } catch (error) {

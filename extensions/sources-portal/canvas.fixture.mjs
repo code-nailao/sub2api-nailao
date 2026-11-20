@@ -13,7 +13,7 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
 export const CUSTOM_ID = 9000000000000001;
 
 // custom: 'off' | 'available' | 'configured'; admin shows the group settings button.
-export async function createCanvasFixture({ groups = [{ id: 26, name: 'Images' }, { id: 27, name: 'Grok' }], connection, session, groupsResponse, standalone = false, custom = 'off', admin = false, settingsRequest } = {}) {
+export async function createCanvasFixture({ groups = [{ id: 26, name: 'Images' }, { id: 27, name: 'Grok' }], connection, session, groupsResponse, standalone = false, custom = 'off', admin = false, settingsRequest, useSessionTransport = Boolean(settingsRequest) } = {}) {
   const origin = 'https://main.example', canvasOrigin = 'https://canvas.example';
   const parentMessages = [], canvasMessages = [], calls = [], frames = [];
   const settings = [], state = { custom, admin, groups };
@@ -22,7 +22,7 @@ export async function createCanvasFixture({ groups = [{ id: 26, name: 'Images' }
   const parent = standalone ? window : { postMessage: (data, target) => {
     assert.equal(target, origin);
     parentMessages.push(data);
-    if (settingsRequest && data.type === 'sub2api:session-check') {
+    if (useSessionTransport && data.type === 'sub2api:session-check') {
       token = fixtureToken(2);
       message({ type: 'sub2api:session-checked', requestId: data.requestId, ok: true }, parent, origin);
     }
@@ -66,7 +66,7 @@ export async function createCanvasFixture({ groups = [{ id: 26, name: 'Images' }
     return connection ? connection(options, config) : { ok: true, status: 200, data: config(options.body.group_id) };
   }
   window.addEventListener('sources:locked', () => { locked = true; });
-  const auth = settingsRequest ? new vm.SourceTextModule(sessionSource, { context })
+  const auth = useSessionTransport ? new vm.SourceTextModule(sessionSource, { context })
     : new vm.SyntheticModule(['authorizedJSON', 'clearSession', 'currentToken'], function () {
       this.setExport('authorizedJSON', respond);
       this.setExport('clearSession', () => window.dispatchEvent(new Event('sources:locked')));

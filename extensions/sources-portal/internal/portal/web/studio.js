@@ -36,6 +36,9 @@ const metadata = requestRounds();
 const isCurrent = (round) => !locked && rounds.current === round;
 const isConnecting = () => rounds.isWaiting() && connectionPending?.round === rounds.current;
 const isBootstrapping = () => rounds.isWaiting() && bootstrapRound === rounds.current;
+// A shell that acknowledged its menu can offer another group before this
+// connection is authorized. It has no configuration for the failed group.
+const canShowRecoveryFrame = () => connectionApplied || (integrated && groups.some(({ id }) => id !== custom.groupId));
 const connectionTimeout = "连接用时较长。可以重试连接，或稍后从主站重新进入。已有作品与草稿会保留。";
 
 function updateControls() {
@@ -53,7 +56,7 @@ function showState(state, text) {
   const resave = needsCustomResave && !locked;
   if (resave) {
     state = "recovery";
-    if (!connectionApplied) frame.hidden = true;
+    frame.hidden = !canShowRecoveryFrame();
     text = text && text !== CUSTOM_RESAVE_HINT ? `${CUSTOM_RESAVE_HINT} ${text}` : CUSTOM_RESAVE_HINT;
   }
   document.body.dataset.state = state;
@@ -93,8 +96,11 @@ function notifyHost(ready) {
 }
 function setIntegrated(ready) {
   integrated = ready;
-  // A shell ACK does not fix a stale connection. Keep its recovery action visible.
-  if (ready && !needsCustomResave) { clearTimeout(compatibilityTimer); showState("ready"); }
+  if (ready) {
+    frame.hidden = needsCustomResave && !canShowRecoveryFrame();
+    // A shell ACK does not fix a stale connection. Keep its recovery action visible.
+    if (!needsCustomResave) { clearTimeout(compatibilityTimer); showState("ready"); }
+  }
   document.body.dataset.integrated = String(ready);
   renderLegacyGroups();
   notifyHost(ready);
@@ -405,7 +411,6 @@ window.addEventListener("message", async (event) => {
     shellPending = null;
     clearInterval(shellTimer);
     appliedShellRevision = pending.config.revision;
-    if (!needsCustomResave || connectionApplied) frame.hidden = false;
     if (!needsCustomResave) message.textContent = "";
     setIntegrated(true);
     return;

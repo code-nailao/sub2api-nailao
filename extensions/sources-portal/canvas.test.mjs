@@ -162,6 +162,41 @@ test('Canvas can rehandshake the previous grant after a failed switch without au
   assert.equal(connections(f).length, 2);
 });
 
+test('Canvas reload during a failed switch must rehandshake the previous grant before reporting ready', async () => {
+  const switchResult = Promise.withResolvers();
+  let switching = false;
+  const f = await fixture({ connection: (options, config) => switching
+    ? switchResult.promise : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.host(); f.loaded(); await f.ack();
+  const original = f.last('sub2api:media-studio-config').payload;
+
+  switching = true;
+  f.select.value = String(f.select.children.at(-1).value);
+  const pending = f.select.onchange();
+  const hostMessageCount = f.parentMessages.length;
+  f.loaded();
+  f.send({ type: 'sub2api:canvas-ready' });
+  switchResult.resolve({ ok: false, status: 503 });
+  await pending;
+  f.elements['#canvas-retry'].onclick();
+
+  assert.equal(f.frame.hidden, true);
+  assert.equal(f.parentMessages.slice(hostMessageCount).some(({ integrated }) => integrated === true), false);
+  const resent = f.last('sub2api:media-studio-config').payload;
+  assert.equal(resent.selectedConnectionId, original.selectedConnectionId);
+  assert.deepEqual(resent.connections, original.connections);
+  assert.notEqual(resent.requestId, original.requestId);
+  await f.ack({ requestId: original.requestId });
+  assert.equal(f.frame.hidden, true);
+  assert.equal(f.parentMessages.slice(hostMessageCount).some(({ integrated }) => integrated === true), false);
+
+  await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.parentMessages.at(-1).integrated, true);
+  assert.equal(connections(f).length, 2);
+});
+
 test('Canvas ignores a late restore conflict after a newer restore of the same grant succeeds', async () => {
   const first = Promise.withResolvers(), second = Promise.withResolvers();
   const restores = [first, second];
@@ -527,6 +562,43 @@ test('Canvas discards a group poll failure from an earlier connection generation
   assert.equal(f.elements['#message'].textContent, message);
   assert.equal(f.frame.hidden, false);
 });
+
+for (const status of [503, 401]) {
+  test(`a Canvas switch ACK supersedes a poll started during authorization that returns ${status}`, async () => {
+    const switchGrant = Promise.withResolvers(), pollResult = Promise.withResolvers();
+    let switching = false, polling = false;
+    const f = await fixture({ useSessionTransport: true, groupsResponse: () => polling ? pollResult.promise : undefined,
+      connection: (options, config) => {
+        const result = { ok: true, status: 200, data: config(options.body.group_id) };
+        return switching ? switchGrant.promise.then(() => result) : result;
+      } });
+    f.host(); f.loaded(); await f.ack();
+    switching = true;
+    f.select.value = String(f.select.children.at(-1).value);
+    const pending = f.select.onchange();
+    polling = true;
+    const poll = [...f.timers.values()].find(({ delay }) => delay === 30000).callback();
+    await flush();
+    const groupReads = () => f.calls.filter(({ path }) => path === '/api/canvas/groups').length;
+    assert.equal(groupReads(), 2);
+    assert.equal(f.document.body.dataset.state, 'loading');
+
+    switchGrant.resolve();
+    await pending;
+    await f.ack();
+    assert.equal(f.document.body.dataset.state, 'ready');
+    const before = f.elements['#message'].textContent;
+    pollResult.resolve({ ok: false, status, data: status === 401 ? { error: 'admin_login_required' } : {} });
+    await poll;
+
+    assert.equal(f.parentMessages.some(({ type }) => type === 'sub2api:session-check'), false);
+    assert.equal(groupReads(), 2);
+    assert.equal(f.locked, false);
+    assert.equal(f.document.body.dataset.state, 'ready');
+    assert.equal(f.elements['#message'].textContent, before);
+    assert.equal(f.frame.hidden, false);
+  });
+}
 
 test('Canvas ignores a settings save result after a newer group connection', async () => {
   const f = await fixture({ custom: 'configured' });
