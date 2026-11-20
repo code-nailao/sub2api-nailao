@@ -2744,6 +2744,14 @@
       "reason": "Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling."
     },
     {
+      "path": "backend/internal/service/gateway_thinking_filter_precheck_test.go",
+      "features": [
+        "thinking_filter_allocation_test_isolation"
+      ],
+      "sha256": "9ac43fe2145de39b27e37b2e6ac520b41d9fb3b611ef428a63502b3bc06955ab",
+      "reason": "Runs the signed thinking history allocation guard in a bounded child process to exclude allocations from unrelated service-test goroutines; preserves the original allocation limit and backing-slice identity assertion."
+    },
+    {
       "path": "backend/internal/service/gateway_usage_billing.go",
       "features": [
         "media_engine_native_boundary",

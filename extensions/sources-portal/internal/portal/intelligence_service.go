@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,6 +19,7 @@ type IntelligenceService struct {
 	apiBaseURLs map[int64]string
 	now         func() time.Time
 	tickMu      sync.Mutex
+	tickActive  atomic.Bool
 	configMu    sync.Mutex
 }
 
@@ -195,9 +197,17 @@ func (s *IntelligenceService) Run(ctx context.Context) {
 	}
 }
 
+// RoundActive reports whether the worker is finishing a round, without waiting
+// for its mutex or exposing task identities or results to shutdown logs.
+func (s *IntelligenceService) RoundActive() bool {
+	return s != nil && s.tickActive.Load()
+}
+
 func (s *IntelligenceService) tick() {
 	s.tickMu.Lock()
 	defer s.tickMu.Unlock()
+	s.tickActive.Store(true)
+	defer s.tickActive.Store(false)
 	s.schedule()
 	state := s.Store.snapshot()
 	rows := make([]intelligenceRunRecord, 0, len(state.Runs))
