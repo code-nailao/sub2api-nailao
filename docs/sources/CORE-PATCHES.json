@@ -2529,16 +2529,16 @@
       "features": [
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Repairs native DeepSeek Chat tool history. Matches reused IDs within each call occurrence, gives adjacent results priority, and breaks ties by preferring content absent from earlier candidates for that ID, including discarded results. Writes results and empty placeholders in tool call order for blocks needing repair. Preserves intact adjacent blocks with their original bytes and separators while repairing other messages.",
-      "sha256": "b60a81ce4cad1bad0a37f4683e9521850f523801d2cfff9b69c59504194e7b7c"
+      "reason": "Repairs native DeepSeek Chat tool history. Protects a complete adjacent parallel block before resolving surplus results. For other calls, matches reused IDs within each call occurrence, gives adjacent results priority, and breaks ties by preferring content absent from earlier candidates for that ID, including discarded results. Writes results and empty placeholders in tool call order for blocks needing repair. Preserves intact adjacent blocks with their original bytes and separators while repairing other messages.",
+      "sha256": "eb923c7294331351ef2ebaf7bd30f519710d3d4d1cd7005757f8bab58f153149"
     },
     {
       "path": "backend/internal/service/deepseek_chat_tool_pairing_test.go",
       "features": [
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Checks streaming and buffered Chat payloads for orphan, missing, and displaced results, adjacency priority and discarded candidates with reused IDs, parallel call order and byte preservation. Covers direct DeepSeek, mapped DeepSeek models on both OpenCode Go account paths, non-DeepSeek models on shared upstreams and Responses-shaped input. Checks aligned native Chat histories without reasoning content for disabled and forced-off thinking, mapped GLM over OpenCode, and enabled DeepSeek thinking. Covers direct thinking aliases, byte preservation across hosted Chat turns, and unusable call IDs in the same assistant message. Covers tool pairing for direct model aliases, intact blocks during hosted repair, and hosted continuation size limits.",
-      "sha256": "2182527e224dcdfe6c732ac15a0443ad62455149692c48c6e136e4872526a4a2"
+      "reason": "Checks streaming and buffered Chat payloads for orphan, missing, and displaced results, adjacency priority and discarded candidates with reused IDs, parallel call order and byte preservation. Covers direct DeepSeek, mapped DeepSeek models on both OpenCode Go account paths, non-DeepSeek models on shared upstreams and Responses-shaped input. Checks aligned native Chat histories without reasoning content for disabled and forced-off thinking, mapped GLM over OpenCode, and enabled DeepSeek thinking. Covers direct thinking aliases, byte preservation across hosted Chat turns, and unusable call IDs in the same assistant message. Covers tool pairing for direct model aliases, intact blocks during hosted repair, and hosted continuation size limits. Covers surplus results after a complete parallel block and rejection or compaction when hosted Chat exceeds the limit after its final body edits.",
+      "sha256": "4a8012ddeb6d9ba98bade12e7b56ef857b6c712c05186fb6153f1748bd2c57bf"
     },
     {
       "path": "backend/internal/service/deepseek_forced_tool_choice.go",
@@ -2686,8 +2686,8 @@
         "deepseek_in_chat_tool_types",
         "deepseek_chat_tool_pairing"
       ],
-      "sha256": "ff4953187e1c20270919ebfcf9edb21ff6b1e82f706517030674d888fa1945c8",
-      "reason": "Runs optional hosted search and fetch with existing eligibility, streaming and usage checkpoint rules. Routes disabled-group Chat requests, including Responses-shaped bodies on fixed Chat accounts, through the bounded web-tool filter. Marks local validation rejections and interruptions so they do not count as account failures. Optional setup failures use ordinary forwarding after removing unavailable declarations and adding a notice. Keeps original native Chat messages as raw JSON, followed by appended hosted tool messages. If the assembled body exceeds the existing limit, compacts only structural whitespace in the history before enforcing that limit."
+      "sha256": "739dfaeccf402824035805c9133f6b963e47e8384834d9b6ecee322f5adbd249",
+      "reason": "Runs optional hosted search and fetch with existing eligibility, streaming and usage checkpoint rules. Routes disabled-group Chat requests, including Responses-shaped bodies on fixed Chat accounts, through the bounded web-tool filter. Marks local validation rejections and interruptions so they do not count as account failures. Optional setup failures use ordinary forwarding after removing unavailable declarations and adding a notice. Keeps original native Chat messages as raw JSON, followed by appended hosted tool messages. If the assembled body exceeds the existing limit, compacts only structural whitespace in the history before enforcing that limit. Reuses the same limit for the final native Chat body. A local size rejection keeps the hosted turn result available for settlement and bypasses retry handling."
     },
     {
       "path": "backend/internal/service/deepseek_tools_in_chat_test.go",
@@ -3004,8 +3004,8 @@
         "deepseek_tool_compat",
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point. For DeepSeek groups with tools off, a Chat transport error permits failover only when delivery tracking confirms the request did not obtain a connection or write request bytes. Makes the protected POST body non-replayable by the underlying HTTP client, including HTTP/2 retries after REFUSED_STREAM. Uses the inbound protocol to keep the existing bridge preparation. In native Chat it respects the final thinking state after forced tool selection and supports aliases on direct DeepSeek routes. Shared OpenCode routes still require a mapped DeepSeek model before adding reasoning placeholders. Native Chat reasoning and tool pairing share the same DeepSeek route classification.",
-      "sha256": "c9cb4693fc8215597ce723c1c51343dbdcd5d2123c9098d2d3a3893c36205836"
+      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point. For DeepSeek groups with tools off, a Chat transport error permits failover only when delivery tracking confirms the request did not obtain a connection or write request bytes. Makes the protected POST body non-replayable by the underlying HTTP client, including HTTP/2 retries after REFUSED_STREAM. Uses the inbound protocol to keep the existing bridge preparation. In native Chat it respects the final thinking state after forced tool selection and supports aliases on direct DeepSeek routes. Shared OpenCode routes still require a mapped DeepSeek model before adding reasoning placeholders. Native Chat reasoning and tool pairing share the same DeepSeek route classification. Checks the final hosted native Chat body after all edits, attempting JSON whitespace compaction only when it exceeds the configured limit.",
+      "sha256": "292bfc082ecd4684296a8222fd280093bcd52ac357e2c4f20a2455eb5fdf6db1"
     },
     {
       "path": "backend/internal/service/openai_gateway_chat_completions.go",

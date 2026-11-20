@@ -19,10 +19,12 @@ func TestDeepSeekChatPairsToolMessagesBeforeForwarding(t *testing.T) {
 		user     = `{"role":"user","content":"Find an example"}`
 		followup = `{"role":"user","content":"Use the result"}`
 		callA    = `{ "role": "assistant", "content":null,"reasoning_content":"Keep the original reasoning","tool_calls":[{"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{\"query\":\"a\"}"}}] }`
+		callB    = `{"role":"assistant","reasoning_content":"Keep the original reasoning","tool_calls":[{"id":"call_b","type":"function","function":{"name":"lookup","arguments":"{}"}}]}`
 		callAB   = `{"role":"assistant","content":"Checking","reasoning_content":"Keep the original reasoning","tool_calls":[{"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{}"}},{"id":"call_b","type":"function","function":{"name":"lookup","arguments":"{}"}}]}`
 		resultA  = `{ "role":"t\u006fol", "tool_call_id":"call_\u0061", "content":"Result A [}\"" }`
 		copyOfA  = `{"content":"Result \u0041 [}\u0022","tool_call_id":"call_a","role":"tool"}`
 		resultB  = `{"role":"tool","tool_call_id":"call_b","content":"Result B"}`
+		extraB   = `{"role":"tool","tool_call_id":"call_b","content":"Extra result"}`
 		secondA  = `{"role":"tool","tool_call_id":"call_a","content":"Second result for A"}`
 		thirdA   = `{"role":"tool","tool_call_id":"call_a","content":"Third result for A"}`
 		orphan   = `{"role":"tool","tool_call_id":"unmatched","content":"Orphan"}`
@@ -41,6 +43,11 @@ func TestDeepSeekChatPairsToolMessagesBeforeForwarding(t *testing.T) {
 		{"reused_id_already_paired", user + "," + callA + ", " + resultA + "," + followup + "," + callA + ",\n" + resultA, ""},
 		{"empty_id_in_call_batch_skips_repair", orphan + "," + strings.Replace(callAB, `"id":"call_b"`, `"id":""`, 1) + "," + resultA, ""},
 		{"duplicate_id_in_call_batch_skips_repair", orphan + "," + strings.Replace(callAB, `"id":"call_b"`, `"id":"call_a"`, 1) + "," + resultA, ""},
+		{
+			"complete_parallel_block_precedes_reused_id_tiebreak",
+			callB + "," + resultB + "," + followup + "," + callAB + ",\n  " + resultB + ", " + resultA + "," + extraB,
+			callB + "," + resultB + "," + followup + "," + callAB + ",\n  " + resultB + ", " + resultA,
+		},
 		{
 			"reused_id_ignores_duplicate_from_previous_call",
 			callA + "," + resultA + "," + resultA + "," + callA + "," + followup + "," + secondA,
@@ -317,6 +324,43 @@ func TestDeepSeekChatHostedContinuationBodyBudget(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestDeepSeekChatHostedFinalBodyBudget(t *testing.T) {
+	const bodyFormat = `{"model":"deepseek-flash","messages":[{"role":"user",%s"content":"Find an example with  two spaces"},{"role":"assistant","content":null,"tool_calls":[{"id":"missing","type":"function","function":{"name":"record","arguments":"{}"}}]},{"role":"user","content":"Continue"}],"thinking":{"type":"disabled"},"tools":[{"type":"web_search"}],"stream":%t}`
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			body := fmt.Appendf(nil, bodyFormat, "", stream)
+			_, baseline, err := runDeepSeekHostedChatWithSearch(t, deepSeekChatFallbackTestConfig(), body)
+			require.NoError(t, err)
+			require.Len(t, baseline, 2)
+			placeholder := gjson.GetBytes(baseline[1], `messages.#(tool_call_id=="missing")`)
+			require.Equal(t, `{"role":"tool","tool_call_id":"missing","content":""}`, placeholder.Raw)
+
+			t.Run("reject_after_pairing", func(t *testing.T) {
+				cfg := deepSeekChatFallbackTestConfig()
+				cfg.Gateway.MaxBodySize = int64(len(baseline[1]) - 1)
+				cfg.Gateway.TextMaxBodySize = cfg.Gateway.MaxBodySize
+				result, requests, err := runDeepSeekHostedChatWithSearch(t, cfg, body)
+				require.ErrorContains(t, err, "DeepSeek conversation exceeds request body limit")
+				require.Len(t, requests, 1)
+				require.Equal(t, 1, result.DeepSeekTools.SearchCount)
+			})
+
+			t.Run("compact_after_pairing", func(t *testing.T) {
+				cfg := deepSeekChatFallbackTestConfig()
+				cfg.Gateway.MaxBodySize = int64(len(baseline[1]))
+				cfg.Gateway.TextMaxBodySize = cfg.Gateway.MaxBodySize
+				padded := fmt.Appendf(nil, bodyFormat, "        ", stream)
+				result, requests, err := runDeepSeekHostedChatWithSearch(t, cfg, padded)
+				require.NoError(t, err)
+				require.Len(t, requests, 2)
+				require.Equal(t, 1, result.DeepSeekTools.SearchCount)
+				require.Equal(t, gjson.GetBytes(padded, "messages.0").Raw, gjson.GetBytes(requests[0], "messages.0").Raw)
+				require.Equal(t, string(baseline[1]), string(requests[1]))
+			})
+		})
 	}
 }
 

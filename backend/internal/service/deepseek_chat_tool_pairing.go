@@ -104,11 +104,10 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 			return nil, err
 		}
 		message := &messages[i]
-		// If the chosen results fill the next slots, retain the full block
-		// in its input order, including its original separators.
-		pairedEnd := 0
-		if last := i + len(message.calls); last > i && last < len(messages) {
-			pairedEnd = messages[last].span.end
+		// A complete parallel block is already a coherent set of results.
+		// Protect it before resolving any surplus results for reused IDs.
+		if len(message.calls) > 1 {
+			message.pairedEnd = deepSeekPairedBlockEnd(messages, i)
 		}
 		for j := range message.calls {
 			call := &message.calls[j]
@@ -118,17 +117,33 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 				}
 			}
 			if call.result != nil && competingIDs[call.id] {
-				if err := call.preferNewResult(ctx, body, seenCandidates); err != nil {
+				if err := call.preferNewResult(ctx, body, seenCandidates, message.pairedEnd == 0); err != nil {
 					return nil, err
 				}
 			}
-			if call.result == nil || call.result.span.start < message.span.end || call.result.span.end > pairedEnd {
-				pairedEnd = 0
-			}
 		}
-		message.pairedEnd = pairedEnd
+		if message.pairedEnd == 0 {
+			message.pairedEnd = deepSeekPairedBlockEnd(messages, i)
+		}
 	}
 	return writeDeepSeekToolHistory(ctx, body, span, messages)
+}
+
+// Each distinct call must own a result in the next len(calls) positions.
+// When those positions are full, keep the input order and separators.
+func deepSeekPairedBlockEnd(messages []deepSeekToolHistoryMessage, i int) int {
+	message := &messages[i]
+	last := i + len(message.calls)
+	if last == i || last >= len(messages) {
+		return 0
+	}
+	end := messages[last].span.end
+	for _, call := range message.calls {
+		if call.result == nil || call.result.span.start < message.span.end || call.result.span.end > end {
+			return 0
+		}
+	}
+	return end
 }
 
 type deepSeekToolResultIdentity struct {
@@ -154,8 +169,9 @@ func deepSeekToolResultKey(body []byte, result *deepSeekToolHistoryMessage) deep
 
 // Adjacent candidates come first and take priority. Within that group, or
 // among displaced candidates if there are no adjacent ones, prefer the first
-// result with unseen content. Record all candidates for later occurrences.
-func (call *deepSeekToolHistoryCall) preferNewResult(ctx context.Context, body []byte, seenCandidates map[deepSeekToolResultIdentity]struct{}) error {
+// result with unseen content when replacement is allowed. Record all
+// candidates for later occurrences, including those in protected blocks.
+func (call *deepSeekToolHistoryCall) preferNewResult(ctx context.Context, body []byte, seenCandidates map[deepSeekToolResultIdentity]struct{}, allowReplacement bool) error {
 	firstKey := deepSeekToolResultKey(body, call.result)
 	_, preferredSeen := seenCandidates[firstKey]
 	seenCandidates[firstKey] = struct{}{}
@@ -165,7 +181,7 @@ func (call *deepSeekToolHistoryCall) preferNewResult(ctx context.Context, body [
 		}
 		key := deepSeekToolResultKey(body, candidate)
 		samePlacement := call.adjacentCount == 0 || i+1 < call.adjacentCount
-		if _, seen := seenCandidates[key]; samePlacement && preferredSeen && !seen {
+		if _, seen := seenCandidates[key]; allowReplacement && samePlacement && preferredSeen && !seen {
 			call.result = candidate
 			preferredSeen = false
 		}

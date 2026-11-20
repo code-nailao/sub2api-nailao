@@ -221,6 +221,18 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 		if targetsDeepSeekChatModel(account, body) && gjson.GetBytes(body, "thinking.type").String() != "disabled" {
 			body = ensureDeepSeekChatReasoningPlaceholders(account, body)
 		}
+		if c.GetBool(deepSeekInternalTurn) {
+			// Pairing and reasoning edits may grow the hosted turn after the
+			// initial size check. Check the exact bytes about to be sent.
+			var err error
+			body, err = fitDeepSeekHostedChatBody(body, s.deepSeekHostedBodyLimit())
+			if err != nil {
+				return nil, err
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 	} else {
 		// Bridges can lose reasoning plaintext on an encrypted-only cache miss.
 		// Preserve their existing placeholder and forced-tool compatibility.

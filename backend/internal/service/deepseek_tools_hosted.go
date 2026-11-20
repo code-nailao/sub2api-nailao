@@ -20,6 +20,8 @@ import (
 
 const deepSeekInternalTurn = "sources.deepseek.internal_turn"
 
+var errDeepSeekHostedBodyLimit = errors.New("DeepSeek conversation exceeds request body limit")
+
 type deepSeekOwnedCall struct {
 	ID, Name, Operation string
 	Arguments           json.RawMessage
@@ -299,6 +301,27 @@ func (r *deepSeekHostedRequest) marshalModelRequest(ctx context.Context, limit i
 		out = append(out, ',')
 	}
 	return append(out, body[span.start+1:]...), nil
+}
+
+func (s *OpenAIGatewayService) deepSeekHostedBodyLimit() int64 {
+	if s.cfg != nil && s.cfg.Gateway.MaxBodySize > 0 {
+		return s.cfg.Gateway.MaxBodySize
+	}
+	return 32 << 20
+}
+
+func fitDeepSeekHostedChatBody(body []byte, limit int64) ([]byte, error) {
+	if int64(len(body)) <= limit {
+		return body, nil
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, body); err != nil {
+		return nil, err
+	}
+	if int64(compact.Len()) > limit {
+		return nil, errDeepSeekHostedBodyLimit
+	}
+	return compact.Bytes(), nil
 }
 
 // deepSeekCapture buffers non-streaming turns or delegates SSE to the hosted
@@ -707,16 +730,13 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 				return result, nil, true, err
 			}
 		}
-		limit := int64(32 << 20)
-		if s.cfg != nil && s.cfg.Gateway.MaxBodySize > 0 {
-			limit = s.cfg.Gateway.MaxBodySize
-		}
+		limit := s.deepSeekHostedBodyLimit()
 		current, marshalErr := req.marshalModelRequest(loopCtx, limit)
 		if marshalErr != nil {
 			return result, nil, true, marshalErr
 		}
 		if int64(len(current)) > limit {
-			return result, nil, true, errors.New("DeepSeek conversation exceeds request body limit")
+			return result, nil, true, errDeepSeekHostedBodyLimit
 		}
 		turn, capture, turnErr := s.deepSeekModelTurn(loopCtx, c, account, current, protocol, defaultModel)
 		if turn != nil {
@@ -737,6 +757,9 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 			}
 		}
 		if turnErr != nil {
+			if errors.Is(turnErr, errDeepSeekHostedBodyLimit) {
+				return result, nil, true, turnErr
+			}
 			// One fresh attempt without our optional tools is allowed only for a
 			// definitive HTTP rejection before any model/tool work or public output.
 			if !req.ToolsUnavailable && turn == nil && len(result.DeepSeekModelTurns) == 0 &&
