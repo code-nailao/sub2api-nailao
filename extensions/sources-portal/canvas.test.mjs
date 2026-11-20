@@ -4,9 +4,9 @@ import { readFile } from 'node:fs/promises';
 import { createCanvasFixture as fixture, CUSTOM_ID } from './canvas.fixture.mjs';
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
-test('Canvas hides repeated title/helper chrome from first paint and reveals one compact connection row after ACK', async () => {
+test('Canvas hides repeated title/helper chrome but keeps one usable connection row from first paint', async () => {
   const f = await fixture(); f.host();
-  assert.equal(f.elements['#canvas-controls'].hidden, true);
+  assert.equal(f.elements['#canvas-controls'].hidden, false);
   assert.equal(f.elements['#canvas-title'].hidden, true);
   assert.equal(f.parentMessages.some(m => m.integrated === true), false);
   f.loaded(); await f.ack();
@@ -279,7 +279,7 @@ test('Canvas ignores a late restore conflict after a newer restore of the same g
   assert.equal(f.frame.hidden, false);
 });
 
-test('a Canvas restore conflict from before a reload neither changes the page nor blocks the new document', async () => {
+test('a Canvas restore conflict from before the child restarted cannot block the new document', async () => {
   const restore = Promise.withResolvers();
   const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only
     ? restore.promise.then((result) => result ?? { ok: true, status: 200, data: config(options.body.group_id) })
@@ -289,31 +289,48 @@ test('a Canvas restore conflict from before a reload neither changes the page no
   const requestId = '00000000-0000-4000-8000-000000000026';
   f.send({ type: 'sub2api:canvas-restore-connection', connectionId, requestId });
   await flush();
-  assert.equal(connections(f).at(-1).options.body.restore_only, true);
 
-  // An ordinary group becomes the accepted connection, then the child reloads.
+  // An ordinary group becomes the accepted connection, then the child restarts.
   const alternate = f.select.children.find(({ value }) => String(value) !== f.select.value && value !== CUSTOM_ID).value;
   f.select.value = String(alternate);
   await f.select.onchange();
   await f.ack();
   assert.equal(f.document.body.dataset.state, 'ready');
 
-  // The old restore's conflict arrives before the new document says it is ready.
-  f.loaded();
+  // The old document's answer arrives before the new document says it is ready.
   restore.resolve({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } });
   await flush();
-  assert.equal(f.last('sub2api:canvas-restore-error'), undefined);
-  assert.doesNotMatch(f.elements['#message'].textContent, /重新保存自定义连接/);
-  assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
-  assert.notEqual(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.last('sub2api:canvas-restore-error').requestId, requestId);
+  assert.match(f.elements['#message'].textContent, /重新保存自定义连接/);
 
-  // The new document is answered instead of being held by the resave state.
+  // The child's restart is always processed: it ends that verdict and asks again.
   f.send({ type: 'sub2api:canvas-ready' });
-  assert.equal(f.document.body.dataset.state, 'loading');
+  assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
   assert.equal(f.last('sub2api:media-studio-config').payload.selectedConnectionId, `group-${alternate}`);
   await f.ack();
   assert.equal(f.document.body.dataset.state, 'ready');
   assert.equal(f.frame.hidden, false);
+});
+
+test('a Canvas bare load neither starts a new document nor hides the acknowledged canvas', async () => {
+  const restore = Promise.withResolvers();
+  const f = await fixture({ connection: (options, config) => options.body.restore_only
+    ? restore.promise
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.host(); f.loaded(); await f.ack();
+  const connectionId = 'group-26';
+  const requestId = '00000000-0000-4000-8000-00000000002a';
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId, requestId });
+  await flush();
+
+  f.loaded();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+  restore.resolve({ ok: true, status: 200, data: { version: 2, surface: 'media', user_id: 9, main_origin: 'https://main.example',
+    selectedConnectionId: connectionId, connections: [{ id: connectionId, apiKey: 'fixture-key' }], capabilities: [{ id: connectionId, groupId: 26 }] } });
+  await flush();
+  assert.equal(f.last('sub2api:media-studio-config').payload.requestId, requestId);
+  assert.equal(f.document.body.dataset.state, 'ready');
 });
 
 test('a Canvas document that asks again gets its own resave verdict', async () => {
@@ -340,24 +357,6 @@ test('a Canvas document that asks again gets its own resave verdict', async () =
   assert.equal(f.last('sub2api:canvas-restore-error').requestId, nextRequestId);
   assert.equal(f.document.body.dataset.state, 'recovery');
   assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
-});
-
-test('a Canvas acknowledgement from before a reload cannot confirm the new document', async () => {
-  const f = await fixture();
-  f.host(); f.loaded(); await f.ack();
-  const original = f.last('sub2api:media-studio-config').payload;
-  f.loaded();
-  assert.equal(f.frame.hidden, true);
-  f.send({ type: 'sub2api:media-studio-config-applied', payload: { status: 'applied',
-    profileId: `sub2api-media-studio-${original.selectedConnectionId}`, requestId: original.requestId } });
-  await flush();
-  assert.equal(f.frame.hidden, true);
-  assert.equal(f.document.body.dataset.state, 'loading');
-
-  f.send({ type: 'sub2api:canvas-ready' });
-  await f.ack();
-  assert.equal(f.document.body.dataset.state, 'ready');
-  assert.equal(f.frame.hidden, false);
 });
 
 test('the first load of the Canvas frame is not a reload', async () => {
@@ -424,6 +423,104 @@ test('Canvas keeps the resave action usable before and after a different group a
   hung.resolve({ ok: false, status: 503 });
   await pending;
   assert.match(f.elements['#message'].textContent, /连接用时较长/);
+});
+
+test('a Canvas restart keeps the retry entry after a saved connection times out', async () => {
+  const groups = Promise.withResolvers();
+  let saved = false;
+  const f = await fixture({ custom: 'configured', groupsResponse: () => saved ? groups.promise : undefined });
+  f.loaded(); await f.ack();
+  f.elements['#canvas-custom'].onclick();
+  saved = true;
+  f.settings.at(-1).onSaved(true);
+  [...f.timers.values()].find(({ delay }) => delay === 20000).callback();
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  const retry = f.elements['#canvas-retry'];
+  assert.equal(retry.disabled, false);
+
+  f.send({ type: 'sub2api:canvas-ready' });
+  assert.equal(f.elements['#canvas-controls'].hidden, false);
+  assert.equal(retry.disabled, false);
+  assert.equal(f.select.disabled, false);
+  groups.resolve({ ok: true, status: 200, data: { groups: f.state.groups,
+    custom: { enabled: true, configured: true, group_id: CUSTOM_ID } } });
+  await flush();
+});
+
+test('a Canvas poll from before a restart cannot change the new document', async () => {
+  const poll = Promise.withResolvers();
+  let polling = false;
+  const f = await fixture({ custom: 'configured', groupsResponse: () => polling ? poll.promise : undefined,
+    connection: (options, config) => options.body.group_id === CUSTOM_ID
+      ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
+      : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.host(); f.loaded(); await f.ack();
+  f.select.value = String(CUSTOM_ID);
+  await f.select.onchange();
+  const text = f.elements['#message'].textContent;
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+
+  polling = true;
+  [...f.timers.values()].find(({ delay }) => delay === 30000).callback();
+  await flush();
+  f.send({ type: 'sub2api:canvas-ready' });
+  poll.resolve({ ok: false, status: 503 });
+  await flush();
+  assert.equal(f.elements['#message'].textContent, text);
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+});
+
+test('a Canvas restore cannot overwrite a newer authorization of the same connection', async () => {
+  const restore = Promise.withResolvers();
+  let fresh = false;
+  const f = await fixture({ connection: (options, config) => options.body.restore_only
+    ? restore.promise
+    : { ok: true, status: 200, data: fresh ? { ...config(options.body.group_id), fresh: true } : config(options.body.group_id) } });
+  f.host(); f.loaded(); await f.ack();
+  const connectionId = 'group-26';
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId, requestId: '00000000-0000-4000-8000-00000000002b' });
+  await flush();
+
+  const alternate = String(f.select.children.find(({ value }) => String(value) !== '26').value);
+  f.select.value = alternate;
+  await f.select.onchange();
+  await f.ack();
+  fresh = true;
+  f.select.value = '26';
+  await f.select.onchange();
+  await f.ack();
+
+  restore.resolve({ ok: true, status: 200, data: { version: 2, surface: 'media', user_id: 9, main_origin: 'https://main.example',
+    selectedConnectionId: connectionId, connections: [{ id: connectionId, apiKey: 'stale-key' }], capabilities: [], stale: true } });
+  await flush();
+  assert.equal(f.canvasMessages.filter((item) => item.type === 'sub2api:media-studio-config' && item.payload.stale).length, 0);
+
+  f.send({ type: 'sub2api:canvas-ready' });
+  const payload = f.last('sub2api:media-studio-config').payload;
+  assert.equal(payload.selectedConnectionId, connectionId);
+  assert.equal('stale' in payload, false);
+});
+
+test('a Canvas resave and a hung switch keep the native menu and retry usable', async () => {
+  const hung = Promise.withResolvers();
+  let switching = false;
+  const f = await fixture({ custom: 'configured', connection: (options, config) => {
+    if (options.body.group_id === CUSTOM_ID) return { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } };
+    return switching ? hung.promise : { ok: true, status: 200, data: config(options.body.group_id) };
+  } });
+  f.loaded(); await f.ack();
+  f.select.value = String(CUSTOM_ID);
+  await f.select.onchange();
+  switching = true;
+  const alternate = String(f.select.children.find(({ value }) => String(value) !== String(CUSTOM_ID) && String(value) !== '26').value);
+  f.select.value = alternate;
+  const pending = f.select.onchange();
+  assert.equal(f.elements['#canvas-retry'].disabled, false);
+  assert.equal(f.select.disabled, false);
+  assert.equal(f.elements['#canvas-controls'].hidden, false);
+  hung.resolve({ ok: false, status: 503 });
+  await pending;
 });
 
 test('Canvas can save from the resave dialog while an earlier switch times out', async () => {

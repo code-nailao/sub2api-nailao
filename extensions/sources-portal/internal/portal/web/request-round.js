@@ -46,41 +46,101 @@ export function requestRounds() {
   return { get current() { return current; }, get generation() { return generation; }, advance, start, markApplied, isWaiting, finish, deadline };
 }
 
-// Round rules for the Portal pages. Every asynchronous result carries the
-// token capture() returned when its request started, and is applied through
-// one comparison: each counter in the token against its current value. Which
-// counters a result depends on is fixed by what the result may change:
+// Round rules for the Portal pages. isCurrent(token) is the only staleness
+// test; the pages never compare a round, generation or document themselves.
+// A token records what its request depended on, and its factory says what the
+// result is allowed to change:
 //
-//   page        round + generation. Work the page itself started: authorizing
-//               or reading a group, saving a connection. Another attempt or an
-//               accepted connection supersedes it. The embedded page starting
-//               a new document does not: the parent's request is still owed.
-//   connection  generation + document. The connection the child accepted: its
-//               acknowledgement and a pending confirmation. It ends when the
-//               connection changes or the document that ran it is replaced.
-//   document    document only. An answer owed to one child document: a restore
-//               of a task's grant, and any page state derived from it.
+//   beginAttempt(scope)  the page's one connection attempt. A new attempt or an
+//                        accepted connection ends it. Scope "page" when the page
+//                        started it, "view" when the child asked for it: that
+//                        one also ends with the document that asked.
+//   beginRead(kind)      the surface the child is showing, plus a serial per
+//                        kind so only the latest read of that kind applies.
+//   beginChild(key)      an answer owed to one document about one connection
+//                        (a task grant restore). It ends with that document,
+//                        with a newer answer for the same connection, or with
+//                        an authorization the page accepted for it. A retry,
+//                        poll or acknowledgement elsewhere does not end it.
+//   captureConnection()  a configuration the child accepted: ends with the
+//                        connection generation or the document showing it.
+//   beginView()          a request the page itself makes on the child's
+//                        behalf (a shell payload): ends with the document.
+//   guardConnection()    a save that outlives its dialog: ends with the
+//                        connection or the document, not with a timeout.
 //
-// generation advances in exactly two places: start() of a page connection
-// attempt and markApplied() of an accepted acknowledgement. document advances
-// only in newDocument(). Nothing else - acknowledgements, polls, save results,
-// restores - advances either.
+// generation moves only on beginAttempt and accepted(); document only on
+// newDocument(); a key only on beginChild and renew for that key. A deadline
+// timeout retires the attempt (retire()) without moving generation.
 export function connectionRounds() {
   const rounds = requestRounds();
   let document = 0;
-  const capture = () => ({ round: rounds.current, generation: rounds.generation, document });
-  const samePage = (started) => started.round === rounds.current && started.generation === rounds.generation;
-  const sameConnection = (started) => started.generation === rounds.generation && started.document === document;
-  const sameDocument = (started) => started.document === document;
-  const isCurrent = (started) => samePage(started) && sameDocument(started);
-  // A save outlives the child document; it ends with the connection it changed.
-  const captureConnection = () => {
-    const started = capture();
-    return () => started.generation === rounds.generation;
+  const keys = new Map();
+  const reads = new Map();
+
+  function token(scope) {
+    return { scope, round: rounds.current, generation: rounds.generation, document };
+  }
+  function beginAttempt(scope = "page") {
+    rounds.start();
+    return token(scope);
+  }
+  function beginView() {
+    return token("view");
+  }
+  function beginRead(kind) {
+    const serial = (reads.get(kind) || 0) + 1;
+    reads.set(kind, serial);
+    return { ...token("view"), kind, serial };
+  }
+  function beginChild(key) {
+    const revision = (keys.get(key) || 0) + 1;
+    keys.set(key, revision);
+    return { scope: "child", document, key, revision };
+  }
+  function renew(key) {
+    keys.set(key, (keys.get(key) || 0) + 1);
+  }
+  const captureConnection = () => token("connection");
+  // A predicate for code that asks later (a save that outlives its dialog).
+  const guardConnection = () => {
+    const started = token("connection");
+    return () => isCurrent(started);
   };
-  // Call where the parent navigates or replaces the iframe, where the child
-  // announces a new document, and where a load shows one the parent did not
-  // navigate. The load that belongs to the opened document is not a boundary.
+
+  function isCurrent(started) {
+    if (!started) return false;
+    if (started.scope === "child") {
+      return started.document === document && keys.get(started.key) === started.revision;
+    }
+    if (started.scope === "connection") {
+      return started.generation === rounds.generation && started.document === document;
+    }
+    if (started.round !== rounds.current || started.generation !== rounds.generation) return false;
+    if (started.scope === "page") return true;
+    if (started.document !== document) return false;
+    return started.kind === undefined || reads.get(started.kind) === started.serial;
+  }
+  // A result still owed after the child was re-addressed: same scope, current
+  // counters. A child key keeps its own revision.
+  function readdress(started) {
+    if (started.scope === "child") return started;
+    return { ...started, round: rounds.current, generation: rounds.generation, document };
+  }
+  const isWaiting = (started) => Boolean(started) && rounds.isWaiting(started.round);
+  const finish = (started) => rounds.finish(started.round);
+  const deadline = (started, delay, onTimeout) => rounds.deadline(started.round, delay, onTimeout);
+  const retire = () => rounds.advance();
+  const accepted = () => rounds.markApplied();
+  // The one place a child document begins. A bare load is not a document.
   const newDocument = () => { document++; };
-  return Object.assign(rounds, { get document() { return document; }, capture, samePage, sameDocument, sameConnection, isCurrent, captureConnection, newDocument });
+
+  // A new object: the base methods must not be overwritten by their token
+  // wrappers above.
+  return {
+    get current() { return rounds.current; }, get generation() { return rounds.generation; }, get document() { return document; },
+    advance: rounds.advance, start: rounds.start, markApplied: rounds.markApplied,
+    isWaiting, finish, deadline, beginAttempt, beginView, beginRead, beginChild, renew,
+    captureConnection, beginView, guardConnection, isCurrent, readdress, retire, accepted, newDocument,
+  };
 }

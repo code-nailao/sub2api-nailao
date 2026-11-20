@@ -1,6 +1,6 @@
 import { authorizedJSON, clearSession, currentToken } from "./session.js";
 import { openCustomSettings, openGroupSettings } from "./studio-settings.js";
-import { connectionRounds, requestRounds } from "./request-round.js";
+import { connectionRounds } from "./request-round.js";
 
 let frame = document.querySelector("#studio");
 const select = document.querySelector("#groups");
@@ -32,23 +32,21 @@ let connectionPending, shellPending, connectionTimer, shellTimer, checkTimer;
 let connectionApplied = false, initialGroupId = null;
 let bootstrapRound, compatibilityTimer, expiredLegacyAttempt, needsCustomResave = false;
 const rounds = connectionRounds();
-const metadata = requestRounds();
+// Every staleness decision goes through the token the request started with.
 const isCurrent = (started) => !locked && rounds.isCurrent(started);
-// The page's own reads survive the child starting a new document; its answers
-// (acknowledgements) do not.
-const isPageCurrent = (started) => !locked && rounds.samePage(started);
-const isConnecting = () => rounds.isWaiting() && connectionPending?.round === rounds.current;
-const isBootstrapping = () => rounds.isWaiting() && bootstrapRound === rounds.current;
+const isConnecting = () => Boolean(connectionPending) && isCurrent(connectionPending.started);
+const isBootstrapping = () => Boolean(bootstrapRound) && isCurrent(bootstrapRound);
 const ordinaryGroups = () => groups.filter(({ id }) => id !== custom.groupId);
 const connectionTimeout = "连接用时较长。可以重试连接，或稍后从主站重新进入。已有作品与草稿会保留。";
 
 function updateControls() {
-  const canSelect = needsCustomResave ? ordinaryGroups().length > 0 : groups.length > 0 && (!connectionApplied || shellRevision === 0);
-  select.disabled = locked || isConnecting() || isBootstrapping() || !canSelect;
+  // The native menu and the retry stay usable through every wait, so a stuck
+  // request always leaves an action the user can take.
+  select.disabled = locked || !groups.length;
   reconnect.hidden = locked || integrated || shellRevision === 0;
   reconnect.disabled = locked || isConnecting() || selectionUncertain;
   retry.hidden = locked;
-  retry.disabled = locked || (!needsCustomResave && (isConnecting() || isBootstrapping()));
+  retry.disabled = locked;
   retry.textContent = needsCustomResave && !locked ? "打开自定义连接" : "重试连接";
   customButton.hidden = locked || !custom.enabled;
   ownKeyButton.hidden = customButton.hidden || needsCustomResave;
@@ -79,7 +77,7 @@ function recoverView(text) {
 }
 function waitForCompatibleShell() {
   clearTimeout(compatibilityTimer);
-  const started = rounds.capture();
+  const started = rounds.beginView();
   const timer = setTimeout(() => {
     if (timer === compatibilityTimer && isCurrent(started) && !integrated) recoverView(connectionTimeout);
   }, 20000);
@@ -97,7 +95,8 @@ function notifyHost(ready) {
     shellMode: hostConfig.shellMode, integrated: ready }, location.origin);
 }
 function setIntegrated(shellApplied) {
-  integrated = shellApplied && connectionApplied;
+  // A connection that needs a resave is not integrated, whatever the shell says.
+  integrated = shellApplied && connectionApplied && !needsCustomResave;
   if (integrated) {
     frame.hidden = false;
     // A shell ACK does not fix a stale connection. Keep its recovery action visible.
@@ -110,8 +109,7 @@ function setIntegrated(shellApplied) {
 function lock(text) {
   if (locked) return;
   locked = true;
-  rounds.advance();
-  metadata.advance();
+  rounds.retire();
   connectionPending = shellPending = null;
   expiredLegacyAttempt = undefined;
   bootstrapRound = undefined;
@@ -123,7 +121,7 @@ function lock(text) {
   clearTimeout(compatibilityTimer);
   connectionApplied = false;
   setIntegrated(false);
-  rounds.newDocument();
+  startDocument();
   frame.src = "about:blank";
   frame.hidden = true;
   select.disabled = true;
@@ -190,9 +188,9 @@ function openSettings(kind) {
     openGroupSettings({ onSaved: () => void refreshMetadata() });
     return;
   }
-  openCustomSettings({ captureConnection: rounds.captureConnection, onSaved: (configured) => {
+  openCustomSettings({ captureConnection: rounds.guardConnection, onSaved: (configured) => {
     if (locked) return;
-    rounds.advance();
+    rounds.retire();
     connectionPending = shellPending = null;
     bootstrapRound = undefined;
     clearInterval(connectionTimer);
@@ -263,7 +261,7 @@ function publishShell() {
     theme: hostConfig?.theme || (params.get("theme") === "dark" ? "dark" : "light"),
     lang: hostConfig?.lang || params.get("lang") || "zh",
   };
-  const pending = shellPending = { config, started: rounds.capture() };
+  const pending = shellPending = { config, started: rounds.beginView() };
   renderLegacyGroups();
   postStudio(config);
   let attempts = 0;
@@ -293,7 +291,7 @@ function selectionResult(pending, status, text = "", reconnectRequired = false) 
     ...(text === null ? { message: "" } : text ? { message: text } : {}), reconnectRequired });
 }
 function sendConnection(pending) {
-  if (!pending?.config || connectionPending !== pending || !isCurrent(pending.started) || !rounds.isWaiting(pending.round)) return;
+  if (!pending?.config || connectionPending !== pending || !isCurrent(pending.started) || !rounds.isWaiting(pending.started)) return;
   pending.target = frame.contentWindow;
   if (!pending.target) return;
   postStudio({ type: "sub2api:image-studio-config", payload: pending.config,
@@ -307,11 +305,27 @@ function bindFrameLoad(target) {
     else if (!integrated) publishShell();
   });
 }
+// The one place a new child document begins: the page navigates or replaces
+// the frame, or the shell says it restarted. A bare load is not a document.
+function startDocument() {
+  rounds.newDocument();
+  shellPending = null;
+  clearInterval(shellTimer);
+  if (connectionPending) {
+    if (connectionPending.requestId) {
+      // A selection the old child made is not the new child's request.
+      clearInterval(connectionTimer);
+      connectionPending = undefined;
+    } else {
+      connectionPending.started = rounds.readdress(connectionPending.started);
+    }
+  }
+  frame.hidden = true;
+}
 function replaceFrame() {
   const previous = frame;
   frame = previous.cloneNode(false);
-  rounds.newDocument();
-  frame.hidden = true;
+  startDocument();
   shellReady = false;
   shellRevision = appliedShellRevision = 0;
   connectionApplied = false;
@@ -331,7 +345,10 @@ function connectionTimedOut(pending, text) {
 }
 async function connect(groupId, request) {
   if (locked || isConnecting() || isBootstrapping() || !groups.some((group) => group.id === groupId)) return;
-  const pending = connectionPending = { groupId, round: rounds.start(),
+  // A selection the child made ends with that child's document; the page's own
+  // menu outlives it.
+  const started = rounds.beginAttempt(request ? "view" : "page");
+  const pending = connectionPending = { groupId, started,
     requestId: request?.requestId, revision: request?.revision,
     restoreOnly: request?.restoreOnly === true, config: null };
   clearInterval(shellTimer);
@@ -340,17 +357,16 @@ async function connect(groupId, request) {
   const expired = expiredLegacyAttempt;
   expiredLegacyAttempt = undefined;
   const replacePeer = !pending.requestId && (expired?.target || (shellRevision > 0 && (needsCustomResave || !connectionApplied)));
-  const authorizing = rounds.capture();
   // Retry custom connections through Portal so it checks the Key's current group.
   const cached = !pending.requestId && !needsCustomResave && groupId !== custom.groupId && expired?.groupId === groupId
     ? expired.config : undefined;
-  rounds.deadline(pending.round, 20000, () => connectionTimedOut(pending, connectionTimeout));
+  rounds.deadline(pending.started, 20000, () => connectionTimedOut(pending, connectionTimeout));
   const connectingText = "正在连接所选分组…";
   if (needsCustomResave) recoverView(connectingText);
   else message.textContent = connectingText;
   updateControls();
-  const waiting = (started) => isPageCurrent(started) && connectionPending === pending && rounds.isWaiting(pending.round);
-  const authorizationCurrent = () => waiting(authorizing);
+  const waiting = (token) => connectionPending === pending && isCurrent(token);
+  const authorizationCurrent = () => waiting(started);
   try {
     let config = cached;
     if (config) await currentToken();
@@ -359,7 +375,7 @@ async function connect(groupId, request) {
     // A peer that saw the shell may reject a legacy selection even if its ACK
     // never arrived. A new frame also isolates retries from old legacy ACKs.
     if (replacePeer) replaceFrame();
-    pending.started = rounds.capture();
+    pending.started = rounds.readdress(pending.started);
     if (needsCustomResave) {
       needsCustomResave = false;
       recoverView("已收到工作台连接配置，正在等待确认…");
@@ -370,7 +386,7 @@ async function connect(groupId, request) {
     const timer = setInterval(() => {
       if (!waiting(pending.started) || timer !== connectionTimer) return;
       if (++attempts > 30) {
-        rounds.advance();
+        rounds.retire();
         connectionTimedOut(pending, "连接尚未确认，请重新选择分组。");
         return;
       }
@@ -380,7 +396,7 @@ async function connect(groupId, request) {
     updateControls();
   } catch (error) {
     if (!authorizationCurrent()) return;
-    rounds.finish(pending.round);
+    rounds.finish(pending.started);
     connectionPending = null;
     selectionResult(pending, "error", error.message);
     if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) needsCustomResave = true;
@@ -414,8 +430,12 @@ window.addEventListener("message", async (event) => {
     return;
   }
   if (data.type === "sub2api:image-studio-shell-ready" && data.version === 1) {
+    // A shell that boots is a new child document. It is always processed, and
+    // the page answers it instead of the document that came before.
+    startDocument();
     shellReady = true;
     publishShell();
+    sendConnection(connectionPending);
     return;
   }
   if (data.type === "sub2api:image-studio-shell-config-applied" && data.version === 1) {
@@ -457,7 +477,7 @@ window.addEventListener("message", async (event) => {
   if (!pending.restoreOnly && data.payload.profileId !== `sub2api-image-studio-group-${pending.groupId}`) return;
   if (pending.requestId && (data.payload.requestId !== pending.requestId || data.payload.revision !== pending.revision)) return;
   try { await currentToken(); } catch { return; }
-  if (!isCurrent(pending.started) || connectionPending !== pending || pending.target !== frame.contentWindow || !rounds.finish(pending.round)) return;
+  if (!isCurrent(pending.started) || connectionPending !== pending || pending.target !== frame.contentWindow || !rounds.finish(pending.started)) return;
   clearInterval(connectionTimer);
   connectionPending = null;
   selectionUncertain = false;
@@ -467,7 +487,7 @@ window.addEventListener("message", async (event) => {
     try { localStorage.setItem(storageKey, String(selectedGroupId)); } catch { /* Storage is optional. */ }
   }
   connectionApplied = true;
-  rounds.markApplied();
+  rounds.accepted();
   if (!integrated) waitForCompatibleShell();
   // Do not reveal the old intermediate surface between connection and shell ACK.
   if (integrated || document.body.dataset.state === "recovery") frame.hidden = false;
@@ -482,8 +502,8 @@ if (window.parent !== window) window.parent.postMessage({ type: "sources:studio-
 
 async function refreshMetadata() {
   if (locked || isConnecting() || isBootstrapping()) return;
-  const started = rounds.capture(), refresh = metadata.advance();
-  const current = () => isPageCurrent(started) && refresh === metadata.current;
+  const started = rounds.beginRead("metadata");
+  const current = () => isCurrent(started);
   try {
     const fresh = await api("/api/studio/groups", current);
     if (!current()) return;
@@ -500,14 +520,13 @@ async function refreshMetadata() {
 }
 async function bootstrap() {
   if (locked || isBootstrapping()) return;
-  const round = bootstrapRound = rounds.start();
+  const started = bootstrapRound = rounds.beginAttempt();
   showState("loading", "正在连接工作台，请稍候…");
-  rounds.deadline(round, 20000, () => {
+  rounds.deadline(started, 20000, () => {
     bootstrapRound = undefined;
     recoverView(connectionTimeout);
   });
-  const started = rounds.capture();
-  const waiting = () => isPageCurrent(started) && rounds.isWaiting(round);
+  const waiting = () => isCurrent(started);
   try {
     const data = await api("/api/studio/groups", waiting);
     if (!waiting()) return;
@@ -521,7 +540,7 @@ async function bootstrap() {
     studioURL.searchParams.set("src_host", location.origin);
     studioURL.searchParams.set("theme", hostConfig?.theme || (params.get("theme") === "dark" ? "dark" : "light"));
     document.querySelector("#keys").href = mainOrigin + "/keys";
-    rounds.finish(round);
+    rounds.finish(started);
     bootstrapRound = undefined;
     updateMetadata(data);
     let remembered;
@@ -534,7 +553,7 @@ async function bootstrap() {
       if (shellRevision > 0 && connectionApplied && !needsCustomResave) { recoverShell(); return; }
       if (id > 0) void connect(id);
     };
-    rounds.newDocument();
+    startDocument();
     frame.src = studioURL.href;
     if (initial) void connect(initial.id);
     else recoverView(groups.length ? "上次使用的分组已不可用，请重新选择。"
@@ -546,7 +565,7 @@ async function bootstrap() {
       if (document.visibilityState === "visible") await refreshMetadata();
     }, 30000);
   } catch (error) {
-    if (!waiting() || !rounds.finish(round)) return;
+    if (!waiting() || !rounds.finish(started)) return;
     bootstrapRound = undefined;
     recoverView(error.message);
   }

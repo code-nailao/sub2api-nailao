@@ -1,6 +1,6 @@
 import { authorizedJSON, clearSession, currentToken } from "./session.js";
 import { openCustomSettings, openGroupSettings } from "./studio-settings.js";
-import { connectionRounds, requestRounds } from "./request-round.js";
+import { connectionRounds } from "./request-round.js";
 
 const params = new URLSearchParams(location.search);
 const CUSTOM_CONNECTION_NEEDS_UPDATE = "custom_connection_needs_update";
@@ -22,48 +22,39 @@ const manageButton = document.querySelector("#canvas-manage");
 const ownKeyButton = document.querySelector("#canvas-own-key");
 let studioURL, connection, attempt, hostConfig, savedGroupToReconnect;
 let locked = false, needsCustomResave = false;
-// Where the resave action came from. A restore result answers one child
-// document and ends with it; a failed authorization is a page decision that
-// stays until a connection succeeds.
-let resaveConnectionId, resaveDocument;
+// Where the resave action came from: a token for a child document's answer, or
+// undefined for a decision the page made itself.
+let resaveConnectionId, resaveStarted;
 let sendTimer, checkTimer, acknowledgment;
-// The child said it started this document (canvas-ready); the load that follows
-// is that document's load, not another navigation.
-let announced = false;
 const rounds = connectionRounds();
-const groupRefresh = requestRounds();
-const groupPoll = requestRounds();
-let nextRestoreRound = 0;
-const restoreRounds = new Map();
 const granted = new Map();
 // The user's own-key connection is addressed like a group, by a reserved ID.
 let custom = { groupId: 0, enabled: false, configured: false };
 const validRequestID = (value) => typeof value === "string" && /^[\w-]{16,80}$/.test(value);
-const isCurrent = (started) => !locked && rounds.isCurrent(started);
-const isPageCurrent = (started) => !locked && rounds.samePage(started);
-const isWaiting = (operation) => !locked && attempt === operation && rounds.isWaiting(operation.round);
-const readingOrAuthorizing = () => rounds.isWaiting() && ["bootstrap", "authorize"].includes(attempt?.phase);
+const connectionKey = (connectionId) => `connection:${connectionId}`;
+// Every staleness decision goes through the token the request started with.
+const resaveActive = () => !locked && needsCustomResave &&
+  (resaveStarted === undefined || rounds.isCurrent(resaveStarted));
+const working = () => Boolean(attempt) && rounds.isWaiting(attempt.started);
+const isWaiting = (operation) => !locked && attempt === operation && rounds.isWaiting(operation.started);
+const readingOrAuthorizing = () => working() && ["bootstrap", "authorize"].includes(attempt.phase);
 const confirmed = () => Boolean(acknowledgment && acknowledgment.payload === connection?.payload &&
-  rounds.sameConnection(acknowledgment.started) && !connection.invalid);
+  rounds.isCurrent(acknowledgment.started) && !connection.invalid);
 
 function waitingFor(operation) {
-  const started = rounds.capture();
-  return () => isWaiting(operation) && isPageCurrent(started);
+  return () => isWaiting(operation) && rounds.isCurrent(operation.started);
 }
 
 function clearResave() {
   needsCustomResave = false;
-  resaveConnectionId = resaveDocument = undefined;
+  resaveConnectionId = resaveStarted = undefined;
 }
-// Every new child document: answers and page state that belonged to the
-// previous one are void. The connection the page holds is re-addressed to the
-// new document; it is not authorized again.
+// The one place a new child document begins: the page navigates or replaces
+// the frame, or the child says it restarted. A bare load is not a new document.
 function startDocument() {
   rounds.newDocument();
   acknowledgment = undefined;
-  restoreRounds.clear();
-  if (resaveDocument !== undefined) clearResave();
-  if (connection) connection = { ...connection, started: rounds.capture() };
+  if (connection) connection = { ...connection, started: rounds.readdress(connection.started) };
   frame.hidden = true;
 }
 function navigateFrame(src) {
@@ -72,14 +63,16 @@ function navigateFrame(src) {
 }
 
 function updateControls() {
-  select.disabled = locked || !select.children.length || readingOrAuthorizing();
+  // The native menu and the retry stay usable through every wait, so a stuck
+  // request always leaves an action the user can take.
+  select.disabled = locked || !select.children.length;
   retry.hidden = locked;
-  retry.disabled = locked || (!needsCustomResave && readingOrAuthorizing());
-  retry.textContent = needsCustomResave && !locked ? "打开自定义连接" : "重试连接";
-  ownKeyButton.hidden = locked || needsCustomResave || !custom.enabled;
+  retry.disabled = locked;
+  retry.textContent = resaveActive() ? "打开自定义连接" : "重试连接";
+  ownKeyButton.hidden = locked || resaveActive() || !custom.enabled;
 }
 function showState(state, text) {
-  const resave = needsCustomResave && !locked;
+  const resave = resaveActive();
   if (resave) {
     state = "recovery";
     if (!confirmed()) frame.hidden = true;
@@ -88,7 +81,7 @@ function showState(state, text) {
   document.body.dataset.state = state;
   document.body.setAttribute("aria-busy", String(state === "loading"));
   statusPanel.hidden = state === "ready";
-  controls.hidden = state === "loading" || locked;
+  controls.hidden = locked;
   recovery.hidden = state !== "recovery";
   statusTitle.textContent = state === "loading" ? "正在打开无限画布" : locked ? "请重新进入画布" : "画布连接需要处理";
   updateControls();
@@ -104,14 +97,15 @@ function notifyHost(ready) {
 function begin(phase, state, text) {
   const previous = connection;
   const keepAcknowledgment = confirmed();
-  const operation = { round: rounds.start(), phase, previous };
+  const operation = { phase, previous };
+  operation.started = rounds.beginAttempt();
   // Starting authorization leaves the current configuration in place. Keep
   // its accepted ACK until we send another configuration or the child resets.
-  if (keepAcknowledgment) acknowledgment = { payload: previous.payload, started: rounds.capture() };
+  if (keepAcknowledgment) acknowledgment = { payload: previous.payload, started: rounds.captureConnection() };
   attempt = operation;
   clearInterval(sendTimer);
   sendTimer = undefined;
-  rounds.deadline(operation.round, 20000, () => {
+  rounds.deadline(operation.started, 20000, () => {
     fail(operation, "连接用时较长。可以重试连接。已有画布和任务会保留。");
   });
   showState(state, text);
@@ -119,7 +113,7 @@ function begin(phase, state, text) {
 }
 function finish(operation) {
   if (attempt !== operation) return;
-  rounds.finish(operation.round);
+  rounds.finish(operation.started);
   attempt = undefined;
   clearInterval(sendTimer);
   sendTimer = undefined;
@@ -162,9 +156,7 @@ function setShell() {
 function lock(text) {
   if (locked) return;
   locked = true;
-  rounds.advance();
-  groupRefresh.advance();
-  groupPoll.advance();
+  rounds.retire();
   attempt = connection = undefined;
   granted.clear();
   clearInterval(sendTimer);
@@ -199,7 +191,7 @@ async function api(path, isCurrent, body) {
 }
 function isConfirming(operation, candidate) {
   return operation && candidate && isWaiting(operation) && operation.phase === "confirm" &&
-    connection === candidate && isCurrent(candidate.started) && !candidate.invalid && !needsCustomResave;
+    connection === candidate && rounds.isCurrent(candidate.started) && !candidate.invalid && !resaveActive();
 }
 function startSending(operation, candidate = connection) {
   if (sendTimer !== undefined || !isConfirming(operation, candidate)) return;
@@ -209,7 +201,7 @@ function startSending(operation, candidate = connection) {
   const timer = setInterval(() => {
     if (timer !== sendTimer || !isConfirming(operation, candidate)) return;
     if (++attempts > 30) {
-      rounds.advance();
+      rounds.retire();
       fail(operation, "画布尚未确认连接。可以重试确认。已有任务会保留。");
       return;
     }
@@ -228,7 +220,7 @@ function confirm(operation, grant) {
   frame.hidden = true;
   const navigating = !frame.getAttribute("src");
   if (navigating) navigateFrame(studioURL.href);
-  connection = { grant, payload, started: rounds.capture() };
+  connection = { grant, payload, started: rounds.captureConnection() };
   if (!navigating) startSending(operation);
   showState("loading", "正在确认画布连接…");
 }
@@ -239,28 +231,22 @@ function repeatConfirmation() {
 }
 function rehandshake() {
   const wasConfirmed = confirmed();
-  // A child asking for configuration is a new document on the same
-  // WindowProxy. Its answers and any restore verdict it got are void.
+  // A child that says it restarted begins a new document on the same
+  // WindowProxy. It is always processed, with or without a connection; the
+  // previous document's answers and any verdict it got are void.
   startDocument();
-  announced = true;
   if (wasConfirmed) notifyHost(false);
-  // The new document is answered from scratch; a resave that still applies
-  // keeps the recovery state instead.
-  if (!needsCustomResave) showState("loading", "正在重新连接画布…");
-  if (needsCustomResave || readingOrAuthorizing() || savedGroupToReconnect !== undefined || connection.invalid) return;
+  if (!connection || resaveActive() || readingOrAuthorizing() ||
+      savedGroupToReconnect !== undefined || connection.invalid) {
+    updateControls();
+    return;
+  }
   if (attempt?.phase === "confirm") confirm(attempt, connection.grant);
   else repeatConfirmation();
 }
-frame.addEventListener("load", () => {
-  if (announced) announced = false;
-  // A frame that had confirmed a connection and loads again without saying so
-  // was reloaded: the previous document's answers must not reach this one.
-  else if (acknowledgment) {
-    startDocument();
-    showState("loading", "正在重新连接画布…");
-  }
-  startSending(attempt);
-});
+// A load only says there is something to configure. It never decides that a
+// document changed; only navigation or canvas-ready does.
+frame.addEventListener("load", () => startSending(attempt));
 
 function requireResave(connectionId, started) {
   needsCustomResave = true;
@@ -279,21 +265,19 @@ function requireResave(connectionId, started) {
   connection = next;
   // Losing the running connection is a page decision: it needs a resave, not
   // an answer that ends with the document that happened to report it.
-  resaveDocument = held ? undefined : started?.document;
+  resaveStarted = held ? undefined : started;
   granted.delete(connectionId);
 }
 async function restoreConnection(connectionId, requestId, target) {
-  const started = rounds.capture(), restoreRound = ++nextRestoreRound;
-  restoreRounds.set(connectionId, restoreRound);
-  // The child can restore grants for its tasks independently of group selection.
-  const current = () => !locked && rounds.sameDocument(started) && target === frame.contentWindow &&
-    restoreRounds.get(connectionId) === restoreRound;
+  // An answer owed to the document that asked, about one connection: a newer
+  // restore or an accepted authorization for it supersedes this one.
+  const started = rounds.beginChild(connectionKey(connectionId));
+  const current = () => !locked && rounds.isCurrent(started) && target === frame.contentWindow;
   let config;
   try {
     config = await api("/api/canvas/connection", current, { group_id: Number(connectionId.slice(6)), restore_only: true });
   } catch (error) {
     if (!current()) return;
-    restoreRounds.delete(connectionId);
     if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) {
       requireResave(connectionId, started);
       if (attempt?.phase === "confirm") finish(attempt);
@@ -304,7 +288,6 @@ async function restoreConnection(connectionId, requestId, target) {
     return;
   }
   if (!current()) return;
-  restoreRounds.delete(connectionId);
   granted.set(connectionId, config);
   target.postMessage({ type: "sub2api:media-studio-config", payload: { ...config, requestId, selectActive: false } }, studioURL.origin);
   // A fresh answer supersedes the verdict about this connection only.
@@ -314,7 +297,7 @@ async function restoreConnection(connectionId, requestId, target) {
       repeatConfirmation();
       return;
     }
-    if (confirmed() && !rounds.isWaiting()) showReady();
+    if (confirmed() && !working()) showReady();
     else showState("recovery", "画布尚未确认连接，请重试连接。");
   } else updateControls();
 }
@@ -352,8 +335,8 @@ window.addEventListener("message", async (event) => {
   try { await currentToken(); } catch { return; }
   if (!isConfirming(pending, candidate) || event.source !== frame.contentWindow) return;
   finish(pending);
-  rounds.markApplied();
-  acknowledgment = { payload: candidate.payload, started: rounds.capture() };
+  rounds.accepted();
+  acknowledgment = { payload: candidate.payload, started: rounds.captureConnection() };
   showReady();
 });
 
@@ -368,6 +351,8 @@ async function authorize(operation, groupId) {
     if (!waiting()) return;
     clearResave();
     granted.set(config.selectedConnectionId, config);
+    // A newer authorization answers this connection; an older restore no longer does.
+    rounds.renew(connectionKey(config.selectedConnectionId));
     confirm(operation, config);
     watchSession();
   } catch (error) {
@@ -423,9 +408,8 @@ function renderGroups(data, keep) {
 // Both background checks and admin refreshes are scoped to the same connection
 // and document. Neither owns the connection deadline.
 async function refreshGroups(updateMenu = false) {
-  const reads = updateMenu ? groupRefresh : groupPoll;
-  const started = rounds.capture(), read = reads.advance();
-  const current = () => isPageCurrent(started) && read === reads.current;
+  const started = rounds.beginRead(updateMenu ? "menu" : "poll");
+  const current = () => rounds.isCurrent(started);
   try {
     const data = await api("/api/canvas/groups", current);
     if (!current() || !updateMenu) return;
@@ -468,11 +452,11 @@ const connectionMenu = document.querySelector("#canvas-connection-menu");
 function openCustomConnectionSettings() {
   if (locked) return;
   connectionMenu.open = false;
-  openCustomSettings({ captureConnection: rounds.captureConnection, onSaved: (configured) => {
+  openCustomSettings({ captureConnection: rounds.guardConnection, onSaved: (configured) => {
     if (locked) return;
     // A changed or removed connection must not be resent from the earlier grant.
     const customId = `group-${custom.groupId}`;
-    restoreRounds.delete(customId);
+    rounds.renew(connectionKey(customId));
     granted.delete(customId);
     if (connection?.payload.selectedConnectionId === customId) {
       connection = undefined;

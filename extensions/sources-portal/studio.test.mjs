@@ -134,7 +134,7 @@ test('lost shell ACK recovers through a new handshake before another group switc
   const timer = [...f.timers.values()].find((entry) => entry.delay === 500);
   for (let i = 0; i < 31; i++) timer.callback();
   assert.equal(f.document.body.dataset.integrated, 'false');
-  assert.equal(f.select.disabled, true);
+  assert.equal(f.select.disabled, false, 'the native menu stays usable while the shell has not confirmed');
   assert.equal(f.reconnect.hidden, false);
   assert.equal(f.reconnect.disabled, false);
   const connections = f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-config').length;
@@ -572,8 +572,70 @@ test('an integrated Studio keeps the resave action visible after a failed switch
   assert.equal(f.settings.length, 0);
   f.retry.onclick();
   assert.equal(f.settings.at(-1)?.kind, 'custom');
-  assert.equal(f.document.body.dataset.integrated, 'true');
+  // A connection that needs a resave is not reported as integrated to the host,
+  // and the acknowledged workspace stays visible while it recovers.
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.parentMessages.at(-1).integrated, false);
   assert.equal(f.frame.hidden, false);
+});
+
+test('a Studio selection made by a shell that already restarted is not applied', async () => {
+  const answer = Promise.withResolvers();
+  let hold = false;
+  const f = await fixture({ custom: 'configured', connection: (options, config) => hold && options.body.group_id === CUSTOM_ID
+    ? answer.promise
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  const shell = await f.integrate();
+  assert.equal(f.document.body.dataset.integrated, 'true');
+
+  hold = true;
+  f.send(select(CUSTOM_ID, shell.revision, 'old-shell-resave-request'));
+  await flush();
+  assert.equal(connections(f), 2);
+
+  // The shell restarts before the page hears back.
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  const restarted = await f.ackShell();
+  assert.ok(restarted.revision > shell.revision);
+
+  hold = false;
+  answer.resolve({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } });
+  await flush();
+  assert.doesNotMatch(f.message.textContent, /重新保存自定义连接/);
+  assert.equal(f.retry.textContent, '重试连接');
+  assert.equal(f.document.body.dataset.integrated, 'true');
+});
+
+test('a Studio settings save from before the shell restarted cannot close the dialog', async () => {
+  const f = await fixture({ custom: 'configured' });
+  await f.integrate();
+  f.customButton.onclick();
+  const finishSave = f.settings.at(-1).beginSave();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackShell();
+  finishSave(true);
+  assert.equal(f.state.reloads, 0);
+});
+
+test('a Studio resave and a hung connection keep the native menu and retry usable', async () => {
+  const hung = Promise.withResolvers();
+  let switching = false;
+  const f = await fixture({ custom: 'configured', connection: (options, config) => {
+    if (options.body.group_id === CUSTOM_ID) return { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } };
+    return switching ? hung.promise : { ok: true, status: 200, data: config(options.body.group_id) };
+  } });
+  await f.integrate();
+  f.select.value = String(CUSTOM_ID);
+  f.select.onchange();
+  await flush();
+  switching = true;
+  f.select.value = '27';
+  f.select.onchange();
+  await flush();
+  assert.equal(f.retry.disabled, false);
+  assert.equal(f.select.disabled, false);
+  hung.resolve({ ok: false, status: 503 });
+  await flush();
 });
 
 test('other Studio connection errors keep their existing hints and do not open settings', async () => {
