@@ -712,6 +712,46 @@ test('a slow-starting shell that announces itself twice keeps the confirmed work
     'the repeated announcement asks for no configuration');
 });
 
+test('a load between a slow start\'s announcements does not replace its document', async () => {
+  const f = await fixture();
+  // The order a delayed store produces: the first announcement, the frame's
+  // own load, the shell being applied, and a second announcement.
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  f.loaded();
+  await f.ackConnection();
+  const shell = await f.ackShell();
+  assert.equal(f.document.body.dataset.integrated, 'true');
+
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await flush();
+  assert.equal(f.document.body.dataset.integrated, 'true');
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.last('sub2api:image-studio-shell-config').revision, shell.revision, 'the shell is not replaced');
+});
+
+test('a reload whose announcements arrive before its load is still a new document', async () => {
+  const f = await fixture();
+  const shell = await f.integrate();
+  // The first document's load never arrived before the child reloaded.
+
+  // The child reloads; both of the new document's announcements come first.
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await flush();
+  const restarted = f.last('sub2api:image-studio-shell-config');
+  assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.frame.hidden, true);
+  assert.equal(f.retry.hidden, false);
+
+  // The load that follows belongs to that document, not to another one.
+  f.loaded();
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.retry.hidden, false);
+  assert.equal(f.select.disabled, false);
+});
+
 test('a Studio shell restart after a failed switch asks the new document for its shell', async () => {
   const f = await fixture({ connection: (options, config) => ({ ok: true, status: 200, data: config(options.body.group_id) }) });
   const shell = await f.integrate();

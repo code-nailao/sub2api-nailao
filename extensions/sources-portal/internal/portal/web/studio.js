@@ -28,11 +28,13 @@ let custom = { groupId: 0, setupId: 0, enabled: false, configured: false }, mana
 let selectedGroupId = null, authorizationName = "";
 let shellRevision = 0, appliedShellRevision = 0;
 let shellReady = false, integrated = false, locked = false, selectionUncertain = false;
-// A load after this document's child announced itself means the document may
-// have been replaced; a load before that belongs to the document still
-// arriving. The page waits for the child to say so before it treats the
-// boundary as real, so repeated announcements in one document stay inert.
-let frameAnnounced = false, frameRestarted = false;
+// A document gives the page a small fixed set of facts: its child announces
+// itself (a starting client sends two) and its frame loads once, in either
+// order. Anything beyond that set belongs to another document. This reads a
+// slow start (an early announcement, a late load, a second announcement) and a
+// reload (its announcements before or after its load) without guessing at the
+// order they arrive in.
+let announcements = 0, frameLoads = 0;
 let connectionPending, shellPending, connectionTimer, shellTimer, checkTimer;
 let connectionApplied = false, initialGroupId = null;
 let bootstrapRound, compatibilityTimer, expiredLegacyAttempt, needsCustomResave = false;
@@ -318,10 +320,11 @@ function sendConnection(pending) {
 function bindFrameLoad(target) {
   target.addEventListener("load", () => {
     if (locked || frame !== target) return;
-    // A load in a document whose child already announced itself can only mean
-    // the child replaced its document. The child announces the new document
-    // itself; until it does, this one is still the page's own.
-    if (frameAnnounced) frameRestarted = true;
+    // The first load is this document's own, even when it arrives after the
+    // child announced itself. A later load in a document that has already
+    // spoken is a replacement.
+    if (frameLoads >= 1 && announcements > 0) startDocument();
+    frameLoads++;
     sendConnection(connectionPending);
     if (shellPending && isCurrent(shellPending.started)) postStudio(shellPending.config);
     else if (!integrated) publishShell();
@@ -353,8 +356,8 @@ function startDocument() {
   connectionApplied = false;
   selectionUncertain = false;
   appliedShellRevision = 0;
-  frameAnnounced = false;
-  frameRestarted = false;
+  announcements = 0;
+  frameLoads = 0;
   if (integrated) setIntegrated(false);
   frame.hidden = true;
 }
@@ -465,15 +468,16 @@ window.addEventListener("message", async (event) => {
     return;
   }
   if (data.type === "sub2api:image-studio-shell-ready" && data.version === 1) {
-    // Only a load that replaced a document whose child had already announced
-    // itself, followed by this announcement, is a restart. A client that
-    // announces itself twice while it starts (the second time after it applied
-    // the shell) is still the same document: the repetition changes nothing.
-    if (frameRestarted) startDocument();
-    frameAnnounced = true;
+    // A document announces itself twice at most. More than that is a reload
+    // whose announcements arrived before its load. Two announcements and one
+    // load, in any order, are the same document: a client that starts slowly
+    // and announces itself again after applying the shell changes nothing.
+    if (announcements >= 2) startDocument();
+    announcements++;
     shellReady = true;
-    // A shell this document already applied needs no replacement here.
-    if (appliedShellRevision === 0) publishShell();
+    // A shell this document already applied, or has in flight, needs no
+    // replacement here.
+    if (appliedShellRevision === 0 && !shellPending) publishShell();
     sendConnection(connectionPending);
     return;
   }
