@@ -94,6 +94,7 @@ export async function createStudioFixture({ remembered, groupList = initialGroup
   const send = (data, { from = frame.contentWindow, fromOrigin = studioOrigin } = {}) => window.dispatchEvent(Object.assign(new Event('message'), { data, source: from, origin: fromOrigin }));
   const host = (revision = 1, shellMode = 'standalone') => send({ type: 'sources:studio-host-config', version: 1, requestId: 'host-request-' + String(revision).padStart(8, '0'), revision, shellMode, standaloneUrl: origin + '/custom/images?studio_view=standalone', theme: 'dark', lang: 'zh' }, { from: parent, fromOrigin: origin });
   const last = (type) => studioMessages.filter((item) => item.type === type).at(-1);
+  const loaded = () => frame.dispatchEvent(new Event('load'));
   const ackConnection = async () => {
     const data = last('sub2api:image-studio-config');
     assert.ok(data);
@@ -113,7 +114,7 @@ export async function createStudioFixture({ remembered, groupList = initialGroup
     send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
     return ackShell();
   };
-  return { window, parent, get frame() { return frame; }, select, reconnect, message, document, calls, loadingPanel, statusTitle, connectionBar, recoveryActions, retry, login, connectionMenu, studioMessages, parentMessages, send, host, last, ackConnection, ackShell, integrate, timers,
+  return { window, parent, get frame() { return frame; }, select, reconnect, message, document, calls, loadingPanel, statusTitle, connectionBar, recoveryActions, retry, login, connectionMenu, studioMessages, parentMessages, send, host, last, loaded, ackConnection, ackShell, integrate, timers,
     customButton, manageButton, ownKeyButton, manageRecoveryButton, settings, state, values, setTokenVersion,
     get frameSets() { return frameSets; }, get locked() { return locked; } };
 }

@@ -28,6 +28,11 @@ let custom = { groupId: 0, setupId: 0, enabled: false, configured: false }, mana
 let selectedGroupId = null, authorizationName = "";
 let shellRevision = 0, appliedShellRevision = 0;
 let shellReady = false, integrated = false, locked = false, selectionUncertain = false;
+// A load after this document's child announced itself means the document may
+// have been replaced; a load before that belongs to the document still
+// arriving. The page waits for the child to say so before it treats the
+// boundary as real, so repeated announcements in one document stay inert.
+let frameAnnounced = false, frameRestarted = false;
 let connectionPending, shellPending, connectionTimer, shellTimer, checkTimer;
 let connectionApplied = false, initialGroupId = null;
 let bootstrapRound, compatibilityTimer, expiredLegacyAttempt, needsCustomResave = false;
@@ -313,6 +318,10 @@ function sendConnection(pending) {
 function bindFrameLoad(target) {
   target.addEventListener("load", () => {
     if (locked || frame !== target) return;
+    // A load in a document whose child already announced itself can only mean
+    // the child replaced its document. The child announces the new document
+    // itself; until it does, this one is still the page's own.
+    if (frameAnnounced) frameRestarted = true;
     sendConnection(connectionPending);
     if (shellPending && isCurrent(shellPending.started)) postStudio(shellPending.config);
     else if (!integrated) publishShell();
@@ -344,6 +353,8 @@ function startDocument() {
   connectionApplied = false;
   selectionUncertain = false;
   appliedShellRevision = 0;
+  frameAnnounced = false;
+  frameRestarted = false;
   if (integrated) setIntegrated(false);
   frame.hidden = true;
 }
@@ -454,13 +465,15 @@ window.addEventListener("message", async (event) => {
     return;
   }
   if (data.type === "sub2api:image-studio-shell-ready" && data.version === 1) {
-    // A child that announces itself after this page already gave it a shell is
-    // a new document: the page no longer treats the old one's confirmations as
-    // its own. The announcements a starting client sends before that are not
-    // restarts, and must not discard what this document is doing.
-    if (appliedShellRevision > 0) startDocument();
+    // Only a load that replaced a document whose child had already announced
+    // itself, followed by this announcement, is a restart. A client that
+    // announces itself twice while it starts (the second time after it applied
+    // the shell) is still the same document: the repetition changes nothing.
+    if (frameRestarted) startDocument();
+    frameAnnounced = true;
     shellReady = true;
-    publishShell();
+    // A shell this document already applied needs no replacement here.
+    if (appliedShellRevision === 0) publishShell();
     sendConnection(connectionPending);
     return;
   }

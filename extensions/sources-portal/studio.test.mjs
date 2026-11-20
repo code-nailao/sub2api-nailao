@@ -606,6 +606,7 @@ test('a Studio deadline from before a restart cannot answer for the new shell', 
   assert.equal(connections(f), 2);
   const resultsBefore = f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-select-group-result').length;
 
+  f.loaded();
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   const restarted = await f.ackShell();
   assert.ok(restarted.revision > shell.revision);
@@ -639,6 +640,7 @@ test('a Studio selection made by a shell that already restarted is not applied',
   assert.equal(connections(f), 2);
 
   // The shell restarts before the page hears back.
+  f.loaded();
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   const restarted = await f.ackShell();
   assert.ok(restarted.revision > shell.revision);
@@ -664,6 +666,7 @@ test('a page configuration keeps the released client shape, and a restart voids 
 
   // The announcements a starting shell sends are not restarts: the page's own
   // connection still belongs to this document and is confirmed by its answer.
+  f.loaded();
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   await f.ackConnection();
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
@@ -671,8 +674,9 @@ test('a page configuration keeps the released client shape, and a restart voids 
   assert.equal(f.document.body.dataset.integrated, 'true');
   assert.equal(f.frame.hidden, false);
 
-  // After that shell, another announcement is a new document. Neither the old
-  // confirmation nor the old answer applies to it.
+  // A reload after that shell, announced by the child, is a new document.
+  // Neither the old confirmation nor the old answer applies to it.
+  f.loaded();
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   const restarted = await f.ackShell();
   assert.ok(restarted.revision > shell.revision);
@@ -683,6 +687,29 @@ test('a page configuration keeps the released client shape, and a restart voids 
   await flush();
   assert.equal(f.document.body.dataset.integrated, 'false');
   assert.equal(f.frame.hidden, true);
+});
+
+test('a slow-starting shell that announces itself twice keeps the confirmed workspace', async () => {
+  const f = await fixture();
+  f.loaded();
+  // The released client queues the shell while its store opens: it applies the
+  // shell and acknowledges it, then announces itself a second time. Both
+  // announcements belong to the same document.
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackConnection();
+  const shell = await f.ackShell();
+  assert.equal(f.document.body.dataset.integrated, 'true');
+  assert.equal(f.frame.hidden, false);
+  const configs = f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-config').length;
+
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await flush();
+  assert.equal(f.document.body.dataset.integrated, 'true');
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.last('sub2api:image-studio-shell-config').revision, shell.revision, 'the shell is not replaced');
+  assert.equal(f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-config').length, configs,
+    'the repeated announcement asks for no configuration');
 });
 
 test('a Studio shell restart after a failed switch asks the new document for its shell', async () => {
@@ -697,6 +724,7 @@ test('a Studio shell restart after a failed switch asks the new document for its
   assert.equal(f.frame.hidden, false);
   assert.equal(f.retry.hidden, false);
 
+  f.loaded();
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   const restarted = f.last('sub2api:image-studio-shell-config');
   assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
@@ -712,6 +740,7 @@ test('a Studio settings save from before the shell restarted cannot close the di
   await f.integrate();
   f.customButton.onclick();
   const finishSave = f.settings.at(-1).beginSave();
+  f.loaded();
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   await f.ackShell();
   finishSave(true);

@@ -60,10 +60,13 @@ export function requestRounds() {
 //   beginRead(kind)      the surface the child is showing, plus a serial per
 //                        kind so only the latest read of that kind applies.
 //   beginChild(key)      an answer owed to one document about one connection
-//                        (a task grant restore). It ends with that document,
-//                        with a newer answer for the same connection, or with
-//                        an authorization the page accepted for it. A retry,
-//                        poll or acknowledgement elsewhere does not end it.
+//                        (a task grant restore). It ends with that document or
+//                        with a newer connection attempt; an answer for the
+//                        same connection supersedes it as well. A confirmation
+//                        of no new attempt does not end it, so a result for the
+//                        connection the page is settling still applies. Once
+//                        the page has started another round, the result may
+//                        not change what that round establishes.
 //   captureConnection()  a configuration the child accepted: ends with the
 //                        connection generation or the document showing it.
 //   beginView()          a request the page itself makes on the child's
@@ -98,7 +101,7 @@ export function connectionRounds() {
   function beginChild(key) {
     const revision = (keys.get(key) || 0) + 1;
     keys.set(key, revision);
-    return { scope: "child", document, key, revision };
+    return { scope: "child", document, round: rounds.current, key, revision };
   }
   function renew(key) {
     keys.set(key, (keys.get(key) || 0) + 1);
@@ -113,7 +116,8 @@ export function connectionRounds() {
   function isCurrent(started) {
     if (!started) return false;
     if (started.scope === "child") {
-      return started.document === document && keys.get(started.key) === started.revision;
+      return started.document === document && started.round === rounds.current &&
+        keys.get(started.key) === started.revision;
     }
     if (started.scope === "connection") {
       return started.generation === rounds.generation && started.document === document;

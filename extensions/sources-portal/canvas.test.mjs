@@ -360,7 +360,7 @@ test('the first load of the Canvas frame is not a reload', async () => {
   assert.equal(f.frame.hidden, false);
 });
 
-test('a Canvas restore remains an answer to its document across another group acknowledgement', async () => {
+test('a Canvas restore from before another group was confirmed cannot change the connection', async () => {
   const restore = Promise.withResolvers();
   const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only
     ? restore.promise.then((result) => result ?? { ok: true, status: 200, data: config(options.body.group_id) })
@@ -375,15 +375,60 @@ test('a Canvas restore remains an answer to its document across another group ac
   f.select.value = String(alternate);
   await f.select.onchange();
   await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  // The page moved on: the old answer must not hand the old connection to the
+  // child or change what the page shows.
+  const posted = f.canvasMessages.length;
   restore.resolve();
   await flush();
-
-  const restored = f.last('sub2api:media-studio-config').payload;
-  assert.equal(restored.requestId, requestId);
-  assert.equal(restored.selectedConnectionId, connectionId);
-  assert.equal(restored.selectActive, false);
+  assert.equal(f.canvasMessages.length, posted);
+  assert.equal(f.canvasMessages.some((item) => item.type === 'sub2api:media-studio-config' &&
+    item.payload.requestId === requestId), false);
   assert.equal(f.document.body.dataset.state, 'ready');
   assert.equal(f.frame.hidden, false);
+  assert.equal(f.select.value, String(alternate));
+});
+
+test('a Canvas restore conflict from before another group was confirmed is discarded', async () => {
+  const restore = Promise.withResolvers();
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only
+    ? restore.promise : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.host(); f.loaded(); await f.ack();
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId: `group-${CUSTOM_ID}`,
+    requestId: '00000000-0000-4000-8000-000000000040' });
+  await flush();
+  f.select.value = '27';
+  await f.select.onchange();
+  await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+
+  restore.resolve({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } });
+  await flush();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.last('sub2api:canvas-restore-error'), undefined);
+  assert.notEqual(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+});
+
+test('a Canvas restore 401 from before another group was confirmed cannot lock the page', async () => {
+  const restore = Promise.withResolvers();
+  const f = await fixture({ custom: 'configured', standalone: true, useSessionTransport: true,
+    connection: (options, config) => options.body.restore_only
+      ? restore.promise : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.loaded(); await f.ack();
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId: `group-${CUSTOM_ID}`,
+    requestId: '00000000-0000-4000-8000-000000000041' });
+  await flush();
+  f.select.value = '27';
+  await f.select.onchange();
+  await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+
+  restore.resolve({ ok: false, status: 401, data: { error: 'admin_login_required' } });
+  await flush();
+  assert.equal(f.locked, false);
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.document.body.dataset.state, 'ready');
 });
 
 test('Canvas keeps the resave action usable before and after a different group authorization times out', async () => {
