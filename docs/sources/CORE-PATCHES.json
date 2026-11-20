@@ -707,6 +707,14 @@
       "reason": "Verifies a parseable Chat SSE validation error frame after a queue heartbeat and verifies that local 400 responses, cancellations and deadlines at account slot acquisition create no advanced scheduler account samples."
     },
     {
+      "path": "backend/internal/handler/deepseek_chat_transport_failover_test.go",
+      "features": [
+        "deepseek_chat_transport_safety"
+      ],
+      "sha256": "83115bf5f4186a334ce0f3480d65c411df8d381392bca372165add6ee9a13f48",
+      "reason": "Exercises streaming and non-streaming DeepSeek Chat requests through two simulated accounts. A disconnect after reading the whole request stops failover, records the selected account failure and leaves usage and billing untouched. Failures before connection keep failover and ordinary billing."
+    },
+    {
       "path": "backend/internal/handler/dto/deepseek_tools_test.go",
       "features": [
         "deepseek_builtin_tools",
@@ -2964,10 +2972,11 @@
     {
       "path": "backend/internal/service/openai_gateway_cc_pipeline.go",
       "features": [
+        "deepseek_chat_transport_safety",
         "deepseek_tool_compat"
       ],
-      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point.",
-      "sha256": "ed7b6dfd7be5f3b4ab129f752f5ec22f93a0b97407c151467515cec40a766d80"
+      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point. For DeepSeek groups with tools off, a Chat transport error permits failover only when the first request is known to have failed before obtaining a connection.",
+      "sha256": "69de97f9e6b0c071b9c9b6f18301743e5de2fed847645a54302cf5cd68fd98af"
     },
     {
       "path": "backend/internal/service/openai_gateway_chat_completions.go",

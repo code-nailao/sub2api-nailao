@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
@@ -198,7 +201,7 @@ func (s *OpenAIGatewayService) resolveCCFallbackTarget(account *Account) (apiKey
 // sendCCUpstreamRequest 构建并发送 CC 上游请求：分离的上游 context、OpenAI HTTP
 // profile、标准头（含流式 Accept 切换）、客户端 header 白名单透传、自定义 UA 与
 // 账号级 header 覆写，最后经代理发出。传输层失败（DNS/TCP/TLS，无 HTTP 响应）
-// 统一由 handleOpenAIUpstreamTransportError 归一为 failover。
+// 统一交给 handleOpenAIUpstreamTransportError 处理。
 //
 // userAgent 为空时保留默认 UA；Grok 的默认 UA 兜底由调用方解析后传入。
 func (s *OpenAIGatewayService) sendCCUpstreamRequest(
@@ -269,11 +272,44 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
 	}
+	group := apiKeyGroup(getAPIKeyFromContext(c))
+	requireUnsent := account.Platform == PlatformDeepseek && group != nil &&
+		group.Platform == PlatformDeepseek && !group.DeepSeekTools.Enabled
+	var connectionRequested, connectionAcquired atomic.Bool
+	if requireUnsent {
+		// A missing HTTP status doesn't say whether the peer read the request.
+		// Only a failed connection acquisition proves nothing was sent.
+		trace := &httptrace.ClientTrace{
+			GetConn: func(string) { connectionRequested.Store(true) },
+			GotConn: func(httptrace.GotConnInfo) { connectionAcquired.Store(true) },
+		}
+		upstreamReq = upstreamReq.WithContext(httptrace.WithClientTrace(upstreamReq.Context(), trace))
+	}
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 	if err != nil {
-		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+		transportErr := s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+		if failoverErr, ok := transportErr.(*UpstreamFailoverError); ok && requireUnsent &&
+			!ccTransportFailedBeforeConnection(err, connectionRequested.Load(), connectionAcquired.Load()) {
+			failoverErr.NextAccountAction = NextAccountStop
+		}
+		return nil, transportErr
 	}
 	return resp, nil
+}
+
+func ccTransportFailedBeforeConnection(err error, requested, acquired bool) bool {
+	if acquired {
+		return false
+	}
+	if requested {
+		return true
+	}
+	// DNS validation can fail outside http.Transport before it starts tracing.
+	// Opaque errors without either a trace or a typed connection error don't
+	// prove that the request was unsent.
+	var dnsErr *net.DNSError
+	var opErr *net.OpError
+	return errors.As(err, &dnsErr) || (errors.As(err, &opErr) && opErr.Op == "dial")
 }
 
 // ccStreamScanState 是 scanCCStream 返回的读取状态快照。
