@@ -131,3 +131,5 @@ Portal 用同一个工具发布：`deploy.py portal <镜像>`，代码在 `deplo
 **固定结构。** 两个槽位 A、B 轮流使用，容器名为 `<前缀>-{a,b}`，每个槽位的本机端口在 `portal.json` 中固定；Nginx 只引用固定的 `upstream sources_portal`，切流时只重写这个 upstream 文件（与 Main 相同的“写入、`nginx -t`、失败恢复原文件、成功 reload”顺序）。首次接入用 `portal-adopt` 记录运行中的容器（槽位 `legacy`，工具从不删除它）。交接后任何失败都按“停新容器（它持有锁）→ 启动旧容器并等 `/health` → 如已切流则切回”回退；回退本身失败时报告 `FAILED AND NOT RESTORED` 并保留 `in_progress`。`portal-rollback` 用同样的流程切回上一容器，但较旧的 Portal 可能拒绝较新版本写下的状态，此时自动回到当前版本。
 
 Portal 和 Main 共用一把发布锁（`portal.json` 与 `main.json` 的 `lock_file` 是同一个文件），两者的发布不会重叠。
+
+**切流后的检查与状态。** Nginx reload 返回时旧 worker 可能仍在接受连接。Portal 在切流阶段先等公网健康返回 200，再开始完整守护时长与失败计数；等待复用 `ready_timeout`，期间新容器停止、重启、被 OOM 终止或等待超时，均按原流程回退。`portal-status` 在发布进行中把 `current`、`previous` 标为本次发布之前的记录，并在独立的 `target` 项展示目标容器的实时状态，守护阶段可直接查看正在服务的目标；已停止的容器不显示过期的健康状态。

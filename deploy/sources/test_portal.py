@@ -610,6 +610,71 @@ class PortalTest(unittest.TestCase):
         self.deploy()
         self.assertEqual("a", self.state()["current"]["slot"])
 
+    def test_reload_transient_public_failures_precede_the_guard(self):
+        checks = []
+        pending = [502, 0, 200]
+        probe = self.ops.http_json
+
+        def public_health(url, *args, **kw):
+            result = probe(url, *args, **kw)
+            if url == PUBLIC:
+                if self.ops.switched and pending:
+                    result = (pending.pop(0), None)
+                step = (self.state().get("in_progress") or {}).get("step")
+                checks.append((step, result[0], self.ops.clock))
+            return result
+
+        with mock.patch.object(self.ops, "http_json", side_effect=public_health):
+            self.deploy()
+
+        self.assertFalse(pending, "wait for a successful public check after reload")
+        guarded = [check for check in checks if check[0] == "guard"]
+        self.assertTrue(guarded)
+        self.assertTrue(all(status == 200 for _, status, _ in guarded), checks)
+        self.assertGreaterEqual(guarded[-1][2] - guarded[0][2], self.cfg.guard_seconds)
+        self.assertEqual("ok", self.history()[-1]["result"])
+
+    def test_public_health_never_recovers_after_reload_restores_old(self):
+        self.cfg.ready_timeout = 2
+        self.ops.public_status_after_reload = 502
+        with self.assertRaises(deploy.DeployError) as ctx:
+            self.deploy()
+        self.assertNotIsInstance(ctx.exception, deploy.FallbackFailed)
+        self.assertIn("public health did not return 200 after reload", str(ctx.exception))
+        self.assertIn("last status 502", str(ctx.exception))
+        self.assertTrue(self.running(OLD))
+        self.assertFalse(self.running(NEW_A))
+        self.assertEqual(portal.render_upstream("sources_portal", PORT_OLD), self.upstream())
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertNotIn("guard", [step["step"] for step in self.history()[-1]["steps"]])
+
+    def test_container_failure_while_waiting_for_public_health_restores_old(self):
+        failures = {
+            "stopped or restarted": {"RestartCount": 1},
+            "stopped": {"State": {"Running": False, "Status": "exited"}},
+            "restarted": {"State": {"StartedAt": "restarted"}},
+            "OOM-killed": {"State": {"OOMKilled": True}},
+        }
+        for reason, change in failures.items():
+            with self.subTest(reason):
+                self.fresh()
+                self.ops.public_status_after_reload = 502
+
+                def fail(change=change):
+                    container = self.ops.containers[NEW_A]
+                    container["State"].update(change.get("State", {}))
+                    container.update({key: value for key, value in change.items() if key != "State"})
+
+                self.ops.on_reload.append(lambda: self.ops.at_clock.append((self.ops.clock + 0.5, fail)))
+                with self.assertRaises(deploy.DeployError) as ctx:
+                    self.deploy()
+                self.assertNotIsInstance(ctx.exception, deploy.FallbackFailed)
+                self.assertIn(reason, str(ctx.exception))
+                self.assertIn("while waiting for public health", str(ctx.exception))
+                self.assertTrue(self.running(OLD))
+                self.assertFalse(self.running(NEW_A))
+                self.assertIsNone(self.state()["in_progress"])
+
     def test_fallback_failure_keeps_in_progress(self):
         self.ops.unhealthy_ports = {PORT_A}
         self.ops.crash_on_start = {OLD}
@@ -690,6 +755,23 @@ class PortalTest(unittest.TestCase):
         self.assertEqual((OLD, NEW_A), (state["current"]["container"], state["previous"]["container"]))
         self.assertEqual("ok", self.history()[-1]["result"])
 
+    def test_rollback_waits_for_public_health_before_the_guard(self):
+        self.deploy()
+        self.ops.local_images.add("old@sha256:1")
+        self.ops.public_status_after_reload = 502
+        self.ops.on_reload.append(lambda: self.ops.at_clock.append(
+            (self.ops.clock + 0.5, lambda: setattr(self.ops, "public_status", 200))))
+        guard = portal.PortalDeployer.guard_portal
+
+        def guarded(deployer, new):
+            self.assertEqual(200, self.ops.public_status)
+            guard(deployer, new)
+
+        with mock.patch.object(portal.PortalDeployer, "guard_portal", new=guarded):
+            self.deployer().rollback_portal()
+        self.assertEqual(OLD, self.state()["current"]["container"])
+        self.assertEqual("ok", self.history()[-1]["result"])
+
     def test_rollback_failure_keeps_current(self):
         self.deploy()
         self.ops.local_images.add("old@sha256:1")
@@ -740,6 +822,8 @@ class PortalTest(unittest.TestCase):
         self.assertEqual(state_before, Path(self.cfg.state_file).read_bytes())
         self.assertEqual([], self.history())
         self.assertTrue(any("DRY-RUN guard" in line for line in self.ops.logs))
+        self.assertTrue(any("DRY-RUN wait" in line for line in self.ops.logs))
+        self.assertEqual(1, self.ops.public_requests, "only the preflight sends a public request")
 
     def test_dry_run_rollback_prints_the_plan(self):
         self.deploy()
@@ -764,6 +848,55 @@ class PortalTest(unittest.TestCase):
         self.assertEqual((NEW_A, "running", 0), (report["current"]["container"], report["current"]["status"],
                                                   report["current"]["restarts"]))
         self.assertEqual((OLD, "exited"), (report["previous"]["container"], report["previous"]["status"]))
+        self.assertNotIn("target", report)
+        self.assertNotIn("label", report["current"])
+        self.assertNotIn("label", report["previous"])
+
+    def test_status_omits_health_for_stopped_containers(self):
+        self.deploy()
+        self.ops.containers[OLD]["State"]["Health"] = {"Status": "unhealthy"}
+        self.ops.containers[NEW_A]["State"]["Health"] = {"Status": "healthy"}
+        report = portal.status(self.cfg, self.ops)
+        self.assertNotIn("health", report["previous"])
+        self.assertEqual("healthy", report["current"]["health"])
+
+    def test_status_during_guard_labels_history_and_lists_live_target(self):
+        self.deploy()
+        self.ops.containers[OLD]["State"]["Health"] = {"Status": "unhealthy"}
+        self.ops.containers[NEW_A]["State"]["Health"] = {"Status": "unhealthy"}
+        self.ops.on_reload.append(
+            lambda: self.ops.containers[NEW_B]["State"].update(Health={"Status": "healthy"}))
+        reports = []
+        guard = portal.PortalDeployer.guard_portal
+
+        def guarded(deployer, new):
+            reports.append(portal.status(self.cfg, self.ops))
+            guard(deployer, new)
+
+        with mock.patch.object(portal.PortalDeployer, "guard_portal", new=guarded):
+            self.deploy()
+
+        report, = reports
+        self.assertEqual("guard", report["in_progress"]["step"])
+        self.assertEqual("current before this release", report["current"]["label"])
+        self.assertEqual("previous before this release", report["previous"]["label"])
+        self.assertEqual((NEW_A, "exited"), (report["current"]["container"], report["current"]["status"]))
+        self.assertEqual((OLD, "exited"), (report["previous"]["container"], report["previous"]["status"]))
+        self.assertEqual((NEW_B, "running", "healthy"),
+                         (report["target"]["container"], report["target"]["status"], report["target"]["health"]))
+        self.assertNotIn("health", report["current"])
+        self.assertNotIn("health", report["previous"])
+        self.assertNotIn("label", self.state()["current"])
+        self.assertNotIn("label", self.state()["previous"])
+
+    def test_status_lists_a_missing_target_without_health(self):
+        target = self.cfg.view("a", "new@sha256:2")
+        self.deployer()._mark(self.state(), target, "create")
+        report = portal.status(self.cfg, self.ops)
+        self.assertIsNone(report["previous"])
+        self.assertEqual("current before this release", report["current"]["label"])
+        self.assertEqual((NEW_A, "missing"), (report["target"]["container"], report["target"]["status"]))
+        self.assertNotIn("health", report["target"])
 
     # config --------------------------------------------------------------------------
     def test_config_validation(self):

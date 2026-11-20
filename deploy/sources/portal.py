@@ -316,6 +316,32 @@ class PortalDeployer(deploy.Deployer):
         raise DeployError(f"{name} did not answer /health with 200 on port {port} within {int(timeout)}s "
                           f"(last status {last})")
 
+    def wait_public_healthy(self, new: dict[str, Any]) -> None:
+        """Let the reloaded workers take over before starting guard counters."""
+        if self.ops.dry_run:
+            self.log(f"DRY-RUN wait up to {self.cfg.ready_timeout}s for public health 200 after reload")
+            return
+        self.log("   waiting for public health 200 after reload before starting the guard")
+        initial = self.ops.inspect(new["container"]) or {}
+        started = (initial.get("State") or {}).get("StartedAt")
+        restarts = initial.get("RestartCount", 0)
+        deadline = self.ops.monotonic() + self.cfg.ready_timeout
+        last = 0
+        while (remaining := deadline - self.ops.monotonic()) > 0:
+            info = self.ops.inspect(new["container"]) or {}
+            state = info.get("State") or {}
+            if not state.get("Running") or state.get("Restarting") or state.get("StartedAt") != started \
+                    or info.get("RestartCount", 0) != restarts:
+                raise DeployError("new Portal stopped or restarted while waiting for public health after reload")
+            if state.get("OOMKilled"):
+                raise DeployError("new Portal was OOM-killed while waiting for public health after reload")
+            last, _ = self.ops.http_json(self.cfg.public_health_url, timeout=min(10, remaining))
+            if last == 200:
+                return
+            self.ops.sleep(min(POLL, remaining))
+        raise DeployError(f"public health did not return 200 after reload within {self.cfg.ready_timeout}s "
+                          f"(last status {last})")
+
     def upstream_text(self) -> str | None:
         try:
             return self.ops.read_text(self.cfg.upstream_file)
@@ -422,6 +448,7 @@ class PortalDeployer(deploy.Deployer):
             with self.step("switch"):
                 self.install(new["port"])
                 self.ops.run(["docker", "update", "--restart=unless-stopped", new["container"]], mutate=True)
+                self.wait_public_healthy(new)
             if self.ops.dry_run:
                 self.log(f"DRY-RUN guard {self.cfg.guard_seconds}s: {new['container']} running, /health 200, "
                          "public health, Nginx connect errors")
@@ -621,17 +648,26 @@ class PortalDeployer(deploy.Deployer):
 
 def status(cfg: PortalConfig, ops: deploy.Ops) -> dict[str, Any]:
     state = load_state(cfg)
-    report: dict[str, Any] = {"in_progress": state.get("in_progress")}
-    for key in ("current", "previous"):
-        view = state.get(key)
+    in_progress = state.get("in_progress")
+    report: dict[str, Any] = {"in_progress": in_progress}
+
+    def describe(view: dict[str, Any] | None) -> dict[str, Any] | None:
         if not view:
-            report[key] = None
-            continue
+            return None
         info = ops.inspect(view["container"])
         s = (info or {}).get("State") or {}
-        report[key] = {**view, "status": s.get("Status", "missing"),
-                       "health": (s.get("Health") or {}).get("Status"),
-                       "restarts": (info or {}).get("RestartCount")}
+        entry = {**view, "status": s.get("Status", "missing"),
+                 "restarts": (info or {}).get("RestartCount")}
+        if s.get("Running"):
+            entry["health"] = (s.get("Health") or {}).get("Status")
+        return entry
+
+    for key in ("current", "previous"):
+        report[key] = describe(state.get(key))
+        if in_progress and report[key] is not None:
+            report[key]["label"] = f"{key} before this release"
+    if in_progress:
+        report["target"] = describe(in_progress.get("target"))
     return report
 
 
