@@ -172,6 +172,9 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusRequestTimeout && responsesSubmissionHasSearchTool(patchedBody) {
+		return stopPaidSubmissionAfterTimeout(c)
+	}
 	if resp.StatusCode >= 400 {
 		respBody := s.readUpstreamErrorBody(resp)
 		resp.Body = io.NopCloser(bytes.NewReader(respBody))

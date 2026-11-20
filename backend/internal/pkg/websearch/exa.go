@@ -81,6 +81,9 @@ func (e *ExaProvider) Search(ctx context.Context, req SearchRequest) (*SearchRes
 		return nil, fmt.Errorf("exa: request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusRequestTimeout {
+		return nil, searchSubmissionTimeout("exa")
+	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {

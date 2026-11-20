@@ -19,6 +19,48 @@ import (
 	"go.uber.org/zap"
 )
 
+// responsesSubmissionHasSearchTool looks only at tool declarations that can
+// request a hosted search. Search items replayed as history are not submissions.
+func responsesSubmissionHasSearchTool(body []byte) bool {
+	if gjson.GetBytes(body, "tool_choice").String() == "none" {
+		return false
+	}
+	containsSearch := func(tools gjson.Result) bool {
+		if !tools.IsArray() {
+			return false
+		}
+		for _, tool := range tools.Array() {
+			typ := tool.Get("type").String()
+			if isOpenAIWebSearchToolType(typ) || typ == "x_search" {
+				return true
+			}
+		}
+		return false
+	}
+	if containsSearch(gjson.GetBytes(body, "tools")) {
+		return true
+	}
+	for _, item := range gjson.GetBytes(body, "input").Array() {
+		if item.Get("type").String() == openAIAdditionalToolsItemType && containsSearch(item.Get("tools")) {
+			return true
+		}
+	}
+	return false
+}
+
+// The upstream may have accepted a paid submission before returning HTTP 408.
+// A terminal response prevents both the account scheduler and SDKs from replaying it.
+func stopPaidSubmissionAfterTimeout(c *gin.Context) (*OpenAIForwardResult, error) {
+	const message = "The upstream timed out and the result is unknown. The request was not retried."
+	setOpsUpstreamError(c, http.StatusRequestTimeout, message, "")
+	c.Header("x-should-retry", "false")
+	MarkResponseCommitted(c)
+	c.JSON(http.StatusRequestTimeout, gin.H{"error": gin.H{
+		"type": "upstream_error", "code": "request_timeout", "message": message,
+	}})
+	return nil, fmt.Errorf("upstream submission outcome unknown: HTTP %d", http.StatusRequestTimeout)
+}
+
 func logOpenAIInstructionsRequiredDebug(
 	ctx context.Context,
 	c *gin.Context,

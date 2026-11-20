@@ -109,6 +109,9 @@ func (m *Manager) SearchWithBestProvider(ctx context.Context, req SearchRequest)
 			if incremented {
 				m.rollbackQuota(ctx, cfg)
 			}
+			if errors.Is(err, ErrSearchOutcomeUnknown) {
+				return nil, "", err
+			}
 			if isProxyError(err) {
 				m.markProxyUnavailable(ctx, cfg, req.ProxyURL)
 				if req.ProxyURL != "" {

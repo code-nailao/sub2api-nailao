@@ -1134,6 +1134,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 
 		// Handle error response
+		if resp.StatusCode == http.StatusRequestTimeout && !imageIntent && responsesSubmissionHasSearchTool(body) {
+			_ = resp.Body.Close()
+			return stopPaidSubmissionAfterTimeout(c)
+		}
 		if resp.StatusCode >= 400 {
 			respBody := s.readUpstreamErrorBody(resp)
 			_ = resp.Body.Close()

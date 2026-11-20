@@ -1144,12 +1144,21 @@
       "reason": "Tests distinct mixed-case metadata keys and rejects repeated keys including equivalent JSON spellings."
     },
     {
-      "path": "backend/internal/pkg/websearch/exa.go",
-      "sha256": "ac4c0163c9f83055259dd351ce59a3fba55d1923d71aa995c5b945be46e46d55",
+      "path": "backend/internal/pkg/websearch/brave.go",
       "features": [
-        "web_search_credential_scope"
+        "paid_submission_no_replay"
       ],
-      "reason": "Restricts the provider client to same-origin redirects so the API key is sent only to the request origin."
+      "sha256": "42fc344c29bb7e22cc869f92d8910a5e7252ba71532d91c6a1d31aa5b8fbe511",
+      "reason": "Treats a Brave HTTP 408 as an unknown search outcome before reading the response body."
+    },
+    {
+      "path": "backend/internal/pkg/websearch/exa.go",
+      "sha256": "31d8c9f7fe73c2923cb04786febc06622fa5280efda68f25e344ed768484bac9",
+      "features": [
+        "web_search_credential_scope",
+        "paid_submission_no_replay"
+      ],
+      "reason": "Restricts the provider client to same-origin redirects so the API key is sent only to the request origin. Treats an Exa HTTP 408 as an unknown search outcome before reading the response body."
     },
     {
       "path": "backend/internal/pkg/websearch/exa_test.go",
@@ -1158,6 +1167,38 @@
         "web_search_credential_scope"
       ],
       "reason": "Uses a fake transport to check that the provider blocks cross-origin sends and can follow an equivalent same-origin HTTPS redirect."
+    },
+    {
+      "path": "backend/internal/pkg/websearch/helpers.go",
+      "features": [
+        "paid_submission_no_replay"
+      ],
+      "sha256": "ec5cb6486b4956977333fef4995eaa3524e46012a2fdda78b2b2c07b172b3aaa",
+      "reason": "Defines the unknown outcome used to stop search provider failover after HTTP 408."
+    },
+    {
+      "path": "backend/internal/pkg/websearch/manager.go",
+      "features": [
+        "paid_submission_no_replay"
+      ],
+      "sha256": "581950adc3cdf7960d40ec074f2e49d5002a96b042f7a1d4a71e962e8bbb2af4",
+      "reason": "Stops provider selection when a submitted search gets HTTP 408 because the result may be unknown."
+    },
+    {
+      "path": "backend/internal/pkg/websearch/manager_test.go",
+      "features": [
+        "paid_submission_no_replay"
+      ],
+      "sha256": "1f7a44d99773450aeb9fabdcb77ef628eeb7de9d2e7daafda9fc1a8bee1a5958",
+      "reason": "Verifies an HTTP 408 from each search provider prevents a second upstream search."
+    },
+    {
+      "path": "backend/internal/pkg/websearch/tavily.go",
+      "features": [
+        "paid_submission_no_replay"
+      ],
+      "sha256": "635891eff4fd9ab18d4aa32c99f22aca54a05e65cca9407e2830f181e5496d62",
+      "reason": "Treats a Tavily HTTP 408 as an unknown search outcome before reading the response body."
     },
     {
       "path": "backend/internal/processrole/admission.go",
@@ -1719,12 +1760,12 @@
     },
     {
       "path": "backend/internal/repository/sources_oauth_rotation_integration_test.go",
-      "sha256": "51ed33f07c8a55b856a74efbe0ac24b2ed8171f6d67dc5db3ecdf87a2c469c0d",
+      "sha256": "4b755c311517b24692740c244996d4d2a96a205f8690248741cc4abba06ade91",
       "features": [
         "release_handoff_p1",
         "openai_manual_oauth_rotation"
       ],
-      "reason": "Verifies with a disposable database that conditional OpenAI credential persistence keeps a newer durable rotation when an older snapshot tries to save. Verifies conditional writes use the same transaction as the scoped account lock and are rolled back with the transaction."
+      "reason": "Verifies with a disposable database that conditional OpenAI credential persistence keeps a newer durable rotation when an older snapshot tries to save. Verifies conditional writes use the same transaction as the scoped account lock and are rolled back with the transaction. Verifies that rotated credentials survive request cancellation between the conditional update and the scoped refresh commit."
     },
     {
       "path": "backend/internal/repository/sources_serving_startup.go",
@@ -2567,6 +2608,14 @@
       "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services."
     },
     {
+      "path": "backend/internal/service/custom_admin_key_accounts.go",
+      "features": [
+        "openai_manual_oauth_rotation"
+      ],
+      "sha256": "aa2a5ff76a136f47b51d5c91002a1dfc20368facda93bd7420e4cfde27702c31",
+      "reason": "Uses a bounded transaction independent of HTTP cancellation for an authorized scoped OAuth refresh so a completed rotation can commit."
+    },
+    {
       "path": "backend/internal/service/custom_admin_key_recovery_review_test.go",
       "features": [
         "upstream_022_request_speed_data"
@@ -2888,10 +2937,11 @@
       "path": "backend/internal/service/grok_media.go",
       "features": [
         "grok_content_rejection_billing",
-        "upstream_022_request_speed_root_upstream_integration"
+        "upstream_022_request_speed_root_upstream_integration",
+        "paid_submission_no_replay"
       ],
-      "sha256": "4c494b308dcc5cab56c6c2d0775c8f8e63eb6da87154a8d9fa3d8f8795407a3c",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour."
+      "sha256": "90b1d544b497379ecc599ee53502738a58cde660ff84b1b298358ac97784d8f0",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Prevents scheduling another account after an HTTP 408 for a Grok media generation or edit submission."
     },
     {
       "path": "backend/internal/service/grok_media_rejection.go",
@@ -3109,16 +3159,17 @@
         "deepseek_in_chat_tool_types",
         "paid_submission_no_replay"
       ],
-      "sha256": "44da19f79e0ea3e236ea0773e9047fb7cb59e7c12144e246b5fcdbbdc47f0232",
-      "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook. Returns a terminal non-retryable 408 when a Responses image submission may already have been accepted. Handles HTTP 408 from the hosted DeepSeek loop at the gateway boundary so the Chat filtering implementation can stay aligned with main."
+      "sha256": "627f7dc9c303fece7ea903810e818edeec880c21887498ba0612e5d7c86b154f",
+      "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook. Returns a terminal non-retryable 408 when a Responses image submission may already have been accepted. Handles HTTP 408 from the hosted DeepSeek loop at the gateway boundary so the Chat filtering implementation can stay aligned with main. Stops Responses requests with hosted search tools after HTTP 408 and marks the outcome as unknown."
     },
     {
       "path": "backend/internal/service/openai_gateway_grok.go",
       "features": [
-        "grok_content_rejection_billing"
+        "grok_content_rejection_billing",
+        "paid_submission_no_replay"
       ],
-      "sha256": "44be5fabee5daa51523c6a331fcb6164b9fc9f89acbc387424217a17d142afc2",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks."
+      "sha256": "ea353bc5dd4850017a11f8c6294c3095e26e41be97478104096325b511ac45e4",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Stops Grok Responses requests with hosted search tools after HTTP 408 without rotating accounts."
     },
     {
       "path": "backend/internal/service/openai_gateway_messages.go",
@@ -3147,8 +3198,8 @@
         "upstream_022_request_speed_root_upstream_integration",
         "paid_submission_no_replay"
       ],
-      "sha256": "5a792d1b805429dd3af304411294d4a67ff1056b7adc058cd2a6bb9269ae71ce",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Returns a terminal non-retryable 408 for image submissions forwarded in passthrough mode."
+      "sha256": "c0894e857ab2b4554da478bde9fc270e8d420d70642536cbf47114a22ee9a47b",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Returns a terminal non-retryable 408 for image submissions forwarded in passthrough mode. Preserves terminal HTTP 408 handling for paid hosted search in the Responses passthrough path."
     },
     {
       "path": "backend/internal/service/openai_gateway_record_usage_test.go",
@@ -3213,6 +3264,14 @@
       "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling."
     },
     {
+      "path": "backend/internal/service/openai_gateway_upstream_errors.go",
+      "features": [
+        "paid_submission_no_replay"
+      ],
+      "sha256": "3005c8695eb918230cdf6cfd9ccba14bab0164b95cfd4ebf3f42bfd22910c6dc",
+      "reason": "Recognizes hosted Responses search declarations and reports a terminal HTTP 408 for paid submissions with an unknown outcome."
+    },
+    {
       "path": "backend/internal/service/openai_gateway_usage.go",
       "features": [
         "group_service_tier_pricing",
@@ -3250,11 +3309,11 @@
     },
     {
       "path": "backend/internal/service/openai_images_test.go",
-      "sha256": "8aefef4d0d596c2caad88919db45dda42cd7f41f907b66dc419c776dbd42aeed",
+      "sha256": "7ce486018a9e8b91ec153ef654e9ab3db76951cfa403ff8ae3f89caffdaefdc1",
       "features": [
         "paid_submission_no_replay"
       ],
-      "reason": "Checks the terminal 408 response on API key, OAuth, Responses and passthrough image submissions including the upstream error fixtures."
+      "reason": "Checks the terminal 408 response on API key, OAuth, Responses and passthrough image submissions including the upstream error fixtures. Verifies that OpenAI and Grok hosted search and Grok image generation cannot replay after HTTP 408."
     },
     {
       "path": "backend/internal/service/openai_model_alias.go",
@@ -3369,8 +3428,8 @@
         "upstream_022_request_speed_gateway",
         "paid_submission_no_replay"
       ],
-      "sha256": "4fa10bd80a7ac3127564727fcbf02d2a59afad5d8d753144b2c09da4433524f7",
-      "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling. Prevents a WebSocket image turn that receives HTTP 408 from being replayed onto a replacement account."
+      "sha256": "6c33ea401e0371baf938c9df8c3c94224d512dcddc8986602a010e483a01418a",
+      "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling. Prevents a WebSocket image turn that receives HTTP 408 from being replayed onto a replacement account. Prevents the Responses HTTP bridge from switching accounts after a paid hosted search receives HTTP 408."
     },
     {
       "path": "backend/internal/service/openai_ws_http_bridge_resume_test.go",
@@ -3379,6 +3438,14 @@
         "paid_submission_no_replay"
       ],
       "reason": "Covers the single terminal error frame for an image submission that times out in the WebSocket HTTP bridge."
+    },
+    {
+      "path": "backend/internal/service/openai_ws_http_bridge_test.go",
+      "features": [
+        "paid_submission_no_replay"
+      ],
+      "sha256": "3984f8e1cb1ff29a4ae818d62005091cc5c204234eef37b42440e7bdd950c660",
+      "reason": "Verifies the Responses HTTP bridge does not replay a paid-search HTTP 408 and keeps existing text-only behavior."
     },
     {
       "path": "backend/internal/service/openai_ws_v2_passthrough_adapter.go",

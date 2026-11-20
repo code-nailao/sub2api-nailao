@@ -634,12 +634,12 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		if upstreamMsg == "" {
 			upstreamMsg = http.StatusText(resp.StatusCode)
 		}
-		// An image submission may already have been accepted before a 408.
-		timedOutImage := resp.StatusCode == http.StatusRequestTimeout &&
-			IsImageGenerationIntentForPlatform(openAIResponsesEndpoint, originalModel, body, account.Platform)
-		shouldFailover := !timedOutImage && s.shouldFailoverOpenAIUpstreamResponse(account, resp.StatusCode, upstreamMsg, respBody)
+		// A paid tool submission may already have been accepted before a 408.
+		timedOutSubmission := resp.StatusCode == http.StatusRequestTimeout &&
+			(IsImageGenerationIntentForPlatform(openAIResponsesEndpoint, originalModel, body, account.Platform) || responsesSubmissionHasSearchTool(body))
+		shouldFailover := !timedOutSubmission && s.shouldFailoverOpenAIUpstreamResponse(account, resp.StatusCode, upstreamMsg, respBody)
 		if account.Platform == PlatformGrok {
-			shouldFailover = !timedOutImage && s.shouldFailoverGrokUpstreamError(resp.StatusCode, respBody)
+			shouldFailover = !timedOutSubmission && s.shouldFailoverGrokUpstreamError(resp.StatusCode, respBody)
 			s.handleGrokAccountUpstreamError(withGrokTeamRateLimitModel(ctx, resolveGrokWSUpstreamModel(account, body, originalModel)), account, resp.StatusCode, resp.Header, respBody)
 			if shouldFailover && (turn == 1 || resp.StatusCode == http.StatusTooManyRequests) {
 				return nil, newOpenAIUpstreamFailoverError(resp.StatusCode, resp.Header, respBody, upstreamMsg, false)

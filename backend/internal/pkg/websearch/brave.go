@@ -63,6 +63,9 @@ func (b *BraveProvider) Search(ctx context.Context, req SearchRequest) (*SearchR
 		return nil, fmt.Errorf("brave: request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusRequestTimeout {
+		return nil, searchSubmissionTimeout("brave")
+	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {

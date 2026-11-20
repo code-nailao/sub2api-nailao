@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,6 +73,33 @@ func TestManager_SearchWithBestProvider_UsesFirstAvailable(t *testing.T) {
 	require.Equal(t, "brave", providerName)
 	require.Len(t, resp.Results, 1)
 	require.Equal(t, "from brave", resp.Results[0].Snippet)
+}
+
+func TestManagerDoesNotReplaySearchAfterHTTP408(t *testing.T) {
+	for _, first := range []string{"exa", "brave", "tavily"} {
+		t.Run(first, func(t *testing.T) {
+			backup := "brave"
+			if first == backup {
+				backup = "exa"
+			}
+			manager := NewManager([]ProviderConfig{{Type: first, APIKey: "fixture-first"}, {Type: backup, APIKey: "fixture-backup"}}, nil)
+			var calls []string
+			manager.clientCache[""] = &http.Client{Transport: exaRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls = append(calls, req.URL.Hostname())
+				if len(calls) == 1 {
+					return &http.Response{StatusCode: http.StatusRequestTimeout, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"message":"fixture timeout"}`))}, nil
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+			})}
+
+			result, _, err := manager.SearchWithBestProvider(t.Context(), SearchRequest{Query: "fixture"})
+
+			require.Len(t, calls, 1, "a 408 must not submit the same paid search to a second provider")
+			require.Nil(t, result)
+			require.ErrorIs(t, err, ErrSearchOutcomeUnknown)
+			require.ErrorContains(t, err, "408")
+		})
+	}
 }
 
 func TestManager_SearchWithBestProvider_NilRedis(t *testing.T) {

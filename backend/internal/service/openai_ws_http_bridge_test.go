@@ -828,9 +828,12 @@ func TestProxyOpenAIWSHTTPBridgeTurnHTTPStatusFailoverSafety(t *testing.T) {
 		status       int
 		wantFailover bool
 		wantWrites   int
+		webSearch    bool
 	}{
 		{name: "first_turn_401", turn: 1, status: http.StatusUnauthorized, wantFailover: true},
 		{name: "first_turn_429", turn: 1, status: http.StatusTooManyRequests, wantFailover: true},
+		{name: "first_turn_408_text_only", turn: 1, status: http.StatusRequestTimeout, wantFailover: true},
+		{name: "first_turn_408_paid_search", turn: 1, status: http.StatusRequestTimeout, wantWrites: 1, webSearch: true},
 		{name: "first_turn_500", turn: 1, status: http.StatusInternalServerError, wantFailover: true},
 		{name: "later_turn_500_does_not_replay", turn: 2, status: http.StatusInternalServerError, wantWrites: 1},
 	}
@@ -847,6 +850,9 @@ func TestProxyOpenAIWSHTTPBridgeTurnHTTPStatusFailoverSafety(t *testing.T) {
 			c, _ := gin.CreateTestContext(recorder)
 			c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 			payload := []byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`)
+			if tt.webSearch {
+				payload = []byte(`{"type":"response.create","model":"gpt-5","input":"hi","tools":[{"type":"web_search"}]}`)
+			}
 			var writes [][]byte
 
 			result, err := svc.proxyOpenAIWSHTTPBridgeTurn(

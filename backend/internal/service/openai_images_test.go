@@ -1002,6 +1002,47 @@ func TestOpenAIGatewayServiceForwardImages_OAuthUpstreamHTTPErrorSurfacesRealErr
 	require.Contains(t, gjson.Get(rec.Body.String(), "error.message").String(), "Invalid value for 'size'")
 }
 
+func TestPaidGatewaySubmission408IsTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name, platform, path, body string
+		passthrough                bool
+	}{
+		{"openai-responses-search", PlatformOpenAI, "/v1/responses", `{"model":"gpt-5","input":"fixture","tools":[{"type":"web_search"}]}`, false},
+		{"openai-passthrough-search", PlatformOpenAI, "/v1/responses", `{"model":"gpt-5","input":"fixture","tools":[{"type":"web_search_preview"}]}`, true},
+		{"grok-responses-search", PlatformGrok, "/v1/responses", `{"model":"grok-4.6","input":"fixture","tools":[{"type":"web_search"}]}`, false},
+		{"grok-images", PlatformGrok, "/v1/images/generations", `{"model":"grok-imagine-image","prompt":"fixture"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(tc.body)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			upstream := &httpUpstreamRecorder{resp: &http.Response{
+				StatusCode: http.StatusRequestTimeout,
+				Header:     http.Header{"Content-Type": {"application/json"}, "X-Should-Retry": {"true"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"fixture timeout"}}`)),
+			}}
+			svc := &OpenAIGatewayService{httpUpstream: upstream, cfg: &config.Config{}}
+			account := &Account{ID: 1, Platform: tc.platform, Type: AccountTypeAPIKey,
+				Credentials: map[string]any{"api_key": "fixture-key"}, Extra: map[string]any{"openai_passthrough": tc.passthrough}}
+			var result *OpenAIForwardResult
+			var err error
+			if tc.path == "/v1/responses" {
+				result, err = svc.Forward(c.Request.Context(), c, account, body)
+			} else {
+				result, err = svc.ForwardGrokMedia(c.Request.Context(), c, account, GrokMediaEndpointImagesGenerations, "", body, "application/json")
+			}
+			var failover *UpstreamFailoverError
+			require.NotErrorAs(t, err, &failover, "the account scheduler must not replay a paid submission with an unknown outcome")
+			require.Nil(t, result, "there is no confirmed work to bill")
+			require.Len(t, upstream.requests, 1)
+			require.Equal(t, http.StatusRequestTimeout, recorder.Code)
+			require.Equal(t, "false", recorder.Header().Get("X-Should-Retry"))
+		})
+	}
+}
+
 func TestOpenAIImageSubmissionTimeoutDoesNotFailOver(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, tc := range []struct {

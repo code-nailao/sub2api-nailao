@@ -8,6 +8,8 @@ import (
 	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/adminaccess"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/stretchr/testify/require"
 )
@@ -66,4 +68,72 @@ func TestOpenAIOAuthRotationUsesTheScopedTransaction(t *testing.T) {
 	current, err := repo.GetByID(t.Context(), account.ID)
 	require.NoError(t, err)
 	require.Equal(t, before, current.Credentials)
+}
+
+// Cancel the original HTTP request once PostgreSQL has accepted the CAS, but
+// before ScopedAdminWrite can commit the transaction.
+type cancelAfterOAuthCAS struct {
+	*accountRepository
+	cancel context.CancelFunc
+}
+
+func (r cancelAfterOAuthCAS) UpdateOpenAIOAuthCredentialsIfUnchanged(ctx context.Context, id int64, expected map[string]any, proxyID *int64, credentials map[string]any) (bool, error) {
+	applied, err := r.accountRepository.UpdateOpenAIOAuthCredentialsIfUnchanged(ctx, id, expected, proxyID, credentials)
+	if applied && err == nil {
+		r.cancel()
+	}
+	return applied, err
+}
+
+type scopedOAuthRotationClient struct {
+	service.OpenAIOAuthClient
+}
+
+func (scopedOAuthRotationClient) RefreshTokenWithClientID(context.Context, string, string, string) (*openai.TokenResponse, error) {
+	return &openai.TokenResponse{AccessToken: "fixture-next-access", RefreshToken: "fixture-next-refresh", ExpiresIn: 3600}, nil
+}
+
+func TestScopedOAuthRotationPersistsAfterHTTPContextCancellation(t *testing.T) {
+	repo := newAccountRepositoryWithSQL(integrationEntClient, integrationDB, nil)
+	account := &service.Account{
+		Name: "scoped-canceled-rotation-fixture", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth,
+		Status: service.StatusActive, Concurrency: 1,
+		Credentials: map[string]any{"access_token": "fixture-prior-access", "refresh_token": "fixture-prior-refresh"},
+	}
+	require.NoError(t, repo.Create(t.Context(), account))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, repo.Delete(ctx, account.ID))
+	})
+	principal := &adminaccess.Principal{Policy: adminaccess.Policy{Rules: []adminaccess.Rule{{
+		Permissions: []string{"accounts.refresh"}, AccountTypes: []string{service.AccountTypeOAuth},
+		Platforms: []string{service.PlatformOpenAI}, IncludeUngrouped: true,
+	}}}}
+	requestCtx, cancelRequest := context.WithCancel(adminaccess.WithPrincipal(t.Context(), principal))
+	defer cancelRequest()
+	admin := service.NewAdminService(nil, nil, nil, repo, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		integrationEntClient, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	scoped := admin.(service.ScopedAdminAccounts)
+	canceled, cancelBeforeRefresh := context.WithCancel(adminaccess.WithPrincipal(t.Context(), principal))
+	cancelBeforeRefresh()
+	_, err := scoped.ScopedAdminWrite(canceled, account.ID, "accounts.refresh", nil, func(context.Context, *service.Account) (*service.Account, error) {
+		t.Fatal("a request cancelled before the exchange must not call the OAuth provider")
+		return nil, nil
+	})
+	require.ErrorIs(t, err, context.Canceled)
+
+	refreshAPI := service.NewOAuthRefreshAPI(cancelAfterOAuthCAS{accountRepository: repo, cancel: cancelRequest}, nil)
+	oauth := service.ProvideOpenAIOAuthService(nil, scopedOAuthRotationClient{}, nil, refreshAPI)
+	t.Cleanup(oauth.Stop)
+
+	updated, resErr := scoped.ScopedAdminWrite(requestCtx, account.ID, "accounts.refresh", nil, oauth.RefreshStoredAccount)
+
+	require.ErrorIs(t, requestCtx.Err(), context.Canceled, "cancel only after the real conditional update succeeds")
+	durable, err := repo.GetByID(t.Context(), account.ID)
+	require.NoError(t, err)
+	require.Equal(t, "fixture-next-refresh", durable.GetOpenAIRefreshToken(), "cancelling HTTP must not roll back rotated credentials")
+	require.Equal(t, "fixture-next-access", durable.GetOpenAIAccessToken())
+	require.NoError(t, resErr)
+	require.Equal(t, durable.GetOpenAIRefreshToken(), updated.GetOpenAIRefreshToken())
 }

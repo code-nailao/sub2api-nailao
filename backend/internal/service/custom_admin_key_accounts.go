@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
@@ -15,6 +16,8 @@ import (
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 )
+
+const scopedAdminRefreshTransactionTimeout = 60 * time.Second
 
 // ScopedAdminAccounts 只提供受限管理密钥需要的窄接口。
 type ScopedAdminAccounts interface {
@@ -211,7 +214,20 @@ func (s *adminServiceImpl) ScopedAdminWrite(ctx context.Context, id int64, actio
 		}
 		return s.scopedAdminCreateTransaction(ctx, &CreateAccountInput{ProxyID: input.ProxyID, ProxyMode: proxyMode, Name: input.Name, Notes: input.Notes, Platform: input.Platform, Type: input.Type, Credentials: input.Credentials, Extra: input.Extra, RateMultiplier: input.RateMultiplier, GroupIDs: input.GroupIDs, Concurrency: input.Concurrency, Priority: input.Priority, LoadFactor: input.LoadFactor, ExpiresAt: input.ExpiresAt, AutoPauseOnExpired: input.AutoPause, SkipDefaultGroupBind: true})
 	}
-	result, err := s.scopedAdminTransaction(ctx, id, action == "accounts.delete", func(txctx context.Context) (*Account, error) {
+	transactionCtx := ctx
+	detachedRefresh := action == "accounts.refresh" && run != nil
+	if detachedRefresh {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// A refresh can consume a single-use token. The transaction that holds
+		// authorization and writes the replacement must be able to commit even
+		// if the caller disconnects after the exchange has started.
+		var cancel context.CancelFunc
+		transactionCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), scopedAdminRefreshTransactionTimeout)
+		defer cancel()
+	}
+	result, err := s.scopedAdminTransaction(transactionCtx, id, action == "accounts.delete", func(txctx context.Context) (*Account, error) {
 		a, e := s.accountRepo.GetByID(txctx, id)
 		if e != nil {
 			return nil, infraerrors.NotFound("SCOPED_ACCOUNT_NOT_FOUND", "账户不存在")
@@ -251,6 +267,13 @@ func (s *adminServiceImpl) ScopedAdminWrite(ctx context.Context, id int64, actio
 		}
 
 		if run != nil {
+			if detachedRefresh {
+				// Honor cancellation while waiting for the locks, before the
+				// irreversible exchange begins.
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			return run(txctx, a)
 		}
 		if action == "accounts.delete" {
