@@ -1,4 +1,5 @@
 import http.client
+import io
 import json
 import os
 import socketserver
@@ -126,6 +127,8 @@ class FakeOps(deploy.Ops):
             c = self.containers.get(args[-1])
             if c:
                 c["HostConfig"]["RestartPolicy"]["Name"] = args[2].split("=", 1)[1]
+        elif args[:3] == ["docker", "container", "ls"]:
+            out = "\n".join(self.containers)
         elif args[:3] == ["docker", "image", "inspect"]:
             rc = 0 if args[3] in self.local_images else 1
         elif args[1:] == ["-T"]:
@@ -633,6 +636,163 @@ class DeployTest(unittest.TestCase):
         self.assertTrue(self.ops.containers[old]["State"]["Running"])
         self.assertEqual("unless-stopped", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
         self.assertIsNone(self.state()["in_progress"])
+
+    def test_ctrl_c_during_recovery_wait_still_restores_background(self):
+        old = self.state()["current"]["containers"]["background"]
+        self.cfg.background_exit_timeout = 2
+        self.ops.drain_seconds[old] = 8
+        original_sleep = self.ops.sleep
+        interrupted = False
+
+        def sleep(seconds):
+            nonlocal interrupted
+            exit_at = self.ops.containers[old].get("draining_until")
+            if not interrupted and exit_at and exit_at - self.ops.clock < 5:
+                interrupted = True
+                raise KeyboardInterrupt
+            original_sleep(seconds)
+
+        with mock.patch.object(self.ops, "sleep", sleep):
+            try:
+                with self.assertRaisesRegex(deploy.BackgroundRestored, "is running again"):
+                    self.deploy()
+            except KeyboardInterrupt:
+                self.fail("Ctrl-C abandoned recovery before a background could start")
+        self.assertTrue(interrupted)
+        self.assertTrue(self.ops.containers[old]["State"]["Running"])
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_undelivered_term_restores_restart_policy_without_waiting(self):
+        old = self.state()["current"]["containers"]["background"]
+        self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"] = "always"
+        self.cfg.background_exit_timeout = 2
+        original_run = self.ops.run
+        original_sleep = self.ops.sleep
+        sent_at = None
+
+        def run(args, **kwargs):
+            nonlocal sent_at
+            if args == ["docker", "kill", "--signal=TERM", old]:
+                sent_at = self.ops.clock
+                self.ops.commands.append(list(args))
+                return subprocess.CompletedProcess(args, 1, "", "signal rejected")
+            return original_run(args, **kwargs)
+
+        def sleep(seconds):
+            if sent_at is not None:
+                self.assertLess(self.ops.clock - sent_at, 10, "a rejected signal must not wait for exit")
+            original_sleep(seconds)
+
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "sleep", sleep):
+            with self.assertRaisesRegex(deploy.DeployError, "SIGTERM"):
+                self.deploy()
+        self.assertIsNotNone(sent_at)
+        self.assertTrue(self.ops.containers[old]["State"]["Running"])
+        self.assertEqual("always", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertNotIn(["docker", "start", old], self.ops.commands)
+        self.assertFalse(self.ops.switched)
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_failed_term_response_can_still_be_followed_by_drain(self):
+        old = self.state()["current"]["containers"]["background"]
+        self.ops.drain_seconds[old] = 6
+        original_run = self.ops.run
+        original_http = self.ops.http_json
+        term_at = None
+
+        def run(args, **kwargs):
+            nonlocal term_at
+            result = original_run(args, **kwargs)
+            if args == ["docker", "kill", "--signal=TERM", old]:
+                term_at = self.ops.clock
+                return subprocess.CompletedProcess(args, 1, "", "response lost")
+            return result
+
+        def http_json(*args, **kwargs):
+            status, body = original_http(*args, **kwargs)
+            if term_at is not None and self.ops.clock - term_at < 1 and isinstance(body, dict) and body.get("draining"):
+                body.update(ready=True, draining=False)
+            return status, body
+
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "http_json", http_json):
+            self.deploy()
+        self.assertEqual("a", self.state()["current"]["slot"])
+        self.assertFalse(self.ops.containers[old]["State"]["Running"])
+
+    def test_removed_background_allows_handoff_after_docker_confirms_absence(self):
+        old = self.state()["current"]["containers"]["background"]
+        successor = self.cfg.container("a", "background")
+        self.ops.drain_seconds[old] = 5
+        self.cfg.background_exit_timeout = 2
+        original_inspect = self.ops.inspect
+        original_run = self.ops.run
+        original_sleep = self.ops.sleep
+        missing_since = None
+        failed_list = False
+
+        def inspect(name):
+            nonlocal missing_since
+            info = original_inspect(name)
+            if name == old and info and not info["State"]["Running"]:
+                del self.ops.containers[old]
+                missing_since = self.ops.clock
+                return None
+            return info
+
+        def run(args, **kwargs):
+            nonlocal failed_list
+            if args[:3] == ["docker", "container", "ls"] and missing_since is not None and not failed_list:
+                failed_list = True
+                return subprocess.CompletedProcess(args, 1, "", "Docker unavailable")
+            if args == ["docker", "start", successor]:
+                self.assertTrue(failed_list, "a failed inspect alone must not confirm exit")
+                self.assertGreater(self.ops.clock, missing_since, "a failed Docker listing must be retried")
+            return original_run(args, **kwargs)
+
+        def sleep(seconds):
+            if missing_since is not None and not self.ops.containers[successor]["State"]["Running"]:
+                self.assertLess(self.ops.clock - missing_since, 12, "Docker confirmed that the old owner is gone")
+            original_sleep(seconds)
+
+        with mock.patch.object(self.ops, "inspect", inspect), mock.patch.object(self.ops, "run", run), \
+                mock.patch.object(self.ops, "sleep", sleep):
+            self.deploy()
+        self.assertNotIn(old, self.ops.containers)
+        self.assertTrue(self.ops.containers[successor]["State"]["Running"])
+
+    def test_background_removed_before_restart_policy_change_allows_handoff(self):
+        old = self.state()["current"]["containers"]["background"]
+        original_run = self.ops.run
+
+        def run(args, **kwargs):
+            if args == ["docker", "update", "--restart=no", old]:
+                del self.ops.containers[old]
+                raise deploy.DeployError("container removed")
+            return original_run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "run", run):
+            self.deploy()
+        self.assertNotIn(["docker", "kill", "--signal=TERM", old], self.ops.commands)
+        active = self.state()["current"]["containers"]["background"]
+        self.assertTrue(self.ops.containers[active]["State"]["Running"])
+        self.assertNotEqual(active, old)
+
+    def test_rollback_cli_checks_backup_before_changing_slots(self):
+        self.deploy()
+        before = self.state()
+        old = before["current"]["containers"]["background"]
+        self.ops.runtime_extra[old] = {"scheduled_backup_remaining_seconds": 0}
+        self.ops.commands.clear()
+        stderr = io.StringIO()
+        with mock.patch.object(deploy, "Ops", return_value=self.ops), \
+                mock.patch.object(deploy.Config, "load", return_value=self.cfg), \
+                mock.patch.object(sys, "stderr", stderr):
+            self.assertEqual(1, deploy.main(["rollback"]))
+            self.assertIn("--allow-running-backup", stderr.getvalue())
+            self.assertEqual(before, self.state())
+            self.assertEqual([], self.ops.commands)
+            self.assertEqual(0, deploy.main(["rollback", "--allow-running-backup"]))
+        self.assertEqual(before["previous"]["slot"], self.state()["current"]["slot"])
 
     def test_rollback_timeout_restores_owner_of_current_traffic_slot(self):
         self.deploy()
