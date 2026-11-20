@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -452,12 +453,29 @@ func (s *BackupService) UpdateS3Config(ctx context.Context, cfg BackupS3Config) 
 	return &cfg, nil
 }
 
+// sameBackupS3Endpoint allows the optional slash the SDK adds to a base
+// path. Comparing the rest verbatim keeps alternate destinations distinct.
+func sameBackupS3Endpoint(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	if b != a+"/" || strings.ContainsAny(a, "?#") {
+		return false
+	}
+	endpoint, err := url.Parse(a)
+	return err == nil && (endpoint.Scheme == "http" || endpoint.Scheme == "https") &&
+		endpoint.Hostname() != "" && endpoint.User == nil && !strings.HasSuffix(endpoint.Path, "/")
+}
+
 func (s *BackupService) TestS3Connection(ctx context.Context, cfg BackupS3Config) error {
 	// Reuse the saved secret for the same configured endpoint, bucket, region
 	// and access key. This lets admins test either addressing mode for it.
 	if cfg.SecretAccessKey == "" {
 		old, _ := s.loadS3Config(ctx)
-		if old != nil && old.Endpoint == cfg.Endpoint && old.Bucket == cfg.Bucket &&
+		if old != nil && sameBackupS3Endpoint(old.Endpoint, cfg.Endpoint) && old.Bucket == cfg.Bucket &&
 			cmp.Or(old.Region, "auto") == cmp.Or(cfg.Region, "auto") &&
 			old.AccessKeyID == cfg.AccessKeyID {
 			cfg.SecretAccessKey = old.SecretAccessKey

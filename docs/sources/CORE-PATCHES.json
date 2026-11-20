@@ -2300,8 +2300,8 @@
         "scheduled_backup_handoff",
         "backup_connection_credentials"
       ],
-      "sha256": "ba1ba786a7d780c7013665ff4294e38f35262fcda3982eef1256349bd0741bd3",
-      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Lets admitted scheduled backup creation keep its own deadline during shutdown, while retention cleanup remains cancellable under the original shutdown grace period. Reuses a saved S3 secret for connection tests when the configured endpoint, region, bucket and access key match. The addressing mode can change."
+      "sha256": "8e1a05f69a67521cb239a60905e8488f52f64bfbcb48bdedda4e40c252b33524",
+      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Lets admitted scheduled backup creation keep its own deadline during shutdown, while retention cleanup remains cancellable under the original shutdown grace period. Reuses a saved S3 secret for connection tests when the configured endpoint, region, bucket and access key match. The addressing mode can change and the same HTTP(S) endpoint may include an optional trailing slash."
     },
     {
       "path": "backend/internal/service/backup_service_test.go",
@@ -2310,8 +2310,8 @@
         "backup_bounded_disk",
         "backup_connection_credentials"
       ],
-      "sha256": "4d0a4e14271f27c8dd8e7546d1bab5c8549205c82ad22fb442cfad911c6c73fb",
-      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Tests for this behaviour. Covers saved-secret reuse for either addressing mode at the saved S3 target and rejects reuse across endpoint, region, bucket or access key changes."
+      "sha256": "51a64041e71174fb944538a95b7ad211dbf949370e48936e4d61a03045284c6c",
+      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Tests for this behaviour. Covers saved-secret reuse for either addressing mode at the saved S3 target and rejects reuse across endpoint, region, bucket or access key changes. Uses the S3 SDK with an in-memory transport to verify identical signed request URLs with and without the optional trailing slash."
     },
     {
       "path": "backend/internal/service/backup_shutdown_test.go",

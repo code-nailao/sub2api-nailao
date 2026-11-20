@@ -2,6 +2,7 @@ import http.client
 import io
 import json
 import os
+import signal
 import socketserver
 import threading
 import subprocess
@@ -597,9 +598,9 @@ class DeployTest(unittest.TestCase):
         calls = []
         real_exit, real_ready = deploy.Deployer.wait_exit, deploy.Deployer.wait_ready
 
-        def wait_exit(deployer, name, timeout, **kw):
+        def wait_exit(deployer, name, deadline, **kw):
             calls.append(("exit", name, kw.get("poll", 2)))
-            return real_exit(deployer, name, timeout, **kw)
+            return real_exit(deployer, name, deadline, **kw)
 
         def wait_ready(deployer, port, token, role, timeout, **kw):
             calls.append(("ready", role, kw.get("poll", 2)))
@@ -636,6 +637,71 @@ class DeployTest(unittest.TestCase):
         self.assertTrue(self.ops.containers[old]["State"]["Running"])
         self.assertEqual("unless-stopped", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
         self.assertIsNone(self.state()["in_progress"])
+
+    def test_sigint_in_normal_drain_restores_old_background_after_exit(self):
+        old = self.state()["current"]["containers"]["background"]
+        successor = self.cfg.container("a", "background")
+        self.ops.drain_seconds[old] = 3
+        original_sleep = self.ops.sleep
+        interrupted = False
+
+        def sleep(seconds):
+            nonlocal interrupted
+            if not interrupted and "draining_until" in self.ops.containers[old]:
+                interrupted = True
+                signal.raise_signal(signal.SIGINT)
+            original_sleep(seconds)
+
+        with mock.patch.object(self.ops, "sleep", sleep):
+            with self.assertRaisesRegex(deploy.BackgroundRestored, "previous background .* is running again"):
+                self.deploy()
+        self.assertTrue(interrupted)
+        self.assertTrue(self.ops.containers[old]["State"]["Running"])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertNotIn(["docker", "start", successor], self.ops.commands)
+
+    def test_stuck_background_without_backup_releases_publish_lock(self):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        successor = self.cfg.container("a", "background")
+        self.cfg.background_exit_timeout = 2
+        self.ops.drain_seconds[old] = float("inf")
+        self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"] = "always"
+        original_run = self.ops.run
+        original_sleep = self.ops.sleep
+        term_at = None
+        interrupts = 0
+
+        def run(args, **kwargs):
+            nonlocal term_at
+            if args == ["docker", "kill", "--signal=TERM", old]:
+                term_at = self.ops.clock
+            return original_run(args, **kwargs)
+
+        def sleep(seconds):
+            nonlocal interrupts
+            if term_at is not None:
+                elapsed = self.ops.clock - term_at
+                if elapsed >= 6 and interrupts < 2:
+                    interrupts += 1
+                    original_sleep(1)
+                    raise KeyboardInterrupt
+                self.assertLess(elapsed + seconds, 33, "a stuck owner kept the release lock past recovery")
+            original_sleep(seconds)
+
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "sleep", sleep), \
+                deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "could not confirm exit"):
+                self.deploy()
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertEqual(current, self.state()["current"])
+            self.assertIn("could not confirm exit", self.state()["in_progress"]["failed"])
+        self.assertEqual(2, interrupts)
+        self.assertLess(self.ops.clock - term_at, 33)
+        self.assertTrue(self.ops.containers[old]["State"]["Running"])
+        self.assertEqual("always", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertNotIn(["docker", "start", successor], self.ops.commands)
+        self.assertFalse(self.ops.switched)
 
     def test_ctrl_c_during_recovery_wait_still_restores_background(self):
         old = self.state()["current"]["containers"]["background"]
@@ -906,6 +972,59 @@ class DeployTest(unittest.TestCase):
         self.assertTrue(self.state()["in_progress"]["failed"])
         self.assertNotIn(["docker", "start", successor], self.ops.commands)
         self.assertFalse(self.ops.switched)
+
+    def test_sigint_between_confirmation_timeout_and_cleanup_preserves_failure(self):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        successor = self.cfg.container("a", "background")
+        original_run = self.ops.run
+        original_http = self.ops.http_json
+        term_at = None
+        interrupted = False
+
+        def run(args, **kwargs):
+            nonlocal term_at
+            if args == ["docker", "kill", "--signal=TERM", old]:
+                term_at = self.ops.clock
+                return subprocess.CompletedProcess(args, 1, "", "signal rejected")
+            return original_run(args, **kwargs)
+
+        def http_json(url, **kwargs):
+            if term_at is not None and url.endswith("/internal/sources/runtime"):
+                return 200, {"ready": False, "draining": True}
+            return original_http(url, **kwargs)
+
+        def trace(frame, event, _arg):
+            nonlocal interrupted
+            if frame.f_code is not deploy.Deployer.drain_background.__code__:
+                return None
+            # Deliver an actual SIGINT after the timeout was caught, before
+            # the first line in its handler can perform any cleanup.
+            if (event == "line" and not interrupted
+                    and isinstance(frame.f_locals.get("err"), deploy.BackgroundExitTimeout)):
+                self.assertGreaterEqual(self.ops.clock - term_at, deploy.HANDOFF_TERM_CONFIRM_SECONDS)
+                interrupted = True
+                signal.raise_signal(signal.SIGINT)
+            return trace
+
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "http_json", http_json), \
+                deploy.release_lock(self.cfg.lock_file):
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(trace)
+                with self.assertRaisesRegex(deploy.FallbackFailed, "SIGTERM"):
+                    self.deploy()
+            except KeyboardInterrupt:
+                self.fail("SIGINT escaped at the handoff timeout before cleanup")
+            finally:
+                sys.settrace(previous_trace)
+
+        self.assertTrue(interrupted)
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertEqual(current, self.state()["current"])
+            self.assertIn("SIGTERM", self.state()["in_progress"]["failed"])
+        self.assertEqual("unless-stopped", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertNotIn(["docker", "start", successor], self.ops.commands)
 
     def test_ctrl_c_during_restart_policy_restore_still_records_failed_handoff(self):
         current = self.state()["current"]
