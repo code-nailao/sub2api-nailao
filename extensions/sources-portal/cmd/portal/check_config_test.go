@@ -341,6 +341,9 @@ func TestCheckConfigFailsLikeStart(t *testing.T) {
 		{"bridge without internal origin", set("SUB_INTERNAL_ORIGIN", ""), errBridgeConfig},
 		{"bridge with webhook", set("BALANCE_ALERT_WEBHOOK", "https://alerts.example/hook"), errBridgeOwner},
 		{"trusted proxy invalid", set("PORTAL_TRUSTED_PROXIES", "10.0.0.0/8,nope"), errTrustedProxy},
+		{"studio API labels invalid", set("STUDIO_CUSTOM_API_LABELS", "api,API"), errStudioAPILabels},
+		{"studio API labels duplicate", set("STUDIO_CUSTOM_API_LABELS", "api,api"), errStudioAPILabels},
+		{"studio registry labels invalid", state("studio-registry.json", `{"revision":1,"groups":[],"custom_api_labels":["api"],"custom_api_default":"api2"}`), errStudio},
 		{"studio config missing", func(_ *testing.T, f *checkFixture) { f.env["STUDIO_CONFIG_FILE"] = filepath.Join(f.root, "none.json") }, errStudioConfigRead},
 		{"studio config corrupt", file("STUDIO_CONFIG_FILE", "{", 0600), errStudioConfig},
 		{"studio config unknown engine", file("STUDIO_CONFIG_FILE", `[{"group_id":1,"engine":"other","models":["m"]}]`, 0600), errStudio},
@@ -392,5 +395,14 @@ func TestCheckConfigListenAddressFailsLikeStart(t *testing.T) {
 	f.env["PORTAL_LISTEN"] = ""
 	if code, _, stderr := runCheck(f); code != 0 {
 		t.Fatalf("default listen address: %s", stderr)
+	}
+}
+
+func TestCheckConfigAcceptsCustomAPILabels(t *testing.T) {
+	f := newCheckFixture(t)
+	f.env["STUDIO_CUSTOM_API_LABELS"] = "api, api2"
+	code, stdout, stderr := runCheck(f)
+	if code != 0 || stdout != checkConfigOK+"\n" || stderr != "" {
+		t.Fatal(code, stdout, stderr)
 	}
 }

@@ -10,7 +10,7 @@
 - 原生账号列表余额列与配置抽屉；来源独立加密保存，一来源可绑定多个账号，同站不同钱包分别保存。Main 只提供管理员只读 HMAC 身份标记，换模型 Key/地址需重新确认关联。USD/CNY/TOKENS/CUSTOM、30分钟轮询、5分钟错误退避、手动15秒防抖、最大并发2、保留最后成功值。低额/恢复 outbox 至少一次投递，接收端按事件ID去重。
 - 原版用户 API 发放普通、可见、可撤销的工作台 Key；每人/组30天有效。外部只保存Key ID/操作号，不保存用户JWT或Key。撤销/过期不补建；用户通过原版Key页面管理/续期。
 - 管理员在工作台/画布页面里在线登记原生分组并选择模型，保存即生效，不需要改服务器文件或重启；媒体引擎分组仍只由登记文件配置。见“在线分组登记”。
-- 自定义连接：用户用自己在本站已有的一把 API 密钥连接工作台/画布，只保存该 Key 的 ID；请求域名固定为本站，前缀可改，其后的路径由系统拼接。见“自定义连接”。
+- 自定义连接：用户用自己在本站已有的一把 API 密钥连接工作台/画布，只保存该 Key 的 ID；站点域名固定，用户选择管理员允许的 API 子域名，路径由系统推导。见“自定义连接”。
 
 - 智商测试复用同一Portal进程与锁：糖果/鹈鹕异步计划、管理员开关、原生限额普通Key、持久结果和完整作品预览。该监测Key需加密持久保存供定时执行，与只保存工作台Key ID的授权桥分开；不持久保存管理员JWT。
 
@@ -64,6 +64,8 @@ PORTAL_TRUSTED_PROXIES=YOUR_EXACT_PROXY_CIDR
 STUDIO_CONFIG_FILE=/YOUR_PRIVATE_DATA_DIR/studio.json
 STUDIO_URL=https://YOUR_SEPARATE_STUDIO_ORIGIN/
 CANVAS_URL=https://YOUR_SEPARATE_CANVAS_ORIGIN/infinite/canvas
+# 可选；逗号分隔的小写 DNS 标签，最多 16 个，第一个为初始默认值；非法时启动检查和启动都会失败。
+STUDIO_CUSTOM_API_LABELS=YOUR_API_LABEL,YOUR_SECOND_API_LABEL
 # 必填；智商测试的外部检测服务，固定HTTPS源（无路径、查询串或账号），无内置默认值，缺失或非法时启动失败。
 INTELLIGENCE_PROVIDER_ORIGIN=https://YOUR_DETECTION_SERVICE_ORIGIN
 # 可选；未配置时UI明确显示未接外部告警。
@@ -93,20 +95,14 @@ studio.json是外部能力登记，不授予分组权限；每次仍交原版判
 
 分组没有登记时，用户可以在同一页面用“自定义连接”自助接入：
 
-- 用户从自己在本站的 API 密钥里选一把（列出前 100 把启用且未过期的），不粘贴密钥。Portal 通过 Main 以用户会话读取该 Key，确认属于当前用户、启用且未过期；只保存 Key ID、接口类型、路径和模型（`<PORTAL_DATA_DIR>/studio-custom.json`），不保存 Key 本身。刷新或重开后按 Key ID 恢复；Key 被撤销或过期时报告失效，不创建、不换用其他 Key。
-- 没有域名输入：下发给客户端的地址始终是配置的本站 API 源。用户能改的是前缀，即网关上该接口所在的路径前缀，起始值按 Key 所在分组的平台给出：OpenAI、Grok 为 `/v1`，Gemini 为 `/v1beta`，Antigravity 为 `/antigravity/v1beta`。前缀只允许 1～4 段字母、数字和 `. _ ~ -`，不能带协议、主机、查询串、上级目录或转义字符。Studio 与 Canvas 客户端各自还会在解析配置和发请求时校验域名。
-- 前缀之后的路径不由用户填写，按接口类型拼接：OpenAI、Grok 是 `<前缀>/images/generations/async`、`<前缀>/images/edits/async` 和任务查询；原生 Gemini 是 `<前缀>/models/{model}:generateContent`。
-- 两个客户端拼接地址的方式不同，同一份设置按请求方分别表达：
-
-  | 接口 | 前缀 | Studio | Canvas |
-  |---|---|---|---|
-  | OpenAI、Grok | `/v1` | 任务接口，与登记分组相同 | 任务接口，与登记分组相同 |
-  | OpenAI、Grok | 其他，须以 `/v1` 结尾 | 任务接口，前缀并入基础地址 | 该前缀下的同步接口 |
-  | 原生 Gemini | 任意 | 同步 | 同步 |
-
-  Studio 客户端总是在 `/v1` 段之下寻址 OpenAI、Grok 接口，所以这两种接口的前缀必须以 `/v1` 结尾；Canvas 客户端只在默认任务路径上运行任务，其他前缀下发同步接口。
-- 模型先获取、后勾选：弹窗打开、换 Key、换接口或改前缀时，Portal 用该 Key 向 Main 的 `<前缀>/models` 读取列表（OpenAI 和 Gemini 两种列表格式都识别），按名称预选图片模型供用户调整。读取失败或列表里缺少某个模型时，才手动填写模型名称。“分组设置”同样在勾选分组时自动读取该分组的候选模型。
-- 不按平台拒绝 Key：自定义连接是登记不了的分组的入口，能否调用由 Main 判定。媒体引擎分组的 Key 除外，其请求格式不同，应从分组列表进入。
+- 用户从自己在本站的 API 密钥里选一把（列出前 100 把启用且未过期的），不粘贴密钥。Portal 通过 Main 以用户会话读取该 Key，确认属于当前用户、启用且未过期；只保存 Key ID、接口类型、API 子域名标签、系统推导的前缀和模型（`<PORTAL_DATA_DIR>/studio-custom.json`），不保存 Key 本身。刷新或重开后按 Key ID 恢复；Key 被撤销或过期时报告失效，不创建、不换用其他 Key。
+- 站点域名 H 固定为 `SUB_ORIGIN` 的主机名。用户从允许列表选择标签，请求源为 `https://<YOUR_API_LABEL>.H`，不能自由填写地址；主站地址不出现在可选列表中。未配置允许列表时显示固定主站地址，继续使用 `SUB_ORIGIN`。
+- 管理员在“分组设置”的“自定义连接可选的 API 子域名”中添加、移除标签并选择默认值。每项必须是一个小写 DNS 标签：字母、数字或中划线，首尾必须为字母或数字，最长 63 个字符；最多 16 项且不能重复，默认值必须在列表内。此列表沿用分组设置的版本冲突检查和原子保存。
+- 生效顺序：非空在线列表 > 部署变量 `STUDIO_CUSTOM_API_LABELS` > 主站地址。部署变量为逗号分隔的标签，第一个为默认值；在线列表留空则恢复部署初始值。弹窗会显示当前来源和部署初始值。该变量非法时正常启动和 `-check-config` 都拒绝继续，不回显变量值。
+- 路径不再允许用户填写。服务器按 Key 查询返回的分组平台和所选接口推导，弹窗只读预览完整生成/编辑地址：原生 Gemini 为 `/v1beta/models/<模型>:generateContent`；OpenAI、Grok 为 `/v1/images/generations`、`/v1/images/edits`，两个客户端实际沿用现有异步任务接口及任务查询。Antigravity 只允许 Gemini 原生接口，前缀为 `/antigravity/v1beta`，暂时固定走主站地址，不显示子域名选择。
+- 模型先获取、后勾选：弹窗打开、换 Key 或换接口时，Portal 用该 Key 向 Main 的系统推导前缀下的 `/models` 读取列表（OpenAI 和 Gemini 两种列表格式都识别），按名称预选图片模型供用户调整。读取失败或列表里缺少某个模型时，才手动填写模型名称。“分组设置”同样在勾选分组时自动读取该分组的候选模型。
+- 管理员移除某标签后，使用该标签的连接下发时改用当前默认地址；没有有效列表则回到主站地址。用户重开弹窗会看到提示。已有无标签的旧连接继续使用主站及原前缀，含义不变；重新保存后才采用当前选择和系统路径。前缀字段仍保存，供回滚到旧版 Portal 读取。
+- 除 Antigravity 的接口限制外，不按平台拒绝 Key，能否调用由 Main 判定。媒体引擎分组的 Key 除外，其请求格式不同，应从分组列表进入。管理员登记的分组继续使用主站地址，不受自定义连接地址设置影响。
 - 管理员可在“分组设置”里关闭自定义连接；关闭后已保存的连接不会被删除，只是不再下发。
 - 每个用户一个自定义连接。费用照常由 Main 按该 Key 所在分组从余额扣除，Portal 不参与计费。
 
@@ -159,7 +155,7 @@ python3 scripts/sources_extensions/check_boundaries.py
 
 测试身份与供应商夹具只编译进测试二进制，正式程序没有 mock 鉴权开关。
 
-`internal/portal/browser_fixture_test.go` 中的 `TestBrowserFixture` 在本机启动一个使用本地身份、刷新和模型夹具的 Portal，用于真实浏览器检查 Main 自定义菜单 → Portal → Studio/Canvas 静态客户端的三层页面：过期后经 Main 现有 apiClient 刷新、仅提交预期次数的原生图片任务、刷新与切组只查询原任务、冷重载恢复旧授权、结果回填原画布槽位和账号隔离。所需变量包括 `PORTAL_HOME_DIR`（构建后的 homeweb 绝对路径）、`PORTAL_BROWSER_STUDIO_URL` 或 `PORTAL_BROWSER_CANVAS_URL`（Canvas 开发服务需设置 `VITE_BASE=/infinite/`）。两个客户端的正式构建只接受本站域名下的 HTTPS 地址，用它们联调时再设置 `PORTAL_BROWSER_API_ORIGIN`（下发给客户端的模型 API 源，默认是一个占位地址）。所有模型请求被本地夹具拦截，不产生真实收费。驱动浏览器的脚本不在本仓库中。夹具里还有一个未登记的分组、用户自己的一把普通 Key 和一把 Antigravity 分组的 Key，用于检查“分组设置”和“自定义连接”两个弹窗；弹窗是页面 DOM 代码，`*.test.mjs` 只覆盖其规则和页面间的消息。
+`internal/portal/browser_fixture_test.go` 中的 `TestBrowserFixture` 在本机启动一个使用本地身份、刷新和模型夹具的 Portal，用于真实浏览器检查 Main 自定义菜单 → Portal → Studio/Canvas 静态客户端的三层页面：过期后经 Main 现有 apiClient 刷新、仅提交预期次数的原生图片任务、刷新与切组只查询原任务、冷重载恢复旧授权、结果回填原画布槽位和账号隔离。所需变量包括 `PORTAL_HOME_DIR`（构建后的 homeweb 绝对路径）、`PORTAL_BROWSER_STUDIO_URL` 或 `PORTAL_BROWSER_CANVAS_URL`（Canvas 开发服务需设置 `VITE_BASE=/infinite/`）。两个客户端的正式构建只接受本站域名下的 HTTPS 地址，用它们联调时再设置 `PORTAL_BROWSER_API_ORIGIN`（下发给客户端的模型 API 源，默认是一个占位地址）。所有模型请求被本地夹具拦截，不产生真实收费。驱动浏览器的脚本不在本仓库中。夹具配置了两个中性 API 子域名标签，还有一个未登记的分组、用户自己的一把普通 Key 和一把 Antigravity 分组的 Key，用于检查“分组设置”和“自定义连接”两个弹窗；弹窗是页面 DOM 代码，`*.test.mjs` 只覆盖其规则和页面间的消息。
 
 正式构建不能放宽 Canvas 的 HTTPS 父站检查；`PORTAL_BROWSER_ORIGIN` 只存在于 Go 测试二进制中，正式 Portal 没有此开关。本地夹具通过不能代替真实环境的检查。
 

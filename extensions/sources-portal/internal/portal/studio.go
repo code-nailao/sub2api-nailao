@@ -48,15 +48,16 @@ type StudioService struct {
 	// Capabilities is the operator's registry file and does not change while
 	// the process runs. Users are served from capabilities(), which applies the
 	// groups an administrator manages in the browser on top of it.
-	Capabilities   []StudioCapability
-	effective      []StudioCapability
-	registry       studioRegistryState
-	registryPath   string
-	registryFailed bool
-	custom         map[string]StudioCustomBinding
-	customPath     string
-	customFailed   bool
-	APIOrigin      string
+	Capabilities     []StudioCapability
+	effective        []StudioCapability
+	registry         studioRegistryState
+	registryPath     string
+	registryFailed   bool
+	custom           map[string]StudioCustomBinding
+	customPath       string
+	customFailed     bool
+	APIOrigin        string
+	deploymentLabels []string
 	// mediaEngine is the canonical engine value of media engine capabilities
 	// and the value the Studio client receives.
 	mediaEngine string
@@ -91,11 +92,15 @@ type studioKey struct {
 	Name      string     `json:"name"`
 	Status    string     `json:"status"`
 	ExpiresAt *time.Time `json:"expires_at"`
+	Group     *struct {
+		Name     string `json:"name"`
+		Platform string `json:"platform"`
+	} `json:"group"`
 }
 
 // OpenStudio accepts either the neutral or the legacy media engine value in
 // capabilities; mediaEngineLegacyName is "" on a fresh install.
-func OpenStudio(dir, origin string, capabilities []StudioCapability, mediaEngineLegacyName string) (*StudioService, error) {
+func OpenStudio(dir, origin string, capabilities []StudioCapability, mediaEngineLegacyName string, customAPILabels ...[]string) (*StudioService, error) {
 	mediaEngine, err := studioMediaEngineSelector(mediaEngineLegacyName)
 	if err != nil {
 		return nil, err
@@ -103,6 +108,13 @@ func OpenStudio(dir, origin string, capabilities []StudioCapability, mediaEngine
 	// Copy before canonicalizing so the caller's configuration is not rewritten.
 	capabilities = append([]StudioCapability(nil), capabilities...)
 	s := &StudioService{path: filepath.Join(dir, "studio-bindings.json"), registryPath: filepath.Join(dir, "studio-registry.json"), customPath: filepath.Join(dir, "studio-custom.json"), bindings: map[string]StudioBinding{}, custom: map[string]StudioCustomBinding{}, locks: map[string]chan struct{}{}, APIOrigin: origin, Capabilities: capabilities, mediaEngine: mediaEngine}
+	if len(customAPILabels) > 0 {
+		labels := customAPILabels[0]
+		if err := validateStudioAPILabels(labels, firstStudioAPILabel(labels)); err != nil {
+			return nil, err
+		}
+		s.deploymentLabels = append([]string(nil), labels...)
+	}
 	seen := map[int64]bool{}
 	for i, c := range capabilities {
 		if c.Engine == studioMediaEngineNeutral || c.Engine == mediaEngine {
@@ -124,7 +136,7 @@ func OpenStudio(dir, origin string, capabilities []StudioCapability, mediaEngine
 		return nil, e
 	}
 	if e = s.loadRegistry(); e != nil {
-		return nil, errors.New("invalid_studio_registry")
+		return nil, ErrStudioRegistry
 	}
 	if e = s.loadCustom(); e != nil {
 		return nil, errors.New("invalid_studio_custom_connections")
@@ -315,10 +327,11 @@ func (s *Server) studioRoutes(mux *http.ServeMux) {
 		// basePath is set only by a custom connection under a prefix the Studio
 		// client must be given as part of its base address.
 		basePath := ""
+		apiOrigin := s.Studio.APIOrigin
 		if in.GroupID == studioCustomGroupID {
 			// The user's own key: nothing is created here, so a restore and a
 			// first connection read the same saved binding.
-			key, c, basePath, task, e = s.studioCustomConnection(r, r.URL.Path == "/api/canvas/connection")
+			key, c, apiOrigin, basePath, task, e = s.studioCustomConnection(r, r.URL.Path == "/api/canvas/connection")
 			if errors.Is(e, errStudioCustomNone) {
 				jsonResponse(w, 403, map[string]string{"error": "existing_authorization_required"})
 				return
@@ -353,7 +366,7 @@ func (s *Server) studioRoutes(mux *http.ServeMux) {
 		for i, m := range c.Models {
 			models = append(models, map[string]any{"id": m, "label": m, "isDefault": i == 0, "parameters": studioModelParameters(c.Engine == s.Studio.mediaEngine, c.Protocol, m)})
 		}
-		transport := map[string]any{"baseUrl": s.Studio.APIOrigin + basePath, "credentialRef": key.Key}
+		transport := map[string]any{"baseUrl": apiOrigin + basePath, "credentialRef": key.Key}
 		if key.ExpiresAt != nil {
 			transport["expiresAt"] = key.ExpiresAt.Unix()
 		}

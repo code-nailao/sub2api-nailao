@@ -52,6 +52,7 @@ const (
 	errStudioConfigRead   = "studio config unavailable"
 	errStudioConfig       = "invalid studio config"
 	errStudio             = "studio bindings initialization failed"
+	errStudioAPILabels    = "STUDIO_CUSTOM_API_LABELS must contain at most 16 unique lowercase DNS labels"
 	errStudioURL          = "fixed HTTPS STUDIO_URL required"
 	errStudioOrigin       = "STUDIO_URL must use a separate origin so the workbench cannot read Main login storage"
 	errCanvasURL          = "CANVAS_URL requires a fixed HTTPS page on a separate origin"
@@ -265,6 +266,10 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 		}
 		server.TrustedProxies = append(server.TrustedProxies, p)
 	}
+	customAPILabels, labelErr := portal.ParseStudioCustomAPILabels(getenv("STUDIO_CUSTOM_API_LABELS"))
+	if labelErr != nil {
+		return fail(errStudioAPILabels)
+	}
 	if file := getenv("STUDIO_CONFIG_FILE"); file != "" {
 		b, e := os.ReadFile(file)
 		if e != nil {
@@ -276,7 +281,7 @@ func prepare(getenv func(string) string, open stateOpeners) (setup *portalSetup,
 		}
 		// Same private setting as Main: the engine value an existing registry
 		// and Studio client already use. Not echoed; it is private configuration.
-		server.Studio, err = portal.OpenStudio(dir, sub, caps, getenv("SOURCES_MEDIA_ENGINE_LEGACY_NAME"))
+		server.Studio, err = portal.OpenStudio(dir, sub, caps, getenv("SOURCES_MEDIA_ENGINE_LEGACY_NAME"), customAPILabels)
 		if err != nil {
 			return fail(errStudio)
 		}

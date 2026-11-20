@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -13,8 +15,7 @@ import (
 
 // A custom connection lets a user reach the workbench with one of their own
 // API keys when their group is not registered. The user chooses the key, the
-// interface and the URL prefix; the host is always this site and the paths
-// below the prefix are the interface's own, never typed by the user. Only the
+// interface and an allowed API subdomain; paths are derived by the server. Only the
 // key's ID is stored, as for a group authorization, never the key.
 
 var (
@@ -29,6 +30,7 @@ var studioCustomPrefix = regexp.MustCompile(`^(/[A-Za-z0-9][A-Za-z0-9._~-]{0,63}
 type StudioCustomBinding struct {
 	KeyID    int64  `json:"key_id"`
 	Protocol string `json:"protocol"`
+	APILabel string `json:"api_label,omitempty"`
 	// Prefix is the gateway prefix the interface is served under, such as /v1.
 	Prefix    string    `json:"prefix"`
 	Models    []string  `json:"models"`
@@ -51,8 +53,8 @@ func studioCustomDefaults(platform string) (protocol, prefix string) {
 
 func studioCustomBinding(in StudioCustomBinding) (StudioCustomBinding, error) {
 	models, ok := studioModels(in.Models)
-	out := StudioCustomBinding{KeyID: in.KeyID, Protocol: in.Protocol, Prefix: in.Prefix, Models: models}
-	if in.KeyID < 1 || !ok {
+	out := StudioCustomBinding{KeyID: in.KeyID, Protocol: in.Protocol, Prefix: in.Prefix, Models: models, APILabel: in.APILabel}
+	if in.KeyID < 1 || !ok || in.APILabel != "" && !studioAPILabel.MatchString(in.APILabel) {
 		return out, ErrStudioCustom
 	}
 	switch in.Protocol {
@@ -187,20 +189,20 @@ func (s *Server) studioOwnKey(r *http.Request, id int64) (studioKey, error) {
 	return key, nil
 }
 
-// studioCustomConnection also returns the base path to add to the API origin.
-func (s *Server) studioCustomConnection(r *http.Request, canvas bool) (studioKey, StudioCapability, string, map[string]any, error) {
+// studioCustomConnection returns the resolved origin and the client base path.
+func (s *Server) studioCustomConnection(r *http.Request, canvas bool) (studioKey, StudioCapability, string, string, map[string]any, error) {
 	user := r.Context().Value(identityKey{}).(Identity)
 	binding, ok := s.Studio.customBinding(user.ID)
 	if !ok || !s.Studio.customAllowed() {
-		return studioKey{}, StudioCapability{}, "", nil, errStudioCustomNone
+		return studioKey{}, StudioCapability{}, "", "", nil, errStudioCustomNone
 	}
 	key, e := s.studioOwnKey(r, binding.KeyID)
 	if e != nil {
-		return studioKey{}, StudioCapability{}, "", nil, e
+		return studioKey{}, StudioCapability{}, "", "", nil, e
 	}
 	capability := StudioCapability{GroupID: studioCustomGroupID, Engine: "sub2api", Models: binding.Models, DisplayName: "自定义连接", Protocol: binding.Protocol}
 	basePath, task := studioCustomTask(binding, canvas)
-	return key, capability, basePath, task, nil
+	return key, capability, s.Studio.customAPIOrigin(binding), basePath, task, nil
 }
 
 type studioCustomKey struct {
@@ -211,7 +213,7 @@ type studioCustomKey struct {
 	GroupName string `json:"group_name"`
 	Platform  string `json:"platform"`
 	// Protocol and Prefix are where Main serves images for the key's platform;
-	// the dialog starts from them and the user may change either.
+	// the dialog may change the protocol; the prefix remains derived.
 	Protocol string `json:"protocol"`
 	Prefix   string `json:"prefix"`
 	// Blocker is why this key cannot be used here; empty when it can.
@@ -283,6 +285,8 @@ func (s *Server) studioCustomRoutes(mux *http.ServeMux) {
 		user := r.Context().Value(identityKey{}).(Identity)
 		out := s.studioCustomInfo(user)
 		out["api_origin"] = s.Studio.APIOrigin
+		out["api_host"] = s.Studio.customAPIHost()
+		out["api_labels"], out["api_default"], _ = s.Studio.customAPISettings()
 		if out["enabled"] == true {
 			keys, e := s.studioCustomKeys(r)
 			if e != nil {
@@ -298,10 +302,11 @@ func (s *Server) studioCustomRoutes(mux *http.ServeMux) {
 	})
 	mux.HandleFunc("POST /api/studio/custom/models", func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
-			KeyID  int64  `json:"key_id"`
-			Prefix string `json:"prefix"`
+			KeyID    int64           `json:"key_id"`
+			Protocol string          `json:"protocol"`
+			Prefix   json.RawMessage `json:"prefix"` // Ignored for older callers.
 		}
-		if decode(w, r, &in) != nil || in.KeyID < 1 || len(in.Prefix) > 128 || !studioCustomPrefix.MatchString(in.Prefix) {
+		if decode(w, r, &in) != nil || in.KeyID < 1 {
 			jsonResponse(w, 400, map[string]string{"error": ErrStudioCustom.Error()})
 			return
 		}
@@ -313,7 +318,12 @@ func (s *Server) studioCustomRoutes(mux *http.ServeMux) {
 			unavailable(w, e)
 			return
 		}
-		models, e := s.gatewayModels(r, key.Key, in.Prefix)
+		prefix, e := studioCustomPathPrefix(studioKeyPlatform(key), in.Protocol)
+		if e != nil {
+			jsonResponse(w, 400, map[string]string{"error": ErrStudioCustom.Error()})
+			return
+		}
+		models, e := s.gatewayModels(r, key.Key, prefix)
 		if e != nil {
 			unavailable(w, e)
 			return
@@ -322,25 +332,33 @@ func (s *Server) studioCustomRoutes(mux *http.ServeMux) {
 	})
 	mux.HandleFunc("PUT /api/studio/custom", func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
-			KeyID    int64    `json:"key_id"`
-			Protocol string   `json:"protocol"`
-			Prefix   string   `json:"prefix"`
-			Models   []string `json:"models"`
+			KeyID    int64           `json:"key_id"`
+			Protocol string          `json:"protocol"`
+			Prefix   json.RawMessage `json:"prefix"` // Ignored for older callers.
+			APILabel string          `json:"api_label"`
+			Models   []string        `json:"models"`
 		}
-		if decode(w, r, &in) != nil {
+		if decode(w, r, &in) != nil || in.KeyID < 1 {
 			jsonResponse(w, 400, map[string]string{"error": "invalid_json"})
 			return
 		}
 		if !allowed(w) {
 			return
 		}
-		binding, e := studioCustomBinding(StudioCustomBinding{KeyID: in.KeyID, Protocol: in.Protocol, Prefix: in.Prefix, Models: in.Models})
+		key, e := s.studioOwnKey(r, in.KeyID)
 		if e != nil {
-			jsonResponse(w, 400, map[string]string{"error": ErrStudioCustom.Error()})
+			unavailable(w, e)
 			return
 		}
-		if _, e = s.studioOwnKey(r, binding.KeyID); e != nil {
-			unavailable(w, e)
+		prefix, e := studioCustomPathPrefix(studioKeyPlatform(key), in.Protocol)
+		labels, _, _ := s.Studio.customAPISettings()
+		if studioKeyPlatform(key) == "antigravity" {
+			in.APILabel = ""
+		}
+		labelOK := slices.Contains(labels, in.APILabel) || in.APILabel == "" && (len(labels) == 0 || studioKeyPlatform(key) == "antigravity")
+		binding, invalid := studioCustomBinding(StudioCustomBinding{KeyID: in.KeyID, Protocol: in.Protocol, Prefix: prefix, Models: in.Models, APILabel: in.APILabel})
+		if e != nil || invalid != nil || !labelOK {
+			jsonResponse(w, 400, map[string]string{"error": ErrStudioCustom.Error()})
 			return
 		}
 		binding.UpdatedAt = time.Now().UTC()
@@ -359,4 +377,97 @@ func (s *Server) studioCustomRoutes(mux *http.ServeMux) {
 		}
 		w.WriteHeader(204)
 	})
+}
+
+var studioAPILabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+func firstStudioAPILabel(labels []string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	return labels[0]
+}
+
+func validateStudioAPILabels(labels []string, defaultLabel string) error {
+	if len(labels) > 16 || len(labels) == 0 && defaultLabel != "" || len(labels) > 0 && !slices.Contains(labels, defaultLabel) {
+		return ErrStudioRegistry
+	}
+	seen := map[string]bool{}
+	for _, label := range labels {
+		if !studioAPILabel.MatchString(label) || seen[label] {
+			return ErrStudioRegistry
+		}
+		seen[label] = true
+	}
+	return nil
+}
+
+// ParseStudioCustomAPILabels validates deployment defaults without echoing input.
+func ParseStudioCustomAPILabels(raw string) ([]string, error) {
+	labels := []string{}
+	if raw != "" {
+		for _, label := range strings.Split(raw, ",") {
+			labels = append(labels, strings.TrimSpace(label))
+		}
+	}
+	if e := validateStudioAPILabels(labels, firstStudioAPILabel(labels)); e != nil {
+		return nil, e
+	}
+	return labels, nil
+}
+
+// customAPISettings returns a detached snapshot; online settings override deployment defaults.
+func (s *StudioService) customAPISettings() ([]string, string, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.registry.CustomAPILabels) > 0 {
+		return append([]string{}, s.registry.CustomAPILabels...), s.registry.CustomAPIDefault, "online"
+	}
+	if len(s.deploymentLabels) > 0 {
+		return append([]string{}, s.deploymentLabels...), firstStudioAPILabel(s.deploymentLabels), "deployment"
+	}
+	return []string{}, "", "none"
+}
+
+func (s *StudioService) customAPIHost() string {
+	u, _ := url.Parse(s.APIOrigin)
+	return u.Hostname()
+}
+
+func (s *StudioService) customAPIOrigin(b StudioCustomBinding) string {
+	if strings.HasPrefix(b.Prefix, "/antigravity/") || b.APILabel == "" {
+		return s.APIOrigin
+	}
+	labels, defaultLabel, _ := s.customAPISettings()
+	label := b.APILabel
+	if !slices.Contains(labels, label) {
+		label = defaultLabel
+	}
+	if label == "" {
+		return s.APIOrigin
+	}
+	return "https://" + label + "." + s.customAPIHost()
+}
+
+func studioKeyPlatform(key studioKey) string {
+	if key.Group == nil {
+		return ""
+	}
+	return key.Group.Platform
+}
+
+func studioCustomPathPrefix(platform, protocol string) (string, error) {
+	if platform == "antigravity" {
+		if protocol == "gemini_native" {
+			return "/antigravity/v1beta", nil
+		}
+		return "", ErrStudioCustom
+	}
+	switch protocol {
+	case "gemini_native":
+		return "/v1beta", nil
+	case "openai_images", "grok_image":
+		return "/v1", nil
+	}
+	return "", ErrStudioCustom
 }

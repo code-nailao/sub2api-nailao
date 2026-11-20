@@ -112,8 +112,10 @@ func (f *customFixture) connection(t *testing.T, path, body, key string) customP
 		t.Fatal(code, out)
 	}
 	transport := payload.Connections[0].Transport
-	// Whatever was saved, the host is the configured site and the key is the user's.
-	if !strings.HasPrefix(transport["baseUrl"], f.s.SubOrigin) || strings.ContainsAny(strings.TrimPrefix(transport["baseUrl"], f.s.SubOrigin), "@:?#") || transport["credentialRef"] != key {
+	// The origin follows current address settings and the key is the user's.
+	binding, _ := f.s.Studio.customBinding(f.user)
+	origin := f.s.Studio.customAPIOrigin(binding)
+	if !strings.HasPrefix(transport["baseUrl"], origin) || strings.ContainsAny(strings.TrimPrefix(transport["baseUrl"], origin), "@:?#") || transport["credentialRef"] != key {
 		t.Fatal(out)
 	}
 	return customPayload{Surface: payload.Surface, BaseURL: transport["baseUrl"], Key: transport["credentialRef"], Models: len(payload.Capabilities[0].Models), Task: payload.Capabilities[0].Task}
@@ -152,11 +154,11 @@ func TestStudioCustomConnectionUsesOwnKeyOnTheFixedOrigin(t *testing.T) {
 	}
 
 	// Models are listed under the chosen prefix, in either list shape.
-	code, body = f.call("POST", "/api/studio/custom/models", `{"key_id":11,"prefix":"/v1"}`)
+	code, body = f.call("POST", "/api/studio/custom/models", `{"key_id":11,"protocol":"openai_images","prefix":"/ignored"}`)
 	if code != 200 || body != `{"models":["gpt-image-2","gpt-5"]}`+"\n" {
 		t.Fatal(code, body)
 	}
-	code, body = f.call("POST", "/api/studio/custom/models", `{"key_id":16,"prefix":"/antigravity/v1beta"}`)
+	code, body = f.call("POST", "/api/studio/custom/models", `{"key_id":16,"protocol":"gemini_native","prefix":"/ignored"}`)
 	if code != 200 || body != `{"models":["gemini-3-pro-image-preview","gemini-3-pro"]}`+"\n" {
 		t.Fatal(code, body)
 	}
@@ -164,31 +166,12 @@ func TestStudioCustomConnectionUsesOwnKeyOnTheFixedOrigin(t *testing.T) {
 		t.Fatal(f.models)
 	}
 	for _, key := range []string{"13", "14", "15", "99"} {
-		if code, _ := f.call("POST", "/api/studio/custom/models", `{"key_id":`+key+`,"prefix":"/v1"}`); code != 403 {
+		if code, _ := f.call("POST", "/api/studio/custom/models", `{"key_id":`+key+`,"protocol":"openai_images"}`); code != 403 {
 			t.Fatalf("key %s listed models: %d", key, code)
 		}
 	}
-	badPrefixes := []string{"", "v1", "//elsewhere.example/v1", "https://elsewhere.example/v1", "/@elsewhere.example/v1", "/v1/../../api", "/%2e%2e/v1", "/v1?x=1", "/v1#x", `/v1\\x`, "/v1/", "/a/b/c/d/v1", "/ v1", "/{model}/v1"}
-	for _, prefix := range badPrefixes {
-		request, _ := json.Marshal(map[string]any{"key_id": 11, "prefix": prefix})
-		if code, out := f.call("POST", "/api/studio/custom/models", string(request)); code != 400 {
-			t.Fatalf("models listed under prefix %q: %d %s", prefix, code, out)
-		}
-	}
-	if len(f.models) != 2 {
-		t.Fatal("a refused key or prefix reached the model gateway", f.models)
-	}
-
 	save := func(fields string) (int, string) { return f.call("PUT", "/api/studio/custom", `{`+fields+`}`) }
-	for _, prefix := range badPrefixes[1:] {
-		request, _ := json.Marshal(map[string]any{"key_id": 11, "protocol": "openai_images", "prefix": prefix, "models": []string{"gpt-image-2"}})
-		if code, out := f.call("PUT", "/api/studio/custom", string(request)); code != 400 {
-			t.Fatalf("saved prefix %q: %d %s", prefix, code, out)
-		}
-	}
 	for name, fields := range map[string]string{
-		"openai below v1beta":   `"key_id":11,"protocol":"openai_images","prefix":"/v1beta","models":["gpt-image-2"]`,
-		"grok without v1":       `"key_id":11,"protocol":"grok_image","prefix":"/grok","models":["grok-imagine-image"]`,
 		"unknown protocol":      `"key_id":11,"protocol":"grok_video","prefix":"/v1","models":["gpt-image-2"]`,
 		"no models":             `"key_id":11,"protocol":"openai_images","prefix":"/v1","models":[]`,
 		"typed path":            `"key_id":11,"protocol":"openai_images","prefix":"/v1","create_path":"/images/generations","models":["gpt-image-2"]`,
@@ -223,11 +206,15 @@ func TestStudioCustomConnectionUsesOwnKeyOnTheFixedOrigin(t *testing.T) {
 		t.Fatal(got)
 	}
 
-	// Another prefix: Studio is given it as part of the base address and keeps
-	// the task interface; Canvas runs tasks only on the default path, so it is
-	// given the plain interface of the same prefix.
-	if code, out := save(`"key_id":11,"protocol":"openai_images","prefix":"/alt/v1","models":["gpt-image-2"]`); code != 200 {
-		t.Fatal(code, out)
+	// An old file with a user-typed prefix retains both clients' old contracts.
+	legacy := `{"9":{"key_id":11,"protocol":"openai_images","prefix":"/alt/v1","models":["gpt-image-2"]}}`
+	if e := os.WriteFile(filepath.Join(dir, "studio-custom.json"), []byte(legacy), 0600); e != nil {
+		t.Fatal(e)
+	}
+	var loadErr error
+	f.s.Studio, loadErr = OpenStudio(dir, f.s.SubOrigin, f.s.Studio.Capabilities, "")
+	if loadErr != nil {
+		t.Fatal(loadErr)
 	}
 	got := f.connection(t, "/api/studio/connection", custom, "sk-own-openai-0011")
 	if got.BaseURL != f.s.SubOrigin+"/alt/v1" || got.Task["createPath"] != "/images/generations/async" || got.Task["editPath"] != "/images/edits/async" || fmt.Sprint(got.Task["modes"]) != "[async]" {
@@ -287,7 +274,7 @@ func TestStudioCustomConnectionUsesOwnKeyOnTheFixedOrigin(t *testing.T) {
 	if code, _ := save(`"key_id":11,"protocol":"openai_images","prefix":"/v1","models":["gpt-image-2"]`); code != 403 {
 		t.Fatal("saved while disabled", code)
 	}
-	if code, _ := f.call("POST", "/api/studio/custom/models", `{"key_id":11,"prefix":"/v1"}`); code != 403 {
+	if code, _ := f.call("POST", "/api/studio/custom/models", `{"key_id":11,"protocol":"openai_images","prefix":"/ignored"}`); code != 403 {
 		t.Fatal("listed models while disabled", code)
 	}
 	if code, _ := f.call("POST", "/api/studio/connection", custom); code != 403 {
