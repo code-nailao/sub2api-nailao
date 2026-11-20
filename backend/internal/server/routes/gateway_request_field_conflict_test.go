@@ -90,6 +90,27 @@ func TestGatewayRoutesRejectConflictingFieldsCoversGatewayRoutes(t *testing.T) {
 	}
 }
 
+func TestGatewayRoutesMetadataAllowsDistinctUserKeys(t *testing.T) {
+	router := newGatewayRoutesTestRouterWithGroup(allowlistGroup(service.PlatformOpenAI, false))
+	for _, tc := range []struct {
+		name, metadata, message string
+		status                  int
+	}{
+		{"distinct", `{"trace":"first","TRACE":"second"}`, "User context not found", http.StatusInternalServerError},
+		{"duplicate", `{"trace":"first","trace":"second"}`, "metadata.trace", http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"fixture","input":"test","metadata":`+tc.metadata+`}`))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			// The fixture intentionally stops in the handler before scheduling.
+			require.Equal(t, tc.status, w.Code, w.Body.String())
+			require.Contains(t, w.Body.String(), tc.message)
+		})
+	}
+}
+
 // 白名单开启时，不在名单内的模型仍由白名单按原有格式拒绝（404），不会被这层
 // 改写成 400；两个候选都在名单内但取值不同时，由这层拒绝。
 func TestGatewayRoutesRejectConflictingFieldsKeepsAllowlistResponse(t *testing.T) {

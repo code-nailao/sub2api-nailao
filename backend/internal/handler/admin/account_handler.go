@@ -1423,26 +1423,24 @@ func (h *AccountHandler) refreshSingleAccount(ctx context.Context, account *serv
 			"cannot refresh spark shadow account; its credentials are managed by the parent account")
 	}
 
-	var newCredentials map[string]any
-
 	if account.IsOpenAI() {
-		tokenInfo, err := h.openaiOAuthService.RefreshAccountToken(ctx, account)
+		updatedAccount, err := h.openaiOAuthService.RefreshStoredAccount(ctx, account)
 		if err != nil {
-			// 刷新失败但 access_token 可能仍有效，尝试设置隐私
-			service.AfterAccountCommit(ctx, func(committed context.Context) {
-				h.adminService.EnsureOpenAIPrivacy(committed, account)
-			})
+			// A failed exchange can leave the previous access token usable.
+			if infraerrors.Code(err) != http.StatusConflict {
+				service.AfterAccountCommit(ctx, func(committed context.Context) {
+					h.adminService.EnsureOpenAIPrivacy(committed, account)
+				})
+			}
 			return nil, "", err
 		}
+		h.afterAccountRefresh(ctx, updatedAccount)
+		return updatedAccount, "", nil
+	}
 
-		newCredentials = h.openaiOAuthService.BuildAccountCredentials(tokenInfo)
-		for k, v := range account.Credentials {
-			if _, exists := newCredentials[k]; !exists {
-				newCredentials[k] = v
-			}
-		}
-		newCredentials = service.NormalizeOpenAIPersonalAccessTokenCredentials(account, tokenInfo, newCredentials)
-	} else if account.Platform == service.PlatformGemini {
+	var newCredentials map[string]any
+	switch account.Platform {
+	case service.PlatformGemini:
 		tokenInfo, err := h.geminiOAuthService.RefreshAccountToken(ctx, account)
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to refresh credentials: %w", err)
@@ -1454,7 +1452,7 @@ func (h *AccountHandler) refreshSingleAccount(ctx context.Context, account *serv
 				newCredentials[k] = v
 			}
 		}
-	} else if account.Platform == service.PlatformAntigravity {
+	case service.PlatformAntigravity:
 		tokenInfo, err := h.antigravityOAuthService.RefreshAccountToken(ctx, account)
 		if err != nil {
 			return nil, "", err
@@ -1496,7 +1494,7 @@ func (h *AccountHandler) refreshSingleAccount(ctx context.Context, account *serv
 				return nil, "", fmt.Errorf("failed to clear account error: %w", clearErr)
 			}
 		}
-	} else if account.Platform == service.PlatformGrok {
+	case service.PlatformGrok:
 		if h.grokOAuthService == nil {
 			return nil, "", fmt.Errorf("grok oauth service is not configured")
 		}
@@ -1509,7 +1507,7 @@ func (h *AccountHandler) refreshSingleAccount(ctx context.Context, account *serv
 		if baseURL := strings.TrimSpace(account.GetCredential("base_url")); baseURL != "" {
 			newCredentials["base_url"] = baseURL
 		}
-	} else {
+	default:
 		// Use Anthropic/Claude OAuth service to refresh token
 		tokenInfo, err := h.oauthService.RefreshAccountToken(ctx, account)
 		if err != nil {
@@ -1542,6 +1540,11 @@ func (h *AccountHandler) refreshSingleAccount(ctx context.Context, account *serv
 		return nil, "", err
 	}
 
+	h.afterAccountRefresh(ctx, updatedAccount)
+	return updatedAccount, "", nil
+}
+
+func (h *AccountHandler) afterAccountRefresh(ctx context.Context, updatedAccount *service.Account) {
 	service.AfterAccountCommit(ctx, func(ctx context.Context) {
 		// 刷新成功后，清除 token 缓存，确保下次请求使用新 token
 		if h.tokenCacheInvalidator != nil {
@@ -1555,8 +1558,6 @@ func (h *AccountHandler) refreshSingleAccount(ctx context.Context, account *serv
 		// Antigravity OAuth: 刷新成功后检查并设置 privacy_mode
 		h.adminService.EnsureAntigravityPrivacy(ctx, updatedAccount)
 	})
-
-	return updatedAccount, "", nil
 }
 
 // Refresh handles refreshing account credentials

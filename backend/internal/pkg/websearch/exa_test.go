@@ -89,3 +89,57 @@ func TestExaProvider_SearchHTTPError(t *testing.T) {
 
 	require.ErrorContains(t, err, "exa: status 401")
 }
+
+func TestExaProviderDoesNotFollowCrossOriginRedirect(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		location func(*http.Request) string
+	}{
+		{"host", func(*http.Request) string { return "https://other.example/search" }},
+		{"port", func(r *http.Request) string { return "https://" + r.URL.Hostname() + ":444/search" }},
+		{"scheme", func(r *http.Request) string { return "http://" + r.URL.Host + "/search" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests := 0
+			client := &http.Client{Transport: exaRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				requests++
+				if requests == 1 {
+					return &http.Response{
+						StatusCode: http.StatusTemporaryRedirect,
+						Header:     http.Header{"Location": {test.location(r)}},
+						Body:       http.NoBody,
+					}, nil
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"results":[]}`))}, nil
+			})}
+			provider := NewExaProvider("fixture-key", client)
+
+			_, err := provider.Search(t.Context(), SearchRequest{Query: "fixture"})
+
+			require.Equal(t, 1, requests, "no credential-bearing request should reach another origin")
+			require.Error(t, err)
+			require.Nil(t, client.CheckRedirect, "the provider must leave the shared client unchanged")
+		})
+	}
+}
+
+func TestExaProviderFollowsSameOriginRedirect(t *testing.T) {
+	var paths []string
+	client := &http.Client{Transport: exaRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.Path)
+		require.Equal(t, "fixture-key", r.Header.Get("x-api-key"))
+		if len(paths) == 1 {
+			return &http.Response{
+				StatusCode: http.StatusTemporaryRedirect,
+				Header:     http.Header{"Location": {"https://" + r.URL.Hostname() + ":443/redirected"}},
+				Body:       http.NoBody,
+			}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"results":[]}`))}, nil
+	})}
+
+	_, err := NewExaProvider("fixture-key", client).Search(t.Context(), SearchRequest{Query: "fixture"})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"/search", "/redirected"}, paths)
+}

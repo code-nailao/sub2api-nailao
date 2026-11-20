@@ -122,10 +122,11 @@
         "grok_content_rejection_billing",
         "deepseek_builtin_tools",
         "upstream_022_request_speed_root_upstream_integration",
-        "background_handoff_read_only"
+        "background_handoff_read_only",
+        "openai_manual_oauth_rotation"
       ],
-      "sha256": "fe326c11f1f7b8cb903779d4bb7fd9cc7a9417117891f63a5f4cd87f88cf15de",
-      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Generated Wire injector. provideCleanup returns an applicationCleanup with two phases, background services and the rest, run once each in the old order; each background step is reported as stopping in the runtime status while it runs."
+      "sha256": "7755ecf78a6666a0e126cddeb0f4ae7c165fc81381991bc77f74d3c3bac447ca",
+      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Generated Wire injector. provideCleanup returns an applicationCleanup with two phases, background services and the rest, run once each in the old order; each background step is reported as stopping in the runtime status while it runs. Wires the same OAuth refresh API into the account service and the request and background refreshers."
     },
     {
       "path": "backend/cmd/server/wire_gen_test.go",
@@ -507,10 +508,11 @@
     },
     {
       "path": "backend/internal/handler/admin/account_handler.go",
-      "sha256": "1d6e318e4c20b6598684a4616a5fa2a136f16032920353424099ad9425851369",
-      "reason": "Stores request-speed tier choices on keys, groups and account-group links for groups that enable them, saving key, group and account configuration in one transaction under an advisory lock; this adds schema fields, generated Ent code, repository methods and DTO fields.",
+      "sha256": "457481ac37f81f5a9f07345a015ec2a82a08df5d84e531c3ea802bc69cffc934",
+      "reason": "Stores request-speed tier choices on keys, groups and account-group links for groups that enable them, saving key, group and account configuration in one transaction under an advisory lock; this adds schema fields, generated Ent code, repository methods and DTO fields. Routes single, bulk and scoped OpenAI account refreshes through the shared credential rotation path while keeping post-refresh cache and privacy actions.",
       "features": [
-        "upstream_022_request_speed_data"
+        "upstream_022_request_speed_data",
+        "openai_manual_oauth_rotation"
       ]
     },
     {
@@ -576,6 +578,14 @@
       "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Stores request-speed tier choices on keys, groups and account-group links for groups that enable them, saving key, group and account configuration in one transaction under an advisory lock; this adds schema fields, generated Ent code, repository methods and DTO fields."
     },
     {
+      "path": "backend/internal/handler/admin/openai_oauth_handler.go",
+      "sha256": "258c4ec3bb6d21c924d5a0ff98cc132cc31337bb3b1b2ed2d7007a0e468627fc",
+      "features": [
+        "openai_manual_oauth_rotation"
+      ],
+      "reason": "Uses shared conditional credential persistence for the dedicated OpenAI account refresh endpoint."
+    },
+    {
       "path": "backend/internal/handler/admin/payment_handler.go",
       "features": [
         "verified_native_payment"
@@ -623,6 +633,14 @@
       ],
       "sha256": "a6163562cb5b2722f9a3f7f9464d1f2ae5ead316403b6c6b61bd5e6aa128b65c",
       "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit."
+    },
+    {
+      "path": "backend/internal/handler/admin/sources_openai_manual_refresh_test.go",
+      "sha256": "94a6f95ee31517d9982643a03f0eedf3b3661c03130c08747c8996d7ce3ada6e",
+      "features": [
+        "openai_manual_oauth_rotation"
+      ],
+      "reason": "Covers both OpenAI administrator refresh entry points racing with reauthorization and checks that scoped refreshes hold the lock through commit or rollback."
     },
     {
       "path": "backend/internal/handler/admin/wallet_management.go",
@@ -1110,6 +1128,38 @@
       "reason": "Adds a native BEpusdt (USDT) payment provider and verifies payments before fulfilment: active order lookup, one payment-proof transaction with unique receipts, configuration versions for older orders, late and duplicate callback handling, a pending-verification order state and durable post-commit compensation."
     },
     {
+      "path": "backend/internal/pkg/requestmodel/conflict.go",
+      "sha256": "1c748c185091cb25c880d6679285a4b91d0bc25af30f617ef3d655ddbabd0480",
+      "features": [
+        "upstream_metadata_key_compatibility"
+      ],
+      "reason": "Allows distinct case-sensitive keys in user metadata while retaining duplicate detection and case folding for the structured metadata.user_id field."
+    },
+    {
+      "path": "backend/internal/pkg/requestmodel/conflict_test.go",
+      "sha256": "ad84601880aafb86b3b804970783f857683de3af68fa4fb8a94ab2299fa50e6a",
+      "features": [
+        "upstream_metadata_key_compatibility"
+      ],
+      "reason": "Tests distinct mixed-case metadata keys and rejects repeated keys including equivalent JSON spellings."
+    },
+    {
+      "path": "backend/internal/pkg/websearch/exa.go",
+      "sha256": "ac4c0163c9f83055259dd351ce59a3fba55d1923d71aa995c5b945be46e46d55",
+      "features": [
+        "web_search_credential_scope"
+      ],
+      "reason": "Restricts the provider client to same-origin redirects so the API key is sent only to the request origin."
+    },
+    {
+      "path": "backend/internal/pkg/websearch/exa_test.go",
+      "sha256": "1879cf71c8504c102865187c92b3f19fa6787be64bc9b49d493d4ef59464aaa0",
+      "features": [
+        "web_search_credential_scope"
+      ],
+      "reason": "Uses a fake transport to check that the provider blocks cross-origin sends and can follow an equivalent same-origin HTTPS redirect."
+    },
+    {
       "path": "backend/internal/processrole/admission.go",
       "sha256": "7be807a2a728fa046be9946a6af30f71c99ba8b41f8179252e8e129cbc46507d",
       "features": [
@@ -1179,11 +1229,12 @@
     },
     {
       "path": "backend/internal/repository/account_repo.go",
-      "sha256": "6b3d70c2898876d55d249ac2e118517628ea884203eabf207ad23f7fc0af6238",
-      "reason": "Keeps a verified wallet binding and its snapshot when an account edit changes only model metadata (model mappings or capabilities), by comparing a full identity hash under the account row lock inside the save transaction; changes to credentials, URL, proxy, protocol or headers still drop the binding. Stores request-speed tier choices on keys, groups and account-group links for groups that enable them, saving key, group and account configuration in one transaction under an advisory lock; this adds schema fields, generated Ent code, repository methods and DTO fields.",
+      "sha256": "338f484e6be6810dc85dba236abc419053e7034d6e87754369538751422c6d94",
+      "reason": "Keeps a verified wallet binding and its snapshot when an account edit changes only model metadata (model mappings or capabilities), by comparing a full identity hash under the account row lock inside the save transaction; changes to credentials, URL, proxy, protocol or headers still drop the binding. Stores request-speed tier choices on keys, groups and account-group links for groups that enable them, saving key, group and account configuration in one transaction under an advisory lock; this adds schema fields, generated Ent code, repository methods and DTO fields. Uses the scoped administrator transaction for conditional credential persistence and publishes the scheduler snapshot after commit.",
       "features": [
         "wallet_metadata_edit",
-        "upstream_022_request_speed_data"
+        "upstream_022_request_speed_data",
+        "openai_manual_oauth_rotation"
       ]
     },
     {
@@ -1668,11 +1719,12 @@
     },
     {
       "path": "backend/internal/repository/sources_oauth_rotation_integration_test.go",
-      "sha256": "5aa3fcdff75ba843983c8ff95b7e1e60ae45e411989a36ba8cf1956331810212",
+      "sha256": "51ed33f07c8a55b856a74efbe0ac24b2ed8171f6d67dc5db3ecdf87a2c469c0d",
       "features": [
-        "release_handoff_p1"
+        "release_handoff_p1",
+        "openai_manual_oauth_rotation"
       ],
-      "reason": "Verifies with a disposable database that conditional OpenAI credential persistence keeps a newer durable rotation when an older snapshot tries to save."
+      "reason": "Verifies with a disposable database that conditional OpenAI credential persistence keeps a newer durable rotation when an older snapshot tries to save. Verifies conditional writes use the same transaction as the scoped account lock and are rolled back with the transaction."
     },
     {
       "path": "backend/internal/repository/sources_serving_startup.go",
@@ -1958,6 +2010,14 @@
       ],
       "sha256": "a9f7d7139a697a5ba3ea68da1b46130a1d52994cc7e921fd7c86a76c80dc7674",
       "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Adds five standalone DeepSeek tool endpoints (search, fetch, OCR, ASR, TTS) as thin relays billed from the balance at fixed per-unit group prices that are not multiplied by the group rate: OCR per confirmed page, ASR per started second, TTS per billable character with a Han character counting as 2. Size, type and duration limits are checked and the estimate is reserved before any supplier call; the group's tool-enabled accounts are scheduled with failover only on a definitive rejection before anything was relayed, unknown outcomes are never replayed, and supplier costs become optional. This needs gateway routes, account selection, the shared tool usage snapshot and admin fields. Preserves standalone tool upload admission before body reads, then uses upstream duplicate field rejection after the model allowlist and before composite routing."
+    },
+    {
+      "path": "backend/internal/server/routes/gateway_request_field_conflict_test.go",
+      "sha256": "7048e8d6428751c96922c10aee7ec17212596c70f175cb5e4f4e5c87023298ae",
+      "features": [
+        "upstream_metadata_key_compatibility"
+      ],
+      "reason": "Verifies that metadata with distinct case-sensitive keys reaches the real gateway handler and a repeated key is rejected at ingress."
     },
     {
       "path": "backend/internal/server/routes/payment.go",
@@ -2966,6 +3026,14 @@
       "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages."
     },
     {
+      "path": "backend/internal/service/oauth_refresh_api.go",
+      "sha256": "d2a1c9046b6e15b75b05c6fc259604cd19f9cd197523be9a5bf941185e6bf294",
+      "features": [
+        "openai_manual_oauth_rotation"
+      ],
+      "reason": "Shares process and distributed locks with manual OpenAI refresh, uses conditional writes and defers cache publication and lock release to the end of scoped transactions."
+    },
+    {
       "path": "backend/internal/service/oauth_refresh_api_test.go",
       "sha256": "57aa8a857b3f624b63967f86431bd65ecb13c91c718dfa05ab9b1e528659894e",
       "features": [
@@ -2988,6 +3056,22 @@
       ],
       "sha256": "c6a2d9cef4d74524bc7cff48514b0cdfdc456bf44e90d57c8dab444bf3461abd",
       "reason": "Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling."
+    },
+    {
+      "path": "backend/internal/service/openai_alpha_search.go",
+      "sha256": "8d3e0f93e09ad757edd8ed8ef804e7a6f6c6977a140ca97b1df212efa05e4edb",
+      "features": [
+        "paid_submission_no_replay"
+      ],
+      "reason": "Returns a terminal HTTP 408 without switching accounts or proposing a client retry when standalone search may already have been accepted."
+    },
+    {
+      "path": "backend/internal/service/openai_alpha_search_test.go",
+      "sha256": "93183e16f23d9e4422ae7de54cf6fbc03206a31ccdcda181704040daa5cd785c",
+      "features": [
+        "paid_submission_no_replay"
+      ],
+      "reason": "Checks that uncertain HTTP 408 search results do not signal replay or billing on either OpenAI search path."
     },
     {
       "path": "backend/internal/service/openai_gateway_cc_pipeline.go",
@@ -3179,6 +3263,14 @@
       ],
       "sha256": "414142a6da383ca24e27b8ec3ba2f5594e519e2cef2df2f62a26d4825ef74d10",
       "reason": "Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages."
+    },
+    {
+      "path": "backend/internal/service/openai_oauth_service.go",
+      "sha256": "b832576925b1981276f92223550fc6101988c161942183c62dc02dec48249b3e",
+      "features": [
+        "openai_manual_oauth_rotation"
+      ],
+      "reason": "Forces administrator refresh through the shared OAuth rotation path, using the latest account snapshot and accounting for lock contention."
     },
     {
       "path": "backend/internal/service/openai_plugin_account_directory_test.go",
@@ -3992,10 +4084,11 @@
         "account_wallet_refresh",
         "grok_content_rejection_billing",
         "deepseek_builtin_tools",
-        "upstream_022_request_speed_root_upstream_integration"
+        "upstream_022_request_speed_root_upstream_integration",
+        "openai_manual_oauth_rotation"
       ],
-      "sha256": "c03efb7e2aa338d352b3e8819738c83ea1ea3a64d4988df1832940cffa7c0841",
-      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour."
+      "sha256": "7462c40d1cd8ec2f520a9ea5432064f0afaa883b85c0a3b11a1dfc2b5c5bc4d9",
+      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Injects the shared OAuth refresh API into the service used by manual refresh handlers."
     },
     {
       "path": "backend/internal/web/embed_on.go",

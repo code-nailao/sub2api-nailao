@@ -10,6 +10,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	dbent "github.com/Wei-Shaw/sub2api/ent"
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 )
 
 // OAuthRefreshExecutor 各平台实现的 OAuth 刷新执行器
@@ -105,6 +108,15 @@ func (m *contextMutex) Lock(ctx context.Context) error {
 	}
 }
 
+func (m *contextMutex) TryLock() bool {
+	select {
+	case m.token <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
 func (m *contextMutex) Unlock() {
 	<-m.token
 }
@@ -179,6 +191,16 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 	executor OAuthRefreshExecutor,
 	refreshWindow time.Duration,
 ) (*OAuthRefreshResult, error) {
+	return api.refresh(ctx, account, executor, refreshWindow, false)
+}
+
+func (api *OAuthRefreshAPI) refresh(
+	ctx context.Context,
+	account *Account,
+	executor OAuthRefreshExecutor,
+	refreshWindow time.Duration,
+	manual bool,
+) (*OAuthRefreshResult, error) {
 	if api == nil || api.accountRepo == nil {
 		return nil, errors.New("oauth refresh account repository is not configured")
 	}
@@ -191,17 +213,37 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 	requestPath := isOAuthRefreshRequestPath(ctx)
 	cacheKey := executor.CacheKey(account)
 
-	// 0. 获取进程内互斥锁（防止同一进程内的并发刷新竞争）
 	localMu := api.getLocalLock(cacheKey)
-	if err := localMu.Lock(ctx); err != nil {
+	if manual {
+		// A scoped admin transaction may already hold the account row. Return
+		// on contention so we never wait for a refresher that needs that row.
+		if !localMu.TryLock() {
+			return &OAuthRefreshResult{LockHeld: true}, nil
+		}
+	} else if err := localMu.Lock(ctx); err != nil {
 		return nil, fmt.Errorf("oauth refresh local lock: %w", err)
 	}
-	defer localMu.Unlock()
+	lockCtx := ctx
+	leaseHeld := false
+	release := func() {
+		if leaseHeld {
+			api.releaseRefreshLock(lockCtx, cacheKey)
+		}
+		localMu.Unlock()
+	}
+	if tx := dbent.TxFromContext(ctx); manual && tx != nil {
+		releaseOAuthRefreshWhenTransactionEnds(tx, release)
+	} else {
+		defer release()
+	}
 
 	// 1. 获取分布式锁
 	if api.tokenCache != nil {
 		acquired, lockErr := api.tokenCache.AcquireRefreshLock(ctx, cacheKey, api.lockTTL)
 		if lockErr != nil {
+			if manual {
+				return nil, infraerrors.ServiceUnavailable("OAUTH_REFRESH_LOCK_UNAVAILABLE", "OAuth refresh lock is unavailable")
+			}
 			// Redis 错误，降级为无锁刷新（进程内互斥锁仍生效）
 			slog.Warn("oauth_refresh_lock_failed_degraded",
 				"account_id", account.ID,
@@ -212,7 +254,7 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 			// 锁被其他 worker 持有
 			return &OAuthRefreshResult{LockHeld: true}, nil
 		} else {
-			defer api.releaseRefreshLock(ctx, cacheKey)
+			leaseHeld = true
 			if account.Platform == PlatformOpenAI && account.Type == AccountTypeOAuth {
 				// Reserve lease time for the irreversible rotation's detached save,
 				// cache invalidation and lock release, including request-path calls.
@@ -244,7 +286,7 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 	if freshAccount.ID != account.ID {
 		return nil, fmt.Errorf("%w: account identity mismatch", errOAuthRefreshAccountRereadFailed)
 	}
-	if !freshAccount.IsActive() {
+	if !manual && !freshAccount.IsActive() {
 		if requestPath {
 			return nil, fmt.Errorf("%w: account is not active", errOAuthRefreshAccountStateChanged)
 		}
@@ -256,6 +298,9 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 		}
 	}
 	if !executor.CanRefresh(freshAccount) {
+		if manual {
+			return nil, infraerrors.Conflict("OAUTH_REFRESH_ACCOUNT_CHANGED", "The account changed before it could be refreshed")
+		}
 		if requestPath && freshAccount.IsGrokOAuth() && strings.TrimSpace(freshAccount.GetGrokRefreshToken()) == "" {
 			return nil, withGrokCredentialFailureSnapshot(errGrokOAuthRefreshTokenMissing, freshAccount)
 		}
@@ -266,7 +311,7 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 	}
 
 	// 3. 二次检查是否仍需刷新（另一条路径可能已刷新）
-	if !executor.NeedsRefresh(freshAccount, refreshWindow) {
+	if !manual && !executor.NeedsRefresh(freshAccount, refreshWindow) {
 		return &OAuthRefreshResult{
 			Account: freshAccount,
 		}, nil
@@ -275,16 +320,19 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 	// 4. 执行平台特定刷新逻辑
 	attemptedAccount := snapshotOAuthRefreshAccount(freshAccount)
 	newCredentials, refreshErr := executor.Refresh(ctx, freshAccount)
-	if refreshErr == nil && hasOpenAIRefreshCredentials(attemptedAccount, newCredentials) {
-		// The upstream rotation is irreversible. Cancellation of optional
-		// enrichment must not discard its result or cause an old-token retry.
+	rotated := refreshErr == nil && hasOpenAIRefreshCredentials(attemptedAccount, newCredentials)
+	if rotated || (manual && refreshErr == nil && newCredentials != nil && ctx.Err() == nil) {
+		// A completed rotation is irreversible. A manual update that only
+		// validated an existing token also needs a conditional write.
 		durableAccount, applied, persistErr := persistOpenAIRefreshCredentials(ctx, api.accountRepo, attemptedAccount, newCredentials)
 		if applied && api.tokenCache != nil {
-			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultRefreshPostPersistCleanupTimeout)
-			defer cancel()
-			if err := api.tokenCache.DeleteAccessToken(cleanupCtx, cacheKey); err != nil {
-				slog.Warn("oauth_refresh_post_persist_cache_delete_failed", "account_id", account.ID, "error", err)
-			}
+			AfterAccountCommit(ctx, func(committed context.Context) {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(committed), defaultRefreshPostPersistCleanupTimeout)
+				defer cancel()
+				if err := api.tokenCache.DeleteAccessToken(cleanupCtx, cacheKey); err != nil {
+					slog.Warn("oauth_refresh_post_persist_cache_delete_failed", "account_id", account.ID, "error", err)
+				}
+			})
 		}
 		if persistErr != nil {
 			return nil, persistErr
@@ -469,6 +517,24 @@ func persistOpenAIRefreshCredentials(parent context.Context, repo AccountReposit
 		}
 	}
 	return nil, false, &providerCycleContainmentRefreshError{err: fmt.Errorf("%w: OpenAI credentials changed repeatedly during persistence", errOAuthRefreshCredentialPersist)}
+}
+
+// Register before the refresh adds its post-commit cache hooks so those hooks
+// run after the write commits and before the locks are released.
+func releaseOAuthRefreshWhenTransactionEnds(tx *dbent.Tx, release func()) {
+	finish := sync.OnceFunc(release)
+	tx.OnCommit(func(next dbent.Committer) dbent.Committer {
+		return dbent.CommitFunc(func(ctx context.Context, tx *dbent.Tx) error {
+			defer finish()
+			return next.Commit(ctx, tx)
+		})
+	})
+	tx.OnRollback(func(next dbent.Rollbacker) dbent.Rollbacker {
+		return dbent.RollbackFunc(func(ctx context.Context, tx *dbent.Tx) error {
+			defer finish()
+			return next.Rollback(ctx, tx)
+		})
+	})
 }
 
 func (api *OAuthRefreshAPI) releaseRefreshLock(parent context.Context, cacheKey string) {

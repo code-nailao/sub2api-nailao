@@ -324,6 +324,46 @@ func TestForwardAlphaSearchReturnsFailoverBeforeWriting(t *testing.T) {
 	require.Empty(t, recorder.Body.String())
 }
 
+func TestForwardAlphaSearchRequestTimeoutDoesNotSignalReplay(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, personalAccessToken := range []bool{false, true} {
+		name := "standalone"
+		if personalAccessToken {
+			name = "responses_fallback"
+		}
+		t.Run(name, func(t *testing.T) {
+			body := []byte(`{"model":"gpt-5","commands":{"search_query":[{"q":"fixture"}]}}`)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/alpha/search", bytes.NewReader(body))
+			upstream := &httpUpstreamRecorder{resp: &http.Response{
+				StatusCode: http.StatusRequestTimeout,
+				Header:     http.Header{"Content-Type": {"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"fixture timeout"}}`)),
+			}}
+			svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+			account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
+				Credentials: map[string]any{"api_key": "fixture-key"}}
+			if personalAccessToken {
+				account.Type = AccountTypeOAuth
+				account.Credentials = map[string]any{
+					"auth_mode": OpenAIAuthModePersonalAccessToken, "access_token": "fixture-access", "chatgpt_account_id": "fixture-account",
+				}
+			}
+
+			result, err := svc.ForwardAlphaSearch(c.Request.Context(), c, account, body)
+
+			var failover *UpstreamFailoverError
+			require.NotErrorAs(t, err, &failover, "the handler may replay only on a failover signal")
+			require.NoError(t, err)
+			require.Nil(t, result, "there is no confirmed search to bill")
+			require.Len(t, upstream.requests, 1)
+			require.Equal(t, http.StatusRequestTimeout, w.Code)
+			require.Equal(t, "false", w.Header().Get("x-should-retry"))
+		})
+	}
+}
+
 func TestForwardAlphaSearchSetupToken429CarriesSameAccountRetryWindow(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	body := []byte(`{"id":"search-session","model":"gpt-5.6-sol","commands":{}}`)

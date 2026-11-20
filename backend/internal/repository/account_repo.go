@@ -1728,7 +1728,11 @@ func (r *accountRepository) updateOAuthCredentialsIfUnchanged(
 	if err != nil {
 		return false, err
 	}
-	result, err := r.sql.ExecContext(ctx, `
+	executor := r.sql
+	if tx := dbent.TxFromContext(ctx); tx != nil {
+		executor = tx.Client()
+	}
+	result, err := executor.ExecContext(ctx, `
 		WITH updated AS (
 		UPDATE accounts AS a
 		SET credentials = $1::jsonb,
@@ -1763,7 +1767,9 @@ func (r *accountRepository) updateOAuthCredentialsIfUnchanged(
 	if rowsAffected == 0 {
 		return false, nil
 	}
-	r.syncSchedulerAccountSnapshotDetached(ctx, id)
+	service.AfterAccountCommit(ctx, func(committed context.Context) {
+		r.syncSchedulerAccountSnapshotDetached(committed, id)
+	})
 	return true, nil
 }
 

@@ -101,9 +101,10 @@ const conflictLinearScanLimit = 32
 var conflictHashSeed = maphash.MakeSeed()
 
 type scanFrame struct {
-	object  bool
-	fold    bool // 是否按大小写折叠比较本对象的成员名
-	wantKey bool // object：下一个字符串是成员名
+	object   bool
+	fold     bool // 是否按大小写折叠比较本对象的协议成员名
+	metadata bool // 顶层 metadata 对象，仅 user_id 按结构体绑定规则折叠
+	wantKey  bool // object：下一个字符串是成员名
 	// 当前成员名在请求体中的原始范围（不含引号），用于路径与自由键判定。
 	keyStart, keyEnd int
 	keyEscaped       bool
@@ -176,22 +177,30 @@ func scanDuplicateMember(body []byte) (string, bool) {
 
 func (s *duplicateScanner) push(object bool) {
 	fold := true
+	metadata := false
 	if n := len(s.stack); n > 0 {
 		parent := &s.stack[n-1]
 		fold = parent.fold
 		if fold && parent.object {
 			s.names = appendMemberName(s.names[:0], s.body[parent.keyStart:parent.keyEnd], parent.keyEscaped, false)
+			metadata = object && n == 1 && bytes.EqualFold(s.names, []byte("metadata"))
 			fold = !isFreeformMember(s.names, n > 1)
 		}
 	}
-	s.stack = append(s.stack, scanFrame{object: object, fold: fold, wantKey: object, hashStart: len(s.hashes)})
+	s.stack = append(s.stack, scanFrame{object: object, fold: fold, metadata: metadata, wantKey: object, hashStart: len(s.hashes)})
 }
 
 // repeated 登记 top 的当前成员名，返回它是否与本对象中更早的成员重名。
 func (s *duplicateScanner) repeated(top *scanFrame) bool {
 	s.hash.Reset()
 	s.runes = appendMemberName(s.runes[:0], s.body[top.keyStart:top.keyEnd], top.keyEscaped, top.fold)
-	_, _ = s.hash.Write(s.runes)
+	if top.metadata && bytes.EqualFold(s.runes, []byte("user_id")) {
+		// Antigravity binds this particular field case-insensitively. Other
+		// metadata keys belong to the caller and keep their exact spelling.
+		_, _ = s.hash.WriteString("user_id")
+	} else {
+		_, _ = s.hash.Write(s.runes)
+	}
 	sum := s.hash.Sum64()
 
 	if top.seen != nil {
@@ -240,13 +249,12 @@ func (s *duplicateScanner) path() string {
 // 参数、提示词模板变量、MCP 请求头、标签。这些子树内的成员名只做精确比较（成员名
 // 解码后不区分大小写地匹配本表）。它们都不在网关计费/策略读取、也不被结构体绑定
 // 的字段路径上；input / response 只在非顶层时算（顶层 input 是 Responses 的输入
-// 列表，顶层 response 是 realtime response.create 的参数）。metadata 不在表内：
-// Antigravity 把 metadata.user_id 绑定到结构体（大小写不敏感），而网关的粘性会话
-// 用 gjson 读它。
+// 列表，顶层 response 是 realtime response.create 的参数）。顶层 metadata.user_id
+// 是结构体绑定的协议字段，例外规则见 repeated。
 var freeformMembers = []string{
 	"properties", "patternProperties", "$defs", "definitions", "dependentSchemas",
 	"dependentRequired", "dependencies", "default", "const", "examples", "enum",
-	"args", "arguments", "variables", "headers", "labels",
+	"args", "arguments", "variables", "headers", "labels", "metadata",
 }
 
 func isFreeformMember(name []byte, nested bool) bool {

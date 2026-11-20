@@ -95,6 +95,24 @@ func TestConflictingFieldJSONAcceptsUnambiguousBodies(t *testing.T) {
 }
 
 // 回归：JSON handler 不看 Content-Type，把 JSON 请求体标成 multipart 不能绕过检查。
+func TestConflictingFieldMetadataUsesExactUserKeys(t *testing.T) {
+	for _, body := range []string{
+		`{"metadata":{"trace":"a","TRACE":"b"}}`,
+		`{"METADATA":{"trace":{"A":1,"a":2},"TRACE":"b"}}`,
+	} {
+		field, conflict := ConflictingField("application/json", []byte(body))
+		require.False(t, conflict, "distinct metadata keys must be accepted: %s", field)
+	}
+	for _, body := range []string{
+		`{"metadata":{"trace":"a","trace":"a"}}`,
+		`{"meta\u0064ata":{"trace":"a","tr\u0061ce":"b"}}`,
+	} {
+		field, conflict := ConflictingField("application/json", []byte(body))
+		require.True(t, conflict)
+		require.Equal(t, "metadata.trace", field)
+	}
+}
+
 func TestConflictingFieldIgnoresMultipartLabelOnJSONBody(t *testing.T) {
 	body := []byte(`{"model":"claude-3-5-haiku-20241022","messages":[],"model":"claude-opus-4-8"}`)
 	for _, contentType := range []string{"multipart/form-data", "multipart/form-data; boundary=zzz", `Multipart/Form-Data; boundary="a"`, "text/plain", ""} {

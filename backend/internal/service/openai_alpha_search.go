@@ -89,7 +89,9 @@ func (s *OpenAIGatewayService) ForwardAlphaSearch(ctx context.Context, c *gin.Co
 		return nil, fmt.Errorf("read alpha search response: %w", err)
 	}
 
-	if resp.StatusCode >= http.StatusBadRequest {
+	// An HTTP 408 leaves the paid search outcome unknown. Pass it through
+	// without asking the scheduler to submit the same search again.
+	if resp.StatusCode >= http.StatusBadRequest && resp.StatusCode != http.StatusRequestTimeout {
 		upstreamMessage := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(respBody)))
 		if s.shouldFailoverOpenAIUpstreamResponse(account, resp.StatusCode, upstreamMessage, respBody) ||
 			isOpenAIAlphaSearchEndpointUnsupported(account, resp.StatusCode) {
@@ -117,12 +119,7 @@ func (s *OpenAIGatewayService) ForwardAlphaSearch(ctx context.Context, c *gin.Co
 	if !account.IsShadow() {
 		s.UpdateCodexUsageSnapshotFromHeaders(ctx, account.ID, resp.Header)
 	}
-	writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
-	contentType := resp.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/json"
-	}
-	c.Data(resp.StatusCode, contentType, respBody)
+	s.writeAlphaSearchHTTPResponse(c, resp, respBody)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		// 非 2xx（错误/重定向）已原样透传给客户端：不是一次成功的搜索，不计费。
 		return nil, nil
@@ -173,7 +170,7 @@ func (s *OpenAIGatewayService) forwardAlphaSearchViaResponsesWebSearch(
 		return nil, fmt.Errorf("read alpha search responses fallback response: %w", err)
 	}
 
-	if resp.StatusCode >= http.StatusBadRequest {
+	if resp.StatusCode >= http.StatusBadRequest && resp.StatusCode != http.StatusRequestTimeout {
 		upstreamMessage := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(respBody)))
 		if s.shouldFailoverOpenAIUpstreamResponse(account, resp.StatusCode, upstreamMessage, respBody) {
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
@@ -194,12 +191,7 @@ func (s *OpenAIGatewayService) forwardAlphaSearchViaResponsesWebSearch(
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
-		contentType := resp.Header.Get("Content-Type")
-		if contentType == "" {
-			contentType = "application/json"
-		}
-		c.Data(resp.StatusCode, contentType, respBody)
+		s.writeAlphaSearchHTTPResponse(c, resp, respBody)
 		return nil, nil
 	}
 
@@ -221,6 +213,19 @@ func (s *OpenAIGatewayService) forwardAlphaSearchViaResponsesWebSearch(
 		Duration:         time.Since(upstreamStart),
 		WebSearchCalls:   1,
 	}, nil
+}
+
+func (s *OpenAIGatewayService) writeAlphaSearchHTTPResponse(c *gin.Context, resp *http.Response, body []byte) {
+	writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+	if resp.StatusCode == http.StatusRequestTimeout {
+		// Search may already have been accepted. Do not request a client retry.
+		c.Header("x-should-retry", "false")
+	}
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	c.Data(resp.StatusCode, contentType, body)
 }
 
 func openAIAlphaSearchSchedulingModel(account *Account, requestedModel string) string {

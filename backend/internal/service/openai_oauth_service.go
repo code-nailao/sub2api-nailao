@@ -17,6 +17,7 @@ type OpenAIOAuthService struct {
 	sessionStore         *openai.SessionStore
 	proxyRepo            ProxyRepository
 	oauthClient          OpenAIOAuthClient
+	refreshAPI           *OAuthRefreshAPI
 	privacyClientFactory PrivacyClientFactory // 用于调用 chatgpt.com/backend-api（ImpersonateChrome）
 }
 
@@ -333,6 +334,26 @@ func resolveChatGPTSubscriptionAccountID(tokenInfo *OpenAITokenInfo, orgID strin
 		}
 	}
 	return ""
+}
+
+// RefreshStoredAccount forces an administrative refresh under the same locks
+// and credential checks used by request and background refreshes.
+func (s *OpenAIOAuthService) RefreshStoredAccount(ctx context.Context, account *Account) (*Account, error) {
+	if account == nil || account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth || account.IsCredentialShadow() {
+		return nil, infraerrors.BadRequest("OPENAI_OAUTH_INVALID_ACCOUNT", "account is not a refreshable OpenAI OAuth account")
+	}
+	if s.refreshAPI == nil {
+		return nil, infraerrors.ServiceUnavailable("OAUTH_REFRESH_UNAVAILABLE", "OAuth account refresh is unavailable")
+	}
+	executor := NewOpenAITokenRefresher(s, s.refreshAPI.accountRepo)
+	result, err := s.refreshAPI.refresh(ctx, account, executor, 0, true)
+	if err != nil {
+		return nil, err
+	}
+	if result.LockHeld {
+		return nil, infraerrors.Conflict("OAUTH_REFRESH_IN_PROGRESS", "This account is already being refreshed")
+	}
+	return result.Account, nil
 }
 
 // RefreshAccountToken refreshes token for an OpenAI OAuth account

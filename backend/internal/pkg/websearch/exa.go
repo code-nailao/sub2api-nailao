@@ -27,7 +27,26 @@ func NewExaProvider(apiKey string, httpClient *http.Client) *ExaProvider {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	return &ExaProvider{apiKey: apiKey, httpClient: httpClient}
+	// Other providers may share this client. Keep the transport, timeout and
+	// any caller-supplied redirect policy while restricting Exa's credentials.
+	client := *httpClient
+	previousRedirect := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if previousRedirect != nil {
+			if err := previousRedirect(req, via); err != nil {
+				return err
+			}
+		} else if len(via) >= 10 {
+			return http.ErrUseLastResponse
+		}
+		origin := via[0].URL
+		if req.URL.Scheme != origin.Scheme || !strings.EqualFold(req.URL.Hostname(), origin.Hostname()) ||
+			(req.URL.Port() != "" && req.URL.Port() != "443") || req.URL.User != nil {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}
+	return &ExaProvider{apiKey: apiKey, httpClient: &client}
 }
 
 func (e *ExaProvider) Name() string { return exaProviderName }
