@@ -2537,8 +2537,8 @@
       "features": [
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Checks streaming and buffered Chat payloads for orphan, missing, and displaced results, adjacency priority and discarded candidates with reused IDs, parallel call order and byte preservation. Covers direct DeepSeek, mapped DeepSeek models on both OpenCode Go account paths, non-DeepSeek models on shared upstreams and Responses-shaped input. Checks aligned native Chat histories without reasoning content for disabled and forced-off thinking, mapped GLM over OpenCode, and enabled DeepSeek thinking.",
-      "sha256": "4ed68bfc24be63263bcdd2e63a3378210cc844d21d5726e4d164c0ebf8ce2c48"
+      "reason": "Checks streaming and buffered Chat payloads for orphan, missing, and displaced results, adjacency priority and discarded candidates with reused IDs, parallel call order and byte preservation. Covers direct DeepSeek, mapped DeepSeek models on both OpenCode Go account paths, non-DeepSeek models on shared upstreams and Responses-shaped input. Checks aligned native Chat histories without reasoning content for disabled and forced-off thinking, mapped GLM over OpenCode, and enabled DeepSeek thinking. Covers direct thinking aliases, byte preservation across hosted Chat turns, and unusable call IDs in the same assistant message.",
+      "sha256": "78bc846ca7d945a5f7d6dcebcebb95b471dc294ca2ba1f7275f74af43d25eda3"
     },
     {
       "path": "backend/internal/service/deepseek_forced_tool_choice.go",
@@ -2672,20 +2672,22 @@
       "path": "backend/internal/service/deepseek_tools_failures_test.go",
       "features": [
         "deepseek_builtin_tools",
-        "deepseek_in_chat_tool_types"
+        "deepseek_in_chat_tool_types",
+        "deepseek_chat_tool_pairing"
       ],
-      "sha256": "ca9bc295912df07edb721024795760c0b7a88415abfe58544f5d8fdbe12fb3ee",
-      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook. Tests for this behaviour."
+      "sha256": "ad6ca8b380486db4448e0fb60a90bfb9571b5e3b23315234190e2b02d9c83ee3",
+      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook. Tests for this behaviour. Shares the hosted fixture with raw Chat requests for byte comparisons."
     },
     {
       "path": "backend/internal/service/deepseek_tools_hosted.go",
       "features": [
         "deepseek_builtin_tools",
         "deepseek_tool_compat",
-        "deepseek_in_chat_tool_types"
+        "deepseek_in_chat_tool_types",
+        "deepseek_chat_tool_pairing"
       ],
-      "sha256": "0ff94253dfef90d49fc63689469879aaf32ca0832d19564cc3c2affabf1af102",
-      "reason": "Runs optional hosted search and fetch with existing eligibility, streaming and usage checkpoint rules. Routes disabled-group Chat requests, including Responses-shaped bodies on fixed Chat accounts, through the bounded web-tool filter. Marks local validation rejections and interruptions so they do not count as account failures. Optional setup failures use ordinary forwarding after removing unavailable declarations and adding a notice."
+      "sha256": "83b2ad4affc45b6af35d639dde8c326da26f89b375b33a267ab575562af4475e",
+      "reason": "Runs optional hosted search and fetch with existing eligibility, streaming and usage checkpoint rules. Routes disabled-group Chat requests, including Responses-shaped bodies on fixed Chat accounts, through the bounded web-tool filter. Marks local validation rejections and interruptions so they do not count as account failures. Optional setup failures use ordinary forwarding after removing unavailable declarations and adding a notice. Holds original native Chat messages as raw JSON and assembles them before appended hosted tool messages without re-encoding them."
     },
     {
       "path": "backend/internal/service/deepseek_tools_in_chat_test.go",
@@ -3002,8 +3004,8 @@
         "deepseek_tool_compat",
         "deepseek_chat_tool_pairing"
       ],
-      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point. For DeepSeek groups with tools off, a Chat transport error permits failover only when delivery tracking confirms the request did not obtain a connection or write request bytes. Makes the protected POST body non-replayable by the underlying HTTP client, including HTTP/2 retries after REFUSED_STREAM. Uses the inbound protocol to keep the existing bridge preparation. In native Chat it checks the mapped model and the final thinking state after forced tool selection before adding DeepSeek reasoning placeholders.",
-      "sha256": "a2eeb24fc6770f79eaded532367d6d0471f6e903a9ab102f30af2a890c7186bb"
+      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point. For DeepSeek groups with tools off, a Chat transport error permits failover only when delivery tracking confirms the request did not obtain a connection or write request bytes. Makes the protected POST body non-replayable by the underlying HTTP client, including HTTP/2 retries after REFUSED_STREAM. Uses the inbound protocol to keep the existing bridge preparation. In native Chat it respects the final thinking state after forced tool selection and supports aliases on direct DeepSeek routes. Shared OpenCode routes still require a mapped DeepSeek model before adding reasoning placeholders.",
+      "sha256": "77bd593b36f8cdb2f795041974ce2a31ce5aa758e18ac61d51c2345a2b227e40"
     },
     {
       "path": "backend/internal/service/openai_gateway_chat_completions.go",

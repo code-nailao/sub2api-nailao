@@ -11,7 +11,7 @@
 - Portal 的普通启动和只读检查对指向文件等非目录的路径给出相同错误，包括文件路径带尾斜杠的情况。工作台登记配置必须是可读普通文件，指向命名管道时会立即报错。
 - 渠道状态设计预览默认在新标签页打开同源路径。配置有效的主站源后，入口会打开对应的主站页面。
 - 关闭联网工具的 DeepSeek 分组在转发前移除 `web_search`、`web_fetch`、`deepseek_web_search`、`deepseek_read_url` 家族的条目，包括带版本或 preview 后缀的写法，也覆盖发送到固定 Chat 账号的 Responses 形状请求。显式指定仍然存在的工具的选择保留；指向被移除工具的选择（含只写 `tool` 或 `function` 的写法）在还有工具时改为 `auto`，工具删空时连同 `tools` 一起移除，`required` 一并删除，`auto` 和 `none` 保持不变。需要提示时写进最后一个 `messages`，Responses 形状写进 `input`。不含这些工具的请求保持原字节；工具字段的重复键和超限在转发前拒绝。
-- 修复 DeepSeek 原生 Chat 的工具历史，覆盖直连和经 OpenCode Go/Zen 转发的 DeepSeek 模型。复用 ID 时，每次调用优先保留相邻结果。位置优先级相同的候选中，优先选内容未在同 ID 早先候选中出现的结果，落选的旧候选也参与比较。修复并行调用时按原调用顺序排列结果，移除孤立结果，缺失结果补空字符串。工具配对保留完整相邻历史的原字节。原生 Chat 仅在出站模型属于 DeepSeek 且 thinking 未关闭时补缺失的 `reasoning_content`。Responses 形状的请求沿用原有转换。
+- 修复 DeepSeek 原生 Chat 的工具历史，覆盖直连和经 OpenCode Go/Zen 转发的 DeepSeek 模型。复用 ID 时，每次调用优先保留相邻结果。位置优先级相同的候选中，优先选内容未在同 ID 早先候选中出现的结果，落选的旧候选也参与比较。修复并行调用时按原调用顺序排列结果，移除孤立结果，缺失结果补空字符串。工具配对保留完整相邻历史的原字节，托管联网也会保留输入消息的原字节，再追加续轮消息。原生 Chat 在 thinking 未关闭时为直连 DeepSeek 的模型及其别名补缺失的 `reasoning_content`。经 OpenCode Go/Zen 转发时，仍按映射后的模型判断是否补齐。Responses 形状的请求沿用原有转换。
 - 关闭工具的 DeepSeek 分组中，Chat 请求已取得上游连接或已写出时，如果传输失败且未收到 HTTP 状态，网关会结束本次请求，避免换号重发和重复扣费。HTTP/2 返回 `REFUSED_STREAM` 时，HTTP 客户端也不会自动重发该 POST。上游客户端缓存满、客户端获取失败和拨号前 DNS 失败时，仍可换号。
 
 ## Main / Portal 0.2.82 — 2026-11-20

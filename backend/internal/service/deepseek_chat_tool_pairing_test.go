@@ -4,7 +4,9 @@ package service
 
 import (
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -36,6 +38,8 @@ func TestDeepSeekChatPairsToolMessagesBeforeForwarding(t *testing.T) {
 		{"parallel_first_result_displaced", callAB + "," + resultB + "," + followup + "," + resultA, callAB + "," + resultA + "," + resultB + "," + followup},
 		{"already_paired", user + ",\n  " + callAB + ", \t" + resultB + ",\n\t" + resultA + ", " + followup, ""},
 		{"reused_id_already_paired", user + "," + callA + ", " + resultA + "," + followup + "," + callA + ",\n" + resultA, ""},
+		{"empty_id_in_call_batch_skips_repair", orphan + "," + strings.Replace(callAB, `"id":"call_b"`, `"id":""`, 1) + "," + resultA, ""},
+		{"duplicate_id_in_call_batch_skips_repair", orphan + "," + strings.Replace(callAB, `"id":"call_b"`, `"id":"call_a"`, 1) + "," + resultA, ""},
 		{
 			"reused_id_ignores_duplicate_from_previous_call",
 			callA + "," + resultA + "," + resultA + "," + callA + "," + followup + "," + secondA,
@@ -124,12 +128,13 @@ func TestDeepSeekChatPairingPreservesAdjacentResultsWithReusedIDs(t *testing.T) 
 	require.Equal(t, want, string(run.sent))
 }
 
-func TestDeepSeekChatPairingKeepsAlignedHistory(t *testing.T) {
-	const messages = `[
+const deepSeekPairedChatFixture = `[
 	  {"role":"user","content":"Example"},
 	  { "role":"assistant", "content":null, "tool_calls":[{"id":"call_a","type":"function","function":{"name":"record","arguments":"{}"}}] },
 	  {"role":"tool","tool_call_id":"call_a","content":"Result"}
 	]`
+
+func TestDeepSeekChatPairingKeepsAlignedHistory(t *testing.T) {
 	cases := []struct {
 		name, baseURL, model, options, wantThinking string
 		wantPlaceholder                             bool
@@ -143,7 +148,7 @@ func TestDeepSeekChatPairingKeepsAlignedHistory(t *testing.T) {
 	for _, tc := range cases {
 		for _, stream := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/stream=%t", tc.name, stream), func(t *testing.T) {
-				body := fmt.Appendf(nil, `{"model":"fixture-model","messages":%s,"stream":%t%s}`, messages, stream, tc.options)
+				body := fmt.Appendf(nil, `{"model":"fixture-model","messages":%s,"stream":%t%s}`, deepSeekPairedChatFixture, stream, tc.options)
 				c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
 				upstream := &httpUpstreamRecorder{resp: deepSeekFixtureModelResponse(t, stream, deepSeekChatFallbackOKBody)}
 				svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
@@ -158,10 +163,73 @@ func TestDeepSeekChatPairingKeepsAlignedHistory(t *testing.T) {
 				if tc.wantPlaceholder {
 					require.Equal(t, deepSeekChatReasoningPlaceholderText, gjson.GetBytes(upstream.lastBody, "messages.1.reasoning_content").String())
 				} else {
-					require.Equal(t, messages, gjson.GetBytes(upstream.lastBody, "messages").Raw)
+					require.Equal(t, deepSeekPairedChatFixture, gjson.GetBytes(upstream.lastBody, "messages").Raw)
 				}
 			})
 		}
+	}
+}
+
+func TestDeepSeekChatThinkingAliasKeepsReasoningPlaceholder(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			body := fmt.Appendf(nil, `{"model":"fixture-model","messages":%s,"thinking":{"type":"enabled"},"stream":%t}`, deepSeekPairedChatFixture, stream)
+			c := newDeepSeekForcedToolChoiceContext(t, "/v1/chat/completions", body)
+			account := deepSeekForcedToolChoiceAccount()
+			account.Credentials["model_mapping"] = map[string]any{"fixture-model": "thinking-alias"}
+			sent := 0
+			svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: deepSeekHTTPFixture{fn: func(req *http.Request) (*http.Response, error) {
+				sent++
+				wire, err := io.ReadAll(req.Body)
+				require.NoError(t, err)
+				require.Equal(t, "thinking-alias", gjson.GetBytes(wire, "model").String())
+				require.Equal(t, "enabled", gjson.GetBytes(wire, "thinking.type").String())
+				if gjson.GetBytes(wire, "messages.1.reasoning_content").String() == "" {
+					resp := deepSeekFixtureResponse(`{"error":{"message":"fixture requires reasoning_content"}}`)
+					resp.StatusCode = http.StatusBadRequest
+					return resp, nil
+				}
+				return deepSeekFixtureModelResponse(t, stream, deepSeekChatFallbackOKBody), nil
+			}}}
+
+			_, err := svc.ForwardAsChatCompletions(c.Request.Context(), c, account, body, "", "")
+			require.Equal(t, 1, sent)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestDeepSeekChatHostedKeepsPairedHistoryBytes(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			body := fmt.Appendf(nil, `{"model":"deepseek-flash","messages":%s,"thinking":{"type":"disabled"},"tools":[{"type":"web_search"}],"stream":%t}`, deepSeekPairedChatFixture, stream)
+			var requests [][]byte
+			result, _, _, err := deepSeekHostedWireFixture(t, "chat", body, func(req *http.Request) (*http.Response, error) {
+				if strings.HasSuffix(req.URL.Path, "/tools/search") {
+					return deepSeekFixtureResponse(`{"results":[{"url":"https://source.example/page"}]}`), nil
+				}
+				require.True(t, strings.HasSuffix(req.URL.Path, "/chat/completions"))
+				wire, err := io.ReadAll(req.Body)
+				require.NoError(t, err)
+				requests = append(requests, wire)
+				if len(requests) == 1 {
+					req.Body = io.NopCloser(strings.NewReader(string(wire)))
+					return deepSeekFixtureModelResponse(t, stream, deepSeekModelFixtureBody(t, req, "search_call", "example")), nil
+				}
+				return deepSeekFixtureModelResponse(t, stream, deepSeekChatFallbackOKBody), nil
+			})
+			require.NoError(t, err)
+			require.Equal(t, 1, result.DeepSeekTools.SearchCount)
+			require.Len(t, requests, 2)
+			require.Equal(t, deepSeekPairedChatFixture, gjson.GetBytes(requests[0], "messages").Raw)
+			messages := gjson.GetBytes(requests[1], "messages").Array()
+			require.Len(t, messages, 5)
+			for i, message := range gjson.Parse(deepSeekPairedChatFixture).Array() {
+				require.Equal(t, message.Raw, messages[i].Raw)
+			}
+			require.Equal(t, "search_call", messages[3].Get("tool_calls.0.id").String())
+			require.Equal(t, "search_call", messages[4].Get("tool_call_id").String())
+		})
 	}
 }
 
