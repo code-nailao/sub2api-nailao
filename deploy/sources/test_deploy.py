@@ -511,6 +511,63 @@ class DeployTest(unittest.TestCase):
         self.assertEqual("a", self.state()["current"]["slot"])
         self.assertIn("scheduled backup still active", "\n".join(self.ops.logs))
 
+    def run_backup_handoff(self, backup_finishes, owner_exits, fail_probe_at=None):
+        old = self.state()["current"]["containers"]["background"]
+        old_id = self.ops.containers[old]["Id"]
+        self.ops.drain_seconds[old] = owner_exits
+        original_http = self.ops.http_json
+        original_run = self.ops.run
+        successor = self.cfg.container("a", "background")
+        observations = []
+        failed = False
+
+        def http_json(*args, **kwargs):
+            nonlocal failed
+            status, body = original_http(*args, **kwargs)
+            if not isinstance(body, dict) or body.get("instance_id") != old_id or not body.get("draining"):
+                return status, body
+            since_term = self.ops.clock - (self.ops.containers[old]["draining_until"] - owner_exits)
+            if not failed and fail_probe_at is not None and since_term >= fail_probe_at:
+                failed = True
+                observations.append((since_term, "unavailable"))
+                return 0, None
+            active = since_term < backup_finishes
+            observations.append((since_term, "active" if active else "finished"))
+            if active:
+                body["scheduled_backup_remaining_seconds"] = max(0, int(backup_finishes - since_term))
+            return status, body
+
+        def run(args, **kwargs):
+            if args[:2] == ["docker", "start"] and args[-1] == successor:
+                self.assertFalse(self.ops.inspect(old)["State"]["Running"], "lease owner still running")
+            return original_run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "http_json", http_json), mock.patch.object(self.ops, "run", run):
+            self.deploy()
+        self.assertEqual(successor, self.state()["current"]["containers"]["background"])
+        self.assertTrue(self.ops.containers[successor]["State"]["Running"])
+        return observations
+
+    def test_handoff_waits_for_owner_when_backup_finishes_near_timeout(self):
+        cutoff = self.cfg.background_exit_timeout
+        observations = self.run_backup_handoff(backup_finishes=cutoff - 0.5, owner_exits=cutoff + 1)
+        self.assertTrue(any(when < cutoff and state == "active" for when, state in observations))
+        self.assertTrue(any(cutoff <= when < cutoff + 1 and state == "finished" for when, state in observations))
+
+    def test_handoff_rechecks_backup_that_finishes_just_after_timeout(self):
+        cutoff = self.cfg.background_exit_timeout
+        exit_at = cutoff + deploy.BACKUP_STATUS_POLL_SECONDS + 2
+        observations = self.run_backup_handoff(backup_finishes=cutoff + 1, owner_exits=exit_at)
+        self.assertTrue(any(cutoff <= when < cutoff + 1 and state == "active" for when, state in observations))
+        self.assertTrue(any(cutoff + 1 < when < exit_at and state == "finished" for when, state in observations))
+
+    def test_handoff_retries_a_failed_backup_probe_at_timeout(self):
+        cutoff = self.cfg.background_exit_timeout
+        observations = self.run_backup_handoff(backup_finishes=cutoff + 6, owner_exits=cutoff + 8, fail_probe_at=cutoff)
+        failed_at = next(when for when, state in observations if state == "unavailable")
+        self.assertLess(failed_at - cutoff, 1)
+        self.assertTrue(any(failed_at < when < failed_at + 3 and state == "active" for when, state in observations))
+
     def test_handoff_says_admin_stays_read_only_when_the_old_owner_reports_it(self):
         self.ops.runtime_extra["old-bg"] = {"admin_during_drain": "read-only"}
         self.deploy()
@@ -555,74 +612,54 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(0.5, deploy.HANDOFF_POLL_SECONDS)
         self.assertIn(0.5, self.ops.sleeps)
 
-    def test_old_owner_that_never_exits_keeps_in_progress_with_instructions(self):
-        self.ops.drain_seconds["old-bg"] = float("inf")
-        with self.assertRaises(deploy.FallbackFailed) as ctx:
-            self.deploy()
-        message = str(ctx.exception)
-        for part in ("old-bg is still draining after 2100s", "nothing was killed",
-                     "sources-main-a-background was not started", "Traffic is on slot legacy",
-                     "no background owner runs",
-                     "Left running without traffic: sources-main-a-serving, sources-main-a-standby",
-                     "start the background of slot legacy: 'docker update --restart=unless-stopped old-bg' "
-                     "and 'docker start old-bg'", "Do not deploy again"):
-            self.assertIn(part, message)
-        self.assertTrue(self.ops.containers["sources-main-a-serving"]["State"]["Running"],
-                        "as the message says, the new serving containers are left running")
-        old = self.ops.containers["old-bg"]
-        self.assertTrue(old["State"]["Running"], "never killed")
-        self.assertEqual("no", old["HostConfig"]["RestartPolicy"]["Name"])
-        self.assertFalse(self.ops.containers["sources-main-a-background"]["State"]["Running"])
-        self.assertFalse(self.ops.switched, "traffic never moved")
-        in_progress = self.state()["in_progress"]
-        self.assertEqual("background handoff", in_progress["step"])
-        self.assertEqual(message, in_progress["failed"])
-        self.assertIn("failed_at", in_progress)
-        # 'status' shows it, and the next deploy refuses until a person clears it.
-        report = deploy.status(self.cfg, self.ops)
-        self.assertEqual(message, report["in_progress"]["failed"])
-        self.assertEqual("running", report["current"]["containers"]["background"]["status"])
-        self.assertEqual("no", report["current"]["containers"]["background"]["restart_policy"])
-        self.assertIn("FAILED AND NOT RESTORED", "\n".join(self.ops.logs))
-        commands = len(self.ops.commands)
-        with self.assertRaises(deploy.DeployError) as again:
-            self.deploy()
-        self.assertIn("did not finish", str(again.exception))
-        self.assertIn("Do not deploy again", str(again.exception))
-        self.assertEqual(commands, len(self.ops.commands))
+    def test_handoff_timeout_restores_owner_after_it_exits(self):
+        old = self.state()["current"]["containers"]["background"]
+        self.cfg.background_exit_timeout = 2
+        self.ops.drain_seconds[old] = 8
+        starts = []
+        original_run = self.ops.run
 
-    def test_rollback_with_an_owner_that_never_exits_keeps_in_progress(self):
+        def run(args, **kw):
+            if args[:2] == ["docker", "start"] and args[-1] == old:
+                self.assertFalse(self.ops.inspect(old)["State"]["Running"], "the draining owner still holds the lock")
+                starts.append(args[-1])
+            return original_run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", run):
+            with self.assertRaisesRegex(deploy.DeployError, "previous background .* is running again"):
+                self.deploy()
+        self.assertEqual([old], starts)
+        self.assertFalse(self.ops.switched)
+        self.assertTrue(self.ops.containers[old]["State"]["Running"])
+        self.assertEqual("unless-stopped", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_rollback_timeout_restores_owner_of_current_traffic_slot(self):
         self.deploy()
-        self.ops.drain_seconds["sources-main-a-background"] = float("inf")
-        with self.assertRaises(deploy.FallbackFailed):
+        current = self.state()["current"]
+        old = current["containers"]["background"]
+        previous = self.state()["previous"]["containers"]["background"]
+        self.cfg.background_exit_timeout = 2
+        self.ops.drain_seconds[old] = 8
+        with self.assertRaisesRegex(deploy.DeployError, "previous background .* is running again"):
             deploy.Deployer(self.cfg, self.ops).rollback()
-        in_progress = self.state()["in_progress"]
-        self.assertEqual("background handoff", in_progress["step"])
-        # Traffic is still on slot a while its background drains; the restarted
-        # previous serving containers have none.
-        for part in ("sources-main-a-background is still draining", "Traffic is on slot a.",
-                     "Left running without traffic: old-serving, old-spare",
-                     "'docker start sources-main-a-background'"):
-            self.assertIn(part, in_progress["failed"])
+        self.assertEqual(current, self.state()["current"])
+        self.assertTrue(self.ops.containers[old]["State"]["Running"])
+        self.assertFalse(self.ops.containers[previous]["State"]["Running"])
+        self.assertIsNone(self.state()["in_progress"])
 
-    def test_handing_back_to_an_owner_that_never_exits_names_the_previous_background(self):
-        # Guard fails, traffic goes back to the previous slot, and the new
-        # background never exits: the person must start the previous release's
-        # background, not restart the newer one.
+    def test_guard_handback_timeout_still_restores_the_previous_background(self):
+        previous = self.state()["current"]["containers"]["background"]
+        new = self.cfg.container("a", "background")
         self.ops.memory_after_switch = 20 * GIB
-        self.ops.drain_seconds["sources-main-a-background"] = float("inf")
-        with self.assertRaises(deploy.FallbackFailed) as ctx:
+        self.cfg.background_exit_timeout = 2
+        self.ops.drain_seconds[new] = 8
+        with self.assertRaisesRegex(deploy.DeployError, "guard failed.*previous release serves traffic"):
             self.deploy()
-        message = str(ctx.exception)
-        for part in ("sources-main-a-background is still draining", "old-bg was not started",
-                     "Traffic is on slot legacy",
-                     "Left running without traffic: sources-main-a-serving, sources-main-a-standby",
-                     "start the background of slot legacy (not sources-main-a-background): "
-                     "'docker update --restart=unless-stopped old-bg' and 'docker start old-bg'"):
-            self.assertIn(part, message)
-        self.assertNotIn("docker start sources-main-a-background", message)
-        self.assertIn("127.0.0.1:9426 max_fails", self.ops.files[self.cfg.upstream_file], "traffic is back")
-        self.assertEqual(message, self.state()["in_progress"]["failed"])
+        self.assertEqual(previous, self.state()["current"]["containers"]["background"])
+        self.assertTrue(self.ops.containers[previous]["State"]["Running"])
+        self.assertFalse(self.ops.containers[new]["State"]["Running"])
+        self.assertIsNone(self.state()["in_progress"])
 
     def test_a_reply_cut_off_mid_way_never_ends_the_handoff(self):
         # The old owner exits while answering a runtime read: the progress note

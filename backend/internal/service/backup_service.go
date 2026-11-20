@@ -1,6 +1,7 @@
 package service
 
 import (
+	"cmp"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -452,10 +453,14 @@ func (s *BackupService) UpdateS3Config(ctx context.Context, cfg BackupS3Config) 
 }
 
 func (s *BackupService) TestS3Connection(ctx context.Context, cfg BackupS3Config) error {
-	// 如果没提供 secret，用已保存的
+	// A connection test may only reuse the saved secret for the saved target
+	// and access key. The bucket, region and addressing mode can change the
+	// effective address, even with the same endpoint field.
 	if cfg.SecretAccessKey == "" {
 		old, _ := s.loadS3Config(ctx)
-		if old != nil {
+		if old != nil && old.Endpoint == cfg.Endpoint && old.Bucket == cfg.Bucket &&
+			cmp.Or(old.Region, "auto") == cmp.Or(cfg.Region, "auto") &&
+			old.ForcePathStyle == cfg.ForcePathStyle && old.AccessKeyID == cfg.AccessKeyID {
 			cfg.SecretAccessKey = old.SecretAccessKey
 		}
 	}

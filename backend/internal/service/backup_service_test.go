@@ -1119,6 +1119,58 @@ func TestBackupService_TestS3Connection(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestBackupService_TestS3ConnectionReusesSecretOnlyForSavedTarget(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestBackupService(newMockSettingRepo(), &mockDumper{}, newMockObjectStore())
+	saved := BackupS3Config{Endpoint: "SAVED_ENDPOINT", Region: "auto", Bucket: "fixture-bucket",
+		AccessKeyID: "fixture-key", SecretAccessKey: "fixture-secret", ForcePathStyle: true}
+	_, err := svc.UpdateS3Config(ctx, saved)
+	require.NoError(t, err)
+
+	for _, tt := range []struct {
+		name       string
+		change     func(*BackupS3Config)
+		wantSecret string
+	}{
+		{name: "same target", wantSecret: saved.SecretAccessKey},
+		{name: "same default region", change: func(c *BackupS3Config) { c.Region = "" }, wantSecret: saved.SecretAccessKey},
+		{name: "different endpoint", change: func(c *BackupS3Config) { c.Endpoint = "NEW_ENDPOINT" }},
+		{name: "removed endpoint", change: func(c *BackupS3Config) { c.Endpoint = "" }},
+		{name: "different region", change: func(c *BackupS3Config) { c.Region = "other" }},
+		{name: "different bucket", change: func(c *BackupS3Config) { c.Bucket = "other" }},
+		{name: "different addressing mode", change: func(c *BackupS3Config) { c.ForcePathStyle = false }},
+		{name: "different access key", change: func(c *BackupS3Config) { c.AccessKeyID = "other" }},
+		{name: "new target with explicit secret", wantSecret: "replacement", change: func(c *BackupS3Config) {
+			c.Endpoint = "NEW_ENDPOINT"
+			c.SecretAccessKey = "replacement"
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := saved
+			cfg.SecretAccessKey = ""
+			if tt.change != nil {
+				tt.change(&cfg)
+			}
+			var usedSecret string
+			called := false
+			svc.storeFactory = func(_ context.Context, cfg *BackupS3Config) (BackupObjectStore, error) {
+				called = true
+				usedSecret = cfg.SecretAccessKey
+				return newMockObjectStore(), nil
+			}
+			err := svc.TestS3Connection(ctx, cfg)
+			if tt.wantSecret == "" {
+				require.ErrorContains(t, err, "incomplete S3 config")
+				require.False(t, called)
+				return
+			}
+			require.NoError(t, err)
+			require.True(t, called)
+			require.Equal(t, tt.wantSecret, usedSecret)
+		})
+	}
+}
+
 func TestBackupService_TestS3Connection_Incomplete(t *testing.T) {
 	repo := newMockSettingRepo()
 	svc := newTestBackupService(repo, &mockDumper{}, newMockObjectStore())
