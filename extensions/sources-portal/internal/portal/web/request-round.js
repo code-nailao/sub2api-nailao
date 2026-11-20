@@ -2,8 +2,9 @@
 // request may still finish, but its callbacks no longer own the page.
 export function requestRounds() {
   let current = 0;
-  // An expired result is discarded, but a timeout is not a new user action.
-  let latestStart = 0;
+  // A new attempt or an accepted connection supersedes an earlier save.
+  // A timeout retires the request but preserves the connection generation.
+  let generation = 0;
   let waiting;
   let timer;
 
@@ -16,8 +17,12 @@ export function requestRounds() {
     return ++current;
   }
   function start() {
-    waiting = latestStart = advance();
+    generation++;
+    waiting = advance();
     return waiting;
+  }
+  function markApplied() {
+    generation++;
   }
   function isWaiting(round = current) {
     return waiting === round;
@@ -38,5 +43,5 @@ export function requestRounds() {
     timer = scheduled;
   }
 
-  return { get current() { return current; }, get latestStart() { return latestStart; }, advance, start, isWaiting, finish, deadline };
+  return { get current() { return current; }, get generation() { return generation; }, advance, start, markApplied, isWaiting, finish, deadline };
 }

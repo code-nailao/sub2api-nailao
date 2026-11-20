@@ -473,6 +473,42 @@ test('retrying a failed Canvas poll keeps the acknowledged iframe visible withou
   assert.equal(f.parentMessages.at(-1).integrated, true);
 });
 
+test('retrying a failed Canvas switch acknowledges the latest host theme revision', async () => {
+  const authorization = Promise.withResolvers();
+  let switching = false;
+  const f = await fixture({ connection: (options, config) => switching
+    ? authorization.promise : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.host(1, 'embedded', { theme: 'light' });
+  f.loaded(); await f.ack();
+  const previous = f.select.value;
+  const config = f.last('sub2api:media-studio-config');
+  assert.equal(f.parentMessages.at(-1).revision, 1);
+
+  switching = true;
+  f.select.value = String(f.select.children.at(-1).value);
+  const pending = f.select.onchange();
+  assert.equal(f.frame.hidden, true);
+  const requestId = 'updated-host-theme-request';
+  f.host(2, 'embedded', { requestId, theme: 'dark' });
+  assert.equal(f.parentMessages.some(({ revision }) => revision === 2), false);
+  authorization.resolve({ ok: false, status: 503 });
+  await pending;
+  assert.equal(f.document.body.dataset.state, 'recovery');
+
+  f.elements['#canvas-retry'].onclick();
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.select.value, previous);
+  assert.equal(f.last('sources:canvas-appearance').theme, 'dark');
+  assert.equal(f.last('sub2api:media-studio-config'), config);
+  assert.equal(connections(f).length, 2);
+  const reply = f.parentMessages.at(-1);
+  assert.equal(reply.type, 'sources:studio-host-config-applied');
+  assert.equal(reply.requestId, requestId);
+  assert.equal(reply.revision, 2);
+  assert.equal(reply.integrated, true);
+});
+
 test('Canvas discards a group poll failure from an earlier connection generation', async () => {
   const oldPoll = Promise.withResolvers();
   let pollPending = false;
@@ -511,6 +547,63 @@ test('Canvas ignores a settings save result after a newer group connection', asy
   assert.equal(f.document.body.dataset.state, 'ready');
   assert.equal(f.frame.hidden, false);
 });
+
+for (const status of [200, 401]) {
+  test(`a Canvas switch ACK supersedes an in-flight settings save that returns ${status}`, async () => {
+    const switchGrant = Promise.withResolvers(), saveResult = Promise.withResolvers();
+    let switching = false, writes = 0;
+    const f = await fixture({ custom: 'configured', connection: (options, config) => {
+      const id = options.body.group_id;
+      if (id === CUSTOM_ID) return { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } };
+      const result = { ok: true, status: 200, data: config(id) };
+      return switching ? switchGrant.promise.then(() => result) : result;
+    }, settingsRequest: (path, options) => {
+      if (options.method === 'PUT') return ++writes === 1 ? saveResult.promise : { status, data: { error: 'admin_login_required' } };
+      if (path.endsWith('/models')) return { status: 200, data: { models: ['image-fixture'] } };
+      return { status: 200, data: { enabled: true, api_origin: 'https://main.example', api_labels: [],
+        keys: [{ id: 1, name: '示例密钥', protocol: 'openai_images' }],
+        binding: { key_id: 1, protocol: 'openai_images', models: ['image-fixture'] } } };
+    } });
+    f.host(); f.loaded(); await f.ack();
+    const alternate = f.select.children.map(({ value }) => String(value)).find((id) => id !== f.select.value && id !== String(CUSTOM_ID));
+    f.select.value = String(CUSTOM_ID);
+    await f.select.onchange();
+    const retry = f.elements['#canvas-retry'];
+    assert.equal(retry.textContent, '打开自定义连接');
+
+    switching = true;
+    f.select.value = alternate;
+    const pending = f.select.onchange();
+    retry.onclick();
+    await flush();
+    const [dialog] = f.document.body.querySelectorAll('dialog');
+    const save = dialog.querySelectorAll('button').find((button) => button.textContent === '保存并连接');
+    const saveStatus = dialog.querySelectorAll('p').find((element) => element.className === 'portal-dialog-status');
+    save.click();
+    await flush();
+    assert.equal(writes, 1);
+    assert.equal(saveStatus.textContent, '正在保存…');
+
+    switchGrant.resolve();
+    await pending;
+    await f.ack();
+    assert.equal(f.document.body.dataset.state, 'ready');
+    const priorConnectionCalls = connections(f).length;
+    saveResult.resolve({ status, data: status === 401 ? { error: 'admin_login_required' } : {} });
+    await flush();
+
+    assert.equal(f.parentMessages.some(({ type }) => type === 'sub2api:session-check'), false);
+    assert.equal(writes, 1);
+    assert.equal(f.locked, false);
+    assert.equal(dialog.open, true);
+    assert.equal(save.disabled, false);
+    assert.equal(saveStatus.textContent, '');
+    assert.equal(f.document.body.dataset.state, 'ready');
+    assert.equal(f.frame.hidden, false);
+    assert.equal(f.select.value, alternate);
+    assert.equal(connections(f).length, priorConnectionCalls);
+  });
+}
 
 test('restoring a stale Canvas connection reports the failure and offers settings without opening a dialog', async () => {
   let stale = true;

@@ -178,8 +178,8 @@ function openSettings(kind) {
     openGroupSettings({ onSaved: () => void refreshMetadata() });
     return;
   }
-  openCustomSettings({ getGeneration: () => rounds.latestStart, onSaved: (configured, started) => {
-    if (locked || started !== rounds.latestStart) return;
+  openCustomSettings({ getGeneration: () => rounds.generation, onSaved: (configured, started) => {
+    if (locked || started !== rounds.generation) return;
     rounds.advance();
     connectionPending = shellPending = null;
     bootstrapRound = undefined;
@@ -446,6 +446,7 @@ window.addEventListener("message", async (event) => {
     try { localStorage.setItem(storageKey, String(selectedGroupId)); } catch { /* Storage is optional. */ }
   }
   connectionApplied = true;
+  rounds.markApplied();
   if (!integrated) waitForCompatibleShell();
   // Do not reveal the old intermediate surface between connection and shell ACK.
   if (integrated || document.body.dataset.state === "recovery") frame.hidden = false;

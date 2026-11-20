@@ -105,6 +105,12 @@ function applyAppearance() {
       theme, lang: hostConfig?.lang?.startsWith("en") ? "en-US" : "zh-CN" }, studioURL.origin);
   }
 }
+function showReady() {
+  frame.hidden = false;
+  showState("ready");
+  applyAppearance();
+  notifyHost(true);
+}
 function setShell() {
   const standalone = hostConfig ? hostConfig.shellMode === "standalone" : window.parent === window;
   document.body.dataset.shellMode = standalone ? "standalone" : "embedded";
@@ -269,10 +275,8 @@ window.addEventListener("message", async (event) => {
   if (!isWaiting(pending) || connection !== candidate || needsCustomResave || event.source !== frame.contentWindow) return;
   finish(pending);
   connection = { ...candidate, acknowledged: true };
-  frame.hidden = false;
-  showState("ready");
-  applyAppearance();
-  notifyHost(true);
+  rounds.markApplied();
+  showReady();
 });
 
 async function authorize(operation, groupId) {
@@ -305,7 +309,7 @@ retry.onclick = () => {
   if (readingOrAuthorizing()) return;
   if (savedGroupToReconnect !== undefined) { void reconnectSavedGroup(savedGroupToReconnect); return; }
   if (!studioURL) { void bootstrap(); return; }
-  if (confirmed()) { showState("ready"); return; }
+  if (confirmed()) { showReady(); return; }
   if (connection && !connection.invalid) { repeatConfirmation(); return; }
   void connect();
 };
@@ -389,9 +393,8 @@ const connectionMenu = document.querySelector("#canvas-connection-menu");
 function openCustomConnectionSettings() {
   if (locked) return;
   connectionMenu.open = false;
-  openCustomSettings({ getGeneration: () => rounds.latestStart, onSaved: (configured, started) => {
-    // A timeout retires a request, but a new connection supersedes this save.
-    if (locked || started !== rounds.latestStart) return;
+  openCustomSettings({ getGeneration: () => rounds.generation, onSaved: (configured, started) => {
+    if (locked || started !== rounds.generation) return;
     // A changed or removed connection must not be resent from the earlier grant.
     const customId = `group-${custom.groupId}`;
     granted.delete(customId);

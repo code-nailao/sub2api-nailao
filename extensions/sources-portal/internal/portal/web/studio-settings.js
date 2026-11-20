@@ -135,10 +135,11 @@ function say(view, text, kind = "") {
   view.status.textContent = text;
   view.status.dataset.kind = kind;
 }
-async function busy(view, text, task) {
+async function busy(view, text, task, isRelevant = () => true) {
   if (!view.isOpen()) return;
   const round = view.operations.start();
-  const current = () => view.isOpen() && view.operations.isWaiting(round);
+  const ownsOperation = () => view.isOpen() && view.operations.isWaiting(round);
+  const current = () => ownsOperation() && isRelevant();
   const controls = [...view.node.querySelectorAll("button,input,select")].filter((control) => !control.disabled);
   for (const control of controls) {
     view.heldControls.add(control);
@@ -150,7 +151,8 @@ async function busy(view, text, task) {
   } catch (error) {
     if (current()) say(view, error.message || "操作未完成，请重试。", "error");
   } finally {
-    if (current()) {
+    if (ownsOperation()) {
+      if (!isRelevant()) say(view, "");
       view.operations.finish(round);
       for (const control of view.heldControls) control.disabled = false;
       view.heldControls.clear();
@@ -391,13 +393,13 @@ export function openCustomSettings({ getGeneration = () => undefined, onSaved = 
   };
   view.actions.append(button("关闭", view.close));
   function persistBinding(configured, options) {
-    const pageRound = getGeneration();
+    const generation = getGeneration();
     return busy(view, configured ? "正在保存…" : "正在删除…", async (current) => {
       await request("/api/studio/custom", { ...options, isCurrent: current }, messages);
       if (!current()) return;
       view.close();
-      onSaved(configured, pageRound);
-    });
+      onSaved(configured, generation);
+    }, () => generation === getGeneration());
   }
   function show(data) {
     if (data.enabled !== true) { view.body.append(el("p", { text: messages.custom_connection_disabled })); return; }
