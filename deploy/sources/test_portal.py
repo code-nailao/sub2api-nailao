@@ -182,11 +182,13 @@ class PortalTest(unittest.TestCase):
                 p.unlink()
         self.cfg = make_config(self.tmp)
         self.ops = PortalFakeOps(self.tmp)
+        self.ops.upstream_file = self.cfg.upstream_file
         self.ops.add(OLD, PORT_OLD)
         self.ops.modes.update({self.cfg.env_file: 0o600, "/srv/example/state": 0o755,
                                "/srv/example/registry.json": 0o644})
         self.ops.files["/proc/sys/net/ipv4/ip_local_reserved_ports"] = "\n"
         self.ops.write_file_atomic(self.cfg.upstream_file, portal.render_upstream("sources_portal", PORT_OLD))
+        self.ops.loaded_upstreams = self.ops.files[self.cfg.upstream_file]
         self.ops.writes.clear()
         deploy.save_state(self.cfg, {"current": dict(LEGACY), "previous": None, "in_progress": None})
 
@@ -739,6 +741,58 @@ class PortalTest(unittest.TestCase):
         with self.assertRaises(deploy.FallbackFailed):
             self.deploy()
         self.assertIsNotNone(self.state()["in_progress"])
+
+    def test_reload_error_runs_portal_recovery_before_reloading_the_old_route(self):
+        run = self.ops.run
+        reloads = []
+
+        def fail_after_first_reload(args, **kw):
+            result = run(args, **kw)
+            if args[1:] == ["-s", "reload"]:
+                reloads.append(self.upstream())
+                if len(reloads) == 1:
+                    raise deploy.DeployError("fixture: reload outcome is unknown")
+                self.assertTrue(self.running(OLD))
+                self.assertFalse(self.running(NEW_A))
+            return result
+
+        with mock.patch.object(self.ops, "run", fail_after_first_reload):
+            with self.assertRaisesRegex(deploy.DeployError, "previous Portal.*serving again"):
+                self.deploy()
+        self.assertEqual([portal.render_upstream(self.cfg.upstream_name, port) for port in (PORT_A, PORT_OLD)], reloads)
+        self.assertEqual(LEGACY, self.state()["current"])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual("failed", self.history()[-1]["result"])
+
+    def test_failed_upstream_file_restore_still_recovers_portal(self):
+        run, write = self.ops.run, self.ops.write_file_atomic
+        original = self.upstream()
+        failed_restore = False
+        failed_test = False
+
+        def reject_once(args, **kw):
+            nonlocal failed_test
+            if args[1:] == ["-t"] and not failed_test:
+                failed_test = True
+                return subprocess.CompletedProcess(args, 1, "", "fixture: rejected upstream")
+            return run(args, **kw)
+
+        def fail_file_restore(path, text, **kw):
+            nonlocal failed_restore
+            if path == self.cfg.upstream_file and text == original and not failed_restore:
+                failed_restore = True
+                raise OSError("fixture: could not restore old upstream")
+            return write(path, text, **kw)
+
+        with mock.patch.object(self.ops, "run", reject_once), mock.patch.object(self.ops, "write_file_atomic", fail_file_restore):
+            with self.assertRaisesRegex(deploy.RoutingRestored, "previous Portal.*serving again"):
+                self.deploy()
+        self.assertTrue(failed_restore)
+        self.assertTrue(self.running(OLD))
+        self.assertFalse(self.running(NEW_A))
+        self.assertEqual(original, self.upstream())
+        self.assertEqual(original, self.ops.loaded_upstreams)
+        self.assertIsNone(self.state()["in_progress"])
 
     # slots ---------------------------------------------------------------------------
     def test_slots_alternate_and_never_remove_legacy(self):

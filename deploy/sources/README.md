@@ -34,7 +34,7 @@ ssh <host> 'sudo -n journalctl -fu sources-deploy'
 | 启动新 serving | 目标槽位的主、备两个容器，等待就绪 | 删除新容器，退出 |
 | 后台交接 | 旧后台收到一次 SIGTERM，处理完在途任务后退出（不发 SIGKILL），排空期间管理接口只读；新后台拿锁、就绪。日志写明管理接口在排空期间是只读还是不可用，以及旧后台还在停止哪些服务 | 未就绪：重新启动旧后台，删除新 serving，退出。旧后台在 `background_exit_timeout` 内没有退出：`FAILED AND NOT RESTORED`，保留 `in_progress`（见下文） |
 | 切流 | 重写 `00-sources-main-upstreams.conf`，`nginx -t`，reload 一次 | `nginx -t` 失败：恢复原文件，把后台交还旧版本 |
-| 守护 | 5 分钟：新主实例就绪、无重启和 OOM、内存不超过上限 70% 且 30 秒内涨幅不超过 4GiB、公网健康、Nginx 连不上新端口的次数 | 流量切回旧槽位，后台交还旧版本，新 serving 停止并保留供排查 |
+| 守护 | 5 分钟：新主实例就绪、无重启和 OOM、内存不超过上限 70% 且 30 秒内涨幅不超过 4GiB、公网健康、Nginx 连不上新端口的次数 | 先确认旧后台健康并持锁，再切回旧槽位。退役的 serving 排空后保留供排查 |
 | 退役 | 旧 serving 重启策略改为 `no`，排空，发 SIGTERM，不等待 | — |
 
 Main 的 `history.jsonl` 记录发布结果和各步骤耗时。追加失败时只告警一次，已保存的状态和命令的退出结果仍有效。`--dry-run` 是全局参数，写在子命令之前（`deploy.py --dry-run main <镜像>`）。演练仍按需拉取镜像，实际运行用于列出迁移或检查启动的一次性容器，不写历史。有待执行迁移时跳过启动检查，正式发布会在迁移完成后检查两个环境。公网健康预检在演练中同样执行。
@@ -57,9 +57,9 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 
 回滚复用上一槽位仍存在的容器，依次启动、交接后台、切流、守护和退役。准备暂停的目标槽位也会删除槽位里原来的容器。即使之后成功 `abort`，先前的回滚目标也可能已经不存在。
 
-查看 `status` 的 `in_progress.phase` 区分暂停、正在发布和故障。若为 `held`，用 `resume` 或 `abort`。若为 `aborting`，重试 `abort`。若为 `failed` 或发布进程已退出，先用 `status` 和 `docker ps` 核对现场，恢复后再清除 `in_progress`。失败位置和原因分别记录在 `failed_step` 与 `reason`。容器的 `restart_policy` 为 `no` 时，退出后不会自动重启。通过日志和运行时状态确认它是否已收到 SIGTERM。
+查看 `status` 的 `in_progress.phase` 区分暂停、正在发布和故障。若为 `held`，用 `resume` 或 `abort`。若为 `aborting`，重试 `abort`。若失败步骤为 `prepare held slot`，可用 `resume` 重试准备，或用 `abort` 放弃。其它失败或发布进程已退出时，先用 `status` 和 `docker ps` 核对现场，恢复后再清除 `in_progress`。失败位置和原因分别记录在 `failed_step` 与 `reason`。容器的 `restart_policy` 为 `no` 时，退出后不会自动重启。通过日志和运行时状态确认它是否已收到 SIGTERM。
 
-正在排空的后台超过 `background_exit_timeout` 仍未退出时，接手的后台没有启动，排空中的后台退出后就没有后台进程。错误信息（也写在 `in_progress.reason`）写明哪个槽位在服务流量、哪些 serving 容器留着运行但没有流量、要启动哪一个后台：切流之前是当前槽位那个正在排空的后台本身，交还时（流量已回到上一槽位）是上一槽位的后台，不是正在排空的新版本后台。等它退出后按信息执行 `docker update --restart=unless-stopped` 和 `docker start`，`status` 确认后台在运行，再清空 `in_progress`；在此之前不要再次发布。详见 [DEPLOY.md](../../docs/sources/DEPLOY.md) 的“无法自动恢复的情况”。
+后台排空超过 `background_exit_timeout` 时，接手的后台尚未启动。自动回退和手动回滚都要求目标后台返回 `/health` 200 并确认持锁后才切换管理 upstream。若原管理后台仍能应答，工具只回退用户流量，记录 `ROLLBACK INCOMPLETE`。两边都无法确认可用时保留已加载的路由，记录 `FAILED AND NOT RESTORED`。原后台可能仍在排空并已关闭自动重启。先用 `status` 和实际路由确认现场，等它退出后再启动选定的后台。确认后台健康并持锁后才更新路由和恢复记录。详见 [DEPLOY.md](../../docs/sources/DEPLOY.md#无法自动恢复的情况)。
 
 ## 首次接入
 

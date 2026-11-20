@@ -223,6 +223,11 @@ class FakeOps(deploy.Ops):
             return str(self.memory.get(name, GIB))
         raise FileNotFoundError(path)
 
+    def read_bytes(self, path):
+        if path in self.files:
+            return self.files[path].encode()
+        return super().read_bytes(path)
+
     def write_file_atomic(self, path, text, mode=0o644):
         if self.dry_run:
             self.commands.append(["DRY", "write", path])
@@ -284,6 +289,8 @@ class DeployTest(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.cfg = make_config(self.tmp)
         self.ops = FakeOps(self.tmp)
+        for path in self.cfg.env_files.values():
+            self.ops.files[path] = "FIXTURE=environment\n"
         self.ops.upstream_file = self.cfg.upstream_file
         for role, name in LEGACY["containers"].items():
             self.ops.add(name, LEGACY["ports"][role])
@@ -450,6 +457,126 @@ class DeployTest(unittest.TestCase):
         self.assertEqual("failed", self.state()["in_progress"]["phase"])
         expected = {**LEGACY["ports"], "background": target["ports"]["background"]}
         self.assertEqual(self.upstreams_for({"ports": expected}), self.ops.loaded_upstreams)
+
+    def test_rollback_reloads_held_state_after_lock_acquisition(self):
+        self.deploy()
+        self.ops.commands.clear()
+        current = self.state()
+        lock = deploy.release_lock
+
+        @contextlib.contextmanager
+        def publish_hold_before_lock(path, **kw):
+            deploy.save_state(self.cfg, {**current, "in_progress": {"phase": "held"}})
+            with lock(path, **kw):
+                yield
+
+        with mock.patch.object(deploy, "release_lock", publish_hold_before_lock):
+            with self.assertRaisesRegex(deploy.DeployError, "resume.*abort"):
+                deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertEqual([], self.ops.commands)
+        self.assertEqual("held", self.state()["in_progress"]["phase"])
+        self.assert_live_release(current["current"])
+
+    def test_hold_slot_cleanup_failure_can_resume_preparation_or_abort(self):
+        for action in ("resume", "abort"):
+            with self.subTest(action=action):
+                target = self.cfg.slot_view("a")
+                name = target["containers"]["background"]
+                self.ops.add(name, target["ports"]["background"], running=False)
+                cid = self.ops.inspect(name)["Id"]
+                run = self.ops.run
+
+                def cannot_remove(args, **kw):
+                    if args[:2] == ["docker", "rm"] and args[-1] in (name, cid):
+                        if kw.get("check", True):
+                            raise deploy.DeployError("fixture: removal failed")
+                        return subprocess.CompletedProcess(args, 1, "", "fixture: removal failed")
+                    return run(args, **kw)
+
+                with mock.patch.object(self.ops, "run", cannot_remove):
+                    with self.assertRaisesRegex(deploy.DeployError, "retry.*resume.*abort"):
+                        self.hold()
+                    self.assertEqual("failed", self.state()["in_progress"]["phase"])
+                    self.assertFalse(any(n in self.ops.containers for role, n in target["containers"].items()
+                                         if role in deploy.SERVING_ROLES))
+                    if action == "abort":
+                        deploy.Deployer(self.cfg, self.ops).abort()
+                        self.assertIsNotNone(self.ops.inspect(cid))
+                if action == "resume":
+                    deploy.Deployer(self.cfg, self.ops).resume()
+                    self.assertEqual("held", self.state()["in_progress"]["phase"])
+                    self.assertIsNone(self.ops.inspect(cid))
+                    deploy.Deployer(self.cfg, self.ops).abort()
+                self.assertIsNone(self.state()["in_progress"])
+                self.assert_live_release(LEGACY)
+
+    def test_resume_rejects_in_place_changes_to_background_env(self):
+        path = self.tmp / "background.env"
+        path.write_bytes(b"FIXTURE=before\n")
+        self.cfg.env_files["background"] = str(path)
+        held = self.hold()
+        path.write_bytes(b"FIXTURE=after\n")
+        before = list(self.ops.commands)
+        with self.assertRaisesRegex(deploy.DeployError, "environment files changed.*abort"):
+            deploy.Deployer(self.cfg, self.ops).resume()
+        self.assertEqual(before, self.ops.commands)
+        self.assertEqual(held, self.state()["in_progress"])
+        self.assert_live_release(LEGACY)
+
+    def assert_rollback_degrades_on_late_background_exit(self, *, manual):
+        source = self.cfg.slot_view("a")
+        if manual:
+            self.deploy()
+        else:
+            self.ops.memory_after_switch = 20 * GIB
+        run = self.ops.run
+        previous_route = self.upstreams_for(LEGACY)
+        reloads = []
+        exited = False
+
+        def stop_destination_after_test(args, **kw):
+            nonlocal exited
+            candidate = self.ops.files[self.cfg.upstream_file]
+            if args[1:] == ["-s", "reload"]:
+                reloads.append(candidate)
+            result = run(args, **kw)
+            if args[1:] == ["-t"] and candidate == previous_route:
+                name = LEGACY["containers"]["background"]
+                self.ops.containers[name]["State"].update(Running=False, Status="exited")
+                exited = True
+            return result
+
+        with mock.patch.object(self.ops, "run", stop_destination_after_test):
+            with self.assertRaisesRegex(deploy.RollbackIncomplete, "Serving uses slot.*admin uses slot"):
+                if manual:
+                    deploy.Deployer(self.cfg, self.ops).rollback()
+                else:
+                    self.deploy()
+        self.assertTrue(exited)
+        expected = self.upstreams_for({"ports": {**LEGACY["ports"], "background": source["ports"]["background"]}})
+        self.assertEqual([expected] if manual else [self.upstreams_for(source), expected], reloads)
+        self.assertEqual(expected, self.ops.loaded_upstreams)
+        self.assertEqual(expected, self.ops.files[self.cfg.upstream_file])
+        self.assertTrue(deploy.Deployer(self.cfg, self.ops).background_answering(source))
+        progress = self.state()["in_progress"]
+        self.assertEqual("failed", progress["phase"])
+        self.assertIn("not answering health checks", progress["reason"])
+        self.assertEqual("failed", self.history()[-1]["result"])
+
+    def test_manual_rollback_background_exit_before_reload_rolls_back_serving_only(self):
+        self.assert_rollback_degrades_on_late_background_exit(manual=True)
+
+    def test_guard_rollback_background_exit_before_reload_rolls_back_serving_only(self):
+        self.assert_rollback_degrades_on_late_background_exit(manual=False)
+
+    def test_port_probe_sets_reuseaddr_before_bind(self):
+        conn = mock.MagicMock()
+        conn.__enter__.return_value = conn
+        with mock.patch.object(deploy.socket, "socket", return_value=conn):
+            self.assertTrue(deploy.Ops().port_free(self.cfg.slots["a"]["background"]))
+        self.assertEqual(mock.call.setsockopt(deploy.socket.SOL_SOCKET, deploy.socket.SO_REUSEADDR, 1),
+                         conn.method_calls[0])
+        conn.listen.assert_called_once_with(1)
 
     def test_manual_rollback_can_recover_a_stopped_background(self):
         self.deploy()
@@ -1206,6 +1333,8 @@ class DeployTest(unittest.TestCase):
         lock = self.tmp / "missing-lock-directory" / "release.lock"
         self.cfg.lock_file = str(lock)
         self.hold()
+        lock.unlink()
+        lock.parent.rmdir()
         state_bytes = Path(self.cfg.state_file).read_bytes()
         history = self.history()
         self.ops.dry_run = True
@@ -1524,22 +1653,26 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(before, self.state())
         self.assertEqual(history, self.history())
 
-    def test_resume_network_restore_failure_keeps_failed_progress_instead_of_idle_state(self):
-        self.hold()
+    def test_persistent_second_network_failure_keeps_hold_abortable(self):
+        held = self.hold()
+        network = self.ops.network_ids[self.cfg.networks[1]]
         run = self.ops.run
 
         def fail(args, **kw):
-            if args[:3] == ["docker", "network", "connect"]:
+            if args[:3] == ["docker", "network", "connect"] and args[-2] == network:
                 raise deploy.DeployError("simulated connection failure")
             return run(args, **kw)
 
         with mock.patch.object(self.ops, "run", fail):
-            with self.assertRaises(deploy.FallbackFailed):
+            with self.assertRaisesRegex(deploy.DeployError, "'abort'"):
                 deploy.Deployer(self.cfg, self.ops).resume()
-        self.assertIn("restoring the pause failed", self.state()["in_progress"]["reason"])
-        self.assertEqual("failed", self.state()["in_progress"]["phase"])
-        self.assert_live_release(LEGACY)
-        self.assertEqual("failed", self.history()[-1]["result"])
+            progress = self.state()["in_progress"]
+            self.assertEqual("held", progress["phase"])
+            self.assertEqual(held["containers"], progress["containers"])
+            self.assertTrue(progress["reason"])
+            self.assert_live_release(LEGACY)
+            deploy.Deployer(self.cfg, self.ops).abort()
+        self.assertIsNone(self.state()["in_progress"])
 
     def test_main_reload_restore_failure_keeps_failed_progress(self):
         run = self.ops.run

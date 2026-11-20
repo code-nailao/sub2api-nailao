@@ -4,16 +4,26 @@
 
 ## Unreleased
 
-- Main rollbacks wait for the destination background to answer health checks and hold the background lock before reloading Nginx. If that owner cannot start and the current admin endpoint still answers, only serving traffic rolls back and the release records the incomplete recovery.
-- Main releases can pause after serving readiness with `--hold-before-switch`, then `resume` through the shared handoff and switch pipeline or `abort` with retryable cleanup. Held instances stay outside the shared serving alias; status reports pause age, and failed recovery remains distinct from a deliberate pause.
-- Portal validates the configuration before opening state and reports the same configuration errors in normal startup and `-check-config`. Both validate the host and numeric port of `PORTAL_LISTEN`. Normal startup binds the listener after opening state, so a bind failure can occur after state has been written. Portal compares origins by scheme, host, and port after normalizing ASCII case, the scheme’s default port, and equivalent IPv6 spellings. Workbench and canvas configuration requires HTTPS. It rejects ambiguous spellings such as padded or empty ports, non-ASCII hostnames, trailing dots, and legacy IPv4 spellings. Separate workbench and canvas origins can use canonical private or loopback addresses. The registration file accepts `[]` and rejects `null`.
-- Portal cancels read-only balance queries during shutdown and logs the active HTTP requests, pending background work, current detection round and elapsed drain time. Reads interrupted by shutdown keep the entire prior balance record, schedule and alert state without recording a false failure; request deadlines and real upstream failures keep their existing handling. Slow synchronous refreshes no longer hold up the handoff; accepted writes and already-started detection submissions or polls still finish and persist before the state lock is released.
-- During a release the old background process keeps the admin pages and admin reads available while it drains. On SIGTERM it answers only admin `GET` and `HEAD`, except the few reads that reach an upstream provider (active account usage, wallet refresh, OpenAI, Grok and CN provider quota or balance, Claude reset credits, account model discovery) or the stopped media engine store; those, other methods, MCP and WebSocket upgrades get a 503 in the usual error envelope (reason `BACKGROUND_HANDOFF_READ_ONLY`, `Retry-After: 5`) before any handler runs, so a retry is always safe. It waits for the admin requests it now refuses (writes and those reads) that arrived before the signal, stops its background services, closes admin WebSockets (the ops realtime page reconnects by itself) and only then closes its listener. The admin API is now down only from that moment until the new background is ready, not for the whole drain; writes still wait for the new background. `/health` stays 200 while draining and the runtime reports `ready: false`. Serving and standalone shut down in the same order as before, and ownership of the background lock is unchanged. Before, an open ops realtime page could keep the old background from exiting at all.
-- The release tool polls every 0.5 seconds during the background handoff, says before the signal whether the admin API will be read-only or unavailable, and logs which services the old background is still stopping. An old background that has not exited within `background_exit_timeout` now ends the run as `FAILED AND NOT RESTORED` and keeps `in_progress` with the reason, the slot serving traffic, the serving containers left running without traffic and which background to start; before, the run cleared `in_progress` although no background would run once the old one exited. `status` shows each container's restart policy. A runtime reply cut off by a process exiting mid-response now counts as no reply instead of ending the run with a traceback.
-- In-chat DeepSeek web tools also recognize the provider's own tool types: `deepseek_web_search` is handled as `web_search` and `deepseek_read_url` as `web_fetch`, run and billed by the gateway in all three protocols, including when `tool_choice` forces one.
-- When the gateway's tool loop does not take a request (tools off for the group, or `tool_choice` `none`), those two provider tool types are removed before forwarding, with a notice that live information is unavailable unless `tool_choice` is `none`; otherwise the provider ran paid tool calls that were never billed. `web_search` and `web_fetch` keep their existing handling. Every other byte of the request is forwarded as sent.
-- A request that declares web tools itself is no longer refused when the tools cannot be set up (no usable tool account, prices not configured, an unsupported request shape, a background request, the usage journal unavailable): the web tools and `max_tool_calls` are removed, the model is told live information could not be checked, and the request is answered and billed as an ordinary one. A forced choice of a removed tool stops being forced, and an emptied tool list is dropped together with `tool_choice`.
-- Remove the unused native tool branch for DeepSeek accounts on the native Responses protocol, its hook in the shared response handling and its account switch. A saved `deepseek_native_tools_enabled` is still accepted and ignored.
+### 新增功能
+
+- 主站发布可在新 serving 就绪后暂停。验证通过后用 `resume` 继续切流，也可以用 `abort` 放弃。暂停实例不接收共享别名流量。`status` 显示暂停时长和恢复状态。
+- 聊天工具支持 DeepSeek 原生的 `deepseek_web_search` 和 `deepseek_read_url`，分别按搜索和网页读取处理。三个协议和强制工具选择都走同一套执行与计费流程。
+
+### 优化改进
+
+- 主站后台排空时可以继续处理管理页和只读请求。写入、MCP、WebSocket 升级和会访问上游或读取媒体引擎的例外请求会在执行前返回 503，并给出重试时间。已经接收的请求会先处理完，后台停止服务、关闭管理 WebSocket 后才关闭监听。实时页面会自动重连。排空期间 `/health` 仍返回 200，运行时会报告未就绪。
+- 发布工具缩短后台交接轮询间隔，并显示排空期间管理入口是否可读及仍在等待的服务。`status` 显示容器重启策略。运行时响应中断按未收到响应处理。
+- Portal 退出时会取消只读余额查询，并记录在途请求、后台工作、检测轮次和排空耗时。退出取消保留原余额、计划和告警状态。请求超时和真实上游错误按原规则处理。已接收的写入和已经开始的检测操作完成并持久化后才释放锁。
+
+### Bug 修复
+
+- 主站自动和手动回退等目标后台健康并持锁后再重载 Nginx。目标后台不就绪或在最后确认时退出，若原管理后台可用，只回退用户流量并记录恢复未完成。没有可确认的管理后台时保留已加载的路由并提示人工恢复。后台排空超时会保留进度与原因。
+- 主站暂停前核实目标槽位已清理。清理失败可继续准备或放弃，接网失败保留可放弃的暂停记录。继续前复核环境文件内容，历史追加失败时记录警告。
+- Portal 重载异常时先恢复上一版本并确认健康，再把路由切回。
+- Portal 在打开状态目录前校验配置。正常启动和 `-check-config` 使用相同的检查规则，都校验 `PORTAL_LISTEN` 的主机和数字端口。正常启动在打开状态后才绑定监听。工作台和画布要求 HTTPS，可用规范写法配置独立的私网或回环来源。来源比较统一处理大小写、默认端口和等价 IPv6 写法，拒绝歧义端口、非 ASCII 主机名、末尾点和旧式 IPv4 写法。登记文件接受 `[]`，拒绝 `null`。
+- 群组关闭内置工具或请求指定 `tool_choice` 为 `none` 时，网关移除 DeepSeek 原生搜索和读取工具，避免上游执行未计费的调用。两种通用工具和请求的其余字段沿用原规则。用户未禁用工具时会看到实时信息不可用的提示。
+- 请求声明的网页工具无法使用时，网关移除失效工具及相应的强制选择，并告知模型无法核验实时信息。请求按普通请求回答和计费。工具列表为空时一起移除 `tool_choice`。
+- DeepSeek 原生 Responses 移除未使用的原生工具分支及账号开关，兼容读取已保存的 `deepseek_native_tools_enabled`。
 
 ## Main / Portal 0.2.81 — 2026-11-20
 
