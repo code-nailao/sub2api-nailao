@@ -296,3 +296,78 @@ func TestStudioCustomAPIHandlersAndConnectionPayloads(t *testing.T) {
 		}
 	}
 }
+
+func TestStudioCustomCurrentFollowsTheKeysGroup(t *testing.T) {
+	for _, tc := range []struct {
+		name, label, protocol, prefix, platform string
+		wantLabel, wantPrefix                   string
+		stale                                   bool
+	}{
+		{"unchanged subdomain binding", "api2", "gemini_native", "/v1beta", "gemini", "api2", "/v1beta", false},
+		{"Gemini key moved to Antigravity", "api2", "gemini_native", "/v1beta", "antigravity", "", "/antigravity/v1beta", false},
+		{"Antigravity key moved to Gemini", "", "gemini_native", "/antigravity/v1beta", "gemini", "", "/v1beta", false},
+		{"OpenAI key moved to Antigravity", "api", "openai_images", "/v1", "antigravity", "", "", true},
+		{"old binding keeps its own path", "", "openai_images", "/alt/v1", "openai", "", "/alt/v1", false},
+		{"old Gemini binding moved to Antigravity", "", "gemini_native", "/v1beta", "antigravity", "", "/antigravity/v1beta", false},
+		{"old Antigravity binding stays", "", "gemini_native", "/antigravity/v1beta", "antigravity", "", "/antigravity/v1beta", false},
+	} {
+		got, e := studioCustomCurrent(StudioCustomBinding{KeyID: 1, Protocol: tc.protocol, Prefix: tc.prefix, APILabel: tc.label, Models: []string{"m"}}, tc.platform)
+		if tc.stale {
+			if !errors.Is(e, errStudioCustomStale) {
+				t.Fatal(tc.name, got, e)
+			}
+			continue
+		}
+		if e != nil || got.APILabel != tc.wantLabel || got.Prefix != tc.wantPrefix || got.Protocol != tc.protocol {
+			t.Fatal(tc.name, got, e)
+		}
+	}
+}
+
+// A key saved on a subdomain and then moved to another group is handed out
+// for the group it is in now, or refused when the saved interface no longer fits.
+func TestStudioCustomConnectionAfterTheKeyChangesGroup(t *testing.T) {
+	f := newCustomFixture(t, t.TempDir())
+	f.s.Studio.deploymentLabels = []string{"api", "api2"}
+	connectionBody := fmt.Sprintf(`{"group_id":%d}`, studioCustomGroupID)
+	save := func(key int, protocol, label string) {
+		t.Helper()
+		body := fmt.Sprintf(`{"key_id":%d,"protocol":%q,"api_label":%q,"models":["m"]}`, key, protocol, label)
+		if code, out := f.call("PUT", "/api/studio/custom", body); code != 200 {
+			t.Fatal(code, out)
+		}
+	}
+	antigravity := func(id int, secret string) string {
+		return fmt.Sprintf(`{"id":%d,"user_id":9,"group_id":42,"key":%q,"name":"moved","status":"active","group":{"name":"Antigravity","platform":"antigravity"}}`, id, secret)
+	}
+
+	save(12, "gemini_native", "api2")
+	f.moved = map[string]string{"12": antigravity(12, "sk-own-gemini-0012")}
+	for _, path := range []string{"/api/studio/connection", "/api/canvas/connection"} {
+		got := f.connection(t, path, connectionBody, "sk-own-gemini-0012")
+		if got.BaseURL != f.s.SubOrigin || got.Task["createPath"] != "/antigravity/v1beta/models/{model}:generateContent" {
+			t.Fatal(path, got)
+		}
+	}
+	// Nothing is rewritten on hand-out; the stored binding still says what the user saved.
+	if b, _ := f.s.Studio.customBinding(9); b.APILabel != "api2" || b.Prefix != "/v1beta" {
+		t.Fatal(b)
+	}
+
+	f.moved = nil
+	save(11, "openai_images", "api")
+	f.moved = map[string]string{"11": antigravity(11, "sk-own-openai-0011")}
+	for _, path := range []string{"/api/studio/connection", "/api/canvas/connection"} {
+		code, out := f.call("POST", path, connectionBody)
+		if code != 409 || !strings.Contains(out, errStudioCustomStale.Error()) || strings.Contains(out, "sk-own-openai-0011") {
+			t.Fatal(path, code, out)
+		}
+	}
+
+	f.moved = nil
+	for _, path := range []string{"/api/studio/connection", "/api/canvas/connection"} {
+		if got := f.connection(t, path, connectionBody, "sk-own-openai-0011"); got.BaseURL != "https://api."+strings.TrimPrefix(f.s.SubOrigin, "https://") {
+			t.Fatal(path, got)
+		}
+	}
+}

@@ -21,6 +21,9 @@ import (
 var (
 	ErrStudioCustom     = errors.New("invalid_custom_connection")
 	errStudioCustomNone = errors.New("custom_connection_not_configured")
+	// errStudioCustomStale: the key's group now has a platform the saved
+	// interface cannot be served on; the user saves the connection again.
+	errStudioCustomStale = errors.New("custom_connection_needs_update")
 )
 
 // A prefix is one to four plain segments, so it cannot carry a scheme, a host,
@@ -198,6 +201,10 @@ func (s *Server) studioCustomConnection(r *http.Request, canvas bool) (studioKey
 	}
 	key, e := s.studioOwnKey(r, binding.KeyID)
 	if e != nil {
+		return studioKey{}, StudioCapability{}, "", "", nil, e
+	}
+	// The key may have moved to another group since the binding was saved.
+	if binding, e = studioCustomCurrent(binding, studioKeyPlatform(key)); e != nil {
 		return studioKey{}, StudioCapability{}, "", "", nil, e
 	}
 	capability := StudioCapability{GroupID: studioCustomGroupID, Engine: "sub2api", Models: binding.Models, DisplayName: "自定义连接", Protocol: binding.Protocol}
@@ -470,4 +477,25 @@ func studioCustomPathPrefix(platform, protocol string) (string, error) {
 		return "/v1", nil
 	}
 	return "", ErrStudioCustom
+}
+
+// studioCustomCurrent fits a saved binding to the platform of the key's group
+// as it is now. The path follows the platform and the saved interface; a
+// binding saved before subdomains existed keeps its own path while that path
+// still belongs to the platform. An Antigravity key always uses the main
+// address. Nothing is written: the user's next save stores the new values.
+func studioCustomCurrent(b StudioCustomBinding, platform string) (StudioCustomBinding, error) {
+	derived, e := studioCustomPathPrefix(platform, b.Protocol)
+	if e != nil {
+		return b, errStudioCustomStale
+	}
+	antigravity := platform == "antigravity"
+	if b.APILabel == "" && strings.HasPrefix(b.Prefix, "/antigravity/") == antigravity {
+		return b, nil
+	}
+	b.Prefix = derived
+	if antigravity {
+		b.APILabel = ""
+	}
+	return b, nil
 }

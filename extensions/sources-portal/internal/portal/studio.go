@@ -336,6 +336,10 @@ func (s *Server) studioRoutes(mux *http.ServeMux) {
 				jsonResponse(w, 403, map[string]string{"error": "existing_authorization_required"})
 				return
 			}
+			if errors.Is(e, errStudioCustomStale) {
+				jsonResponse(w, 409, map[string]string{"error": errStudioCustomStale.Error(), "message": "这把密钥所在的分组已经变化，原来选的接口不能再用；请重新打开“自定义连接”保存一次。"})
+				return
+			}
 		} else {
 			if in.RestoreOnly {
 				user := r.Context().Value(identityKey{}).(Identity)

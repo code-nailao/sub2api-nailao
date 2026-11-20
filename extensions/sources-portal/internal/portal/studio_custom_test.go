@@ -18,6 +18,9 @@ type customFixture struct {
 	revoked bool
 	created int
 	models  []string
+	// moved replaces a key's reply, as when an administrator moves the key to
+	// another group after the user saved a connection with it.
+	moved map[string]string
 }
 
 // User 9 owns key 11 (OpenAI group), 12 (Gemini group), 13 (expired), 14 (a
@@ -53,7 +56,11 @@ func newCustomFixture(t *testing.T, dir string) *customFixture {
 			f.created++
 			return reply(500, `{}`), nil
 		case strings.HasPrefix(r.URL.Path, "/api/v1/keys/"):
-			key, ok := keys[strings.TrimPrefix(r.URL.Path, "/api/v1/keys/")]
+			id := strings.TrimPrefix(r.URL.Path, "/api/v1/keys/")
+			key, ok := keys[id]
+			if moved, isMoved := f.moved[id]; isMoved {
+				key = moved
+			}
 			if !ok || f.revoked {
 				return reply(404, `{}`), nil
 			}
@@ -114,6 +121,13 @@ func (f *customFixture) connection(t *testing.T, path, body, key string) customP
 	transport := payload.Connections[0].Transport
 	// The origin follows current address settings and the key is the user's.
 	binding, _ := f.s.Studio.customBinding(f.user)
+	if moved, ok := f.moved[fmt.Sprint(binding.KeyID)]; ok {
+		var now studioKey
+		if json.Unmarshal([]byte(moved), &now) != nil {
+			t.Fatal(moved)
+		}
+		binding, _ = studioCustomCurrent(binding, studioKeyPlatform(now))
+	}
 	origin := f.s.Studio.customAPIOrigin(binding)
 	if !strings.HasPrefix(transport["baseUrl"], origin) || strings.ContainsAny(strings.TrimPrefix(transport["baseUrl"], origin), "@:?#") || transport["credentialRef"] != key {
 		t.Fatal(out)
