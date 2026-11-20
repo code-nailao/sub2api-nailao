@@ -57,7 +57,7 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 
 回滚先确认上一槽位的后台容器仍在，隔离并启动主备，随后交接后台、切流、守护和退役。准备失败保留当前路由并告警。准备暂停的目标槽位也会删除槽位里原来的容器。即使之后成功 `abort`，先前的回滚目标也可能已经不存在。
 
-查看 `status` 的 `in_progress.phase` 区分暂停、正在发布和故障。若为 `held`，用 `resume` 或 `abort`。若为 `aborting`，重试 `abort`。若失败步骤为 `prepare held slot`，可用 `resume` 重试准备，或用 `abort` 放弃。暂停流程的其它 `failed` 可运行 `abort`。工具会先核对原槽位能否接流，再清理候选。对于其余故障或意外退出，用 `status` 和 `docker ps` 核对现场，恢复后再清除 `in_progress`。失败位置和原因分别记录在 `failed_step` 与 `reason`。容器的 `restart_policy` 为 `no` 时，退出后不会自动重启。通过日志和运行时状态确认它是否已收到 SIGTERM。
+查看 `status` 的 `in_progress.phase` 区分暂停、正在发布和故障。若为 `held`，用 `resume` 或 `abort`。若为 `aborting`，重试 `abort`。若失败步骤为 `prepare held slot`，可用 `resume` 重试准备，或用 `abort` 放弃。首次保存暂停记录失败时，`save held release` 可用 `resume` 或 `abort`。其它 `failed` 可运行 `abort`。工具核对实际路由、恢复原槽位，再清理本次候选。确认或清理未完成时可重试 `abort`。失败位置和原因分别记录在 `failed_step` 与 `reason`。容器的 `restart_policy` 为 `no` 时，退出后不会自动重启。通过日志和运行时状态确认它是否已收到 SIGTERM。
 
 后台排空超过 `background_exit_timeout` 时，接手的后台尚未启动。自动回退和手动回滚都要求目标后台返回 `/health` 200 并确认持锁后才切换管理 upstream。若原管理后台仍能应答，工具只回退用户流量，记录 `ROLLBACK INCOMPLETE`。工具确认实际用户路由已切换、目标槽位能接住共享别名流量后，才排空原主备并撤下它们的共享别名。探测未确认或目标缺少共享别名时，保留两组 serving 并告警。两边都无法确认可用时保留已加载的路由，记录 `FAILED AND NOT RESTORED`。原后台可能仍在排空并已关闭自动重启。先用 `status` 和实际路由确认现场，等它退出后再启动选定的后台。确认后台健康并持锁后才更新路由和恢复记录。详见 [DEPLOY.md](../../docs/sources/DEPLOY.md#无法自动恢复的情况)。
 
@@ -84,7 +84,7 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 
 ## 内部调用方使用稳定别名
 
-主备 serving 通过 `main.json` 中的 `serving_alias` 提供稳定的内部入口。暂停实例在继续之前保持隔离。手动回滚到带共享别名的槽位时，先隔离启动主备，确认主备和目标后台均就绪后才恢复别名。旧容器停止后会从别名解析结果中消失。同一 Docker 网络内的调用方使用共享别名访问 serving，避免依赖某台容器的地址。
+主备 serving 通过 `main.json` 中的 `serving_alias` 提供稳定的内部入口。暂停实例在继续之前保持隔离。每次交接只允许一个槽位持有别名。工具确认新路由生效和目标网络可接手后，先排空旧主备，确认已撤下别名再交给新槽位。目标缺少别名时保留当前提供方。同一 Docker 网络内的调用方使用共享别名访问 serving，避免依赖某台容器的地址。
 
 `adopt` 记录的旧容器可能已有其它网络别名。首次正式发布后，确认新版本已提供配置中的共享别名，再将内部调用方切过去。
 
