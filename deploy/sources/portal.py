@@ -325,9 +325,8 @@ class PortalDeployer(deploy.Deployer):
         initial = self.ops.inspect(new["container"]) or {}
         started = (initial.get("State") or {}).get("StartedAt")
         restarts = initial.get("RestartCount", 0)
-        deadline = self.ops.monotonic() + self.cfg.ready_timeout
-        last = 0
-        while (remaining := deadline - self.ops.monotonic()) > 0:
+
+        def check_container() -> None:
             info = self.ops.inspect(new["container"]) or {}
             state = info.get("State") or {}
             if not state.get("Running") or state.get("Restarting") or state.get("StartedAt") != started \
@@ -335,8 +334,16 @@ class PortalDeployer(deploy.Deployer):
                 raise DeployError("new Portal stopped or restarted while waiting for public health after reload")
             if state.get("OOMKilled"):
                 raise DeployError("new Portal was OOM-killed while waiting for public health after reload")
+
+        deadline = self.ops.monotonic() + self.cfg.ready_timeout
+        last = 0
+        while (remaining := deadline - self.ops.monotonic()) > 0:
+            check_container()
             last, _ = self.ops.http_json(self.cfg.public_health_url, timeout=min(10, remaining))
             if last == 200:
+                # The request may have spanned a restart. Keep the original
+                # baseline until the successful response has been checked.
+                check_container()
                 return
             self.ops.sleep(min(POLL, remaining))
         raise DeployError(f"public health did not return 200 after reload within {self.cfg.ready_timeout}s "

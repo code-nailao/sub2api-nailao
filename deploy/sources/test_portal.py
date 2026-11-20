@@ -675,6 +675,51 @@ class PortalTest(unittest.TestCase):
                 self.assertFalse(self.running(NEW_A))
                 self.assertIsNone(self.state()["in_progress"])
 
+    def test_restart_during_successful_public_health_check_restores_old(self):
+        for action in ("deploy", "rollback"):
+            for changed in ("RestartCount", "StartedAt", "both"):
+                with self.subTest(action=action, changed=changed):
+                    self.fresh()
+                    if action == "rollback":
+                        self.deploy()
+                        self.ops.local_images.add(LEGACY["image"])
+                        old, target, old_port = NEW_A, OLD, PORT_A
+                        run = self.deployer().rollback_portal
+                    else:
+                        old, target, old_port = OLD, NEW_A, PORT_OLD
+                        run = self.deploy
+                    probe = self.ops.http_json
+                    injected = False
+
+                    def public_health(url, *args, **kw):
+                        nonlocal injected
+                        result = probe(url, *args, **kw)
+                        step = (self.state().get("in_progress") or {}).get("step")
+                        if url == PUBLIC and step == "switch" and not injected:
+                            injected = True
+                            container = self.ops.containers[target]
+                            if changed in ("RestartCount", "both"):
+                                container["RestartCount"] += 1
+                            if changed in ("StartedAt", "both"):
+                                container["State"]["StartedAt"] = "restarted-during-public-check"
+                            return 200, {"status": "ok"}
+                        return result
+
+                    with mock.patch.object(self.ops, "http_json", side_effect=public_health):
+                        with self.assertRaises(deploy.DeployError) as ctx:
+                            run()
+
+                    self.assertTrue(injected, "restart happened during the first public check after reload")
+                    self.assertNotIsInstance(ctx.exception, deploy.FallbackFailed)
+                    self.assertIn("stopped or restarted while waiting for public health", str(ctx.exception))
+                    self.assertTrue(self.running(old))
+                    self.assertFalse(self.running(target))
+                    self.assertEqual(portal.render_upstream("sources_portal", old_port), self.upstream())
+                    self.assertEqual(old, self.state()["current"]["container"])
+                    self.assertIsNone(self.state()["in_progress"])
+                    self.assertEqual("failed", self.history()[-1]["result"])
+                    self.assertNotIn("guard", [step["step"] for step in self.history()[-1]["steps"]])
+
     def test_fallback_failure_keeps_in_progress(self):
         self.ops.unhealthy_ports = {PORT_A}
         self.ops.crash_on_start = {OLD}

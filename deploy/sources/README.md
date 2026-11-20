@@ -128,7 +128,7 @@ ssh <host> 'sudo -n journalctl -fu sources-deploy-portal'
 
 成功后 `state.json` 的 `previous` 是旧版本、`current` 是新版本，`history.jsonl` 追加一行 `action` 为 `portal` 的记录（演练不写）。
 
-reload 返回时旧 worker 可能仍在接受连接，所以切流阶段先等到公网健康返回 200，再开始完整的守护时长和连续失败计数。等待复用 `ready_timeout`，超时沿用回退流程；这段等待不把旧 worker 引起的短暂失败记入守护。进入守护后，公网健康连续失败的判定不变。
+reload 返回时旧 worker 可能仍在接受连接，所以切流阶段先等到公网健康返回 200，再开始完整的守护时长和连续失败计数。成功响应后还会按等待开始时的 `StartedAt` 和重启次数复核容器，并检查它仍在运行、未处于重启中且没有被 OOM 终止；即使探测返回 200，请求期间发生的重启也会触发回退。等待复用 `ready_timeout`，超时沿用回退流程；这段等待不把旧 worker 引起的短暂失败记入守护。进入守护后，公网健康连续失败的判定不变。
 
 ### 回退
 
