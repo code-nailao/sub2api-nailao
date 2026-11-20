@@ -1,4 +1,5 @@
 import { authorizedJSON } from "./session.js";
+import { requestRounds } from "./request-round.js";
 
 // Settings dialogs of the Portal page that hosts Image Studio and Canvas. They
 // open above the client frame and call only this origin's /api/studio/ routes.
@@ -99,9 +100,10 @@ function el(tag, props = {}, ...children) {
 }
 const button = (text, onclick, className, label) => el("button", { type: "button", text, onclick, class: className, "aria-label": label });
 
-let current = null;
+let current = null, dialogSession = 0;
 function openDialog(title, hint) {
   current?.close();
+  const session = ++dialogSession;
   const body = el("div", { class: "portal-dialog-body" });
   const status = el("p", { class: "portal-dialog-status", role: "status", "aria-live": "polite" });
   const actions = el("div", { class: "portal-dialog-actions" });
@@ -110,14 +112,18 @@ function openDialog(title, hint) {
   // The close event arrives later, and in a background tab much later, so a
   // dialog closed from here is removed at once; the event covers the Escape key.
   const cleanup = () => {
-    if (view.closed) return;
-    view.closed = true;
+    view.operations.advance();
     node.remove();
     window.removeEventListener("sources:locked", view.close);
-    if (current === view) current = null;
+    if (dialogSession === session) {
+      dialogSession++;
+      current = null;
+    }
   };
-  const view = { node, body, status, actions, closed: false, close: () => { if (node.open) node.close(); cleanup(); } };
-  node.addEventListener("close", cleanup);
+  const view = { node, body, status, actions, operations: requestRounds(), heldControls: new Set(),
+    isOpen: () => session === dialogSession && node.open,
+    close: () => { if (node.open) node.close(); cleanup(); } };
+  node.addEventListener("close", () => { if (dialogSession === session) cleanup(); });
   // Signing out or switching account in another tab closes an open dialog.
   window.addEventListener("sources:locked", view.close);
   document.body.append(node);
@@ -130,16 +136,25 @@ function say(view, text, kind = "") {
   view.status.dataset.kind = kind;
 }
 async function busy(view, text, task) {
-  if (view.closed) return;
+  if (!view.isOpen()) return;
+  const round = view.operations.start();
+  const current = () => view.isOpen() && view.operations.isWaiting(round);
   const controls = [...view.node.querySelectorAll("button,input,select")].filter((control) => !control.disabled);
-  for (const control of controls) control.disabled = true;
+  for (const control of controls) {
+    view.heldControls.add(control);
+    control.disabled = true;
+  }
   say(view, text);
   try {
-    await task();
+    await task(current);
   } catch (error) {
-    if (!view.closed) say(view, error.message || "操作未完成，请重试。", "error");
+    if (current()) say(view, error.message || "操作未完成，请重试。", "error");
   } finally {
-    for (const control of controls) control.disabled = false;
+    if (current()) {
+      view.operations.finish(round);
+      for (const control of view.heldControls) control.disabled = false;
+      view.heldControls.clear();
+    }
   }
 }
 async function request(path, options, messages = {}) {
@@ -150,7 +165,7 @@ async function request(path, options, messages = {}) {
 
 // Models are fetched and then picked from the list. Typing a name is the
 // fallback for a list that cannot be fetched or lacks a model.
-function modelPicker({ selected, load, onChange = () => {}, preselect = false }) {
+function modelPicker({ selected, load, isOpen, onChange = () => {}, preselect = false }) {
   let models = [...selected], candidates = [], filter = "", sequence = 0, loaded = false;
   const count = el("span", { class: "portal-note" });
   const note = el("p", { class: "portal-note", role: "status" });
@@ -189,11 +204,12 @@ function modelPicker({ selected, load, onChange = () => {}, preselect = false })
   }
   async function refresh() {
     const current = ++sequence;
+    const accepted = () => isOpen() && current === sequence;
     refreshButton.disabled = true;
     say("正在获取模型…");
     try {
       const ids = sortCandidates(await load());
-      if (current !== sequence) return;
+      if (!accepted()) return;
       candidates = ids;
       loaded = true;
       let picked = 0;
@@ -208,7 +224,7 @@ function modelPicker({ selected, load, onChange = () => {}, preselect = false })
         say("没有获取到模型，可以在下方手动填写模型名称。", "error");
       } else say(picked ? `获取到 ${ids.length} 个模型，已按名称预选 ${picked} 个图片模型，可以调整。` : `获取到 ${ids.length} 个模型，点选要使用的。`);
     } catch (error) {
-      if (current !== sequence) return;
+      if (!accepted()) return;
       // A value the user has to correct first is not a failed fetch; the
       // field that holds it says what is wrong.
       if (error.fixInput) say("");
@@ -217,7 +233,7 @@ function modelPicker({ selected, load, onChange = () => {}, preselect = false })
         say(`${error.message || "获取模型失败。"}可以在下方手动填写模型名称。`, "error");
       }
     } finally {
-      if (current === sequence) {
+      if (accepted()) {
         refreshButton.disabled = false;
         render();
       }
@@ -277,15 +293,20 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
     if (error) { say(view, error, "error"); return; }
     const addresses = customAPILabelRequest(addressRows.map((row) => row.input.value.trim()), addressRows.find((row) => row.radio.checked)?.input.value.trim() || "");
     if (addresses.error) { say(view, addresses.error, "error"); return; }
-    void busy(view, "正在保存…", async () => {
+    void busy(view, "正在保存…", async (current) => {
       const result = await authorizedJSON("/api/studio/admin/registry", { method: "PUT", body: { revision, custom_disabled: !allowCustom.checked, groups, ...addresses } });
+      if (!current()) return;
       if (result.ok) {
         show(result.data);
         say(view, "已保存，已经生效。");
         onSaved();
         return;
       }
-      if (result.data?.error === "source_changed_refresh_page") show(await request("/api/studio/admin/registry", undefined, messages));
+      if (result.data?.error === "source_changed_refresh_page") {
+        const data = await request("/api/studio/admin/registry", undefined, messages);
+        if (!current()) return;
+        show(data);
+      }
       throw Error(messages[result.data?.error] || "暂时无法保存，请稍后重试。");
     });
   };
@@ -294,7 +315,7 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
     let dirty = false, reset = false;
     const touched = () => { dirty = true; reset = false; note.textContent = ""; };
     const check = el("input", { type: "checkbox", checked: group.enabled, disabled: group.locked });
-    const picker = group.locked ? null : modelPicker({ selected: group.models, onChange: touched, preselect: true,
+    const picker = group.locked ? null : modelPicker({ selected: group.models, isOpen: view.isOpen, onChange: touched, preselect: true,
       load: async () => (await request(`/api/studio/admin/groups/${group.group_id}/models`, undefined, messages)).models });
     const note = el("span", { class: "portal-note" });
     const tags = [
@@ -350,8 +371,9 @@ export function openGroupSettings({ onSaved = () => {} } = {}) {
       button("添加", () => addAddress("", addressRows.length === 0), "portal-link", "添加 API 子域名"), addressSource, addressDeployment,
       el("p", { class: "portal-note", text: "留空则使用部署配置的初始值；都没有时使用主站地址。" })), list);
   view.actions.append(button("关闭", view.close), saveButton);
-  void busy(view, "正在读取分组…", async () => {
+  void busy(view, "正在读取分组…", async (current) => {
     const data = await request("/api/studio/admin/registry", undefined, messages);
+    if (!current()) return;
     say(view, "");
     show(data);
   });
@@ -367,17 +389,12 @@ export function openCustomSettings({ getGeneration = () => undefined, onSaved = 
   };
   view.actions.append(button("关闭", view.close));
   function persistBinding(configured, options) {
-    const generation = getGeneration();
-    return busy(view, configured ? "正在保存…" : "正在删除…", async () => {
-      try {
-        await request("/api/studio/custom", options, messages);
-      } catch (error) {
-        if (getGeneration() === generation) throw error;
-        return;
-      }
-      if (getGeneration() !== generation) return;
+    const pageRound = getGeneration();
+    return busy(view, configured ? "正在保存…" : "正在删除…", async (current) => {
+      await request("/api/studio/custom", options, messages);
+      if (!current()) return;
       view.close();
-      onSaved(configured, generation);
+      onSaved(configured, pageRound);
     });
   }
   function show(data) {
@@ -403,7 +420,7 @@ export function openCustomSettings({ getGeneration = () => undefined, onSaved = 
     // A connection saved before subdomains existed still uses the main address until it is saved again.
     const legacy = Boolean(saved && !saved.api_label && (data.api_labels || []).length);
     notice.textContent = choice.removed ? "之前选的地址已停用，已改用默认地址。" : legacy ? "现在的连接仍使用主站地址，保存后改用上面选择的地址。" : "";
-    const picker = modelPicker({ selected: saved ? saved.models : [], preselect: true, load: async () => {
+    const picker = modelPicker({ selected: saved ? saved.models : [], isOpen: view.isOpen, preselect: true, load: async () => {
       return (await request("/api/studio/custom/models", { method: "POST", body: { key_id: Number(keySelect.value), protocol: protocolSelect.value } }, messages)).models;
     } });
     const describe = () => {
@@ -451,8 +468,10 @@ export function openCustomSettings({ getGeneration = () => undefined, onSaved = 
     // The list is fetched as soon as the dialog opens.
     void picker.refresh();
   }
-  void busy(view, "正在读取你的密钥…", async () => {
-    show(await request("/api/studio/custom", undefined, messages));
+  void busy(view, "正在读取你的密钥…", async (current) => {
+    const data = await request("/api/studio/custom", undefined, messages);
+    if (!current()) return;
+    show(data);
     say(view, "");
   });
 }

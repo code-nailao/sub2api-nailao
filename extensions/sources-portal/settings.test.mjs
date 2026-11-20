@@ -3,16 +3,96 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
-// The dialogs themselves need a browser; this covers the rules they apply
-// before asking Portal, which checks every value again.
+// Test the same module with either no DOM (validation) or a small dialog fixture.
 const source = await readFile(new URL('./internal/portal/web/studio-settings.js', import.meta.url), 'utf8');
-const context = vm.createContext({});
-const session = new vm.SyntheticModule(['authorizedJSON'], function () { this.setExport('authorizedJSON', async () => { throw Error('not called'); }); }, { context });
-const module = new vm.SourceTextModule(source, { context });
-await module.link(() => session);
-await module.evaluate();
-const { sortCandidates, managedGroups, customPathPrefix, customAddressChoice, customPreview, customAPILabelRequest, customRequest } = module.namespace;
+const roundSource = await readFile(new URL('./internal/portal/web/request-round.js', import.meta.url), 'utf8');
+async function settingsModule(globals = {}, authorizedJSON = async () => { throw Error('not called'); }) {
+  const context = vm.createContext({ setTimeout, clearTimeout, ...globals });
+  const session = new vm.SyntheticModule(['authorizedJSON'], function () { this.setExport('authorizedJSON', authorizedJSON); }, { context });
+  const module = new vm.SourceTextModule(source, { context });
+  const rounds = new vm.SourceTextModule(roundSource, { context });
+  await module.link((specifier) => specifier === './request-round.js' ? rounds : session);
+  await module.evaluate();
+  return module.namespace;
+}
+const { sortCandidates, managedGroups, customPathPrefix, customAddressChoice, customPreview, customAPILabelRequest, customRequest } = await settingsModule();
 const plain = (value) => JSON.parse(JSON.stringify(value));
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+class Element extends EventTarget {
+  constructor(tag) { super(); this.tag = tag; }
+  children = [];
+  dataset = {};
+  attributes = {};
+  open = false;
+  disabled = false;
+  append(...children) {
+    for (const child of children) {
+      if (child instanceof Element) child.parent = this;
+      this.children.push(child);
+    }
+  }
+  replaceChildren(...children) { this.children = []; this.append(...children); }
+  querySelectorAll(selector) {
+    const tags = selector.split(',');
+    return this.children.filter((child) => child instanceof Element).flatMap((child) => [
+      ...(tags.includes(child.tag) ? [child] : []), ...child.querySelectorAll(selector),
+    ]);
+  }
+  setAttribute(key, value) { this.attributes[key] = value; }
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); }
+  showModal() { this.open = true; }
+  close() {
+    this.open = false;
+    setImmediate(() => this.dispatchEvent(new Event('close')));
+  }
+  click() { if (!this.disabled) this.dispatchEvent(new Event('click')); }
+}
+
+test('only the latest open custom dialog accepts overlapping successful saves', async (t) => {
+  for (const firstFinishesFirst of [true, false]) await t.test(firstFinishesFirst ? 'closed dialog finishes first' : 'open dialog finishes first', async () => {
+    const window = new EventTarget(), body = new Element('body');
+    const document = { body, createElement: (tag) => new Element(tag) };
+    const pending = [Promise.withResolvers(), Promise.withResolvers()];
+    const results = [];
+    let writes = 0, generation = 0;
+    const { openCustomSettings } = await settingsModule({ window, document }, async (path, options) => {
+      if (options?.method === 'PUT') return pending[writes++].promise;
+      if (path.endsWith('/models')) return { ok: true, data: { models: ['image-fixture'] } };
+      return { ok: true, data: { enabled: true, api_labels: [], api_origin: 'YOUR_MAIN_ORIGIN',
+        keys: [{ id: 1, name: '示例密钥', protocol: 'openai_images' }],
+        binding: { key_id: 1, protocol: 'openai_images', models: ['image-fixture'] } } };
+    });
+    const openAndSave = async (name) => {
+      openCustomSettings({ getGeneration: () => generation, onSaved: () => { results.push(name); generation++; } });
+      await flush();
+      const [dialog] = body.querySelectorAll('dialog');
+      const save = dialog.querySelectorAll('button').find((button) => button.textContent === '保存并连接');
+      assert.equal(save.disabled, false);
+      save.click();
+      assert.equal(dialog.querySelectorAll('p').find((p) => p.className === 'portal-dialog-status').textContent, '正在保存…');
+      return dialog;
+    };
+    const first = await openAndSave('first');
+    // Native Escape closes the dialog before dispatching its close event.
+    first.close();
+    const second = await openAndSave('second');
+    assert.equal(writes, 2);
+    if (firstFinishesFirst) {
+      pending[0].resolve({ ok: true });
+      await flush();
+      assert.deepEqual(results, []);
+      assert.equal(second.open, true);
+    }
+    pending[1].resolve({ ok: true });
+    await flush();
+    assert.equal(second.open, false);
+    if (!firstFinishesFirst) pending[0].resolve({ ok: true });
+    await flush();
+    assert.deepEqual(results, ['second']);
+    assert.deepEqual(body.querySelectorAll('dialog'), []);
+  });
+});
 
 test('model candidates list image models first and keep the given order otherwise', () => {
   assert.deepEqual(plain(sortCandidates(['gpt-5', 'gpt-image-2', 'o4', 'grok-imagine-image', 'gemini-3-pro-image-preview'])),

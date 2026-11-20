@@ -156,6 +156,7 @@ test('lost shell ACK recovers through a new handshake before another group switc
 
 test('initial connection timeout remains retryable before any new shell was published', async () => {
   const f = await fixture();
+  const timedOutFrame = f.frame;
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   assert.equal(f.last('sub2api:image-studio-shell-config'), undefined);
   const timer = [...f.timers.values()].find((entry) => entry.delay === 500);
@@ -166,9 +167,52 @@ test('initial connection timeout remains retryable before any new shell was publ
   f.select.onchange();
   await flush();
   await f.ackConnection();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   await f.ackShell();
   assert.equal(f.document.body.dataset.integrated, 'true');
-  assert.equal(f.frameSets, 1);
+  assert.notEqual(f.frame, timedOutFrame);
+});
+
+test('Studio ignores the first legacy ACK when startup retries the same group', async () => {
+  const f = await fixture();
+  const original = f.last('sub2api:image-studio-config').payload;
+  const oldPeer = f.frame.contentWindow;
+  const authorizations = f.calls.filter(({ path }) => path.endsWith('/connection')).length;
+  const interval = [...f.timers.values()].find(({ delay }) => delay === 500);
+  for (let i = 0; i < 31; i++) interval.callback();
+  f.retry.onclick();
+  await flush();
+  f.send({ type: 'sub2api:image-studio-config-applied', payload: {
+    status: 'applied', profileId: `sub2api-image-studio-${original.selectedConnectionId}`,
+  } }, { from: oldPeer });
+  await flush();
+  assert.equal(f.frame.hidden, true);
+  await f.ackConnection();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackShell();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.calls.filter(({ path }) => path.endsWith('/connection')).length, authorizations);
+});
+
+test('Studio can retry a hung group read on startup after saving settings', async () => {
+  const hung = Promise.withResolvers();
+  let readPending = true;
+  // A successful save reloads the page with the saved group remembered.
+  const f = await fixture({ remembered: String(CUSTOM_ID), custom: 'configured', waitForBootstrap: false,
+    groupsResponse: () => readPending ? hung.promise : undefined });
+  [...f.timers.values()].find(({ delay }) => delay === 20000).callback();
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.retry.disabled, false);
+  readPending = false;
+  f.retry.onclick();
+  await flush();
+  await f.integrate();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  hung.resolve({ ok: false, status: 503 });
+  await flush();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.frame.hidden, false);
 });
 
 

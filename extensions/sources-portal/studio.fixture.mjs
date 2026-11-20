@@ -4,22 +4,28 @@ import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 
 const source = await readFile(new URL('./internal/portal/web/studio.js', import.meta.url), 'utf8');
+const roundSource = await readFile(new URL('./internal/portal/web/request-round.js', import.meta.url), 'utf8');
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const initialGroups = [{ id: 26, name: 'Images' }, { id: 27, name: 'Grok' }];
 
 export const CUSTOM_ID = 9000000000000001, SETUP_ID = 9000000000000002, MANAGE_ID = 9000000000000003;
 
 // custom: 'off' | 'available' | 'configured'; admin adds the group settings entry.
-export async function createStudioFixture({ remembered, groupList = initialGroups, connection, session, groupsResponse, custom = 'off', admin = false,
+export async function createStudioFixture({ remembered, groupList = initialGroups, connection, session, groupsResponse, custom = 'off', admin = false, waitForBootstrap = true,
   origin = 'https://main.example', studioOrigin = 'https://studio.example' } = {}) {
   const window = new EventTarget();
   const parentMessages = [], studioMessages = [], calls = [];
   const parent = { postMessage: (data, target) => { assert.equal(target, origin); parentMessages.push(data); } };
   window.parent = parent;
-  const studioWindow = { postMessage: (data, target) => { assert.equal(target, studioOrigin); studioMessages.push(data); } };
-  const frame = Object.assign(new EventTarget(), { contentWindow: studioWindow, hidden: true, src: '' });
-  let frameSets = 0, frameSource = '';
-  Object.defineProperty(frame, 'src', { get: () => frameSource, set: (value) => { frameSource = value; frameSets++; } });
+  let frameSets = 0;
+  function makeFrame(src = '') {
+    const contentWindow = { postMessage: (data, target) => { assert.equal(target, studioOrigin); studioMessages.push(data); } };
+    const element = Object.assign(new EventTarget(), { contentWindow, hidden: true,
+      cloneNode: () => makeFrame(src), replaceWith: (next) => { frame = elements['#studio'] = next; frameSets++; } });
+    Object.defineProperty(element, 'src', { get: () => src, set: (value) => { src = value; frameSets++; } });
+    return element;
+  }
+  let frame = makeFrame();
   const select = { value: '', disabled: false, children: [], replaceChildren() { this.children = []; }, append(option) { this.children.push(option); } };
   const message = { textContent: '' }, keys = {}, lock = {}, reconnect = { hidden: true, disabled: false };
   const loadingPanel = {}, statusTitle = {}, connectionBar = {}, recoveryActions = {}, retry = {}, login = {};
@@ -64,10 +70,12 @@ export async function createStudioFixture({ remembered, groupList = initialGroup
     this.setExport('openGroupSettings', (options) => settings.push({ kind: 'manage', ...options }));
   }, { context });
   const module = new vm.SourceTextModule(source, { context });
-  await module.link((specifier) => specifier === './session.js' ? auth : dialogs);
-  await module.evaluate();
+  const rounds = new vm.SourceTextModule(roundSource, { context });
+  await module.link((specifier) => ({ './request-round.js': rounds, './session.js': auth, './studio-settings.js': dialogs })[specifier]);
+  const evaluation = module.evaluate();
+  if (waitForBootstrap) await evaluation;
   await flush();
-  const send = (data, { from = studioWindow, fromOrigin = studioOrigin } = {}) => window.dispatchEvent(Object.assign(new Event('message'), { data, source: from, origin: fromOrigin }));
+  const send = (data, { from = frame.contentWindow, fromOrigin = studioOrigin } = {}) => window.dispatchEvent(Object.assign(new Event('message'), { data, source: from, origin: fromOrigin }));
   const host = (revision = 1, shellMode = 'standalone') => send({ type: 'sources:studio-host-config', version: 1, requestId: 'host-request-' + String(revision).padStart(8, '0'), revision, shellMode, standaloneUrl: origin + '/custom/images?studio_view=standalone', theme: 'dark', lang: 'zh' }, { from: parent, fromOrigin: origin });
   const last = (type) => studioMessages.filter((item) => item.type === type).at(-1);
   const ackConnection = async () => {
@@ -89,7 +97,7 @@ export async function createStudioFixture({ remembered, groupList = initialGroup
     send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
     return ackShell();
   };
-  return { window, parent, frame, select, reconnect, message, document, calls, loadingPanel, statusTitle, connectionBar, recoveryActions, retry, login, connectionMenu, studioMessages, parentMessages, send, host, last, ackConnection, ackShell, integrate, timers,
+  return { window, parent, get frame() { return frame; }, select, reconnect, message, document, calls, loadingPanel, statusTitle, connectionBar, recoveryActions, retry, login, connectionMenu, studioMessages, parentMessages, send, host, last, ackConnection, ackShell, integrate, timers,
     customButton, manageButton, ownKeyButton, manageRecoveryButton, settings, state, values,
     get frameSets() { return frameSets; }, get locked() { return locked; } };
 }

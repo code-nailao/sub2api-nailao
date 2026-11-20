@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 
 const source = await readFile(new URL('./internal/portal/web/canvas.js', import.meta.url), 'utf8');
+const roundSource = await readFile(new URL('./internal/portal/web/request-round.js', import.meta.url), 'utf8');
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 export const CUSTOM_ID = 9000000000000001;
 
@@ -57,7 +58,11 @@ export async function createCanvasFixture({ groups = [{ id: 26, name: 'Images' }
     });
     this.setExport('openGroupSettings', (options) => settings.push({ kind: 'manage', ...options }));
   }, { context });
-  const module = new vm.SourceTextModule(source, { context }); await module.link((specifier) => specifier === './session.js' ? auth : dialogs); await module.evaluate(); await flush();
+  const module = new vm.SourceTextModule(source, { context });
+  const rounds = new vm.SourceTextModule(roundSource, { context });
+  await module.link((specifier) => ({ './request-round.js': rounds, './session.js': auth, './studio-settings.js': dialogs })[specifier]);
+  await module.evaluate();
+  await flush();
   const send = (data, { from = elements['#studio'].contentWindow, fromOrigin = canvasOrigin } = {}) => window.dispatchEvent(Object.assign(new Event('message'), { data, source: from, origin: fromOrigin }));
   const host = (revision = 1, shellMode = 'embedded', changes = {}) => send({ type: 'sources:studio-host-config', version: 1, requestId: 'host-request-' + String(revision).padStart(8, '0'), revision, shellMode, standaloneUrl: origin + '/custom/canvas?studio_view=standalone', theme: 'dark', lang: 'zh-CN', ...changes }, { from: parent, fromOrigin: origin });
   const last = (type) => canvasMessages.filter((m) => m.type === type).at(-1);

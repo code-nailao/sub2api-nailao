@@ -1,5 +1,6 @@
 import { authorizedJSON, clearSession, currentToken } from "./session.js";
 import { openCustomSettings, openGroupSettings } from "./studio-settings.js";
+import { requestRounds } from "./request-round.js";
 
 const params = new URLSearchParams(location.search);
 const CUSTOM_CONNECTION_NEEDS_UPDATE = "custom_connection_needs_update";
@@ -19,20 +20,35 @@ const home = document.querySelector("#canvas-home");
 const customButton = document.querySelector("#canvas-custom");
 const manageButton = document.querySelector("#canvas-manage");
 const ownKeyButton = document.querySelector("#canvas-own-key");
-let studioURL, configuration, configurationGeneration, hostConfig, savedGroupToReconnect;
-let ack = false, generation = 0, locked = false, connecting = false, bootstrapping = false;
-let sendTimer, checkTimer, startupTimer, needsCustomResave = false;
+let studioURL, connection, attempt, hostConfig, savedGroupToReconnect;
+let locked = false, needsCustomResave = false;
+let sendTimer, checkTimer;
+const rounds = requestRounds();
+const groupRefresh = requestRounds();
+const groupPoll = requestRounds();
+let nextRestoreRound = 0;
+const restoreRounds = new Map();
 const granted = new Map();
 // The user's own-key connection is addressed like a group, by a reserved ID.
 let custom = { groupId: 0, enabled: false, configured: false };
 const validRequestID = (value) => typeof value === "string" && /^[\w-]{16,80}$/.test(value);
-const isCurrentGeneration = (current) => !locked && current === generation;
+const isCurrent = (round) => !locked && round === rounds.current;
+const isWaiting = (operation) => !locked && attempt === operation && rounds.isWaiting(operation.round);
+const readingOrAuthorizing = () => rounds.isWaiting() && ["bootstrap", "authorize"].includes(attempt?.phase);
+const confirmed = () => Boolean(connection?.acknowledged && !connection.invalid);
 
+function updateControls() {
+  select.disabled = locked || !select.children.length || readingOrAuthorizing();
+  retry.hidden = locked;
+  retry.disabled = locked || (!needsCustomResave && readingOrAuthorizing());
+  retry.textContent = needsCustomResave && !locked ? "打开自定义连接" : "重试连接";
+  ownKeyButton.hidden = locked || needsCustomResave || !custom.enabled;
+}
 function showState(state, text) {
   const resave = needsCustomResave && !locked;
   if (resave) {
     state = "recovery";
-    if (!ack) frame.hidden = true;
+    if (!confirmed()) frame.hidden = true;
     text = text && text !== CUSTOM_RESAVE_HINT ? `${CUSTOM_RESAVE_HINT} ${text}` : CUSTOM_RESAVE_HINT;
   }
   document.body.dataset.state = state;
@@ -41,10 +57,7 @@ function showState(state, text) {
   controls.hidden = state === "loading" || locked;
   recovery.hidden = state !== "recovery";
   statusTitle.textContent = state === "loading" ? "正在打开无限画布" : locked ? "请重新进入画布" : "画布连接需要处理";
-  retry.hidden = locked;
-  retry.disabled = connecting || bootstrapping;
-  retry.textContent = resave ? "打开自定义连接" : "重试连接";
-  ownKeyButton.hidden = locked || resave || !custom.enabled;
+  updateControls();
   login.hidden = !locked;
   if (text) message.textContent = text;
 }
@@ -54,23 +67,40 @@ function notifyHost(ready) {
     requestId: hostConfig.requestId, revision: hostConfig.revision,
     shellMode: hostConfig.shellMode, integrated: ready }, location.origin);
 }
-function recover(text) {
-  clearTimeout(startupTimer);
-  showState("recovery", text);
+function begin(phase, state, text) {
+  const previous = connection;
+  const operation = { round: rounds.start(), phase, previous };
+  attempt = operation;
+  clearInterval(sendTimer);
+  restoreRounds.clear();
+  rounds.deadline(operation.round, 20000, () => {
+    fail(operation, "连接用时较长。可以重试连接。已有画布和任务会保留。");
+  });
+  showState(state, text);
+  return operation;
 }
-function armStartupTimeout(current = generation) {
-  clearTimeout(startupTimer);
-  startupTimer = setTimeout(() => {
-    if (isCurrentGeneration(current) && (!ack || savedGroupToReconnect !== undefined)) {
-      recover("连接用时较长。可重试连接；已有画布和任务会保留。");
-    }
-  }, 20000);
+function finish(operation) {
+  if (attempt !== operation) return;
+  rounds.finish(operation.round);
+  attempt = undefined;
+  clearInterval(sendTimer);
+}
+function fail(operation, text) {
+  finish(operation);
+  // Reuse the returned grant after an ACK timeout, or the previous grant if
+  // fetching or authorizing the new group did not succeed.
+  const previous = operation.phase === "confirm" ? connection : operation.previous;
+  connection = previous ? { ...previous, round: rounds.current } : undefined;
+  if (connection) select.value = connection.payload.selectedConnectionId.slice(6);
+  frame.hidden = !confirmed();
+  showState("recovery", text);
+  if (!confirmed()) notifyHost(false);
 }
 function applyAppearance() {
   const theme = hostConfig?.theme || (params.get("theme") === "dark" ? "dark" : "light");
   document.documentElement.dataset.theme = theme;
   document.documentElement.style.colorScheme = theme;
-  if (ack && !locked && studioURL && frame.contentWindow) {
+  if (confirmed() && !locked && studioURL && frame.contentWindow) {
     frame.contentWindow.postMessage({ type: "sources:canvas-appearance", version: 1,
       theme, lang: hostConfig?.lang?.startsWith("en") ? "en-US" : "zh-CN" }, studioURL.origin);
   }
@@ -86,18 +116,19 @@ function setShell() {
 function lock(text) {
   if (locked) return;
   locked = true;
-  generation++;
-  configuration = null;
+  rounds.advance();
+  groupRefresh.advance();
+  groupPoll.advance();
+  restoreRounds.clear();
+  attempt = connection = undefined;
   granted.clear();
-  ack = false;
   clearInterval(sendTimer);
   clearInterval(checkTimer);
-  clearTimeout(startupTimer);
   frame.src = "about:blank";
   frame.hidden = true;
   select.disabled = true;
   customButton.hidden = manageButton.hidden = ownKeyButton.hidden = true;
-  recover(text);
+  showState("recovery", text);
   notifyHost(false);
 }
 document.querySelector("#lock").onclick = () => {
@@ -121,27 +152,87 @@ async function api(path, body) {
     : "授权暂不可用，请稍后重试；不会自动换组或创建新任务。");
   return result.data;
 }
-function send() {
-  if (!locked && !needsCustomResave && configurationGeneration === generation && configuration && frame.contentWindow && !ack) {
-    frame.contentWindow.postMessage({ type: "sub2api:media-studio-config", payload: configuration }, studioURL.origin);
-  }
-}
-function startSending(current) {
-  if (!isCurrentGeneration(current) || needsCustomResave || configurationGeneration !== current || !configuration) return;
+function startSending(operation) {
+  if (!isWaiting(operation) || operation.phase !== "confirm" || connection?.round !== operation.round || needsCustomResave) return;
+  const payload = connection.payload;
+  const send = () => frame.contentWindow?.postMessage({ type: "sub2api:media-studio-config", payload }, studioURL.origin);
   send();
   clearInterval(sendTimer);
   let attempts = 0;
-  sendTimer = setInterval(() => {
-    if (!isCurrentGeneration(current) || needsCustomResave || ack) { clearInterval(sendTimer); return; }
+  const timer = setInterval(() => {
+    if (!isWaiting(operation) || timer !== sendTimer || needsCustomResave) return;
     if (++attempts > 30) {
-      clearInterval(sendTimer);
-      recover("画布尚未确认连接。可重试确认；不会重新生成或重复提交任务。");
+      rounds.advance();
+      fail(operation, "画布尚未确认连接。可以重试确认。已有任务会保留。");
       return;
     }
     send();
   }, 500);
+  sendTimer = timer;
 }
-frame.addEventListener("load", () => startSending(generation));
+function confirm(operation, grant) {
+  operation.phase = "confirm";
+  const payload = { ...grant,
+    connections: [...granted.values()].flatMap((item) => item.connections),
+    capabilities: [...granted.values()].flatMap((item) => item.capabilities),
+    requestId: crypto.randomUUID() };
+  connection = { grant, payload, round: operation.round, acknowledged: false };
+  frame.hidden = true;
+  if (!frame.getAttribute("src")) frame.src = studioURL.href;
+  else startSending(operation);
+  showState("loading", "正在确认画布连接…");
+}
+function repeatConfirmation() {
+  const grant = granted.get(connection.grant.selectedConnectionId) ?? connection.grant;
+  const operation = begin("confirm", "loading", "正在确认画布连接…");
+  confirm(operation, grant);
+}
+frame.addEventListener("load", () => { if (attempt) startSending(attempt); });
+
+function requireResave(connectionId) {
+  needsCustomResave = true;
+  granted.delete(connectionId);
+  const invalidate = (candidate) => candidate?.grant.selectedConnectionId === connectionId
+    ? { ...candidate, invalid: true, acknowledged: false }
+    : candidate;
+  if (attempt) attempt.previous = invalidate(attempt.previous);
+  connection = invalidate(connection);
+}
+async function restoreConnection(connectionId, requestId, target) {
+  const pageRound = rounds.current, restoreRound = ++nextRestoreRound;
+  const activePayload = connection.payload;
+  restoreRounds.set(connectionId, restoreRound);
+  const current = () => isCurrent(pageRound) && target === frame.contentWindow &&
+    connection?.payload === activePayload && restoreRounds.get(connectionId) === restoreRound;
+  let config;
+  try {
+    config = await api("/api/canvas/connection", { group_id: Number(connectionId.slice(6)), restore_only: true });
+  } catch (error) {
+    if (!current()) return;
+    restoreRounds.delete(connectionId);
+    if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) {
+      requireResave(connectionId);
+      if (attempt?.phase === "confirm") finish(attempt);
+      showState("recovery", error.message);
+      if (!confirmed()) notifyHost(false);
+    } else updateControls();
+    target.postMessage({ type: "sub2api:canvas-restore-error", connectionId, requestId }, studioURL.origin);
+    return;
+  }
+  if (!current()) return;
+  restoreRounds.delete(connectionId);
+  granted.set(connectionId, config);
+  target.postMessage({ type: "sub2api:media-studio-config", payload: { ...config, requestId, selectActive: false } }, studioURL.origin);
+  if (needsCustomResave) {
+    needsCustomResave = false;
+    if (connection.invalid && connection.grant.selectedConnectionId === connectionId) {
+      repeatConfirmation();
+      return;
+    }
+    if (confirmed() && !rounds.isWaiting()) showState("ready");
+    else showState("recovery", "画布尚未确认连接，请重试连接。");
+  } else updateControls();
+}
 
 window.addEventListener("message", async (event) => {
   const data = event.data;
@@ -154,129 +245,77 @@ window.addEventListener("message", async (event) => {
     hostConfig = { requestId: data.requestId, revision: data.revision, shellMode: data.shellMode,
       standaloneUrl: standalone.href, theme: data.theme, lang: typeof data.lang === "string" ? data.lang.slice(0, 20) : "zh" };
     setShell();
-    if (ack && !locked) notifyHost(true);
+    if (confirmed() && !frame.hidden) notifyHost(true);
     return;
   }
-  if (locked || event.source !== frame.contentWindow || event.origin !== studioURL?.origin || !configuration) return;
+  if (locked || event.source !== frame.contentWindow || event.origin !== studioURL?.origin || !connection) return;
   if (data?.type === "sub2api:canvas-ready") {
-    if (needsCustomResave || configurationGeneration !== generation) return;
-    ack = false;
-    startSending(generation);
+    restoreRounds.clear();
+    if (!needsCustomResave && !readingOrAuthorizing() && savedGroupToReconnect === undefined && !connection.invalid) repeatConfirmation();
     return;
   }
   if (data?.type === "sub2api:canvas-restore-connection") {
-    const connectionId = data.connectionId, requestId = data.requestId;
+    const { connectionId, requestId } = data;
     if (typeof connectionId !== "string" || !/^group-[1-9][0-9]*$/.test(connectionId) || typeof requestId !== "string" || !/^[a-f0-9-]{36}$/.test(requestId)) return;
-    const current = generation, target = frame.contentWindow;
-    try {
-      const config = await api("/api/canvas/connection", { group_id: Number(connectionId.slice(6)), restore_only: true });
-      if (!isCurrentGeneration(current) || target !== frame.contentWindow) return;
-      granted.set(connectionId, config);
-      target.postMessage({ type: "sub2api:media-studio-config", payload: { ...config, requestId, selectActive: false } }, studioURL.origin);
-      if (needsCustomResave) {
-        needsCustomResave = false;
-        if (ack) showState("ready");
-        else recover("画布尚未确认连接，请重试连接。");
-      }
-    } catch (error) {
-      if (!isCurrentGeneration(current) || target !== frame.contentWindow) return;
-      target.postMessage({ type: "sub2api:canvas-restore-error", connectionId, requestId }, studioURL.origin);
-      if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) {
-        needsCustomResave = true;
-        clearInterval(sendTimer);
-        if (configuration.selectedConnectionId === connectionId) {
-          configurationGeneration = undefined;
-          ack = false;
-        }
-        recover(error.message);
-      }
-    }
+    void restoreConnection(connectionId, requestId, event.source);
     return;
   }
-  if (data?.type !== "sub2api:media-studio-config-applied" || data?.payload?.status !== "applied" || data?.payload?.requestId !== configuration.requestId || data?.payload?.profileId !== `sub2api-media-studio-group-${select.value}`) return;
-  // Match the generation of the sent configuration, including ACKs that arrive
-  // after switching groups or while the session check is in flight.
-  const receivedGeneration = configurationGeneration;
-  if (!isCurrentGeneration(receivedGeneration) || needsCustomResave) return;
+  if (data?.type !== "sub2api:media-studio-config-applied" || data.payload?.status !== "applied") return;
+  const pending = attempt;
+  const candidate = connection;
+  if (!pending || !isWaiting(pending) || pending.phase !== "confirm" || candidate.round !== pending.round || candidate.invalid || needsCustomResave) return;
+  if (data.payload.requestId !== candidate.payload.requestId || data.payload.profileId !== `sub2api-media-studio-${candidate.payload.selectedConnectionId}`) return;
   try { await currentToken(); } catch { return; }
-  if (!isCurrentGeneration(receivedGeneration) || configurationGeneration !== receivedGeneration || needsCustomResave || event.source !== frame.contentWindow) return;
-  ack = true;
-  clearInterval(sendTimer);
-  clearTimeout(startupTimer);
+  if (!isWaiting(pending) || connection !== candidate || needsCustomResave || event.source !== frame.contentWindow) return;
+  finish(pending);
+  connection = { ...candidate, acknowledged: true };
   frame.hidden = false;
   showState("ready");
   applyAppearance();
   notifyHost(true);
 });
-async function connect() {
-  if (locked || connecting || !studioURL || !/^[1-9][0-9]*$/.test(select.value)) return false;
-  const current = ++generation;
+
+async function authorize(operation, groupId) {
   savedGroupToReconnect = undefined;
-  const previous = configuration;
-  const previousAck = ack;
-  connecting = true;
-  select.disabled = true;
+  operation.phase = "authorize";
+  if (!needsCustomResave) frame.hidden = true;
   showState("loading", "正在连接所选分组…");
-  frame.hidden = true;
-  clearInterval(sendTimer);
-  armStartupTimeout();
   try {
-    const config = await api("/api/canvas/connection", { group_id: Number(select.value) });
-    if (!isCurrentGeneration(current)) return false;
-    if (needsCustomResave) {
-      needsCustomResave = false;
-      showState("loading", "正在确认画布连接…");
-    }
+    const config = await api("/api/canvas/connection", { group_id: groupId });
+    if (!isWaiting(operation)) return;
+    needsCustomResave = false;
+    restoreRounds.clear();
     granted.set(config.selectedConnectionId, config);
-    configuration = { ...config,
-      connections: [...granted.values()].flatMap((item) => item.connections),
-      capabilities: [...granted.values()].flatMap((item) => item.capabilities), requestId: crypto.randomUUID() };
-    configurationGeneration = current;
-    ack = false;
-    if (!frame.getAttribute("src")) frame.src = studioURL.href;
-    else startSending(current);
-    return true;
+    confirm(operation, config);
+    watchSession();
   } catch (error) {
-    if (!isCurrentGeneration(current)) return false;
-    configuration = previous;
-    ack = previousAck;
-    if (previous) select.value = previous.selectedConnectionId.slice(6);
-    frame.hidden = !previousAck;
-    if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) needsCustomResave = true;
-    recover(error.message);
-    return false;
-  } finally {
-    if (isCurrentGeneration(current)) {
-      connecting = false;
-      select.disabled = false;
-      retry.disabled = bootstrapping;
-    }
+    if (!isWaiting(operation)) return;
+    if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) requireResave(`group-${groupId}`);
+    fail(operation, error.message);
   }
 }
+function connect() {
+  if (locked || readingOrAuthorizing() || !studioURL || !/^[1-9][0-9]*$/.test(select.value)) return;
+  return authorize(begin("authorize", "loading", "正在连接所选分组…"), Number(select.value));
+}
 retry.onclick = () => {
-  if (locked || connecting || bootstrapping) return;
+  if (locked) return;
   if (needsCustomResave) { openCustomConnectionSettings(); return; }
+  if (readingOrAuthorizing()) return;
   if (savedGroupToReconnect !== undefined) { void reconnectSavedGroup(savedGroupToReconnect); return; }
   if (!studioURL) { void bootstrap(); return; }
-  if (configuration && !ack && configurationGeneration === generation) {
-    // Resend the existing configuration, not a second authorization request.
-    showState("loading", "正在确认画布连接…");
-    armStartupTimeout();
-    startSending(generation);
-    return;
-  }
-  if (configuration && ack) { showState("ready"); notifyHost(true); return; }
+  if (connection && !connection.invalid) { repeatConfirmation(); return; }
   void connect();
 };
 function watchSession() {
   clearInterval(checkTimer);
   checkTimer = setInterval(async () => {
     if (locked || document.visibilityState !== "visible") return;
-    const current = generation;
+    const pageRound = rounds.current, poll = groupPoll.advance();
     try {
       await api("/api/canvas/groups");
     } catch (error) {
-      if (isCurrentGeneration(current)) recover(error.message);
+      if (isCurrent(pageRound) && poll === groupPoll.current) showState("recovery", error.message);
     }
   }, 30000);
 }
@@ -300,57 +339,62 @@ function renderGroups(data, keep) {
   }
   if (keep && entries.some((group) => String(group.id) === keep)) select.value = keep;
   customButton.hidden = !custom.enabled;
-  ownKeyButton.hidden = customButton.hidden || needsCustomResave;
   manageButton.hidden = data.can_manage !== true;
+  updateControls();
   return entries.length;
 }
-// After a settings change: read the groups again and reconnect only when the
-// selected entry changed (or selectId asks for one).
-async function reloadGroups(selectId, afterSave = false) {
-  if (locked || connecting || bootstrapping || !studioURL) return;
-  const current = generation;
+// Admin metadata refreshes do not own the connection deadline.
+async function reloadGroups() {
+  if (locked || readingOrAuthorizing() || !studioURL || savedGroupToReconnect !== undefined) return;
+  const pageRound = rounds.current, refresh = groupRefresh.advance();
+  const current = () => isCurrent(pageRound) && refresh === groupRefresh.current;
   try {
     const data = await api("/api/canvas/groups");
-    if (!isCurrentGeneration(current)) return;
-    if (afterSave) {
-      savedGroupToReconnect = undefined;
-      clearTimeout(startupTimer);
-    }
+    if (!current()) return;
     const previous = select.value;
-    const count = renderGroups(data, selectId || previous);
-    select.disabled = !count;
-    if (!count) {
-      recover(noGroups());
-      return;
-    }
-    select.onchange = connect;
-    if (selectId || select.value !== previous || !configuration) {
-      if (await connect()) watchSession();
-    } else if (afterSave && ack) {
-      showState("ready");
-    }
+    if (!renderGroups(data, previous)) { showState("recovery", noGroups()); return; }
+    if (select.value !== previous || !connection) void connect();
   } catch (error) {
-    if (isCurrentGeneration(current)) recover(error.message);
+    if (current()) showState("recovery", error.message);
   }
 }
-function reconnectSavedGroup(selectId) {
-  const current = ++generation;
-  connecting = false;
-  bootstrapping = false;
+async function reconnectSavedGroup(selectId) {
   savedGroupToReconnect = selectId;
-  clearInterval(sendTimer);
-  showState("recovery", "正在更新画布连接…");
-  armStartupTimeout(current);
-  return reloadGroups(selectId, true);
+  const operation = begin("savedGroups", "recovery", "正在更新画布连接…");
+  try {
+    const data = await api("/api/canvas/groups");
+    if (!isWaiting(operation)) return;
+    const previous = select.value;
+    if (!renderGroups(data, selectId || previous)) {
+      savedGroupToReconnect = undefined;
+      finish(operation);
+      showState("recovery", noGroups());
+    } else if (selectId || select.value !== previous || !connection || connection.invalid) {
+      await authorize(operation, Number(select.value));
+    } else {
+      savedGroupToReconnect = undefined;
+      finish(operation);
+      connection = { ...connection, round: operation.round };
+      showState(confirmed() ? "ready" : "recovery");
+    }
+  } catch (error) {
+    if (isWaiting(operation)) fail(operation, error.message);
+  }
 }
 const connectionMenu = document.querySelector("#canvas-connection-menu");
 function openCustomConnectionSettings() {
   if (locked) return;
   connectionMenu.open = false;
-  openCustomSettings({ getGeneration: () => generation, onSaved: (configured, current) => {
-    if (!isCurrentGeneration(current)) return;
+  openCustomSettings({ getGeneration: () => rounds.latestStart, onSaved: (configured, started) => {
+    // A timeout retires a request, but a new connection supersedes this save.
+    if (locked || started !== rounds.latestStart) return;
     // A changed or removed connection must not be resent from the earlier grant.
-    granted.delete(`group-${custom.groupId}`);
+    const customId = `group-${custom.groupId}`;
+    granted.delete(customId);
+    if (connection?.payload.selectedConnectionId === customId) {
+      connection = undefined;
+      frame.hidden = true;
+    }
     needsCustomResave = false;
     void reconnectSavedGroup(configured ? String(custom.groupId) : "");
   } });
@@ -359,16 +403,14 @@ customButton.onclick = ownKeyButton.onclick = openCustomConnectionSettings;
 manageButton.onclick = () => {
   if (locked) return;
   connectionMenu.open = false;
-  openGroupSettings({ onSaved: () => void reloadGroups("") });
+  openGroupSettings({ onSaved: () => void reloadGroups() });
 };
 async function bootstrap() {
-  if (locked || bootstrapping) return;
-  bootstrapping = true;
-  showState("loading", "正在连接画布，请稍候…");
-  armStartupTimeout();
+  if (locked || readingOrAuthorizing()) return;
+  const operation = begin("bootstrap", "loading", "正在连接画布，请稍候…");
   try {
     const data = await api("/api/canvas/groups");
-    if (locked) return;
+    if (!isWaiting(operation)) return;
     studioURL = new URL(data.canvas_url);
     studioURL.searchParams.set("sources_account", String(data.user_id));
     studioURL.searchParams.set("ui_mode", "embedded");
@@ -376,19 +418,16 @@ async function bootstrap() {
     studioURL.searchParams.set("theme", hostConfig?.theme || (params.get("theme") === "dark" ? "dark" : "light"));
     document.querySelector("#keys").href = data.main_origin + "/keys";
     if (!renderGroups(data)) {
-      select.disabled = true;
-      recover(noGroups());
+      finish(operation);
+      showState("recovery", noGroups());
       return;
     }
-    select.onchange = connect;
-    if (await connect()) watchSession();
+    await authorize(operation, Number(select.value));
   } catch (error) {
-    if (!locked) recover(error.message);
-  } finally {
-    bootstrapping = false;
-    retry.disabled = connecting;
+    if (isWaiting(operation)) fail(operation, error.message);
   }
 }
+select.onchange = connect;
 setShell();
 if (window.parent !== window) window.parent.postMessage({ type: "sources:studio-host-ready", version: 1 }, location.origin);
 await bootstrap();
