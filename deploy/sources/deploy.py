@@ -6,6 +6,8 @@ One command replaces Main serving and the unique background with one image:
     deploy.py main <image>     preflight, migrate, check, start, hand off,
                                switch, guard (auto-rollback), retire
     deploy.py rollback         return to the previous slot's containers
+    deploy.py resume           validate a held release, then finish switching
+    deploy.py abort            discard the held serving containers
     deploy.py status           current/previous slot and container health
     deploy.py watch            resident sampler for systemd (journal only)
     deploy.py adopt ...        one-time: record running legacy containers
@@ -28,6 +30,7 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import http.client
 import json
 import os
@@ -41,7 +44,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -129,6 +132,7 @@ class Config:
     guard_connect_errors: int = 10
     watch_active_http: int = 1200
     watch_memory_gib: float = 12.0
+    hold_warning_seconds: int = 86400
     extra_env: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @classmethod
@@ -231,7 +235,9 @@ class Ops:
     def inspect(self, name: str) -> dict[str, Any] | None:
         proc = self.run(["docker", "inspect", name], mutate=False, check=False, timeout=30)
         if proc.returncode != 0:
-            return None
+            if re.search(r"No such (object|container):", proc.stderr):
+                return None
+            raise DeployError("cannot inspect container; Docker state is unknown; nothing may be removed")
         data = json.loads(proc.stdout)
         return data[0] if data else None
 
@@ -384,16 +390,17 @@ class Target:
     containers: dict[str, str]
     ports: dict[str, int]
     token_files: dict[str, str] = field(default_factory=dict)
+    image_id: str = ""
 
     def view(self) -> dict[str, Any]:
         return {"slot": self.slot, "image": self.image, "containers": self.containers, "ports": self.ports,
-                "runtime_token_files": self.token_files}
+                "runtime_token_files": self.token_files, "image_id": self.image_id}
 
     @classmethod
     def from_view(cls, view: dict[str, Any], default_token: str) -> "Target":
         tokens = {role: (view.get("runtime_token_files") or {}).get(role) or default_token for role in ROLES}
         return cls(slot=view["slot"], image=view.get("image", ""), containers=dict(view["containers"]),
-                   ports=dict(view["ports"]), token_files=tokens)
+                   ports=dict(view["ports"]), token_files=tokens, image_id=view.get("image_id", ""))
 
 
 class Deployer:
@@ -503,7 +510,7 @@ class Deployer:
             args += ["--mount", spec]
         return args
 
-    def create(self, target: Target, role: str) -> None:
+    def create(self, target: Target, role: str, *, serving_alias: bool = True) -> None:
         name = target.containers[role]
         self.prepare_per_container_copies(role, name)
         args = ["docker", "create", "--name", name, "--hostname", name,
@@ -515,16 +522,16 @@ class Deployer:
                 "--publish", f"127.0.0.1:{target.ports[role]}:8080",
                 "--network", self.cfg.networks[0], "--network-alias", name,
                 *(["--network-alias", self.cfg.serving_alias]
-                  if role in SERVING_ROLES and self.cfg.serving_alias else []),
+                  if serving_alias and role in SERVING_ROLES and self.cfg.serving_alias else []),
                 "--label", f"com.sources.deploy.slot={target.slot}",
                 "--label", f"com.sources.deploy.role={role}",
                 "--label", f"com.sources.deploy.created={now()}"]
         args += self.docker_env_args(role)
         args += self.mount_args(self.mounts_for(role, name))
-        args.append(target.image)
+        args.append(target.image_id or target.image)
         self.ops.run(args, mutate=True)
         aliases = ["--alias", name]
-        if role in SERVING_ROLES and self.cfg.serving_alias:
+        if serving_alias and role in SERVING_ROLES and self.cfg.serving_alias:
             aliases += ["--alias", self.cfg.serving_alias]
         for network in self.cfg.networks[1:]:
             self.ops.run(["docker", "network", "connect", *aliases, network, name], mutate=True)
@@ -564,14 +571,28 @@ class Deployer:
         raise DeployError(f"no '{prefix}' line in command output")
 
     def install_upstreams(self, text: str) -> None:
-        previous = self.ops.read_text(self.cfg.upstream_file) if Path(self.cfg.upstream_file).exists() else None
+        try:
+            previous = self.ops.read_text(self.cfg.upstream_file)
+        except FileNotFoundError:
+            previous = None
         self.ops.write_file_atomic(self.cfg.upstream_file, text)
         test = self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False)
         if test.returncode != 0:
             if previous is not None:
                 self.ops.write_file_atomic(self.cfg.upstream_file, previous)
             raise DeployError("nginx -t rejected the upstream file; previous file restored, routing unchanged")
-        self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
+        try:
+            self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
+        except DeployError as err:
+            if previous is None:
+                raise FallbackFailed("reload failed and no previous upstream file is available") from err
+            self.ops.write_file_atomic(self.cfg.upstream_file, previous)
+            try:
+                self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True)
+                self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
+            except DeployError as restore_err:
+                raise FallbackFailed("reload failed; restoring previous routing failed too; inspect status") from restore_err
+            raise DeployError("reload failed; previous routing restored") from err
 
     def switch_to(self, view: dict[str, Any]) -> None:
         ports = view["ports"]
@@ -784,7 +805,11 @@ class Deployer:
                     raise FallbackFailed(f"guard failed ({reason}) and switching back failed ({err})") from err
                 self.log("   handing the background back to the previous release")
                 self.hand_back(target, previous)
-                self.retire_serving(target.view())
+                try:
+                    self.retire_serving(target.view())
+                except DeployError as err:
+                    raise FallbackFailed("traffic and background restored, but target serving retirement "
+                                         "is incomplete; inspect status before clearing in_progress") from err
                 raise DeployError(f"guard failed ({reason}); the previous release serves traffic and owns the "
                                   f"background again; the new serving containers were stopped and kept for inspection")
             if self.ops.monotonic() >= deadline:
@@ -842,12 +867,18 @@ class Deployer:
             self.ops.run(["docker", "kill", "--signal=TERM", name], mutate=True)
 
     # entrypoints --------------------------------------------------------------
-    def deploy(self, image: str, allow_contract: bool = False,
-               allow_public_health_failure: bool = False) -> None:
-        state = load_state(self.cfg)
+    @staticmethod
+    def require_idle(state: dict[str, Any]) -> None:
         if state.get("in_progress"):
             raise DeployError(f"a previous deploy did not finish: {json.dumps(state['in_progress'])}; "
                               "inspect with 'status' and resolve before deploying again")
+        if state.get("paused"):
+            raise DeployError("a release is paused; run 'resume' or 'abort' first (see 'status')")
+
+    def deploy(self, image: str, allow_contract: bool = False,
+               allow_public_health_failure: bool = False, hold_before_switch: bool = False) -> None:
+        state = load_state(self.cfg)
+        self.require_idle(state)
         current = state.get("current") or {}
         slot = "a" if current.get("slot") != "a" else "b"
         target = Target.from_view({**self.cfg.slot_view(slot), "image": image}, self.cfg.runtime_token_file)
@@ -861,6 +892,8 @@ class Deployer:
                 pending = self.preflight(state, target, reuse=False,
                                          allow_public_health_failure=allow_public_health_failure)
                 contract = [p for p in pending if "contract" in p]
+                if contract and hold_before_switch:
+                    raise DeployError("a held release requires additive migrations; contract migrations are not allowed")
                 if contract and not allow_contract:
                     raise DeployError(f"contract migrations need --allow-contract: {contract}; nothing changed")
                 self.log(f"   pending migrations: {pending or 'none'}")
@@ -891,13 +924,16 @@ class Deployer:
                 for role in ROLES:
                     self.ops.run(["docker", "rm", "-f", target.containers[role]], mutate=True, check=False)
                 for role in SERVING_ROLES:
-                    self.create(target, role)
+                    self.create(target, role, serving_alias=not hold_before_switch)
                     self.ops.run(["docker", "start", target.containers[role]], mutate=True)
                 if not self.ops.dry_run:
                     for role in SERVING_ROLES:
                         self.wait_ready(target.ports[role], self.token_for(target.view(), role), "serving",
                                         self.cfg.ready_timeout)
-            self._finish_switch(state, current, target, record, create_background=True)
+            if hold_before_switch:
+                self._hold(state, target, record)
+            else:
+                self._finish_switch(state, current, target, record, create_background=True)
             if skip_check:
                 self.log("note: this dry run did NOT verify the serving and background environment files "
                          "(startup check skipped because migrations are pending)")
@@ -908,9 +944,12 @@ class Deployer:
             if not self.ops.dry_run:
                 append_history(self.cfg, record)
             raise
+        except (OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
+            self._unexpected(state, err, record)
 
     def rollback(self) -> None:
         state = load_state(self.cfg)
+        self.require_idle(state)
         current, previous = state.get("current"), state.get("previous")
         if not current or not previous:
             raise DeployError("no previous release recorded; nothing to roll back to")
@@ -937,12 +976,192 @@ class Deployer:
                 append_history(self.cfg, record)
             raise
 
+    def config_fingerprint(self) -> str:
+        return hashlib.sha256(json.dumps(asdict(self.cfg), sort_keys=True).encode()).hexdigest()
+
+    def upstream_fingerprint(self) -> str:
+        return hashlib.sha256(self.ops.read_text(self.cfg.upstream_file).encode()).hexdigest()
+
+    def _hold(self, state: dict[str, Any], target: Target, record: dict[str, Any]) -> None:
+        if not self.ops.dry_run:
+            containers = {}
+            for role in SERVING_ROLES:
+                info = self.ops.inspect(target.containers[role]) or {}
+                containers[role] = {"id": info.get("Id"), "image_id": info.get("Image")}
+                if not containers[role]["id"] or not containers[role]["image_id"]:
+                    raise DeployError("cannot record held container identity")
+            image_ids = {c["image_id"] for c in containers.values()}
+            if len(image_ids) != 1:
+                raise DeployError("held serving images differ; nothing will switch")
+            target.image_id = image_ids.pop()
+            state.update(paused={"target": target.view(), "containers": containers, "since": now(),
+                                 "phase": "ready", "current": state["current"],
+                                 "config_fingerprint": self.config_fingerprint(),
+                                 "upstream_fingerprint": self.upstream_fingerprint()}, in_progress=None)
+            save_state(self.cfg, state)
+            record.update(result="paused", steps=self.timings, finished_at=now())
+            append_history(self.cfg, record)
+        self.log("paused before background handoff; use 'resume' or 'abort'; no automatic expiry")
+        for role in SERVING_ROLES:
+            self.log(f"   {role}: http://127.0.0.1:{target.ports[role]}/ (access via your tunnel)")
+
+    def held_release(self, state: dict[str, Any]) -> tuple[dict[str, Any], Target]:
+        if state.get("in_progress"):
+            raise DeployError("an unfinished release needs manual recovery; inspect 'status'; this is not a pause")
+        paused = state.get("paused")
+        if not paused:
+            raise DeployError("no paused release; nothing changed")
+        return paused, Target.from_view(paused["target"], self.cfg.runtime_token_file)
+
+    def validate_hold(self, state: dict[str, Any], paused: dict[str, Any], target: Target) -> None:
+        if paused["phase"] != "ready":
+            raise DeployError("abort cleanup has started; retry 'abort', not 'resume'")
+        if state.get("current") != paused["current"] or target.slot == state["current"]["slot"]:
+            raise DeployError("current release changed during pause; inspect 'status' before recovery")
+        if self.config_fingerprint() != paused["config_fingerprint"]:
+            raise DeployError("configuration changed during pause; restore it or abort")
+        if self.upstream_fingerprint() != paused["upstream_fingerprint"]:
+            raise DeployError("upstream file changed during pause; restore it or abort")
+        if self.ops.inspect(target.containers["background"]):
+            raise DeployError("unexpected target background container; inspect and resolve before resuming")
+        for role in SERVING_ROLES:
+            info = self.ops.inspect(target.containers[role]) or {}
+            identity = paused["containers"][role]
+            if info.get("Id") != identity["id"] or info.get("Image") != identity["image_id"]:
+                raise DeployError(f"held {role} is missing or its identity/image changed; restore it or abort")
+            networks = info.get("NetworkSettings", {}).get("Networks", {})
+            if set(networks) != set(self.cfg.networks) or any(
+                    self.cfg.serving_alias and self.cfg.serving_alias in (endpoint.get("Aliases") or [])
+                    for endpoint in networks.values()):
+                raise DeployError(f"held {role} network isolation changed; restore it or abort")
+            runtime = self.wait_ready(target.ports[role], self.token_for(target.view(), role), "serving",
+                                      self.cfg.ready_timeout, container=target.containers[role])
+            if runtime.get("owns_background") or runtime.get("draining"):
+                raise DeployError(f"held {role} is not an ordinary serving instance")
+        current = state["current"]
+        self.wait_ready(current["ports"]["background"], self.token_for(current, "background"),
+                        "background", self.cfg.background_ready_timeout,
+                        container=current["containers"]["background"])
+
+    def resume(self) -> None:
+        state = load_state(self.cfg)
+        paused, target = self.held_release(state)
+        # Validation never changes the pause: fix health/config and retry, or abort.
+        try:
+            self.validate_hold(state, paused, target)
+        except (OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
+            raise DeployError("resume validation interrupted; pause unchanged; fix the cause and retry or abort") from err
+        record = {"started_at": now(), "action": "resume", "image": target.image, "slot": target.slot,
+                  "paused_at": paused["since"]}
+        try:
+            # Atomically consume the pause before the first mutating operation.
+            state["paused"] = None
+            self._mark(state, target, "activate held serving")
+            with self.step("activate held serving"):
+                if self.cfg.serving_alias:
+                    for role in SERVING_ROLES:
+                        name = target.containers[role]
+                        for network in self.cfg.networks:
+                            self.ops.run(["docker", "network", "disconnect", network, name], mutate=True)
+                            self.ops.run(["docker", "network", "connect", "--alias", name,
+                                          "--alias", self.cfg.serving_alias, network, name], mutate=True)
+                if not self.ops.dry_run:
+                    for role in SERVING_ROLES:
+                        self.wait_ready(target.ports[role], self.token_for(target.view(), role), "serving",
+                                        self.cfg.ready_timeout, container=target.containers[role])
+            self._finish_switch(state, state["current"], target, record, create_background=True)
+        except DeployError as err:
+            self._abort(state, target, err)
+            if not self.ops.dry_run:
+                record.update(result="failed", error=str(err), steps=self.timings, finished_at=now())
+                append_history(self.cfg, record)
+            raise
+        except (OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
+            self._unexpected(state, err, record)
+
+    def abort(self) -> None:
+        state = load_state(self.cfg)
+        paused, target = self.held_release(state)
+        current = state.get("current") or {}
+        if target.slot == current.get("slot") or set(target.containers.values()) & set(current.get("containers", {}).values()):
+            raise DeployError("held containers overlap the current release; inspect status before manual recovery")
+        if self.ops.inspect(target.containers["background"]):
+            raise DeployError("unexpected target background container; inspect and resolve before aborting")
+        record = {"started_at": now(), "action": "abort", "image": target.image, "slot": target.slot}
+        try:
+            # Persist intent before cleanup; after an interruption only abort may retry.
+            paused["phase"] = "aborting"
+            if not self.ops.dry_run:
+                save_state(self.cfg, state)
+            for role in SERVING_ROLES:
+                name = target.containers[role]
+                info = self.ops.inspect(name)
+                if not info:
+                    continue  # Already removed by an earlier abort attempt.
+                if info.get("Id") != paused["containers"][role]["id"]:
+                    raise DeployError(f"held {role} was replaced; refusing to remove an unrelated container")
+                self.ops.run(["docker", "update", "--restart=no", name], mutate=True)
+                if info.get("State", {}).get("Running"):
+                    # Do not send TERM again to an instance already draining.
+                    runtime = self.runtime(target.ports[role], self.token_for(target.view(), role))
+                    if not (runtime or {}).get("draining"):
+                        self.ops.run(["docker", "kill", "--signal=TERM", name], mutate=True)
+                    if not self.ops.dry_run:
+                        self.wait_exit(name, self.cfg.ready_timeout)
+                self.ops.run(["docker", "rm", name], mutate=True)
+        except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
+            if not self.ops.dry_run:
+                paused.update(failed=str(err) or "interrupted", failed_at=now())
+                save_state(self.cfg, state)
+            raise DeployError(f"abort incomplete; pause retained, retry 'abort': {err}") from err
+        state["paused"] = None
+        if not self.ops.dry_run:
+            try:
+                save_state(self.cfg, state)
+                record.update(result="ok", finished_at=now())
+                append_history(self.cfg, record)
+            except OSError as err:
+                raise DeployError("held containers removed but metadata write failed; inspect status; "
+                                  "retry abort only if paused is still present") from err
+        self.log("aborted held release; additive migrations and exported assets are kept")
+
+    def _unexpected(self, state: dict[str, Any], err: BaseException, record: dict[str, Any]) -> None:
+        failure = FallbackFailed(f"operation interrupted or command outcome unknown ({type(err).__name__}); inspect 'status', "
+                                 "restore routing/background manually before clearing in_progress")
+        if not self.ops.dry_run:
+            # The last atomic write may have failed: the persisted state is
+            # authoritative, not the in-memory transition we attempted.
+            persisted = load_state(self.cfg)
+            self._record_unrestored(persisted, failure)
+            record.update(result="failed", error=str(failure), steps=self.timings, finished_at=now())
+            append_history(self.cfg, record)
+            if persisted.get("paused") and not persisted.get("in_progress"):
+                raise DeployError("operation interrupted while recording a pause; pause retained; "
+                                  "inspect status, then resume or abort") from err
+        raise failure from err
+
     def _finish_switch(self, state: dict[str, Any], current: dict[str, Any], target: Target,
                        record: dict[str, Any], create_background: bool) -> None:
         view = target.view()
         self._mark(state, target, "background handoff")
         with self.step("background handoff"):
-            self.handoff_background(current, target, create=create_background)
+            try:
+                self.handoff_background(current, target, create=create_background)
+            except FallbackFailed:
+                raise
+            except DeployError as err:
+                owner = self.owner_runtime(current) or {}
+                new = self.owner_runtime(view) or {}
+                if not owner.get("ready") or not owner.get("owns_background") or new.get("owns_background"):
+                    raise FallbackFailed(f"background handoff failed and previous ownership is unconfirmed: {err}; "
+                                         "inspect status and restore the current background") from err
+                try:
+                    self.ops.run(["docker", "update", "--restart=unless-stopped", current["containers"]["background"]],
+                                 mutate=True)
+                except DeployError as restore_err:
+                    raise FallbackFailed("previous background is ready but restoring its restart policy failed; "
+                                         "inspect status before clearing in_progress") from restore_err
+                raise
         self._mark(state, target, "switch")
         with self.step("switch"):
             try:
@@ -957,8 +1176,13 @@ class Deployer:
             self._mark(state, target, "guard")
             with self.step("guard"):
                 self.guard(target, current)
+        self._mark(state, target, "retire previous serving")
         with self.step("retire previous serving"):
-            self.retire_serving(current)
+            try:
+                self.retire_serving(current)
+            except DeployError as err:
+                raise FallbackFailed(f"new release is serving; previous serving retirement incomplete: {err}; "
+                                     "inspect status and finish retirement before updating current/previous") from err
         view["deployed_at"] = now()
         state.update(previous=current, current=view, in_progress=None)
         if not self.ops.dry_run:
@@ -995,9 +1219,19 @@ class Deployer:
             self._record_unrestored(state, err)
             self.log(f"FAILED AND NOT RESTORED: {err}")
             return
-        if step in (None, "migrate", "start serving", "background handoff", "switch"):
-            for role in SERVING_ROLES:
-                self.ops.run(["docker", "rm", "-f", target.containers[role]], mutate=True, check=False)
+        if step in ("migrate", "start serving", "activate held serving", "background handoff", "switch"):
+            try:
+                for role in SERVING_ROLES:
+                    name = target.containers[role]
+                    self.ops.run(["docker", "rm", "-f", name], mutate=True, check=False)
+                    if self.ops.inspect(name):
+                        raise DeployError(f"{name} still exists")
+            except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as cleanup_err:
+                failure = FallbackFailed(f"cleanup incomplete ({cleanup_err}); inspect status and remove the "
+                                         "unused target containers before clearing in_progress")
+                self._record_unrestored(state, failure)
+                self.log(f"FAILED AND NOT RESTORED: {failure}")
+                return
         state["in_progress"] = None
         save_state(self.cfg, state)
         self.log(f"FAILED: {err}")
@@ -1009,7 +1243,28 @@ class Deployer:
 
 def status(cfg: Config, ops: Ops) -> dict[str, Any]:
     state = load_state(cfg)
+    deployer = Deployer(cfg, ops)
     report: dict[str, Any] = {"in_progress": state.get("in_progress")}
+    paused = state.get("paused")
+    report["paused"] = None
+    if paused:
+        since = dt.datetime.fromisoformat(paused["since"])
+        age = max(0, int((dt.datetime.now(dt.timezone.utc) - since).total_seconds()))
+        report["paused"] = {**paused, "age_seconds": age,
+                            "warning": ("held release is old; resume or abort after verification"
+                                        if age >= cfg.hold_warning_seconds else None), "live_containers": {}}
+        for role in SERVING_ROLES:
+            name = paused["target"]["containers"][role]
+            info = ops.inspect(name) or {}
+            runtime = None
+            with contextlib.suppress(OSError):
+                runtime = deployer.runtime(paused["target"]["ports"][role],
+                                           deployer.token_for(paused["target"], role))
+            report["paused"]["live_containers"][role] = {
+                "status": info.get("State", {}).get("Status", "missing"),
+                "ready": (runtime or {}).get("ready"),
+                "identity_matches": info.get("Id") == paused["containers"][role]["id"],
+                "image_matches": info.get("Image") == paused["containers"][role]["image_id"]}
     for key in ("current", "previous"):
         view = state.get(key)
         if not view:
@@ -1040,6 +1295,10 @@ def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]
         return []
     deployer = Deployer(cfg, ops)
     alerts = []
+    if (state.get("in_progress") or {}).get("failed"):
+        alerts.append({"alert": ["release_incomplete"], "at": now(), "in_progress": state["in_progress"]})
+    if (state.get("paused") or {}).get("phase") == "aborting" and state["paused"].get("failed"):
+        alerts.append({"alert": ["abort_incomplete"], "at": now()})
     t = ops.monotonic()
     for role, name in current["containers"].items():
         token = None
@@ -1190,10 +1449,14 @@ def main(argv: list[str] | None = None) -> int:
     p_main = sub.add_parser("main", help="deploy an image to Main serving and background")
     p_main.add_argument("image", help="image reference, preferably pinned by digest")
     p_main.add_argument("--allow-contract", action="store_true", help="allow pending migrations marked 'contract'")
+    p_main.add_argument("--hold-before-switch", action="store_true",
+                        help="exit successfully after serving readiness; resume or abort after verification")
     p_main.add_argument("--allow-public-health-failure", action="store_true",
                         help="warn instead of stopping when the public health check fails before the switch "
                              "(the guard still requires 200 after it)")
     sub.add_parser("rollback", help="switch back to the previous slot")
+    sub.add_parser("resume", help="validate the paused release and continue switching")
+    sub.add_parser("abort", help="stop and remove the paused release's serving containers")
     sub.add_parser("status", help="show current and previous release")
     sub.add_parser("watch", help="resident sampler; one JSON line per alert")
     p_adopt = sub.add_parser("adopt", help="one-time: record running legacy containers")
@@ -1256,9 +1519,14 @@ def main(argv: list[str] | None = None) -> int:
             deployer = Deployer(cfg, ops)
             if args.command == "main":
                 deployer.deploy(args.image, allow_contract=args.allow_contract,
-                                allow_public_health_failure=args.allow_public_health_failure)
+                                allow_public_health_failure=args.allow_public_health_failure,
+                                hold_before_switch=args.hold_before_switch)
             elif args.command == "rollback":
                 deployer.rollback()
+            elif args.command == "resume":
+                deployer.resume()
+            elif args.command == "abort":
+                deployer.abort()
         return 0
     except DeployError as err:
         print(f"deploy: {err}", file=sys.stderr)

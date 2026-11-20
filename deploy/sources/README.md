@@ -4,7 +4,7 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `deploy.py` | 唯一的发布入口：`main <image>`、`rollback`、`status`、`watch`、`adopt` |
+| `deploy.py` | 唯一的发布入口：`main <image>`、`resume`、`abort`、`rollback`、`status`、`watch`、`adopt` |
 | `portal.py` | Portal 的发布逻辑，由 `deploy.py` 的 `portal <image>`、`portal-rollback`、`portal-status`、`portal-adopt` 调用（见下文“Portal”） |
 | `migration_lint.py` | CI 检查：新迁移只能扩展结构，破坏性变更必须放进带 `contract` 的迁移 |
 | `sources-main-watch.service` | 常驻监测（只写 journal，第一版不推送） |
@@ -44,6 +44,8 @@ ssh <host> 'sudo -n journalctl -fu sources-deploy'
 两个槽位 A、B 轮流使用，容器名固定为 `sources-main-{a,b}-{serving,standby,background}`。发到某个槽位时，那里原有的容器（上上个版本）会被删除，所以始终只保留一个可回滚的上一版本。
 
 ## 回滚和查看状态
+
+需要先验证新版本时，使用 `deploy.py main <IMAGE_DIGEST> --hold-before-switch`。工具在新 serving 就绪后成功退出，旧版本继续服务；`deploy.py resume` 验证暂停仍成立后继续交接切流，`deploy.py abort` 优雅停止并移除本次暂停实例。三个入口均支持前置全局参数 `--dry-run`。暂停期间拒绝其它 Main 发布与回滚；不要手工清除暂停来绕过。状态、直连验证范围和失败恢复见 [DEPLOY.md 的“暂停发布”](../../docs/sources/DEPLOY.md#暂停发布)。
 
 ```bash
 ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py rollback'
