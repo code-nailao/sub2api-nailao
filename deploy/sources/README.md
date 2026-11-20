@@ -123,10 +123,12 @@ ssh <host> 'sudo -n journalctl -fu sources-deploy-portal'
 | 启动检查 | 用新镜像、真实环境和挂载（全部强制只读）、不发布端口运行一次 `-check-config`，必须输出 `SOURCES_PORTAL_CONFIG_OK` | 退出，错误里带检查输出的那一行；旧 Portal 没被碰过。没有该参数的旧镜像会因拿不到锁而失败，同样在这里停下 |
 | 创建 | 删除目标槽位上已停止的容器（上上个版本），创建新容器，重启策略 `no`，尚不启动 | 删除新容器，退出 |
 | 交接（不可用开始） | 旧容器重启策略改为 `no`；如果它在运行，发送一次 SIGTERM 并等它退出（它已不在运行时直接跳过，例如当前 Portal 已经崩溃）；随后启动新容器，等 `/health` 返回 200（默认 60 秒，容器退出则立即失败） | 见下文“回退”。旧容器超过 `exit_timeout` 仍未退出：每 30 秒警告并继续等待；超过 `exit_abort_timeout`：见上文，需要人工接手 |
-| 切流（不可用结束） | 重写 upstream 文件，`nginx -t`，通过后 reload；然后新容器重启策略改为 `unless-stopped` | `nginx -t` 失败：恢复原文件，再回退 |
+| 切流（不可用结束） | 重写 upstream 文件，`nginx -t`，通过后 reload；然后新容器重启策略改为 `unless-stopped`，在 `ready_timeout` 内等待公网健康返回 200 后再进入守护；等待期间检查新容器没有停止、重启或被 OOM 终止 | `nginx -t` 失败：恢复原文件，再回退；等待公网健康超时或容器失败：回退 |
 | 守护 | 默认 60 秒、每 5 秒：新容器在运行且 `StartedAt`、重启次数不变、没有被 OOM 终止；本机 `/health` 为 200；公网健康连续 3 次失败算失败；Nginx 错误日志中连接新端口失败（`connect() failed`、`upstream timed out`）累计 5 次算失败 | 回退 |
 
 成功后 `state.json` 的 `previous` 是旧版本、`current` 是新版本，`history.jsonl` 追加一行 `action` 为 `portal` 的记录（演练不写）。
+
+reload 返回时旧 worker 可能仍在接受连接，所以切流阶段先等到公网健康返回 200，再开始完整的守护时长和连续失败计数。成功响应后还会按等待开始时的 `StartedAt` 和重启次数复核容器，并检查它仍在运行、未处于重启中且没有被 OOM 终止；即使探测返回 200，请求期间发生的重启也会触发回退。等待复用 `ready_timeout`，超时沿用回退流程；这段等待不把旧 worker 引起的短暂失败记入守护。进入守护后，公网健康连续失败的判定不变。
 
 ### 回退
 
@@ -142,7 +144,7 @@ ssh <host> 'sudo -n systemd-run --unit=sources-deploy-portal --collect /usr/bin/
 ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py portal-status'
 ```
 
-`portal-rollback` 要求记录了上一版本，且它的容器和镜像都还在；不做启动检查（上一版本的镜像可能还没有 `-check-config`），用同样的交接、切流、守护和回退流程反向切换，成功后交换 `current` 和 `previous`。当前容器已经不在运行（例如崩溃）时回滚照样可用：工具不向它发信号，直接启动上一版本。注意：新版本可能已经改写了状态目录里的数据，较旧的 Portal 有可能拒绝较新版本写下的状态；回滚失败时会自动回到当前版本。`portal-status` 不取锁，输出 `in_progress` 以及当前、上一版本的容器状态、健康状态和重启次数。
+`portal-rollback` 要求记录了上一版本，且它的容器和镜像都还在；不做启动检查（上一版本的镜像可能还没有 `-check-config`），用同样的交接、切流、守护和回退流程反向切换，成功后交换 `current` 和 `previous`。当前容器已经不在运行（例如崩溃）时回滚照样可用：工具不向它发信号，直接启动上一版本。注意：新版本可能已经改写了状态目录里的数据，较旧的 Portal 有可能拒绝较新版本写下的状态；回滚失败时会自动回到当前版本。`portal-status` 不取锁，输出 `in_progress` 以及当前、上一版本的容器状态和重启次数，只有运行中的容器显示 `health`。发布进行中，`current`、`previous` 的 `label` 分别标为 `current before this release`、`previous before this release`，说明它们是本次发布之前的记录；目标容器在独立的 `target` 项中展示实时状态，守护阶段正在服务的是这个目标。查看状态不改写发布记录。
 
 运行没有走完时（`portal-status` 里 `in_progress` 不为空），下一次 `portal` 或 `portal-rollback` 会拒绝执行。先用 `portal-status`、`docker ps -a` 和 `docker logs` 看清哪个 Portal 在运行、Nginx upstream 文件指向哪个端口，恢复服务后再把 Portal 的 `state.json` 中 `in_progress` 改为 `null`。创建步骤会先删除目标槽位上已停止的容器，所以重新运行是安全的。
 
