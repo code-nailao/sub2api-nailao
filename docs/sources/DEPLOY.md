@@ -61,7 +61,7 @@
 
 ## 发布顺序
 
-整个命令持有发布锁，防止并发发布。`in_progress` 非空时，`main` 和 `rollback` 会拒绝执行。按状态的 `phase` 选择继续、放弃或人工恢复，见“暂停发布”。
+所有 Main 写入入口都先取得发布锁，再读取发布状态。`in_progress` 非空时，`main`、`rollback` 和 `adopt` 会拒绝执行。`adopt` 检查现有配置引用的状态文件和目标工作目录的状态文件。按状态的 `phase` 选择继续、放弃或人工恢复，见“暂停发布”。
 
 | 步骤 | 内容 | 失败时留下什么 |
 | --- | --- | --- |
@@ -107,6 +107,8 @@ Main 的状态集中在 `in_progress`。空闲时该字段为 `null`。其它阶
 | `aborting` | 正在放弃，或上次清理未完成。再次运行 `abort` 可接着清理 |
 | `failed` | 自动恢复未完成。`failed_step` 和 `reason` 记录失败位置和原因 |
 
+准备新槽位时会移除留在该槽位的旧容器。暂停和普通发布都复用这两个槽位。即使 `hold` 后成功 `abort`，`previous` 记录所指的回滚容器也可能已经不存在。
+
 暂停命令退出时释放发布锁。暂停不会自动过期。`status` 展示暂停时长、容器状态和身份核对结果，超过 `hold_warning_seconds` 时提示负责人处理。暂停期间 `main` 和 `rollback` 会提示先 `resume` 或 `abort`，这两个入口也使用同一把发布锁。旧格式的 Main 暂停或故障记录可以直接读取。
 
 ### 暂停实例的共享状态边界
@@ -135,11 +137,11 @@ Main 的状态集中在 `in_progress`。空闲时该字段为 `null`。其它阶
 
 `resume` 先检查 `in_progress.phase=held`，核对当前版本、配置和 upstream 文件是否仍一致。它确认目标后台尚未创建，新主和新备的容器 ID 与镜像未变，容器仍在运行、就绪且隔离共享别名，旧后台仍就绪且持锁。它也复查目标后台端口、Nginx 固定 upstream、宿主可用内存和公网健康。公网健康沿用暂停时显式指定的 `--allow-public-health-failure`。验证失败会保留 `held`，修好后可重试，也可放弃。配置指纹覆盖环境配置项。env 文件和挂载文件的内容不参与校验，改动这些输入后应放弃并重新发布。
 
-验证通过后进入与普通发布共用的后半段。工具先保存 `phase=deploying`。需要配置共享别名时，确认所有配置网络都存在，再关闭新主、新备的自动重启。用 SIGTERM 等两台实例排空退出，给停止的容器配置所有网络及别名。确认配置齐全且网络仍存在后才启动容器，复查网络和就绪状态。继续前请结束手工验证请求。Docker 在启动容器时建立端点，应用进程尚未就绪时，经别名连接到新端点的请求可能需要重试。
+验证通过后进入与普通发布共用的后半段。工具先保存 `phase=deploying`。需要配置共享别名时，用 Docker 解析配置中的网络名或 ID，按规范名称核对容器连接，再关闭新主、新备的自动重启。接网操作使用 Docker 返回的网络 ID。用 SIGTERM 等两台实例排空退出，给停止的容器配置所有网络及别名。确认配置齐全且网络仍存在后才启动容器，复查网络和就绪状态。继续前请结束手工验证请求。Docker 在启动容器时建立端点，应用进程尚未就绪时，经别名连接到新端点的请求可能需要重试。
 
 进入后台交接前，工具再次核对目标端口。新后台使用暂停时记录的镜像 ID。新 serving 启动后，经共享别名的内部请求就可能进入它，此时 Nginx 仍可能指向旧 serving。
 
-`abort` 先写入 `in_progress.phase=aborting`，只处理这次记录的新 serving 和 standby：核对容器 ID，关闭自动重启，发送 SIGTERM，等待退出后移除，不发送 SIGKILL。已不存在的容器视为清理完成；同名替换容器不会被删除，当前版本与目标重叠、或出现意外目标后台时也拒绝继续。只有清理完成才清除暂停；只扩展的迁移、已追加的资源和验证请求产生的业务数据保留。
+`abort` 先写入 `in_progress.phase=aborting`，只处理本次记录的 serving 和 standby。它核对容器 ID 并关闭自动重启，对仍在运行的实例发起排空。`/internal/sources/drain` 只改变就绪状态。即使实例已标记为排空，工具仍会发送 SIGTERM，让应用完成优雅退出，确认退出后才移除容器。已不存在的容器视为清理完成。遇到同名替换、目标与当前版本重叠或存在意外的目标后台时拒绝操作。只扩展的迁移、已追加的资源和验证请求产生的业务数据保留。
 
 | 失败或中断位置 | 明确状态与恢复方式 |
 | --- | --- |
@@ -150,11 +152,11 @@ Main 的状态集中在 `in_progress`。空闲时该字段为 `null`。其它阶
 | 守护失败，包括 Docker 查询异常 | 尝试恢复旧流量和后台，再对新 serving 发 SIGTERM 并保留容器供排查。回退或发出退役命令失败时保留故障状态 |
 | 退役旧 serving 失败 | 新版本已在服务，保留步骤为退役的 `in_progress.phase=failed`；`current` 仍是提交完成前的旧记录。核实实际 upstream 和后台，完成旧 serving 排空，再以 `in_progress.target` 更新 current、原 current 记为 previous，最后清除标记；不要直接清空后再发布 |
 | 继续的变更阶段遇到命令超时、无法执行或 Ctrl-C | 命令可能已生效。工具按当前阶段尝试恢复，确认恢复结果后才更新状态。结果仍不明时保留 `in_progress.phase=failed`，按下文人工恢复。进程被强制终止时，以最后一次保存的 `in_progress` 为准 |
-| `abort` 中途失败或被中断 | `in_progress.phase=aborting` 保留；捕获到的失败写入 `reason`。后续只能重试 `abort`，不能 `resume`。修复 Docker/权限或等待排空结束后重试，已移除的容器不会阻碍重试。Docker 不可访问不等于容器不存在，不能据此清除暂停 |
+| `abort` 中途失败或被中断 | `in_progress.phase=aborting` 保留；捕获到的失败写入 `reason`。后续只能重试 `abort`，不能 `resume`。修复 Docker 或权限后可重试。若进程仍在运行，重试会再次发送 SIGTERM。已移除的容器不会阻碍重试。Docker 查询失败时会保留状态 |
 | 暂停期间宿主重启 | 状态文件及容器必须位于持久存储；容器沿用自动重启策略。恢复后先看 `status`，ID 和镜像不变且健康时可继续；未启动的容器先由负责人检查并启动原容器，容器丢失则放弃重发。重启不自动确认发布，也不自动清除暂停。放弃中的容器已关闭自动重启，恢复后重试放弃 |
 | 容器操作结束但状态或历史写入失败 | 以磁盘上原子保存的状态为准；`status` 仍有暂停就继续核查或重试放弃，阶段为 `failed` 或发布进程已退出时人工核查；状态已清除则不要重复容器操作。先修复存储问题，历史写入失败不代表流量一定回退 |
 
-`watch` 报告 `phase=failed` 或发布进程已退出的 `phase=deploying`，告警为 `release_incomplete`。清理未完成且进程不在运行时报告 `abort_incomplete`。健康暂停不触发发布故障告警。检测进程时核对 PID、Linux 启动标识和该进程的启动时刻，避免 PID 被复用时误判。Docker 查询失败时 `status` 显示 `unknown`，`watch` 报告 `docker_inspect_failed`。
+`watch` 报告 `phase=failed` 或发布进程已退出的 `phase=deploying`，告警为 `release_incomplete`。清理未完成且进程不在运行时报告 `abort_incomplete`，即使进程被强制终止而来不及写入 `reason`。健康暂停不触发发布故障告警。检测进程时核对 PID、Linux 启动标识和该进程的启动时刻，避免 PID 被复用时误判。Docker 查询失败时 `status` 显示 `unknown`，`watch` 报告 `docker_inspect_failed`。
 
 `--dry-run` 是全局参数。`main <IMAGE_DIGEST> --hold-before-switch` 和普通 `main` 的演练一样，本地缺少镜像时会真实拉取。它会真实创建、运行、删除一次性容器来列出待迁移项，无待迁移项时也会运行一次性启动检查。有待迁移项时只打印迁移计划，跳过启动检查。迁移、资源导出、发布槽位容器操作和 Nginx 修改只打印计划。普通发布和暂停发布的演练仍会运行 `nginx -T` 做预检。`resume` 和 `abort` 演练读取现场并打印计划，不创建锁文件，不写状态、历史或修改容器。`resume` 演练只打印 `nginx -T`，因为运行该命令时 Nginx 会打开配置所引用的文件。
 
@@ -183,7 +185,7 @@ Main 的状态集中在 `in_progress`。空闲时该字段为 `null`。其它阶
 恢复失败时，`in_progress` 的 `phase` 为 `failed`，`failed_step` 和 `reason` 保留失败位置和原因，`main` 与 `rollback` 会拒绝继续。`current` 是最后一次完成发布时写入的记录，切流或退役失败后可能与线上路由不同。旧后台排空超过 `background_exit_timeout` 时，工具保留进程继续排空。它的重启策略已关闭，如果它随后退出，须人工恢复后台。
 
 1. 暂停其他发布操作。运行 `deploy.py --config <MAIN_CONFIG> status`、`docker ps -a` 和 `docker logs <CONTAINER>`，核对 `current`、`in_progress.target`、两槽位后台状态和 upstream 配置。若 reload 结果不明，从实际入口核对路由，单看磁盘上的配置不足以判定生效结果。
-2. 选择要服务的槽位。正向发布或 `rollback` 在切流前超时时，恢复交接前的后台。切流已回退时，恢复旧路由对应的后台。必要时先把非目标后台设为不自动重启（`docker update --restart=no <OTHER_BACKGROUND>`），只对仍在运行且尚未排空的进程发送 `docker kill --signal=TERM <OTHER_BACKGROUND>`。用 `docker inspect <OTHER_BACKGROUND>` 等它退出。排空中的目标后台也要等其退出后再启动。
+2. 选择要服务的槽位。正向发布或 `rollback` 在切流前超时时，恢复交接前的后台。切流已回退时，恢复旧路由对应的后台。必要时先把非目标后台设为不自动重启（`docker update --restart=no <OTHER_BACKGROUND>`），如果后台仍在运行且尚未收到停止信号，发送 `docker kill --signal=TERM <OTHER_BACKGROUND>`。单独调用排空接口不会令进程退出。用 `docker inspect <OTHER_BACKGROUND>` 等它退出。排空中的目标后台也要等其退出后再启动。
 3. 对选定的后台运行 `docker update --restart=unless-stopped <BACKGROUND>` 和 `docker start <BACKGROUND>`。通过 `/internal/sources/runtime` 确认 `role=background`、`ready=true` 和 `owns_background=true`。如果路由需要修复，按选定槽位的端口恢复 upstream，执行 `nginx -t` 成功后再 reload，并检查用户入口和管理入口。
 4. 排空未选中槽位的 serving，等待退出后再做必要的移除。这些实例即使不在 Nginx 路由中，也可能通过共享别名接过请求。确认实际路由与持锁后台一致后备份状态文件。若决定保留已切流的新版本，完成旧 serving 退役，把 `in_progress.target` 记为 `current`，原 `current` 记为 `previous`。恢复到原版本时保留原 `current`、`previous`。最后将 `in_progress` 改为 `null`，复查 `status`。
 

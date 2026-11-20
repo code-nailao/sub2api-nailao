@@ -55,9 +55,9 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py rollback'
 ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 ```
 
-回滚会复用上一槽位已停止的容器（不重新创建），流程与发版相同：启动 → 后台交接 → 切流 → 守护 → 退役。
+回滚复用上一槽位仍存在的容器，依次启动、交接后台、切流、守护和退役。准备暂停的目标槽位也会删除槽位里原来的容器。即使之后成功 `abort`，先前的回滚目标也可能已经不存在。
 
-查看 `status` 的 `in_progress.phase` 区分暂停、正在发布和故障。若为 `held`，用 `resume` 或 `abort`。若为 `aborting`，重试 `abort`。若为 `failed` 或发布进程已退出，先用 `status` 和 `docker ps` 核对现场，恢复后再清除 `in_progress`。失败位置和原因分别记录在 `failed_step` 与 `reason`。`status` 里每个容器的 `restart_policy` 为 `no` 且仍在运行，说明它已收到 SIGTERM、正在排空，退出后不会自动重启。
+查看 `status` 的 `in_progress.phase` 区分暂停、正在发布和故障。若为 `held`，用 `resume` 或 `abort`。若为 `aborting`，重试 `abort`。若为 `failed` 或发布进程已退出，先用 `status` 和 `docker ps` 核对现场，恢复后再清除 `in_progress`。失败位置和原因分别记录在 `failed_step` 与 `reason`。容器的 `restart_policy` 为 `no` 时，退出后不会自动重启。通过日志和运行时状态确认它是否已收到 SIGTERM。
 
 正在排空的后台超过 `background_exit_timeout` 仍未退出时，接手的后台没有启动，排空中的后台退出后就没有后台进程。错误信息（也写在 `in_progress.reason`）写明哪个槽位在服务流量、哪些 serving 容器留着运行但没有流量、要启动哪一个后台：切流之前是当前槽位那个正在排空的后台本身，交还时（流量已回到上一槽位）是上一槽位的后台，不是正在排空的新版本后台。等它退出后按信息执行 `docker update --restart=unless-stopped` 和 `docker start`，`status` 确认后台在运行，再清空 `in_progress`；在此之前不要再次发布。详见 [DEPLOY.md](../../docs/sources/DEPLOY.md) 的“无法自动恢复的情况”。
 
@@ -73,7 +73,7 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
      --public-health-url https://example.com/health
    ```
 
-   它从正在运行的容器生成 `/opt/sources-deploy/main.json`、两个只有 root 可读的 env 文件和固定输入目录，并把这些容器记为当前版本（槽位 `legacy`）。不碰运行中的容器，不打印任何变量值。`--public-health-url` 必填，是守护阶段检查的公网健康地址，写入 `main.json` 的 `public_health_url`；以后要改，直接编辑该文件。可先加全局参数 `--dry-run`（`deploy.py --dry-run adopt ...`）查看会执行的命令。
+   它从正在运行的容器生成 `/opt/sources-deploy/main.json`、两个只有 root 可读的 env 文件和固定输入目录，并把这些容器记为当前版本（槽位 `legacy`）。不碰运行中的容器，不打印任何变量值。`adopt` 使用 Main 发布锁，遇到暂停或其它未结束的发布时拒绝写入。`--public-health-url` 必填，是守护阶段检查的公网健康地址，写入 `main.json` 的 `public_health_url`；以后要改，直接编辑该文件。可先加全局参数 `--dry-run`（`deploy.py --dry-run adopt ...`）查看会执行的命令。
 3. **Nginx 改用固定名称**：所有反向代理改为 `proxy_pass http://sources_main_serving`，管理后台改为 `http://sources_main_admin`。这两个 upstream 定义在 `/etc/nginx/conf.d/00-sources-main-upstreams.conf`（由 `deploy.py` 在每次切流时重写，不要手工编辑；第一次可按当前容器端口手写一份同名 upstream）。静态资源指向固定目录 `/opt/sources-web/main/assets`。改完先 `nginx -t` 再 reload；预检会拒绝仍引用按版本命名 upstream 的配置。
 4. **常驻监测**：安装并启用 `sources-main-watch.service`，停用此前按版本命名的监测服务。
 5. **第一次正式发版**：`deploy.py main <image>`，它会把 `legacy` 槽位换到 A 槽位。旧容器在确认没有依赖后手动删除。

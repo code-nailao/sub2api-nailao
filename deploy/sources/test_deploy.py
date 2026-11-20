@@ -48,6 +48,7 @@ class FakeOps(deploy.Ops):
         self.oneoffs: list[list[str]] = []
         self.local_images: set[str] = set()
         self.busy_ports: set[int] = set()
+        self.network_ids = {name: f"fixture-network-{name}" for name in ("app-data", "app-upstream")}
         # Status of the public health URL; when set, the second value replaces
         # it at the next Nginx reload (i.e. once traffic switches).
         self.public_status = 200
@@ -63,6 +64,9 @@ class FakeOps(deploy.Ops):
 
     def logs_append(self, msg: str) -> None:
         self.logs.append(msg)
+
+    def network_name(self, ref: str) -> str:
+        return next((name for name, ident in self.network_ids.items() if ident == ref), ref)
 
     def add(self, name: str, port: int, running: bool = True, env=None, mounts=None, image="old@sha256:1"):
         self.containers[name] = {
@@ -96,7 +100,7 @@ class FakeOps(deploy.Ops):
             self.add(name, port, running=False, image=args[-1] if "oneoff" not in name else "x")
             out = self.containers[name]["Id"] + "\n"
             self.containers[name]["role"] = role
-            network = args[args.index("--network") + 1]
+            network = self.network_name(args[args.index("--network") + 1])
             aliases = [args[i + 1] for i, arg in enumerate(args) if arg == "--network-alias"]
             self.containers[name]["NetworkSettings"]["Networks"] = {network: {"Aliases": aliases}}
             # One-off command flags use a single dash (-check-startup ...); docker's
@@ -121,11 +125,12 @@ class FakeOps(deploy.Ops):
                     out = f"{deploy.ASSETS_PREFIX} 3\n"
             else:
                 c.pop("draining_until", None)
+                c.pop("drain_marked", None)
                 c["State"].update(Running=True, Status="running", StartedAt=f"t{self.clock}")
         elif args[:2] == ["docker", "kill"]:
             c = self.containers.get(name)
             if c and name in self.drain_seconds and c["State"]["Running"]:
-                c["draining_until"] = self.clock + self.drain_seconds[name]
+                c.setdefault("draining_until", self.clock + self.drain_seconds[name])
             elif c:
                 c["State"].update(Running=False, Status="exited", ExitCode=0)
         elif args[:2] == ["docker", "rm"]:
@@ -135,11 +140,20 @@ class FakeOps(deploy.Ops):
             if c:
                 c["HostConfig"]["RestartPolicy"]["Name"] = args[2].split("=", 1)[1]
         elif args[:3] == ["docker", "network", "disconnect"]:
-            self.containers[name]["NetworkSettings"]["Networks"].pop(args[-2], None)
+            self.containers[name]["NetworkSettings"]["Networks"].pop(self.network_name(args[-2]), None)
         elif args[:3] == ["docker", "network", "connect"]:
             if name in self.containers:
                 aliases = [args[i + 1] for i, arg in enumerate(args) if arg == "--alias"]
-                self.containers[name]["NetworkSettings"]["Networks"][args[-2]] = {"Aliases": aliases}
+                self.containers[name]["NetworkSettings"]["Networks"][self.network_name(args[-2])] = {"Aliases": aliases}
+        elif args[:3] == ["docker", "network", "inspect"]:
+            networks = []
+            for ref in args[3:]:
+                network = self.network_name(ref)
+                if network not in self.network_ids:
+                    rc = 1
+                    break
+                networks.append({"Name": network, "Id": self.network_ids[network]})
+            out = json.dumps(networks)
         elif args[:3] == ["docker", "image", "inspect"]:
             rc = 0 if args[3] in self.local_images else 1
         elif args[1:] == ["-T"]:
@@ -178,12 +192,15 @@ class FakeOps(deploy.Ops):
         if not c or not c["State"]["Running"]:
             return 0, None
         extra = self.runtime_extra.get(c["Name"][1:], {})
-        if "draining_until" in c and url.endswith("/internal/sources/runtime") and token == "tok":
+        if ("draining_until" in c or c.get("drain_marked")) and url.endswith("/internal/sources/runtime") and token == "tok":
             return 200, {"ready": False, "draining": True, "role": c["role"],
                          "owns_background": c["role"] == "background", "instance_id": c["Id"], **extra}
         if url.endswith("/health"):
             return 200, "ok"
         if url.endswith("/drain"):
+            if method != "POST" or token != "tok" or body != {"instance_id": c["Id"]}:
+                return 409, None
+            c["drain_marked"] = True
             return 200, {}
         if token != "tok" or port in self.unready_ports:
             return (404, None) if token != "tok" else (200, {"ready": False, "role": c["role"]})
@@ -793,6 +810,63 @@ class DeployTest(unittest.TestCase):
         deploy.Deployer(self.cfg, self.ops).abort()
         self.assertIsNone(self.state()["in_progress"])
 
+    def test_abort_signals_serving_already_marked_draining(self):
+        held = self.hold()
+        port = held["target"]["ports"]["serving"]
+        cid = held["containers"]["serving"]["id"]
+        serving = held["target"]["containers"]["serving"]
+        self.ops.drain_seconds[serving] = 3
+        token = self.ops.read_text(self.cfg.runtime_token_file).strip()
+        url = f"http://loopback.invalid:{port}/internal/sources/drain"
+        self.assertEqual(200, self.ops.http_json(url, token=token, method="POST", body={"instance_id": cid})[0])
+        self.assertTrue(self.ops.inspect(cid)["State"]["Running"])
+        self.assertTrue(deploy.Deployer(self.cfg, self.ops).runtime(port, token)["draining"])
+        run = self.ops.run
+
+        def verify_graceful_removal(args, **kw):
+            if args[:2] == ["docker", "rm"] and args[-1] == cid:
+                self.assertEqual(["docker", "rm", cid], args)
+                self.assertFalse(self.ops.inspect(cid)["State"]["Running"])
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", verify_graceful_removal):
+            deploy.Deployer(self.cfg, self.ops).abort()
+        self.assertIn(["docker", "kill", "--signal=TERM", cid], self.ops.commands)
+        self.assertIsNone(self.ops.inspect(cid))
+        self.assertIsNone(self.state()["in_progress"])
+        self.assert_live_release(LEGACY)
+
+    def test_watch_alerts_after_abort_is_interrupted_before_cleanup(self):
+        class ProcessKilled(BaseException):
+            pass
+
+        pid = os.getpid()
+        stat = f"/proc/{pid}/stat"
+        self.ops.files["/proc/sys/kernel/random/boot_id"] = "fixture-boot\n"
+        self.ops.files[stat] = f"{pid} (release) R " + "0 " * 20
+        self.deploy(hold_before_switch=True)
+        run = self.ops.run
+
+        def interrupt_before_cleanup(args, **kw):
+            if args[:3] == ["docker", "update", "--restart=no"]:
+                self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
+                raise ProcessKilled
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", interrupt_before_cleanup):
+            with self.assertRaises(ProcessKilled):
+                deploy.Deployer(self.cfg, self.ops).abort()
+        phase = self.state().get("in_progress") or self.state().get("paused")
+        self.assertEqual("aborting", phase["phase"])
+        self.assertNotIn("reason", phase)
+        self.assertNotIn("failed", phase)
+        del self.ops.files[stat]
+        self.assertEqual([["abort_incomplete"]], [item["alert"] for item in deploy.watch_once(self.cfg, self.ops, {})])
+        self.assert_live_release(LEGACY)
+        deploy.Deployer(self.cfg, self.ops).abort()
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
+
     def test_hold_blocks_main_and_rollback_and_commands_require_a_pause(self):
         for action in ("resume", "abort"):
             with self.assertRaisesRegex(deploy.DeployError, "no paused release"):
@@ -920,12 +994,28 @@ class DeployTest(unittest.TestCase):
             return run(args, **kw)
 
         with mock.patch.object(self.ops, "run", missing_network):
-            with self.assertRaisesRegex(deploy.DeployError, "network disappeared.*pause restored"):
+            with self.assertRaisesRegex(deploy.DeployError, "network disappeared.*pause unchanged"):
                 deploy.Deployer(self.cfg, self.ops).resume()
         self.assertEqual([self.cfg.networks], network_checks)
         self.assertEqual(containers, self.ops.containers)
         self.assertEqual(held, self.state()["in_progress"])
         self.assert_live_release(LEGACY)
+
+    def test_resume_accepts_network_ids_when_container_inspect_uses_names(self):
+        networks = tuple(self.cfg.networks)
+        self.cfg.networks = [self.ops.network_ids[network] for network in networks]
+        held = self.hold()
+        for role in deploy.SERVING_ROLES:
+            name = held["target"]["containers"][role]
+            self.assertEqual(set(networks), set(self.ops.inspect(name)["NetworkSettings"]["Networks"]))
+        deploy.Deployer(self.cfg, self.ops).resume()
+        self.assertEqual(held["target"]["slot"], self.state()["current"]["slot"])
+        self.assert_live_release(held["target"])
+        self.assertIsNone(self.state()["in_progress"])
+        for role in deploy.SERVING_ROLES:
+            networks_after = self.ops.inspect(held["target"]["containers"][role])["NetworkSettings"]["Networks"]
+            self.assertEqual(set(networks), set(networks_after))
+            self.assertTrue(all(self.cfg.serving_alias in endpoint["Aliases"] for endpoint in networks_after.values()))
 
     def test_resume_nginx_failure_hands_background_back(self):
         self.hold()
@@ -947,7 +1037,7 @@ class DeployTest(unittest.TestCase):
 
         def fail(args, **kw):
             if args[:3] == ["docker", "network", "connect"] and self.cfg.serving_alias in args:
-                alias_joins.append(args[-2])
+                alias_joins.append(self.ops.network_name(args[-2]))
                 for name in names:
                     info = self.ops.inspect(name)
                     if info["State"]["Running"] and any(
@@ -1299,7 +1389,8 @@ class DeployTest(unittest.TestCase):
             with self.assertRaisesRegex(deploy.DeployError, "pause retained"):
                 deploy.Deployer(self.cfg, self.ops).resume()
         self.assertEqual(paused, self.state()["in_progress"])
-        self.assertEqual([[self.cfg.nginx_bin, "-T"]], self.ops.commands)
+        self.assertEqual([[self.cfg.nginx_bin, "-T"], ["docker", "network", "inspect", *self.cfg.networks]],
+                         self.ops.commands)
 
     def test_abort_state_write_failure_after_removal_can_retry_without_containers(self):
         self.hold()
@@ -1901,6 +1992,70 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(["memory"], reasons["old-bg"])
         self.assertNotIn("old-spare", reasons)
 
+    def test_adopt_refuses_to_replace_a_held_release(self):
+        cfg_path = self.tmp / "main-config.json"
+        cfg_path.write_text(json.dumps(deploy.asdict(self.cfg)))
+        cfg_bytes = cfg_path.read_bytes()
+        held = self.hold()
+        state_bytes = Path(self.cfg.state_file).read_bytes()
+        docker = list(self.ops.commands)
+        with self.assertRaisesRegex(deploy.DeployError, "resume.*abort"):
+            deploy.adopt(str(cfg_path), self.ops, *(LEGACY["containers"][role] for role in deploy.ROLES),
+                         str(self.tmp), self.cfg.public_health_url)
+        self.assertEqual(cfg_bytes, cfg_path.read_bytes())
+        self.assertEqual(state_bytes, Path(self.cfg.state_file).read_bytes())
+        self.assertEqual(docker, self.ops.commands)
+        self.assertEqual(held, self.state()["in_progress"])
+        self.assert_live_release(LEGACY)
+        deploy.Deployer(self.cfg, self.ops).abort()
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_adopt_uses_configured_release_lock_before_reading_state_or_touching_work_dir(self):
+        cfg_path = self.tmp / "main-config.json"
+        cfg_path.write_text(json.dumps(deploy.asdict(self.cfg)))
+        work_dir = self.tmp / "new-work-dir"
+        args = ["--config", str(cfg_path), "adopt", "--work-dir", str(work_dir),
+                "--public-health-url", self.cfg.public_health_url]
+        for role in deploy.ROLES:
+            args += [f"--{role}", LEGACY["containers"][role]]
+        before = Path(self.cfg.state_file).read_bytes()
+        with deploy.release_lock(self.cfg.lock_file), \
+                mock.patch.object(deploy, "MainOps", return_value=self.ops), \
+                mock.patch.object(deploy, "read_state_file") as read_state, \
+                mock.patch("sys.stderr") as stderr:
+            self.assertEqual(1, deploy.main(args))
+            read_state.assert_not_called()
+            self.assertIn("another release holds", "".join(call.args[0] for call in stderr.write.call_args_list))
+        self.assertEqual(before, Path(self.cfg.state_file).read_bytes())
+        self.assertFalse(work_dir.exists())
+        self.assertEqual([], self.ops.commands)
+
+    def test_adopt_checks_both_existing_and_destination_state(self):
+        held = self.hold()
+        cfg_path = self.tmp / "main-config.json"
+        cfg_path.write_text(json.dumps(deploy.asdict(self.cfg)))
+        destination = self.tmp / "other-work-dir"
+        destination.mkdir()
+        destination_state = destination / "state.json"
+        names = [LEGACY["containers"][role] for role in deploy.ROLES]
+        args = [str(cfg_path), self.ops, *names, str(destination), self.cfg.public_health_url]
+
+        for phase, instruction in (("held", "resume.*abort"), ("aborting", "retry 'abort'"),
+                                   ("failed", "inspect with 'status'"), ("deploying", "inspect with 'status'")):
+            with self.subTest(phase=phase):
+                state = {"current": LEGACY, "in_progress": {**held, "phase": phase}}
+                deploy.save_state(self.cfg, state)
+                with self.assertRaisesRegex(deploy.DeployError, instruction):
+                    deploy.adopt(*args)
+                self.assertEqual(state, self.state())
+                self.assertFalse(destination_state.exists())
+        deploy.save_state(self.cfg, {"current": LEGACY, "in_progress": None})
+        destination_state.write_text(json.dumps({"current": LEGACY, "in_progress": held}))
+        before = destination_state.read_bytes()
+        with self.assertRaisesRegex(deploy.DeployError, "resume.*abort"):
+            deploy.adopt(*args)
+        self.assertEqual(before, destination_state.read_bytes())
+
     def test_adopt_writes_config_and_never_logs_secrets(self):
         ops = FakeOps(self.tmp)
         mounts = [
@@ -1922,8 +2077,9 @@ class DeployTest(unittest.TestCase):
         cfg_path = str(self.tmp / "main.json")
         ops.write_file_atomic = lambda path, text, mode=0o644: Path(path).parent.mkdir(parents=True, exist_ok=True) \
             or Path(path).write_text(text)
-        deploy.adopt(cfg_path, ops, "old-serving", "old-spare", "old-bg", str(work),
-                     "https://example.com/health")
+        with mock.patch.object(deploy, "DEFAULT_RELEASE_LOCK", self.cfg.lock_file):
+            deploy.adopt(cfg_path, ops, "old-serving", "old-spare", "old-bg", str(work),
+                         "https://example.com/health")
 
         self.assertNotIn(SECRET, "\n".join(ops.logs))
         serving_env = (work / "serving.env").read_text()

@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 DEFAULT_CONFIG = "/opt/sources-deploy/main.json"
+DEFAULT_RELEASE_LOCK = "/var/lock/sources-clean-release.lock"
 ROLES = ("serving", "standby", "background")
 SERVING_ROLES = ("serving", "standby")
 PENDING_PREFIX = "SOURCES_PENDING_MIGRATIONS"
@@ -180,15 +181,21 @@ def now() -> str:
 
 
 def load_state(cfg: Config) -> dict[str, Any]:
-    path = Path(cfg.state_file)
+    return read_state_file(Path(cfg.state_file))
+
+
+def read_state_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"current": None, "previous": None, "in_progress": None}
     return json.loads(path.read_text())
 
 
 def load_main_state(cfg: Config) -> dict[str, Any]:
+    return normalize_main_state(load_state(cfg))
+
+
+def normalize_main_state(state: dict[str, Any]) -> dict[str, Any]:
     """Read older Main records without changing shared state readers or writing the file."""
-    state = load_state(cfg)
     progress = state.get("in_progress")
     paused = state.pop("paused", None)
     if progress and "phase" not in progress:
@@ -994,8 +1001,17 @@ class Deployer:
             with contextlib.suppress(OSError):
                 token = self.token_for(target.view(), role)
             runtime = self.runtime(target.ports[role], token) if token else None
-            if not (runtime or {}).get("draining"):
+            if (runtime and runtime.get("instance_id") and not runtime.get("draining")
+                    and not self.ops.dry_run):
+                self.ops.http_json(f"http://127.0.0.1:{target.ports[role]}/internal/sources/drain", token=token,
+                                   method="POST", body={"instance_id": runtime["instance_id"]})
+            # The drain endpoint only marks readiness. Serving's SIGTERM handler
+            # owns the graceful shutdown, including for containers already draining.
+            try:
                 self.ops.run(["docker", "kill", "--signal=TERM", cid], mutate=True)
+            except DeployError:
+                if (self.ops.inspect(cid) or {}).get("State", {}).get("Running"):
+                    raise
             if not self.ops.dry_run:
                 self.wait_exit(cid, self.cfg.ready_timeout)
         return True
@@ -1169,13 +1185,13 @@ class Deployer:
             raise DeployError("an unfinished release needs manual recovery; inspect 'status'; this is not a pause")
         return held, Target.from_view(held["target"], self.cfg.runtime_token_file)
 
-    def has_expected_held_networks(self, info: dict[str, Any], *, shared: bool) -> bool:
+    def has_expected_held_networks(self, info: dict[str, Any], expected: dict[str, str], *, shared: bool) -> bool:
         networks = info.get("NetworkSettings", {}).get("Networks", {})
-        return set(networks) == set(self.cfg.networks) and all(
+        return networks.keys() == expected.keys() and all(
             (self.cfg.serving_alias in (endpoint.get("Aliases") or [])) == shared
             for endpoint in networks.values())
 
-    def validate_hold(self, state: dict[str, Any], held: dict[str, Any], target: Target) -> None:
+    def validate_hold(self, state: dict[str, Any], held: dict[str, Any], target: Target) -> dict[str, str]:
         if state.get("current") != held["current"] or target.slot == state["current"]["slot"]:
             raise DeployError("current release changed during pause; inspect 'status' before recovery")
         if self.config_fingerprint() != held["config_fingerprint"]:
@@ -1184,13 +1200,13 @@ class Deployer:
             raise DeployError("upstream file changed during pause; restore it or abort")
         if self.ops.inspect(target.containers["background"]):
             raise DeployError("unexpected target background container; inspect and resolve before resuming")
+        serving = {}
         for role in SERVING_ROLES:
             info = self.ops.inspect(target.containers[role]) or {}
             identity = held["containers"][role]
             if info.get("Id") != identity["id"] or info.get("Image") != identity["image_id"]:
                 raise DeployError(f"held {role} is missing or its identity/image changed; restore it or abort")
-            if not self.has_expected_held_networks(info, shared=False):
-                raise DeployError(f"held {role} network isolation changed; restore it or abort")
+            serving[role] = info
             runtime = self.wait_ready(target.ports[role], self.token_for(target.view(), role), "serving",
                                       self.cfg.ready_timeout, container=target.containers[role])
             if runtime.get("owns_background") or runtime.get("draining"):
@@ -1210,16 +1226,36 @@ class Deployer:
         problems += self.public_health_preflight(held.get("allow_public_health_failure", False))
         if problems:
             raise DeployError("resume preflight failed:\n  - " + "\n  - ".join(problems))
+        networks = self.inspect_held_networks()
+        for role, info in serving.items():
+            if not self.has_expected_held_networks(info, networks, shared=False):
+                raise DeployError(f"held {role} network isolation changed; restore it or abort")
+        return networks
 
     def check_held_background_port(self, target: Target) -> None:
         problems = port_problems(self.ops, [target.ports["background"]])
         if problems:
             raise DeployError("resume background port check failed:\n  - " + "\n  - ".join(problems))
 
-    def inspect_held_networks(self) -> None:
-        self.ops.run(["docker", "network", "inspect", *self.cfg.networks], mutate=False, timeout=30)
+    def inspect_held_networks(self) -> dict[str, str]:
+        result = self.ops.run(["docker", "network", "inspect", *self.cfg.networks], mutate=False, timeout=30)
+        try:
+            endpoints = json.loads(result.stdout)
+        except ValueError as err:
+            raise DeployError("cannot read configured Docker networks") from err
+        if not isinstance(endpoints, list) or len(endpoints) != len(self.cfg.networks):
+            raise DeployError("cannot resolve all configured Docker networks")
+        networks: dict[str, str] = {}
+        for item in endpoints:
+            name = item.get("Name") if isinstance(item, dict) else None
+            network_id = item.get("Id") if isinstance(item, dict) else None
+            if not isinstance(name, str) or not name or not isinstance(network_id, str) or not network_id or name in networks:
+                raise DeployError("configured Docker networks must resolve to distinct named networks")
+            networks[name] = network_id
+        return networks
 
-    def configure_held_networks(self, target: Target, identities: dict[str, str], *, shared: bool) -> None:
+    def configure_held_networks(self, target: Target, identities: dict[str, str],
+                                expected: dict[str, str], *, shared: bool) -> None:
         if not self.cfg.serving_alias:
             return
         for role in SERVING_ROLES:
@@ -1233,25 +1269,26 @@ class Deployer:
                     or (not self.ops.dry_run and info.get("State", {}).get("Running"))):
                 raise DeployError(f"cannot configure networks for {role}; container identity or stop is unconfirmed")
             networks = info.get("NetworkSettings", {}).get("Networks", {})
-            if networks.keys() - set(self.cfg.networks):
+            if networks.keys() - expected.keys():
                 raise DeployError(f"{role} joined an unexpected network; inspect before continuing")
             aliases = ["--alias", name]
             if shared:
                 aliases += ["--alias", self.cfg.serving_alias]
-            for network in self.cfg.networks:
+            for network, network_id in expected.items():
                 if network in networks:
                     actual = networks[network].get("Aliases") or []
                     if name in actual and (self.cfg.serving_alias in actual) == shared:
                         continue
-                    self.ops.run(["docker", "network", "disconnect", network, identities[role]], mutate=True)
-                self.ops.run(["docker", "network", "connect", *aliases, network, identities[role]], mutate=True)
+                    self.ops.run(["docker", "network", "disconnect", network_id, identities[role]], mutate=True)
+                self.ops.run(["docker", "network", "connect", *aliases, network_id, identities[role]], mutate=True)
         # A stopped container can store configuration for a network that no
         # longer exists. Reject that before activating either container.
-        self.inspect_held_networks()
+        if self.inspect_held_networks() != expected:
+            raise DeployError("configured Docker networks changed during activation")
         if not self.ops.dry_run:
             for role in SERVING_ROLES:
                 info = self.ops.inspect(target.containers[role]) or {}
-                if info.get("Id") != identities[role] or not self.has_expected_held_networks(info, shared=shared):
+                if info.get("Id") != identities[role] or not self.has_expected_held_networks(info, expected, shared=shared):
                     raise DeployError(f"prepared networking for held {role} is unconfirmed")
         for role in SERVING_ROLES:
             self.ops.run(["docker", "start", identities[role]], mutate=True)
@@ -1261,19 +1298,18 @@ class Deployer:
                 self.wait_ready(target.ports[role], self.token_for(target.view(), role), "serving",
                                 self.cfg.ready_timeout, container=name)
                 info = self.ops.inspect(name) or {}
-                if info.get("Id") != identities[role] or not self.has_expected_held_networks(info, shared=shared):
+                if info.get("Id") != identities[role] or not self.has_expected_held_networks(info, expected, shared=shared):
                     raise DeployError(f"running networking for held {role} is unconfirmed")
         for role in SERVING_ROLES:
             self.ops.run(["docker", "update", "--restart=unless-stopped", identities[role]], mutate=True)
 
     def activate_hold(self, state: dict[str, Any], held: dict[str, Any], target: Target,
-                      identities: dict[str, str]) -> None:
+                      identities: dict[str, str], networks: dict[str, str]) -> None:
         changed_networks = False
         try:
             if self.cfg.serving_alias:
-                self.inspect_held_networks()
                 changed_networks = True
-                self.configure_held_networks(target, identities, shared=True)
+                self.configure_held_networks(target, identities, networks, shared=True)
             # Drain and reconnect can take time. Check again before the handoff.
             self.check_held_background_port(target)
         except (Exception, KeyboardInterrupt) as err:
@@ -1281,7 +1317,7 @@ class Deployer:
                 raise
             try:
                 if changed_networks:
-                    self.configure_held_networks(target, identities, shared=False)
+                    self.configure_held_networks(target, identities, networks, shared=False)
                 self._save_progress(state, held)
             except (Exception, KeyboardInterrupt) as restore_err:
                 raise FallbackFailed(f"held serving activation failed ({err}); restoring the pause failed too "
@@ -1293,14 +1329,15 @@ class Deployer:
         held, target = self.held_release(state)
         # Validation never changes the pause: fix health/config and retry, or abort.
         try:
-            self.validate_hold(state, held, target)
+            networks = self.validate_hold(state, held, target)
         except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
             raise DeployError(f"{err or 'resume validation interrupted'}; pause unchanged; fix the cause and retry or abort") from err
         record = {"started_at": now(), "action": "resume", "image": target.image, "slot": target.slot,
                   "paused_at": held["held_at"]}
         identities = {role: held["containers"][role]["id"] for role in SERVING_ROLES}
         try:
-            self._finish_switch(state, state["current"], target, record, create_background=True, held=held)
+            self._finish_switch(state, state["current"], target, record, create_background=True,
+                                held=held, networks=networks)
         except DeployError as err:
             self._abort(state, target, err, identities)
             if not self.ops.dry_run:
@@ -1358,13 +1395,15 @@ class Deployer:
         raise failure from err
 
     def _finish_switch(self, state: dict[str, Any], current: dict[str, Any], target: Target,
-                       record: dict[str, Any], create_background: bool, *, held: dict[str, Any] | None = None) -> None:
+                       record: dict[str, Any], create_background: bool, *, held: dict[str, Any] | None = None,
+                       networks: dict[str, str] | None = None) -> None:
         if held is not None:
             # Ordinary serving containers already got their shared aliases at create time.
             self._mark(state, target, "activate held serving")
             with self.step("activate held serving"):
                 identities = {role: held["containers"][role]["id"] for role in SERVING_ROLES}
-                self.activate_hold(state, held, target, identities)
+                assert networks is not None  # Supplied by resume's read-only validation.
+                self.activate_hold(state, held, target, identities, networks)
         view = target.view()
         self._mark(state, target, "background handoff")
         with self.step("background handoff"):
@@ -1606,8 +1645,38 @@ def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]
     return alerts
 
 
+def adoption_paths(cfg_path: str, work_dir: str) -> tuple[str, Path]:
+    try:
+        config = json.loads(Path(cfg_path).read_text())
+    except FileNotFoundError:
+        return DEFAULT_RELEASE_LOCK, Path(work_dir) / "state.json"
+    except (OSError, ValueError) as err:
+        raise DeployError("cannot read existing Main configuration for adopt") from err
+    if not isinstance(config, dict) or any(
+            not isinstance(config.get(key), str) or not config[key] for key in ("lock_file", "state_file")):
+        raise DeployError("existing Main configuration must specify release lock and state paths before adopt")
+    return config["lock_file"], Path(config["state_file"])
+
+
 def adopt(cfg_path: str, ops: Ops, serving: str, standby: str, background: str, work_dir: str,
           public_health_url: str) -> None:
+    lock_file, configured_state = adoption_paths(cfg_path, work_dir)
+    with release_lock(lock_file, create=not ops.dry_run):
+        if adoption_paths(cfg_path, work_dir) != (lock_file, configured_state):
+            raise DeployError("Main configuration changed during adopt; retry after reviewing it")
+        for path in dict.fromkeys((configured_state, Path(work_dir) / "state.json")):
+            try:
+                state = normalize_main_state(read_state_file(path))
+            except (OSError, ValueError) as err:
+                raise DeployError("cannot confirm existing Main release state before adopt") from err
+            Deployer.require_idle(state)
+        if not ops.dry_run:
+            Path(work_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+        _adopt(cfg_path, ops, serving, standby, background, work_dir, public_health_url, lock_file)
+
+
+def _adopt(cfg_path: str, ops: Ops, serving: str, standby: str, background: str, work_dir: str,
+           public_health_url: str, lock_file: str) -> None:
     """Record running legacy containers as the current release and derive
     the fixed configuration from them. Secrets go to root-only env files and
     are never printed. Durable state paths are referenced in place;
@@ -1688,7 +1757,7 @@ def adopt(cfg_path: str, ops: Ops, serving: str, standby: str, background: str, 
         "work_dir": work_dir,
         "state_file": str(Path(work_dir) / "state.json"),
         "history_file": str(Path(work_dir) / "history.jsonl"),
-        "lock_file": "/var/lock/sources-clean-release.lock",
+        "lock_file": lock_file,
         "public_health_url": public_health_url,
         "cgroup_memory_path": "/sys/fs/cgroup/system.slice/docker-{id}.scope/memory.current",
         "serving_alias": "sources-main-serving",
@@ -1774,7 +1843,6 @@ def main(argv: list[str] | None = None) -> int:
     ops = MainOps(dry_run=args.dry_run)
     try:
         if args.command == "adopt":
-            Path(args.work_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
             adopt(args.config, ops, args.serving, args.standby, args.background, args.work_dir,
                   args.public_health_url)
             return 0
