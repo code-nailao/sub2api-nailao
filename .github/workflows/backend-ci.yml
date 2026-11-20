@@ -281,6 +281,13 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Portal page script tests
+        working-directory: extensions/sources-portal
+        run: node --experimental-vm-modules --test session.test.mjs studio.test.mjs canvas.test.mjs settings.test.mjs
       - name: Fetch and verify the fixed upstream baseline
         run: python3 scripts/sources_extensions/fetch_baseline.py
       - uses: actions/setup-go@v6
