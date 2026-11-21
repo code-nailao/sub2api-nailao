@@ -222,8 +222,8 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 			body = ensureDeepSeekChatReasoningPlaceholders(account, body)
 		}
 		if c.GetBool(deepSeekInternalTurn) {
-			// Pairing and reasoning edits may grow the hosted turn after the
-			// initial size check. Check the exact bytes about to be sent.
+			// Check the hosted limit on the final body. Pairing may remove
+			// messages, and placeholders may add bytes.
 			var err error
 			body, err = fitDeepSeekHostedChatBody(body, s.deepSeekHostedBodyLimit())
 			if err != nil {

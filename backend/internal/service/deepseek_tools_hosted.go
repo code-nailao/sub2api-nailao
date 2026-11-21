@@ -260,9 +260,9 @@ func prepareDeepSeekHosted(body []byte, protocol string, auto bool) (*deepSeekHo
 }
 
 // marshalModelRequest inserts the original Chat history before the messages
-// the loop appended. Only compact its JSON whitespace if the turn would be
-// over budget. json.Marshal would compact even a RawMessage on every turn.
-func (r *deepSeekHostedRequest) marshalModelRequest(ctx context.Context, limit int64) ([]byte, error) {
+// the loop appended. The forwarding path applies the Chat size limit so
+// native Chat can repair tool pairing before deciding whether to compact.
+func (r *deepSeekHostedRequest) marshalModelRequest(ctx context.Context) ([]byte, error) {
 	body, err := json.Marshal(r.Body)
 	if err != nil || r.chatHistory == nil {
 		return body, err
@@ -276,20 +276,8 @@ func (r *deepSeekHostedRequest) marshalModelRequest(ctx context.Context, limit i
 	}
 	history := r.chatHistory
 	span := top.messages.value
-	// Merging the arrays adds the original history, drops two brackets and
-	// needs one comma only when both arrays contain messages.
+	// Only add a separator when both arrays contain messages.
 	join := top.messages.nonemptyArray && len(bytes.TrimSpace(history[1:len(history)-1])) != 0
-	turnSize := len(body) - 2 + len(history)
-	if join {
-		turnSize++
-	}
-	if int64(turnSize) > limit {
-		var compact bytes.Buffer
-		if err := json.Compact(&compact, history); err != nil {
-			return nil, err
-		}
-		history = compact.Bytes()
-	}
 	out := make([]byte, 0, len(body)+len(history)+1)
 	out = append(out, body[:span.start]...)
 	if !top.messages.nonemptyArray {
@@ -730,12 +718,11 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 				return result, nil, true, err
 			}
 		}
-		limit := s.deepSeekHostedBodyLimit()
-		current, marshalErr := req.marshalModelRequest(loopCtx, limit)
+		current, marshalErr := req.marshalModelRequest(loopCtx)
 		if marshalErr != nil {
 			return result, nil, true, marshalErr
 		}
-		if int64(len(current)) > limit {
+		if protocol != "chat" && int64(len(current)) > s.deepSeekHostedBodyLimit() {
 			return result, nil, true, errDeepSeekHostedBodyLimit
 		}
 		turn, capture, turnErr := s.deepSeekModelTurn(loopCtx, c, account, current, protocol, defaultModel)

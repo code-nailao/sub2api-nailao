@@ -142,7 +142,17 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 	if account.IsOpenCodeGo() && IsOpenCodeUnsupportedModel(routingModel) {
 		return nil, writeOpenCodeUnsupportedModelError(c, false, routingModel)
 	}
-	switch s.resolveUpstreamProtocolFor(ctx, account, inbound, routingModel) {
+	upstreamProtocol := s.resolveUpstreamProtocolFor(ctx, account, inbound, routingModel)
+	if c.GetBool(deepSeekInternalTurn) && (inbound != APIProtocolChatCompletions || upstreamProtocol != APIProtocolChatCompletions) {
+		// The native Chat sender checks its final body. Keep the size check
+		// before conversion on other routes for hosted Chat turns.
+		var err error
+		body, err = fitDeepSeekHostedChatBody(body, s.deepSeekHostedBodyLimit())
+		if err != nil {
+			return nil, err
+		}
+	}
+	switch upstreamProtocol {
 	case APIProtocolAnthropic:
 		if convertResponsesShape {
 			return s.forwardResponsesViaNativeAnthropic(ctx, c, account, body, "")

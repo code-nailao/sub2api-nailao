@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
@@ -324,6 +325,74 @@ func TestDeepSeekChatHostedContinuationBodyBudget(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestDeepSeekChatHostedBudgetAfterHistoryRepair(t *testing.T) {
+	const user = `{"role":"user","content":"Find an example"}`
+	const callB = `{"role":"assistant","tool_calls":[{"id":"b","type":"function","function":{"name":"record","arguments":"{}"}}]}`
+	const callsAB = `{"role":"assistant","tool_calls":[{"id":"a","type":"function","function":{"name":"record","arguments":"{}"}},{"id":"b","type":"function","function":{"name":"record","arguments":"{}"}}]}`
+	const resultB = `{"role":"tool","tool_call_id":"b","content":"same"}`
+	const resultA = `{"role":"tool","tool_call_id":"a","content":"current"}`
+	const bodyFormat = `{"model":"deepseek-flash","messages":[%s],"thinking":{"type":"disabled"},"tools":[{"type":"web_search"}],"stream":%t}`
+	// Include enough structural whitespace for a premature compaction to fit
+	// the continuation even before the duplicate result is removed.
+	block := callsAB + ",\n\t" + strings.Repeat(" ", len(resultB)) + resultB + ",\n    " + resultA
+	cases := []struct {
+		name, history, extra string
+	}{
+		{"orphan_does_not_reject_continuation", user, `{"role":"tool","tool_call_id":"orphan","content":"Unmatched"}`},
+		{"duplicate_does_not_compact_paired_block", user + "," + callB + "," + resultB + "," + user + "," + block, resultB},
+	}
+	for _, stream := range []bool{false, true} {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("stream=%t/%s", stream, tc.name), func(t *testing.T) {
+				clean := fmt.Appendf(nil, bodyFormat, tc.history, stream)
+				_, baseline, err := runDeepSeekHostedChatWithSearch(t, deepSeekChatFallbackTestConfig(), clean)
+				require.NoError(t, err)
+				require.Len(t, baseline, 2)
+				require.Equal(t, "["+tc.history+"]", gjson.GetBytes(baseline[0], "messages").Raw)
+				require.True(t, strings.HasPrefix(gjson.GetBytes(baseline[1], "messages").Raw, "["+tc.history+","))
+
+				// The extra result fits on the first turn. On continuation, the
+				// budget is exactly enough for the repaired, uncompressed body.
+				limit := len(baseline[1])
+				require.LessOrEqual(t, len(baseline[0])+1+len(tc.extra), limit)
+				cfg := deepSeekChatFallbackTestConfig()
+				cfg.Gateway.MaxBodySize = int64(limit)
+				cfg.Gateway.TextMaxBodySize = int64(limit)
+				body := fmt.Appendf(nil, bodyFormat, tc.history+","+tc.extra, stream)
+				result, requests, err := runDeepSeekHostedChatWithSearch(t, cfg, body)
+				require.NotNil(t, result)
+				require.Equal(t, 1, result.DeepSeekTools.SearchCount)
+				require.NoError(t, err)
+				require.Len(t, requests, 2)
+				for i, want := range baseline {
+					require.Equal(t, string(want), string(requests[i]), "model turn %d", i+1)
+				}
+			})
+		}
+	}
+}
+
+func TestDeepSeekChatHostedConversionKeepsSizeLimit(t *testing.T) {
+	body := []byte(`{"model":"deepseek-flash","messages":[{"role":"user","content":"Find an example"}],"tools":[{"type":"web_search"}]}`)
+	for _, protocol := range []string{APIProtocolResponses, APIProtocolAnthropic} {
+		t.Run(protocol, func(t *testing.T) {
+			cfg := deepSeekChatFallbackTestConfig()
+			cfg.Gateway.MaxBodySize = int64(len(body))
+			cfg.Gateway.TextMaxBodySize = cfg.Gateway.MaxBodySize
+			// Injecting the hosted tools lifts the assembled body over the limit.
+			_, _, _, err := deepSeekHostedWireFixture(t, cfg, "chat", body, func(*http.Request) (*http.Response, error) {
+				t.Fatal("oversized hosted turn reached upstream")
+				return nil, nil
+			}, func(c *gin.Context) {
+				input, ok := c.MustGet(deepSeekBillingInputKey).(*OpenAIRecordUsageInput)
+				require.True(t, ok)
+				input.Account.Credentials["api_protocol"] = protocol
+			})
+			require.ErrorIs(t, err, errDeepSeekHostedBodyLimit)
+		})
 	}
 }
 
