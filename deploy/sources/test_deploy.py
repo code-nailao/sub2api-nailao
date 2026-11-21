@@ -610,6 +610,68 @@ class DeployTest(unittest.TestCase):
         self.assertEqual("guard", progress["step"])
         self.assertIn("restarted", progress["failed"])
 
+    def failed_handback_admin_owner(self, *, previous_stays_up):
+        """A drain timeout ends the hand-back with a Docker error while the
+        candidate's background cannot take the lock back."""
+        self.ops.memory_after_switch = 20 * GIB
+        self.cfg.background_exit_timeout = 2
+        target = self.cfg.slot_view("a")
+        candidate_background = target["containers"]["background"]
+        candidate_admin = target["ports"]["background"]
+        previous_background = LEGACY["containers"]["background"]
+        previous_admin = LEGACY["ports"]["background"]
+        self.ops.drain_seconds[candidate_background] = 8
+        run = self.ops.run
+        started_previous = False
+
+        def start(args, **kw):
+            nonlocal started_previous
+            result = run(args, **kw)
+            if args == ["docker", "start", previous_background]:
+                started_previous = True
+                if not previous_stays_up:
+                    self.ops.containers[previous_background]["State"].update(
+                        Running=False, Status="exited", ExitCode=1)
+                raise subprocess.TimeoutExpired(args, 600)
+            if args == ["docker", "start", candidate_background] and started_previous:
+                self.ops.containers[candidate_background]["State"].update(
+                    Running=False, Status="exited", ExitCode=1)
+            return result
+
+        with mock.patch.object(self.ops, "run", start):
+            with self.assertRaises(deploy.FallbackFailed) as ctx:
+                self.deploy()
+        upstream = self.ops.files[self.cfg.upstream_file]
+        progress = self.state()["in_progress"]
+        self.assertEqual("guard", progress["step"])
+        self.assertIn("handing the background back to slot legacy did not finish", progress["failed"])
+        return ctx, upstream, candidate_admin, previous_admin, target
+
+    def test_guard_rollback_selects_the_previous_background_that_still_answers(self):
+        ctx, upstream, candidate_admin, previous_admin, target = self.failed_handback_admin_owner(
+            previous_stays_up=True)
+        message = str(ctx.exception)
+        self.assertIn(f"127.0.0.1:{previous_admin};", upstream,
+                      "admin moves to the background that holds the lock and answers")
+        self.assertNotIn(f"127.0.0.1:{candidate_admin};", upstream)
+        self.assertIn("whose background holds the lock and answers", message)
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        self.assertTrue(deployer.background_answering(LEGACY))
+        self.assertFalse(deployer.background_answering(target))
+
+    def test_guard_rollback_points_admin_at_the_only_restorable_owner_when_none_answers(self):
+        ctx, upstream, candidate_admin, previous_admin, target = self.failed_handback_admin_owner(
+            previous_stays_up=False)
+        message = str(ctx.exception)
+        self.assertIn(f"127.0.0.1:{previous_admin};", upstream,
+                      "admin points at the only container a person can restore")
+        self.assertNotIn(f"127.0.0.1:{candidate_admin};", upstream)
+        self.assertIn("admin entry is unavailable", message)
+        self.assertIn("needs a person", message)
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        self.assertFalse(deployer.background_answering(LEGACY))
+        self.assertFalse(deployer.background_answering(target))
+
     def test_guard_counts_connect_failures_only_for_new_ports(self):
         line = 'connect() failed (111) while connecting to upstream, upstream: "http://127.0.0.1:{}/v1"'
         text = "\n".join([line.format(9401)] * 3 + [line.format(9426)] * 50)

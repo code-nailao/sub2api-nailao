@@ -1217,14 +1217,24 @@ class Deployer:
         except DeployError as err:
             raise FallbackFailed(f"handing the background back failed: {err}") from err
 
+    def background_running(self, view: dict[str, Any]) -> bool:
+        """Whether the slot's background container exists and is not stopped."""
+        info = self.ops.inspect(view["containers"]["background"]) or {}
+        state = info.get("State") or {}
+        return bool(state.get("Running") or state.get("Restarting"))
+
+    def background_answering_now(self, view: dict[str, Any]) -> bool:
+        try:
+            return self.background_answering(view, allow_draining=True)
+        except (DeployError, OSError, subprocess.SubprocessError):
+            return False
+
     def revive_background(self, view: dict[str, Any]) -> bool:
         """Restart a background that merely exited and wait for the lock and
         health, so the admin upstream keeps an owner that answers."""
         name = view["containers"]["background"]
         try:
-            info = self.ops.inspect(name) or {}
-            state = info.get("State") or {}
-            if state.get("Running") or state.get("Restarting"):
+            if self.background_running(view):
                 return False
             self.log(f"   {name} is stopped; restarting it so admin keeps an owner")
             self.start_background(view, check_health=True)
@@ -1235,28 +1245,47 @@ class Deployer:
 
     def rollback_admin_owner(self, target: Target, previous: dict[str, Any], reason: str,
                              err: BaseException) -> FallbackFailed:
-        """Keep admin on an owner that answers: restart the released
-        background when it merely exited, and record an incomplete recovery."""
-        view = target.view()
-        try:
-            answering = self.background_answering(view, allow_draining=True)
-        except (DeployError, OSError, subprocess.SubprocessError):
-            answering = False
+        """Pick admin's owner by probing both backgrounds instead of assuming
+        which one is alive: the one that holds the lock and answers, or the
+        only container a person can still restore."""
+        views = {"previous": previous, "candidate": target.view()}
+        answers = {side: self.background_answering_now(view) for side, view in views.items()}
         revived = False
-        if not answering:
-            revived = self.revive_background(view)
-            answering = revived
-        if answering:
-            state = "was restarted and answers" if revived else "answers"
-            where = (f"serving serves from slot {previous['slot']} and admin still uses slot {target.slot}, "
-                     f"whose background {state}")
+        if answers["previous"]:
+            chosen = "previous"
+        elif answers["candidate"]:
+            chosen = "candidate"
+        elif self.revive_background(views["candidate"]):
+            chosen, revived = "candidate", True
+        elif self.background_running(views["previous"]) or not self.background_running(views["candidate"]):
+            chosen = "previous"
         else:
-            where = (f"serving serves from slot {previous['slot']} and the admin upstream still points at "
-                     f"slot {target.slot}, whose background does not answer; restore a background and point "
-                     "admin routing at it")
+            chosen = "candidate"
+        route_error = None
+        if chosen == "previous":
+            try:
+                self.switch_to(views["previous"])
+            except (DeployError, OSError, subprocess.SubprocessError) as route_err:
+                route_error = route_err
+        previous_slot = views["previous"]["slot"]
+        if route_error is not None:
+            where = (f"serving serves from slot {previous_slot}, but moving admin routing to slot {previous_slot} "
+                     f"failed ({route_error}); the admin entry is unavailable and needs a person to check where "
+                     "it points")
+        elif chosen == "previous" and answers["previous"]:
+            where = (f"serving and admin serve from slot {previous_slot}, "
+                     "whose background holds the lock and answers")
+        elif answers[chosen] or revived:
+            state = "was restarted and answers" if revived else "answers"
+            where = (f"serving serves from slot {previous_slot} but admin still uses slot "
+                     f"{views[chosen]['slot']}, whose background {state}; the previous background did not take over")
+        else:
+            where = (f"serving serves from slot {previous_slot} and the admin upstream points at "
+                     f"slot {views[chosen]['slot']}, whose background does not answer: the admin entry is "
+                     "unavailable and needs a person to restore that background")
         return FallbackFailed(
-            f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not finish "
-            f"({err}). {where}. Verify the background, its lock and live routing before clearing in_progress")
+            f"guard failed ({reason}); handing the background back to slot {views['previous']['slot']} did not "
+            f"finish ({err}). {where}. Verify the background, its lock and live routing before clearing in_progress")
 
     def container_memory(self, info: dict[str, Any]) -> int | None:
         cid = info.get("Id")
