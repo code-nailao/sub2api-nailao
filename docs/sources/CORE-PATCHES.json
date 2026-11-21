@@ -2768,7 +2768,7 @@
         "deepseek_chat_tool_pairing"
       ],
       "reason": "Repairs native DeepSeek Chat tool history. Protects a complete adjacent parallel block before resolving surplus results. For other calls, matches reused IDs within each call occurrence, gives adjacent results priority, and breaks ties by preferring content absent from earlier candidates for that ID, including discarded results. Writes results and empty placeholders in tool call order for blocks needing repair. Preserves intact adjacent blocks with their original bytes and separators while repairing other messages.",
-      "sha256": "eb923c7294331351ef2ebaf7bd30f519710d3d4d1cd7005757f8bab58f153149"
+      "sha256": "a3fe7d04062edfbbbf94c8612a8be8ca086258fc75988dc10a9fe48cfff3c10e"
     },
     {
       "path": "backend/internal/service/deepseek_chat_tool_pairing_test.go",
@@ -3309,7 +3309,7 @@
         "grok_content_rejection_billing",
         "paid_submission_no_replay"
       ],
-      "sha256": "2e35e2bb6d9f269955992ce951c146bfa4dd5ff0f1a4b3bfd82252bcdba80df6",
+      "sha256": "816dfa705d47be713f45a32a8128d9f5074bdc7ba4b76f9329739413fbedef9d",
       "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Normalizes tool call and result pairing in native Chat for direct DeepSeek routes including aliases, and for mapped DeepSeek models on recognized OpenCode routes. Responses-shaped input keeps the existing conversion. Passes the inbound protocol to the shared sender for native Chat reasoning checks."
     },
     {

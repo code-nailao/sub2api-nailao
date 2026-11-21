@@ -30,14 +30,6 @@ type deepSeekToolHistoryCall struct {
 // normalizeDeepSeekChatToolPairing repairs tool message adjacency using only
 // the top-level messages array. Each retained message stays byte-for-byte as
 // supplied, including arguments, content and reasoning_content.
-func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte, error) {
-	top, err := scanDeepSeekChatEnvelope(ctx, body)
-	if err != nil {
-		return nil, err
-	}
-	return repairDeepSeekChatToolPairing(ctx, body, top)
-}
-
 // normalizeDeepSeekChatToolPairingForRequest prefers the fields the HTTP
 // ingress already located, so an unchanged preread body is not walked again
 // on its way out. A rewritten body has no index and is scanned here.
