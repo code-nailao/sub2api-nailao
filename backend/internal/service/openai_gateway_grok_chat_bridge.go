@@ -613,6 +613,10 @@ func (s *OpenAIGatewayService) forwardGrokChatCompletionsViaResponses(
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if err := stopHostedToolTimeout(c, resp.StatusCode, responsesBody, APIProtocolChatCompletions); err != nil {
+		return nil, err
+	}
+
 	if resp.StatusCode >= http.StatusBadRequest {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
 		if upstreamMsg == "" {

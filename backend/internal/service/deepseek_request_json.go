@@ -6,8 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"slices"
 	"strings"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requestmodel"
 )
 
 const (
@@ -156,6 +159,29 @@ func deepSeekChatFieldName(raw []byte) string {
 		return ""
 	}
 	return name
+}
+
+// The HTTP ingress has already located the fields for an unchanged preread
+// request. An internally constructed or rewritten body has no matching index.
+func deepSeekChatEnvelopeForRequest(ctx context.Context, req *http.Request, body []byte) (deepSeekChatEnvelope, error) {
+	if fields := requestmodel.ChatFieldsForBody(req, body); fields != nil {
+		return deepSeekChatEnvelope{
+			tools: indexedDeepSeekChatField(fields.Tools), choice: indexedDeepSeekChatField(fields.ToolChoice),
+			messages: indexedDeepSeekChatField(fields.Messages), input: indexedDeepSeekChatField(fields.Input),
+			end: fields.Close, fields: fields.Count,
+		}, ctx.Err()
+	}
+	return scanDeepSeekChatEnvelope(ctx, body)
+}
+
+func indexedDeepSeekChatField(field requestmodel.ChatBodyField) *deepSeekChatField {
+	if field.ValueStart == 0 {
+		return nil
+	}
+	return &deepSeekChatField{
+		value: deepSeekChatSpan{field.ValueStart, field.ValueEnd}, keyStart: field.KeyStart,
+		comma: field.PrevComma, nextComma: field.NextComma, index: field.Index, nonemptyArray: field.NonemptyArray,
+	}
 }
 
 // Scan the envelope once. Untracked fields remain in the original byte ranges

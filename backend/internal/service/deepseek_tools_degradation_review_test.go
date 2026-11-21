@@ -62,6 +62,25 @@ func TestDeepSeekReviewHTTPFallbackBoundaries(t *testing.T) {
 	}
 }
 
+func TestDeepSeekHostedRequestTimeoutDoesNotSignalAccountFailover(t *testing.T) {
+	for _, protocol := range []string{"chat", "responses", "messages"} {
+		t.Run(protocol, func(t *testing.T) {
+			calls := 0
+			result, _, _, err := deepSeekHostedProtocolFixture(t, protocol, map[string]any{}, func(*http.Request) (*http.Response, error) {
+				calls++
+				response := deepSeekFixtureResponse(`{"error":{"message":"fixture timeout"}}`)
+				response.StatusCode = http.StatusRequestTimeout
+				return response, nil
+			})
+			require.Error(t, err)
+			var failover *UpstreamFailoverError
+			require.NotErrorAs(t, err, &failover)
+			require.Equal(t, 1, calls)
+			require.Nil(t, result, "there is no confirmed work to settle")
+		})
+	}
+}
+
 func TestDeepSeekReviewFailedBatchStopsRemainingServerCalls(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprint(stream), func(t *testing.T) {

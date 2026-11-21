@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
@@ -15,6 +16,8 @@ import (
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 )
+
+const scopedAdminRefreshTransactionTimeout = 60 * time.Second
 
 // ScopedAdminAccounts 只提供受限管理密钥需要的窄接口。
 type ScopedAdminAccounts interface {
@@ -211,7 +214,21 @@ func (s *adminServiceImpl) ScopedAdminWrite(ctx context.Context, id int64, actio
 		}
 		return s.scopedAdminCreateTransaction(ctx, &CreateAccountInput{ProxyID: input.ProxyID, ProxyMode: proxyMode, Name: input.Name, Notes: input.Notes, Platform: input.Platform, Type: input.Type, Credentials: input.Credentials, Extra: input.Extra, RateMultiplier: input.RateMultiplier, GroupIDs: input.GroupIDs, Concurrency: input.Concurrency, Priority: input.Priority, LoadFactor: input.LoadFactor, ExpiresAt: input.ExpiresAt, AutoPauseOnExpired: input.AutoPause, SkipDefaultGroupBind: true})
 	}
-	result, err := s.scopedAdminTransaction(ctx, id, action == "accounts.delete", func(txctx context.Context) (*Account, error) {
+	detachedRefresh := action == "accounts.refresh" && run != nil
+	scopedOpenAIRefresh := false
+	if detachedRefresh {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// Select the refresh path. Its account and scope are checked again
+		// under the same locks as other scoped account writes.
+		account, err := s.accountRepo.GetByID(ctx, id)
+		if err != nil || account == nil {
+			return nil, infraerrors.NotFound("SCOPED_ACCOUNT_NOT_FOUND", "账户不存在")
+		}
+		scopedOpenAIRefresh = account.Platform == PlatformOpenAI && account.Type == AccountTypeOAuth
+	}
+	apply := func(txctx context.Context) (*Account, error) {
 		a, e := s.accountRepo.GetByID(txctx, id)
 		if e != nil {
 			return nil, infraerrors.NotFound("SCOPED_ACCOUNT_NOT_FOUND", "账户不存在")
@@ -251,6 +268,15 @@ func (s *adminServiceImpl) ScopedAdminWrite(ctx context.Context, id int64, actio
 		}
 
 		if run != nil {
+			if detachedRefresh {
+				// Honor cancellation while waiting for the locks, before the exchange.
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if scopedOpenAIRefresh != (a.Platform == PlatformOpenAI && a.Type == AccountTypeOAuth) {
+					return nil, infraerrors.Conflict("OAUTH_REFRESH_ACCOUNT_CHANGED", "The account changed before it could be refreshed")
+				}
+			}
 			return run(txctx, a)
 		}
 		if action == "accounts.delete" {
@@ -312,8 +338,17 @@ func (s *adminServiceImpl) ScopedAdminWrite(ctx context.Context, id int64, actio
 			return s.SetAccountSchedulable(txctx, id, *input.Schedulable)
 		}
 		return updated, nil
-	})
-	return result, err
+	}
+	if scopedOpenAIRefresh {
+		return s.refreshScopedOpenAIAccount(ctx, id, apply)
+	}
+	transactionCtx := ctx
+	if detachedRefresh {
+		var cancel context.CancelFunc
+		transactionCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), scopedAdminRefreshTransactionTimeout)
+		defer cancel()
+	}
+	return s.scopedAdminTransaction(transactionCtx, id, action == "accounts.delete", apply)
 }
 
 // scopedAdminTransaction 锁住账户行，分组更改和外部操作均须在重新验权之后执行。

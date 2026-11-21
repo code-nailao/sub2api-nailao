@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,6 +75,215 @@ func TestManager_SearchWithBestProvider_UsesFirstAvailable(t *testing.T) {
 	require.Equal(t, "brave", providerName)
 	require.Len(t, resp.Results, 1)
 	require.Equal(t, "from brave", resp.Results[0].Snippet)
+}
+
+func TestManagerTestSearchStopsAfterUnknownOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		sent   bool
+	}{
+		{name: "408", status: http.StatusRequestTimeout, sent: true},
+		{name: "disconnected-after-write", sent: true},
+		{name: "confirmed-preconnect-failure"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := NewManager([]ProviderConfig{{Type: ProviderTypeExa, APIKey: "fixture-first"}, {Type: ProviderTypeTavily, APIKey: "fixture-backup"}}, nil)
+			calls := 0
+			manager.clientCache[""] = &http.Client{Transport: exaRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if calls == 1 {
+					trace := httptrace.ContextClientTrace(req.Context())
+					trace.GetConn(req.URL.Host)
+					if tc.sent {
+						trace.WroteRequest(httptrace.WroteRequestInfo{})
+					}
+					if tc.status == 0 {
+						return nil, io.ErrUnexpectedEOF
+					}
+					return &http.Response{StatusCode: tc.status, Header: make(http.Header), Body: http.NoBody}, nil
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"results":[]}`))}, nil
+			})}
+
+			result, provider, err := manager.TestSearch(t.Context(), SearchRequest{Query: "fixture"})
+
+			if tc.sent {
+				require.Equal(t, 1, calls, "admin search must not reach the backup after an ambiguous submission")
+				require.ErrorIs(t, err, ErrSearchOutcomeUnknown)
+				require.Nil(t, result)
+				require.Empty(t, provider)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, 2, calls)
+				require.Equal(t, ProviderTypeTavily, provider)
+			}
+		})
+	}
+}
+
+func TestManagerSearchFallsBackAfterHTTP401(t *testing.T) {
+	for _, first := range []string{ProviderTypeBrave, ProviderTypeTavily, ProviderTypeExa} {
+		backup := ProviderTypeTavily
+		if first == backup {
+			backup = ProviderTypeExa
+		}
+		for _, entry := range []struct {
+			name   string
+			search func(*Manager, context.Context, SearchRequest) (*SearchResponse, string, error)
+		}{
+			{"normal", (*Manager).SearchWithBestProvider},
+			{"admin", (*Manager).TestSearch},
+		} {
+			t.Run(first+"/"+entry.name, func(t *testing.T) {
+				manager := NewManager([]ProviderConfig{
+					{Type: first, APIKey: "fixture-first"}, {Type: backup, APIKey: "fixture-backup"},
+				}, nil)
+				var hosts []string
+				manager.clientCache[""] = &http.Client{Transport: exaRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					hosts = append(hosts, req.URL.Hostname())
+					if len(hosts) == 1 {
+						trace := httptrace.ContextClientTrace(req.Context())
+						trace.WroteRequest(httptrace.WroteRequestInfo{})
+						return &http.Response{StatusCode: http.StatusUnauthorized, Header: make(http.Header),
+							Body: io.NopCloser(strings.NewReader(`{"message":"Invalid API key"}`))}, nil
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+						Body: io.NopCloser(strings.NewReader(`{"results":[{"title":"Backup result","url":"https://fixture.example/result"}]}`))}, nil
+				})}
+
+				result, provider, err := entry.search(manager, t.Context(), SearchRequest{Query: "fixture"})
+
+				require.NoError(t, err)
+				require.Equal(t, backup, provider)
+				require.Len(t, hosts, 2)
+				require.NotEqual(t, hosts[0], hosts[1], "the search must use a different provider")
+				require.Len(t, result.Results, 1)
+				require.Equal(t, "Backup result", result.Results[0].Title)
+			})
+		}
+	}
+}
+
+func TestManagerDoesNotReplaySearchAfterHTTP408(t *testing.T) {
+	for _, first := range []string{"exa", "brave", "tavily"} {
+		t.Run(first, func(t *testing.T) {
+			backup := "brave"
+			if first == backup {
+				backup = "exa"
+			}
+			manager := NewManager([]ProviderConfig{{Type: first, APIKey: "fixture-first"}, {Type: backup, APIKey: "fixture-backup"}}, nil)
+			var calls []string
+			manager.clientCache[""] = &http.Client{Transport: exaRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls = append(calls, req.URL.Hostname())
+				if len(calls) == 1 {
+					return &http.Response{StatusCode: http.StatusRequestTimeout, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"message":"fixture timeout"}`))}, nil
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+			})}
+
+			result, _, err := manager.SearchWithBestProvider(t.Context(), SearchRequest{Query: "fixture"})
+
+			require.Len(t, calls, 1, "a 408 must not submit the same paid search to a second provider")
+			require.Nil(t, result)
+			require.ErrorIs(t, err, ErrSearchOutcomeUnknown)
+			require.ErrorContains(t, err, "408")
+		})
+	}
+}
+
+func TestManagerSearchStopsAfterUnknownOutcome(t *testing.T) {
+	cases := []struct {
+		name       string
+		send       bool
+		status     int
+		body       string
+		writeError error
+	}{
+		{name: "confirmed-preconnect-timeout"},
+		{name: "timeout-after-write", send: true},
+		{name: "ambiguous-partial-write", send: true, writeError: io.ErrShortWrite},
+		{name: "provider-error-response", send: true, status: http.StatusServiceUnavailable, body: `{}`},
+		{name: "broken-response", send: true, status: http.StatusOK, body: `{`},
+	}
+	for _, first := range []string{"exa", "brave", "tavily"} {
+		for _, tc := range cases {
+			t.Run(first+"/"+tc.name, func(t *testing.T) {
+				backup := "tavily"
+				if first == backup {
+					backup = "exa"
+				}
+				manager := NewManager([]ProviderConfig{{Type: first, APIKey: "fixture-first"}, {Type: backup, APIKey: "fixture-backup"}}, nil)
+				calls := 0
+				manager.clientCache[""] = &http.Client{Transport: exaRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					calls++
+					trace := httptrace.ContextClientTrace(req.Context())
+					if trace != nil && trace.GetConn != nil {
+						trace.GetConn(req.URL.Host)
+					}
+					if calls == 1 {
+						if tc.send && trace != nil && trace.WroteRequest != nil {
+							trace.WroteRequest(httptrace.WroteRequestInfo{Err: tc.writeError})
+						}
+						if tc.status == 0 {
+							if tc.writeError != nil {
+								return nil, tc.writeError
+							}
+							return nil, context.DeadlineExceeded
+						}
+						return &http.Response{StatusCode: tc.status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+				})}
+
+				result, provider, err := manager.SearchWithBestProvider(t.Context(), SearchRequest{Query: "fixture"})
+
+				if tc.send {
+					require.Equal(t, 1, calls, "a possibly sent search must never reach the backup provider")
+					require.Nil(t, result)
+					require.ErrorIs(t, err, ErrSearchOutcomeUnknown)
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, 2, calls)
+					require.Equal(t, backup, provider)
+				}
+			})
+		}
+	}
+}
+
+func TestSearchTransportDoesNotReplayWrittenGET(t *testing.T) {
+	var received atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if received.Add(1) == 2 {
+			// The request reached the provider, but the connection fails
+			// before it returns the response headers.
+			conn, _, err := http.NewResponseController(w).Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+	client, err := newHTTPClient("")
+	require.NoError(t, err)
+	defer client.CloseIdleConnections()
+	search := func() error {
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, nil)
+		require.NoError(t, err)
+		var response map[string]any
+		return searchJSON(client, request, "fixture", &response)
+	}
+	require.NoError(t, search(), "warm a keep-alive connection if permitted")
+
+	err = search()
+
+	require.Equal(t, int32(2), received.Load(), "the HTTP transport must not reissue a search already received by the server")
+	require.ErrorIs(t, err, ErrSearchOutcomeUnknown)
 }
 
 func TestManager_SearchWithBestProvider_NilRedis(t *testing.T) {
