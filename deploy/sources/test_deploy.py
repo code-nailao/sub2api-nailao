@@ -1486,6 +1486,100 @@ class DeployTest(unittest.TestCase):
         self.assert_live_release(LEGACY)
         self.assertIsNone(self.state()["in_progress"])
 
+    def test_main_can_switch_with_stopped_active_standby_on_adopted_route(self):
+        self.load_fixture_route(LEGACY, proof=False)
+        standby = LEGACY["containers"]["standby"]
+        self.ops.run(["docker", "kill", "--signal=TERM", standby], mutate=True)
+        self.assert_live_release(LEGACY)
+        self.deploy()
+        self.assert_live_release(self.state()["current"])
+        self.assertEqual("a", self.state()["current"]["slot"])
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_first_rollback_can_switch_with_stopped_active_standby_on_adopted_route(self):
+        # This adopted topology does not have a shared alias to move.
+        self.cfg.serving_alias = ""
+        self.deploy()
+        current = self.state()["current"]
+        self.load_fixture_route(current, proof=False)
+        standby = current["containers"]["standby"]
+        self.ops.run(["docker", "kill", "--signal=TERM", standby], mutate=True)
+        self.assert_live_release(current)
+        deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assert_live_release(LEGACY)
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_abort_clears_paused_candidates_while_current_standby_is_stopped(self):
+        self.load_fixture_route(LEGACY, proof=False)
+        held = self.hold()
+        disk = self.ops.files[self.cfg.upstream_file]
+        standby = LEGACY["containers"]["standby"]
+        self.ops.run(["docker", "kill", "--signal=TERM", standby], mutate=True)
+        deploy.Deployer(self.cfg, self.ops).abort()
+        self.assert_live_release(LEGACY)
+        self.assertEqual(disk, self.ops.files[self.cfg.upstream_file])
+        self.assertFalse(self.ops.inspect(standby)["State"]["Running"])
+        for name in held["target"]["containers"].values():
+            self.assertIsNone(self.ops.inspect(name))
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_abort_after_resume_background_second_network_fails(self):
+        held = self.hold()
+        target = held["target"]
+        name = target["containers"]["background"]
+        network = self.cfg.networks[1]
+        runner = deploy.Deployer(self.cfg, self.ops)
+        run = self.ops.run
+
+        def fail_second_network(args, **kw):
+            if args[:3] == ["docker", "network", "connect"] and args[-2:] == [network, name]:
+                raise deploy.DeployError("fixture background network unavailable")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", fail_second_network):
+            with self.assertRaisesRegex(deploy.DeployError, "background network unavailable"):
+                runner.resume()
+        self.assert_live_release(LEGACY)
+        self.assert_release_failure("failed", "background network unavailable")
+        info = self.ops.inspect(name)
+        self.assertFalse(info["State"]["Running"])
+        saved_id = self.state()["in_progress"].get("held_background_id")
+        runner.abort()
+        self.assertEqual(info["Id"], saved_id)
+        self.assertIn(["docker", "rm", info["Id"]], self.ops.commands)
+        for name in target["containers"].values():
+            self.assertIsNone(self.ops.inspect(name))
+        self.assert_live_release(LEGACY)
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_abort_recovers_resume_background_when_create_reply_is_lost(self):
+        held = self.hold()
+        name = held["target"]["containers"]["background"]
+        runner = deploy.Deployer(self.cfg, self.ops)
+        run = self.ops.run
+
+        class ProcessKilled(BaseException):
+            pass
+
+        def lose_create_reply(args, **kw):
+            result = run(args, **kw)
+            if args[:2] == ["docker", "create"] and args[args.index("--name") + 1] == name:
+                raise ProcessKilled
+            return result
+
+        with mock.patch.object(self.ops, "run", lose_create_reply):
+            with self.assertRaises(ProcessKilled):
+                runner.resume()
+        info = self.ops.inspect(name)
+        self.assertFalse(info["State"]["Running"])
+        self.assertNotIn("held_background_id", self.state()["in_progress"])
+        runner.abort()
+        self.assertIn(["docker", "rm", info["Id"]], self.ops.commands)
+        self.assertIsNone(self.ops.inspect(name))
+        self.assert_live_release(LEGACY)
+        self.assertIsNone(self.state()["in_progress"])
+
     def test_abort_can_recover_resume_abandoned_at_background_handoff(self):
         held = self.hold()
         runner = deploy.Deployer(self.cfg, self.ops)
