@@ -500,6 +500,9 @@ class Deployer:
         status, body = self.ops.http_json(f"http://127.0.0.1:{port}/internal/sources/runtime", token=token, timeout=timeout)
         return body if status == 200 and isinstance(body, dict) else None
 
+    def health(self, port: int) -> bool:
+        return self.ops.http_json(f"http://127.0.0.1:{port}/health")[0] == 200
+
     def recovery_timeout(self, deadline: float | None, maximum: float) -> float:
         if deadline is None:
             return maximum
@@ -509,7 +512,8 @@ class Deployer:
         return min(maximum, remaining)
 
     def wait_ready(self, port: int, token: str, role: str, timeout: int,
-                   container: str | None = None, poll: float = 2, *, deadline: float | None = None) -> dict[str, Any]:
+                   container: str | None = None, poll: float = 2, *, deadline: float | None = None,
+                   check_health: bool = False) -> dict[str, Any]:
         """Wait for a role to report ready. During recovery, share its deadline."""
         ready_until = self.ops.monotonic() + timeout
         if deadline is not None:
@@ -530,7 +534,10 @@ class Deployer:
                 last = self.runtime(port, token)
             if last and last.get("ready") and last.get("role") == role:
                 if role != "background" or last.get("owns_background"):
-                    return last
+                    # Routing that a person depends on must not move before
+                    # the new owner answers its health probe too.
+                    if not check_health or self.health(port):
+                        return last
             delay = poll if deadline is None else min(poll, max(0, ready_until - self.ops.monotonic()))
             self.ops.sleep(delay)
         limit = f"within {timeout}s" if deadline is None else "before the recovery deadline"
@@ -753,9 +760,12 @@ class Deployer:
             raise DeployError("nginx -t rejected the upstream file; previous file restored, routing unchanged")
         self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
 
-    def switch_to(self, view: dict[str, Any]) -> None:
+    def switch_to(self, view: dict[str, Any], *, admin: dict[str, Any] | None = None) -> None:
+        """Point both upstreams at view, or keep admin on another slot's
+        background while serving already moves."""
         ports = view["ports"]
-        self.install_upstreams(render_upstreams(ports["serving"], ports["standby"], ports["background"]))
+        admin_port = (view if admin is None else admin)["ports"]["background"]
+        self.install_upstreams(render_upstreams(ports["serving"], ports["standby"], admin_port))
 
     # steps ------------------------------------------------------------------
     def preflight(self, state: dict[str, Any], target: Target, reuse: bool,
@@ -811,6 +821,15 @@ class Deployer:
             lambda timeout: self.runtime(view["ports"]["background"], self.token_for(view, "background"), timeout=timeout),
             deadline,
         )
+
+    def background_answering(self, view: dict[str, Any], *, allow_draining: bool = False) -> bool:
+        """Whether the slot's background owns the lock and answers admin requests.
+        A read-only owner that is still draining can answer reads until it exits."""
+        runtime = self.owner_runtime(view) or {}
+        responding = runtime.get("ready") or (allow_draining and runtime.get("draining")
+                                              and runtime.get("admin_during_drain") == "read-only")
+        return bool(runtime.get("role") == "background" and runtime.get("owns_background") and responding
+                    and self.health(view["ports"]["background"]))
 
     def runtime_request_before(self, request: Callable[[float], dict[str, Any] | None],
                                deadline: float | None) -> dict[str, Any] | None:
@@ -873,7 +892,7 @@ class Deployer:
         return restart
 
     def start_background(self, view: dict[str, Any], *, restart: str = "unless-stopped",
-                         deadline: float | None = None) -> None:
+                         deadline: float | None = None, check_health: bool = False) -> None:
         name = view["containers"]["background"]
         # Once ownership is vacant, Ctrl-C must not stop the Docker clients
         # that put an owner back in service. They inherit the ignored signal.
@@ -884,7 +903,7 @@ class Deployer:
             if not self.ops.dry_run:
                 self.wait_ready(view["ports"]["background"], self.token_for(view, "background"),
                                 "background", self.cfg.background_ready_timeout, container=name,
-                                poll=HANDOFF_POLL_SECONDS, deadline=deadline)
+                                poll=HANDOFF_POLL_SECONDS, deadline=deadline, check_health=check_health)
 
     def restore_background(self, current: dict[str, Any], failed: DeployError, *, restart: str,
                            recovery: BackgroundRecovery | None = None) -> NoReturn:
@@ -901,13 +920,14 @@ class Deployer:
                                  cleanup_deadline=recovery.deadline if recovery else None) from failed
 
     def handoff_background(self, current: dict[str, Any], target: Target, create: bool,
-                           back: bool = False) -> float | None:
+                           back: bool = False, *, check_health: bool = False) -> float | None:
         """Move background ownership from current to target. The old owner gets
         one SIGTERM and finishes in-flight work; the kernel lock passes when it
         exits. If the new owner does not become ready, the old one restarts.
         An old owner that reports admin_during_drain keeps answering admin
         reads until it closes its listener, just before it exits. back: the
         handoff returns ownership to target after traffic already moved there.
+        check_health also requires /health before the new owner counts as ready.
         Return the active recovery deadline, if any, for subsequent cleanup."""
         old = current["containers"]["background"]
         new = target.containers["background"]
@@ -928,7 +948,8 @@ class Deployer:
             else:
                 self.log(f"   {old} is absent. Starting the prepared background {new}.")
             try:
-                self.start_background(view, deadline=recovery.work_until if recovery else None)
+                self.start_background(view, deadline=recovery.work_until if recovery else None,
+                                      check_health=check_health)
             except (DeployError, OSError, subprocess.SubprocessError) as err:
                 if recovery is not None:
                     raise FallbackFailed(f"could not make {new} ready during background recovery: {err}") from err
@@ -1145,35 +1166,214 @@ class Deployer:
                 if errors >= self.cfg.guard_connect_errors:
                     reason = f"{errors} Nginx connect failures to the new serving ports"
             if reason:
-                self.log(f"   guard failed: {reason}; switching traffic back to slot {previous['slot']}")
-                try:
-                    self.switch_to(previous)
-                except DeployError as err:
-                    raise FallbackFailed(f"guard failed ({reason}) and switching back failed ({err})") from err
-                self.log("   handing the background back to the previous release")
-                recovery_deadline = self.hand_back(target, previous)
-                restored = f"guard failed ({reason}); the previous release serves traffic and owns the background again"
-                protect = finish_handoff_cleanup(ignore=True) if recovery_deadline is not None else contextlib.nullcontext()
-                with protect:
-                    try:
-                        self.retire_serving(target.view(), deadline=recovery_deadline, require_known_state=True)
-                    except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
-                        raise ServingCleanupFailed(f"{restored}. Incomplete serving cleanup: {err}. "
-                                                   "Check the target slot before clearing in_progress.") from err
-                raise DeployError(f"{restored}; the new serving containers were stopped and kept for inspection")
+                raise self.fail_back_to_previous(target, previous, reason)
+
             if self.ops.monotonic() >= deadline:
                 return
             self.ops.sleep(self.cfg.guard_interval)
 
-    def hand_back(self, target: Target, previous: dict[str, Any]) -> float | None:
+    def fail_back_to_previous(self, target: Target, previous: dict[str, Any], reason: str) -> DeployError:
+        """Switch serving back, hand the background over and retire the target.
+        Returns the error the caller reports; a settled admin entry raises."""
+        self.log(f"   guard failed: {reason}; switching traffic back to slot {previous['slot']}")
+        try:
+            # Serving goes back first. Admin stays on the background
+            # that still answers (the candidate's while it drains)
+            # until the previous background is ready to take over.
+            self.switch_to(previous, admin=target.view())
+        except BaseException as err:
+            failure = FallbackFailed(
+                f"guard failed ({reason}) and switching serving back failed ({err}); admin still "
+                f"points at slot {target.slot}. The admin entry needs a person to check live routing")
+            self.record_guard_failure(target, failure)
+            raise failure from err
+        self.log(f"   handing the background back to the previous release; admin stays on slot "
+                 f"{target.slot} until slot {previous['slot']}'s background answers")
+        try:
+            recovery_deadline = self.hand_back(target, previous, check_health=True)
+            # The owner can exit or lose the lock between readiness and
+            # the reload. Only a confirmed probe may receive admin.
+            ready, why = self.admin_owner_status(previous)
+            if not ready:
+                raise DeployError(f"the previous background is not the admin owner ({why})")
+            self.switch_to(previous)
+        except BaseException as err:
+            # An interrupt belongs here too: whatever ended the step,
+            # the failure is recorded and admin keeps an owner.
+            raise self.rollback_admin_owner(target, previous, reason, err) from err
+        restored = f"guard failed ({reason}); the previous release serves traffic and owns the background again"
+        protect = finish_handoff_cleanup(ignore=True) if recovery_deadline is not None else contextlib.nullcontext()
+        with protect:
+            try:
+                self.retire_serving(target.view(), deadline=recovery_deadline, require_known_state=True)
+            except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
+                raise ServingCleanupFailed(f"{restored}. Incomplete serving cleanup: {err}. "
+                                           "Check the target slot before clearing in_progress.") from err
+        return DeployError(f"{restored}; the new serving containers were stopped and kept for inspection")
+
+    def hand_back(self, target: Target, previous: dict[str, Any], *, check_health: bool = False) -> float | None:
         """Return background ownership to the release that still serves traffic."""
         try:
             return self.handoff_background(target.view(), Target.from_view(previous, self.cfg.runtime_token_file),
-                                           create=False, back=True)
+                                           create=False, back=True, check_health=check_health)
         except FallbackFailed:
             raise
         except DeployError as err:
             raise FallbackFailed(f"handing the background back failed: {err}") from err
+
+    def background_running(self, view: dict[str, Any]) -> bool:
+        """Whether the slot's background container exists and is not stopped."""
+        info = self.ops.inspect(view["containers"]["background"]) or {}
+        state = info.get("State") or {}
+        return bool(state.get("Running") or state.get("Restarting"))
+
+    def admin_owner_status(self, view: dict[str, Any]) -> tuple[bool, str]:
+        """Probe only: is this background the admin owner right now, and if
+        not, why. The answer comes from the runtime lock and its health, never
+        from Docker visibility: a container whose state cannot be read may
+        still be the one answering admin."""
+        name = view["containers"]["background"]
+        try:
+            runtime = self.owner_runtime(view) or {}
+        except Exception as err:  # noqa: BLE001 - a probe failure disqualifies the candidate
+            return False, f"{name}: runtime probe failed ({err}); {self.docker_state_hint(view)}"
+        if runtime.get("role") != "background" or not runtime.get("owns_background"):
+            return False, f"{name}: does not hold the background lock; {self.docker_state_hint(view)}"
+        if not (runtime.get("ready") or (runtime.get("draining")
+                                         and runtime.get("admin_during_drain") == "read-only")):
+            return False, f"{name}: not ready for admin reads"
+        try:
+            if not self.health(view["ports"]["background"]):
+                return False, f"{name}: /health did not return 200"
+        except Exception as err:  # noqa: BLE001
+            return False, f"{name}: health probe failed ({err})"
+        return True, f"{name}: holds the background lock and answers"
+
+    def docker_state_hint(self, view: dict[str, Any]) -> str:
+        """Wording for a rejection reason only. Docker's view never decides
+        ownership: an unreadable state is reported, not treated as absence."""
+        name = view["containers"]["background"]
+        try:
+            info = self.ops.inspect(name)
+        except Exception as err:  # noqa: BLE001
+            return f"docker state unknown ({err})"
+        if not info:
+            return "container is missing"
+        if not (info.get("State") or {}).get("Running"):
+            return "container is stopped"
+        return "container is running"
+
+    def answering_admin_owner(self, views: dict[str, dict[str, Any]]) -> tuple[dict[str, Any] | None, dict[str, str]]:
+        """Return the first background the probes confirm as admin owner,
+        with why each candidate was rejected."""
+        detail: dict[str, str] = {}
+        for side, view in views.items():
+            owner, why = self.admin_owner_status(view)
+            detail[side] = why
+            if owner:
+                return view, detail
+        return None, detail
+
+    def revive_background(self, view: dict[str, Any]) -> bool:
+        """Restart a background that merely exited and wait for the lock and
+        health, so the admin upstream keeps an owner that answers."""
+        name = view["containers"]["background"]
+        try:
+            if self.background_running(view):
+                return False
+            self.log(f"   {name} is stopped; restarting it so admin keeps an owner")
+            self.start_background(view, check_health=True)
+            return self.background_answering(view)
+        except (Exception, KeyboardInterrupt) as err:  # noqa: BLE001 - the caller probes again
+            self.log(f"   {name} did not come back: {err}")
+            return False
+
+    def record_guard_failure(self, target: Target, failure: FallbackFailed) -> None:
+        """Persist step=guard, the failure and its reason before leaving."""
+        try:
+            state = load_state(self.cfg)
+            progress = state.get("in_progress")
+            if not progress:
+                progress = state["in_progress"] = {"target": target.view(), "since": now()}
+            progress["step"] = "guard"
+            self._record_unrestored(state, failure)
+        except (Exception, KeyboardInterrupt) as record_err:  # noqa: BLE001 - never mask the failure
+            self.log(f"   WARNING: could not record the incomplete recovery: {record_err}")
+
+    def rollback_admin_owner(self, target: Target, previous: dict[str, Any], reason: str,
+                             err: BaseException) -> FallbackFailed:
+        """Settle the admin entry from probes only, and always record why the
+        recovery is incomplete, whatever the cleanup itself raises."""
+        try:
+            failure = self.settle_admin_owner(target, previous, reason, err)
+        except (Exception, KeyboardInterrupt) as cleanup_err:  # noqa: BLE001 - record before leaving
+            failure = FallbackFailed(
+                f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not finish "
+                f"({err}); settling the admin entry failed too ({cleanup_err}). The admin entry is unavailable "
+                "and needs a person to check live routing and restore a background")
+        self.record_guard_failure(target, failure)
+        self._guard_settled = True
+        return failure
+
+    def current_admin_port(self) -> str | None:
+        """Where the admin upstream points right now, read from the rendered
+        file rather than assumed from which step ran last."""
+        try:
+            text = self.ops.read_text(self.cfg.upstream_file)
+        except OSError:
+            return None
+        match = re.search(r"upstream sources_main_admin \{.*?server 127\.0\.0\.1:(\d+)", text, re.S)
+        return match.group(1) if match else None
+
+    def settle_admin_owner(self, target: Target, previous: dict[str, Any], reason: str,
+                           err: BaseException) -> FallbackFailed:
+        """Point admin at a probed owner, or leave the current pointer alone
+        when nothing answers and say which background a person must restore."""
+        views = {"previous": previous, "candidate": target.view()}
+        owner, detail = self.answering_admin_owner(views)
+        restarted = False
+        if owner is None:
+            self.log(f"   no background answers admin; restarting slot {views['candidate']['slot']}'s background")
+            try:
+                self.revive_background(views["candidate"])
+            except (Exception, KeyboardInterrupt) as revive_err:  # noqa: BLE001 - probe again anyway
+                detail["candidate"] += f"; restart failed ({revive_err})"
+            owner, detail = self.answering_admin_owner(views)  # never assume the restart made it the owner
+            restarted = owner is not None
+        admin_port = self.current_admin_port()
+        pointed = next((side for side, view in views.items()
+                        if admin_port is not None and str(view["ports"]["background"]) == admin_port), None)
+        if owner is None:
+            summary = "; ".join(detail.values())
+            where = (f"admin still points at slot {views[pointed]['slot']}" if pointed
+                     else f"admin points at {admin_port or 'an unknown port'}")
+            return FallbackFailed(
+                f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not finish "
+                f"({err}). No background answers admin now ({summary}); {where}, so the admin entry is "
+                f"unavailable and needs a person to restore a background (slot {previous['slot']} for the "
+                "rollback) and point admin routing at it")
+        if not pointed or pointed != ("previous" if owner is views["previous"] else "candidate"):
+            try:
+                if owner is views["previous"]:
+                    self.switch_to(views["previous"])
+                else:
+                    # Serving already serves from the previous slot; only admin moves.
+                    self.switch_to(views["previous"], admin=owner)
+            except (Exception, KeyboardInterrupt) as route_err:  # noqa: BLE001
+                return FallbackFailed(
+                    f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not "
+                    f"finish ({err}). {owner['slot']}'s background answers, but moving admin routing there "
+                    f"failed ({route_err}); the admin entry is unavailable and needs a person to check where "
+                    "it points")
+            moved = f"admin was moved to slot {owner['slot']}, whose background "
+        elif owner is views["previous"]:
+            moved = f"serving and admin serve from slot {previous['slot']}, whose background "
+        else:
+            moved = f"serving serves from slot {previous['slot']} but admin still uses slot {owner['slot']}, whose background "
+        state = "was restarted and answers" if restarted and owner is not views["previous"] else "answers"
+        return FallbackFailed(
+            f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not finish "
+            f"({err}). {moved}{state}. Verify the background, its lock and live routing before clearing in_progress")
 
     def container_memory(self, info: dict[str, Any]) -> int | None:
         cid = info.get("Id")
