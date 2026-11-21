@@ -20,12 +20,15 @@ import (
 
 const deepSeekInternalTurn = "sources.deepseek.internal_turn"
 
+var errDeepSeekHostedBodyLimit = errors.New("DeepSeek conversation exceeds request body limit")
+
 type deepSeekOwnedCall struct {
 	ID, Name, Operation string
 	Arguments           json.RawMessage
 }
 type deepSeekHostedRequest struct {
 	Body             map[string]any
+	chatHistory      json.RawMessage // original Chat messages, separate from messages appended to Body
 	Protocol         string
 	Owned            map[string]string
 	Limits           map[string]int
@@ -73,9 +76,38 @@ func deepSeekProviderTool(typ string) bool {
 	return typ == "deepseek_web_search" || typ == "deepseek_read_url"
 }
 
+// Keep native Chat history opaque. The hosted loop edits the other fields
+// and records only its new messages in the decoded body.
+func decodeDeepSeekHostedBody(body []byte, protocol string) (map[string]any, json.RawMessage, error) {
+	if protocol != "chat" {
+		var fields map[string]any
+		err := json.Unmarshal(body, &fields)
+		return fields, nil, err
+	}
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawFields); err != nil {
+		return nil, nil, err
+	}
+	fields := make(map[string]any, len(rawFields))
+	var history json.RawMessage
+	for name, raw := range rawFields {
+		if name == "messages" && len(raw) > 0 && raw[0] == '[' {
+			history = raw
+			fields[name] = []any{}
+			continue
+		}
+		var value any
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, nil, err
+		}
+		fields[name] = value
+	}
+	return fields, history, nil
+}
+
 func prepareDeepSeekHosted(body []byte, protocol string, auto bool) (*deepSeekHostedRequest, bool, error) {
-	var b map[string]any
-	if err := json.Unmarshal(body, &b); err != nil {
+	b, chatHistory, err := decodeDeepSeekHostedBody(body, protocol)
+	if err != nil {
 		return nil, false, err
 	}
 	choice := b["tool_choice"]
@@ -108,7 +140,7 @@ func prepareDeepSeekHosted(body []byte, protocol string, auto bool) (*deepSeekHo
 	if previous, _ := b["previous_response_id"].(string); previous != "" {
 		return nil, true, errors.New("DeepSeek compatibility tools require explicit conversation history instead of previous_response_id")
 	}
-	r := &deepSeekHostedRequest{Body: b, Protocol: protocol, Owned: map[string]string{}, Limits: map[string]int{}, Used: map[string]int{}}
+	r := &deepSeekHostedRequest{Body: b, chatHistory: chatHistory, Protocol: protocol, Owned: map[string]string{}, Limits: map[string]int{}, Used: map[string]int{}}
 	for _, key := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
 		if v, ok := b[key]; ok {
 			n, valid := v.(float64)
@@ -225,6 +257,59 @@ func prepareDeepSeekHosted(body []byte, protocol string, auto bool) (*deepSeekHo
 		}
 	}
 	return r, true, nil
+}
+
+// marshalModelRequest inserts the original Chat history before the messages
+// the loop appended. The forwarding path applies the Chat size limit so
+// native Chat can repair tool pairing before deciding whether to compact.
+func (r *deepSeekHostedRequest) marshalModelRequest(ctx context.Context) ([]byte, error) {
+	body, err := json.Marshal(r.Body)
+	if err != nil || r.chatHistory == nil {
+		return body, err
+	}
+	top, err := scanDeepSeekChatEnvelope(ctx, body)
+	if err != nil {
+		return nil, err
+	}
+	if top.messages == nil {
+		return nil, errors.New("hosted Chat request lost its messages field")
+	}
+	history := r.chatHistory
+	span := top.messages.value
+	// Only add a separator when both arrays contain messages.
+	join := top.messages.nonemptyArray && len(bytes.TrimSpace(history[1:len(history)-1])) != 0
+	out := make([]byte, 0, len(body)+len(history)+1)
+	out = append(out, body[:span.start]...)
+	if !top.messages.nonemptyArray {
+		out = append(out, history...)
+		return append(out, body[span.end:]...), nil
+	}
+	out = append(out, history[:len(history)-1]...)
+	if join {
+		out = append(out, ',')
+	}
+	return append(out, body[span.start+1:]...), nil
+}
+
+func (s *OpenAIGatewayService) deepSeekHostedBodyLimit() int64 {
+	if s.cfg != nil && s.cfg.Gateway.MaxBodySize > 0 {
+		return s.cfg.Gateway.MaxBodySize
+	}
+	return 32 << 20
+}
+
+func fitDeepSeekHostedChatBody(body []byte, limit int64) ([]byte, error) {
+	if int64(len(body)) <= limit {
+		return body, nil
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, body); err != nil {
+		return nil, err
+	}
+	if int64(compact.Len()) > limit {
+		return nil, errDeepSeekHostedBodyLimit
+	}
+	return compact.Bytes(), nil
 }
 
 // deepSeekCapture buffers non-streaming turns or delegates SSE to the hosted
@@ -633,16 +718,12 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 				return result, nil, true, err
 			}
 		}
-		current, marshalErr := json.Marshal(req.Body)
+		current, marshalErr := req.marshalModelRequest(loopCtx)
 		if marshalErr != nil {
 			return result, nil, true, marshalErr
 		}
-		limit := int64(32 << 20)
-		if s.cfg != nil && s.cfg.Gateway.MaxBodySize > 0 {
-			limit = s.cfg.Gateway.MaxBodySize
-		}
-		if int64(len(current)) > limit {
-			return result, nil, true, errors.New("DeepSeek conversation exceeds request body limit")
+		if protocol != "chat" && int64(len(current)) > s.deepSeekHostedBodyLimit() {
+			return result, nil, true, errDeepSeekHostedBodyLimit
 		}
 		turn, capture, turnErr := s.deepSeekModelTurn(loopCtx, c, account, current, protocol, defaultModel)
 		if turn != nil {
@@ -663,6 +744,9 @@ func (s *OpenAIGatewayService) tryForwardDeepSeekTools(ctx context.Context, c *g
 			}
 		}
 		if turnErr != nil {
+			if errors.Is(turnErr, errDeepSeekHostedBodyLimit) {
+				return result, nil, true, turnErr
+			}
 			// One fresh attempt without our optional tools is allowed only for a
 			// definitive HTTP rejection before any model/tool work or public output.
 			if !req.ToolsUnavailable && turn == nil && len(result.DeepSeekModelTurns) == 0 &&

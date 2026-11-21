@@ -18,12 +18,13 @@ const customButton = document.querySelector("#canvas-custom");
 const manageButton = document.querySelector("#canvas-manage");
 const ownKeyButton = document.querySelector("#canvas-own-key");
 let studioURL, configuration, hostConfig;
-let ack = false, generation = 0, locked = false, connecting = false, bootstrapping = false;
+let ack = false, generation = 0, locked = false, connecting = false, bootstrapping = false, resaveHint = false, resaveClearRequestId = null;
 let sendTimer, checkTimer, startupTimer;
 const granted = new Map();
 // The user's own-key connection is addressed like a group, by a reserved ID.
 let custom = { groupId: 0, enabled: false, configured: false };
 const validRequestID = (value) => typeof value === "string" && /^[\w-]{16,80}$/.test(value);
+const CUSTOM_CONNECTION_NEEDS_UPDATE = "custom_connection_needs_update";
 
 function showState(state, text) {
   document.body.dataset.state = state;
@@ -34,6 +35,9 @@ function showState(state, text) {
   statusTitle.textContent = state === "loading" ? "正在打开无限画布" : locked ? "请重新进入画布" : "画布连接需要处理";
   retry.hidden = locked;
   retry.disabled = connecting || bootstrapping;
+  // The re-save entry stays until a new configuration is acknowledged or the
+  // user handles the connection, even if the next attempt fails differently.
+  retry.textContent = resaveHint ? "打开自定义连接" : "重试连接";
   login.hidden = !locked;
   if (text) message.textContent = text;
 }
@@ -99,6 +103,10 @@ document.querySelector("#canvas-connection-menu").addEventListener("keydown", (e
 });
 async function api(path, body) {
   const result = await authorizedJSON(path, { method: body ? "POST" : "GET", body });
+  if (path === "/api/canvas/connection" && result.status === 409 && result.data?.error === CUSTOM_CONNECTION_NEEDS_UPDATE) {
+    throw Error(typeof result.data.message === "string" && result.data.message
+      ? result.data.message : "密钥所在的分组已经变化，请重新保存自定义连接。", { cause: CUSTOM_CONNECTION_NEEDS_UPDATE });
+  }
   if (!result.ok) throw Error(result.status === 401
     ? "登录已失效，请重新登录主站后打开画布。"
     : result.status === 403 ? "画布授权已撤销或过期，请在主站 API 密钥页面核对。"
@@ -152,8 +160,10 @@ window.addEventListener("message", async (event) => {
       if (current !== generation || target !== frame.contentWindow || locked) return;
       granted.set(connectionId, config);
       target.postMessage({ type: "sub2api:media-studio-config", payload: { ...config, requestId, selectActive: false } }, studioURL.origin);
-    } catch {
-      if (current === generation && target === frame.contentWindow && !locked) target.postMessage({ type: "sub2api:canvas-restore-error", connectionId, requestId }, studioURL.origin);
+    } catch (error) {
+      if (current !== generation || target !== frame.contentWindow || locked) return;
+      target.postMessage({ type: "sub2api:canvas-restore-error", connectionId, requestId }, studioURL.origin);
+      if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) { resaveHint = true; resaveClearRequestId = null; recover(error.message); }
     }
     return;
   }
@@ -164,8 +174,9 @@ window.addEventListener("message", async (event) => {
   ack = true;
   clearInterval(sendTimer);
   clearTimeout(startupTimer);
-  frame.hidden = false;
-  showState("ready");
+  if (data.payload.requestId === resaveClearRequestId) { resaveHint = false; resaveClearRequestId = null; }
+  // A stale custom connection keeps its hint instead of revealing the page.
+  if (!resaveHint) { frame.hidden = false; showState("ready"); }
   applyAppearance();
   notifyHost(true);
 });
@@ -187,6 +198,8 @@ async function connect() {
     configuration = { ...config,
       connections: [...granted.values()].flatMap((item) => item.connections),
       capabilities: [...granted.values()].flatMap((item) => item.capabilities), requestId: crypto.randomUUID() };
+    // Only this new configuration's acknowledgement clears a re-save hint.
+    resaveClearRequestId = configuration.requestId;
     ack = false;
     if (!frame.getAttribute("src")) frame.src = studioURL.href;
     else startSending(current);
@@ -197,6 +210,7 @@ async function connect() {
     ack = previousAck;
     if (previous) select.value = previous.selectedConnectionId.slice(6);
     frame.hidden = !previousAck;
+    if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) { resaveHint = true; resaveClearRequestId = null; }
     recover(error.message);
     return false;
   } finally {
@@ -209,6 +223,7 @@ async function connect() {
 }
 retry.onclick = () => {
   if (locked || connecting || bootstrapping) return;
+  if (resaveHint) { openCustomConnectionSettings(); return; }
   if (!studioURL) { void bootstrap(); return; }
   if (configuration && !ack) {
     // Resend the existing configuration, not a second authorization request.
@@ -223,7 +238,7 @@ retry.onclick = () => {
 function watchSession() {
   clearInterval(checkTimer);
   checkTimer = setInterval(() => {
-    if (!locked && document.visibilityState === "visible") void api("/api/canvas/groups").catch((error) => recover(error.message));
+    if (!locked && document.visibilityState === "visible") void api("/api/canvas/groups").catch((error) => { if (!resaveHint) recover(error.message); });
   }, 30000);
 }
 const noGroups = () => custom.enabled
@@ -270,15 +285,35 @@ async function reloadGroups(selectId) {
   }
 }
 const connectionMenu = document.querySelector("#canvas-connection-menu");
-customButton.onclick = ownKeyButton.onclick = () => {
+function openCustomConnectionSettings() {
   if (locked) return;
   connectionMenu.open = false;
   openCustomSettings({ onSaved: (configured) => {
+    // Saving or removing is the explicit handling that clears the hint.
+    resaveHint = false;
+    resaveClearRequestId = null;
+    const removedId = `group-${custom.groupId}`;
+    if (configured) {
+      // The refresh below connects to the newly saved connection.
+      showState("loading", "正在连接所选分组…");
+    } else if (configuration && ack && configuration.selectedConnectionId !== removedId) {
+      // The acknowledged page still uses another connection; render it now
+      // instead of leaving the re-save button until the list refresh.
+      frame.hidden = false;
+      showState("ready");
+      notifyHost(true);
+    } else {
+      // The page was using the removed connection: drop it and reconnect.
+      if (configuration?.selectedConnectionId === removedId) { configuration = null; ack = false; }
+      frame.hidden = true;
+      recover("自定义连接已移除，正在刷新分组…");
+    }
     // A changed or removed connection must not be resent from the earlier grant.
-    granted.delete(`group-${custom.groupId}`);
+    granted.delete(removedId);
     void reloadGroups(configured ? String(custom.groupId) : "");
   } });
-};
+}
+customButton.onclick = ownKeyButton.onclick = openCustomConnectionSettings;
 manageButton.onclick = () => {
   if (locked) return;
   connectionMenu.open = false;

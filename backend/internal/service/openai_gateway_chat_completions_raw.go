@@ -61,7 +61,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 	body []byte,
 	defaultMappedModel string,
 ) (*OpenAIForwardResult, error) {
-	return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, time.Now())
+	return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, APIProtocolChatCompletions, time.Now())
 }
 
 func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
@@ -70,6 +70,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	account *Account,
 	body []byte,
 	defaultMappedModel string,
+	inboundProtocol string,
 	startTime time.Time,
 ) (out *OpenAIForwardResult, forwardError error) {
 	observedHTTPStatus := 0
@@ -131,6 +132,13 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 		return nil, policyErr
 	}
 	upstreamBody = updatedBody
+	if inboundProtocol == APIProtocolChatCompletions && targetsDeepSeekChatModel(account, upstreamBody) {
+		pairedBody, err := normalizeDeepSeekChatToolPairing(ctx, upstreamBody)
+		if err != nil {
+			return nil, rejectDeepSeekChatFilter(c, err)
+		}
+		upstreamBody = pairedBody
+	}
 	// Keep the final outbound tier separate from the observed response tier so
 	// usage recording can apply the selected credential's response contract.
 	serviceTier := extractOpenAIServiceTierFromBody(upstreamBody)
@@ -223,7 +231,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	// the outbound request (for example GLM xhigh is forwarded as max).
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(upstreamBody, upstreamModel, billingModel, originalModel)
 	reasoningEffort = ApplyThinkingEnabledFallback(reasoningEffort, upstreamBody, upstreamModel)
-	resp, err := s.sendCCUpstreamRequest(ctx, c, account, targetURL, upstreamBody, clientStream, token, customUA, grokCacheIdentity)
+	resp, err := s.sendCCUpstreamRequest(ctx, c, account, targetURL, upstreamBody, inboundProtocol, clientStream, token, customUA, grokCacheIdentity)
 	if err != nil {
 		return nil, err
 	}

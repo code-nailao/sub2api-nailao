@@ -125,7 +125,7 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	if err != nil {
 		return nil, err
 	}
-	resp, err := s.sendCCUpstreamRequest(ctx, c, account, targetURL, chatBody, clientStream, apiKey, account.GetOpenAIUserAgent(), "")
+	resp, err := s.sendCCUpstreamRequest(ctx, c, account, targetURL, chatBody, APIProtocolResponses, clientStream, apiKey, account.GetOpenAIUserAgent(), "")
 	if err != nil {
 		return nil, err
 	}
@@ -473,6 +473,15 @@ func targetsOpenCodeZenUpstream(account *Account) bool {
 // DeepSeek 系列，例如 deepseek-v4-flash / deepseek-v4.1-flash / deepseek-chat。
 func isDeepSeekCatalogModel(model string) bool {
 	return strings.HasPrefix(normalizeOpenCodeGoModelID(model), "deepseek")
+}
+
+// targetsDeepSeekChatModel uses the final model for OpenCode's shared routes.
+// Direct DeepSeek routes also accept custom model aliases.
+func targetsDeepSeekChatModel(account *Account, body []byte) bool {
+	if targetsOpenCodeZenUpstream(account) {
+		return isDeepSeekCatalogModel(gjson.GetBytes(body, "model").String())
+	}
+	return targetsDeepSeekAPIHost(account)
 }
 
 // requiresDeepSeekChatReasoning 报告该 Chat Completions 请求的上游是否按

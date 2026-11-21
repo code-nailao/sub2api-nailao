@@ -32,7 +32,7 @@ ssh <host> 'sudo -n journalctl -fu sources-deploy'
 | 启动检查 | `-check-startup`：用生产配置构造全部依赖 | 退出，没有创建任何容器 |
 | 静态资源 | `-export-web-assets`：把新版本资源追加到固定目录（不删除、不覆盖） | 退出 |
 | 启动新 serving | 目标槽位的主、备两个容器，等待就绪 | 删除新容器，退出 |
-| 后台交接 | 旧后台收到一次 SIGTERM，处理完在途任务后退出（不发 SIGKILL），排空期间管理接口只读；新后台拿锁、就绪。日志写明管理接口在排空期间是只读还是不可用，以及旧后台还在停止哪些服务 | 未就绪：重新启动旧后台，删除新 serving，退出。旧后台在 `background_exit_timeout` 内没有退出：`FAILED AND NOT RESTORED`，保留 `in_progress`（见下文） |
+| 后台交接 | 旧后台收到一次 SIGTERM。支持只读排空的旧后台继续提供普通管理读接口，旧版本可能中断管理读。工具定期复查定时备份状态，查询失败时退避重试。Docker 确认旧后台退出或容器已移除后，新后台才启动并持锁就绪 | 发送 SIGTERM 返回失败后，Docker 和运行态查询共用 30 秒确认窗口。确认发出停止信号后，若常规等待和适用的备份等待均已到期，则用同一个 30 秒窗口确认退出并尝试恢复。到期仍无法恢复时，工具保留失败原因并释放发布锁 |
 | 切流 | 重写 `00-sources-main-upstreams.conf`，`nginx -t`，reload 一次 | `nginx -t` 失败：恢复原文件，把后台交还旧版本 |
 | 守护 | 5 分钟：新主实例就绪、无重启和 OOM、内存不超过上限 70% 且 30 秒内涨幅不超过 4GiB、公网健康、Nginx 连不上新端口的次数 | 流量切回旧槽位，后台交还旧版本，新 serving 停止并保留供排查 |
 | 退役 | 旧 serving 重启策略改为 `no`，排空，发 SIGTERM，不等待 | — |
@@ -53,11 +53,11 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py rollback'
 ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 ```
 
-回滚会复用上一槽位已停止的容器（不重新创建），流程与发版相同：启动 → 后台交接 → 切流 → 守护 → 退役。
+回滚会复用上一槽位已停止的容器。启动前检查当前后台是否在创建定时备份。备份进行中默认中止，可用 `deploy.py rollback --allow-running-backup` 继续。
 
-如果某次运行没有走完（`status` 里 `in_progress` 不为空），下一次 `main` 会拒绝执行。先用 `status` 和 `docker ps` 看清现场，处理完后再把 `state.json` 的 `in_progress` 清空。`FAILED AND NOT RESTORED` 时原因写在 `in_progress.failed`；`status` 里每个容器的 `restart_policy` 为 `no` 且仍在运行，说明它已收到 SIGTERM、正在排空，退出后不会自动重启。
+如果某次运行没有走完（`status` 里 `in_progress` 不为空），下一次 `main` 会拒绝执行。先用 `status` 和 `docker ps` 看清现场，处理完后再把 `state.json` 的 `in_progress` 清空。`FAILED AND NOT RESTORED` 时原因写在 `in_progress.failed`；`status` 里的 `restart_policy` 可用来确认容器的重启策略。
 
-正在排空的后台超过 `background_exit_timeout` 仍未退出时，接手的后台没有启动，排空中的后台退出后就没有后台进程。错误信息（也写在 `in_progress.failed`）写明哪个槽位在服务流量、哪些 serving 容器留着运行但没有流量、要启动哪一个后台：切流之前是当前槽位那个正在排空的后台本身，交还时（流量已回到上一槽位）是上一槽位的后台，不是正在排空的新版本后台。等它退出后按信息执行 `docker update --restart=unless-stopped` 和 `docker start`，`status` 确认后台在运行，再清空 `in_progress`；在此之前不要再次发布。详见 [DEPLOY.md](../../docs/sources/DEPLOY.md) 的“无法自动恢复的情况”。
+常规排空、备份延长和恢复等待期间，Docker 的 `inspect` 和容器列表查询共用当前期限。超过 `background_exit_timeout` 和适用的备份等待期后，状态查询、退出确认、恢复后台和清理新 serving 共用一个 30 秒恢复窗口。备份状态读不到时在窗口内重试。切流前若确认旧后台退出，就按原重启策略恢复当前槽位。若 Docker 确认旧容器已被移除，则继续交接给已准备好的目标后台。恢复就绪检查为写失败记录预留最后 5 秒。切流失败或守护失败后若进入恢复窗口，交还后台后的 serving 清理仍沿用原截止时间。清理未完成时会留下失败记录并释放发布锁。详见 [发布与部署](../../docs/sources/DEPLOY.md)。
 
 ## 首次接入
 

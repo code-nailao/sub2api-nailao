@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -25,12 +26,6 @@ func deepSeekHostedTestFixture(t *testing.T, body map[string]any, upstream func(
 
 func deepSeekHostedProtocolFixture(t *testing.T, protocol string, body map[string]any, upstream func(*http.Request) (*http.Response, error), configure ...func(*gin.Context)) (*OpenAIForwardResult, *deepSeekJournalFixture, string, error) {
 	t.Helper()
-	price, groupID := 6.0, int64(218)
-	key := &APIKey{ID: 2, UserID: 3, GroupID: &groupID, User: &User{ID: 3, Balance: 10}, Group: &Group{ID: groupID, Platform: PlatformDeepseek, SubscriptionType: SubscriptionTypeStandard, RateMultiplier: .35, SearchPricePer1k: &price, DeepSeekTools: DeepSeekToolsConfig{Enabled: true, AutoInject: true, FetchPricePer1K: &price}}}
-	account := &Account{ID: 4, Platform: PlatformDeepseek, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, GroupIDs: []int64{groupID}, Credentials: map[string]any{"api_key": "fixture-only", "base_url": "https://provider.example/v1", "api_protocol": "chat_completions"}, Extra: map[string]any{"deepseek_tools_enabled": true, "deepseek_search_cost_per_call": .005, "deepseek_fetch_cost_per_call": .005}}
-	journal := &deepSeekJournalFixture{}
-	cfg := deepSeekChatFallbackTestConfig()
-	svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: deepSeekHTTPFixture{fn: upstream}, accountRepo: deepSeekAccountFixture{account: account}, usageBillingRepo: journal, billingService: newTestBillingService(), billingCacheService: &BillingCacheService{cfg: cfg, cache: newMemInflightCache(10)}}
 	body["model"] = "deepseek-flash"
 	if protocol == "responses" {
 		body["input"] = "Use the public web"
@@ -43,6 +38,16 @@ func deepSeekHostedProtocolFixture(t *testing.T, protocol string, body map[strin
 		}
 	}
 	wire, _ := json.Marshal(body)
+	return deepSeekHostedWireFixture(t, deepSeekChatFallbackTestConfig(), protocol, wire, upstream, configure...)
+}
+
+func deepSeekHostedWireFixture(t *testing.T, cfg *config.Config, protocol string, wire []byte, upstream func(*http.Request) (*http.Response, error), configure ...func(*gin.Context)) (*OpenAIForwardResult, *deepSeekJournalFixture, string, error) {
+	t.Helper()
+	price, groupID := 6.0, int64(218)
+	key := &APIKey{ID: 2, UserID: 3, GroupID: &groupID, User: &User{ID: 3, Balance: 10}, Group: &Group{ID: groupID, Platform: PlatformDeepseek, SubscriptionType: SubscriptionTypeStandard, RateMultiplier: .35, SearchPricePer1k: &price, DeepSeekTools: DeepSeekToolsConfig{Enabled: true, AutoInject: true, FetchPricePer1K: &price}}}
+	account := &Account{ID: 4, Platform: PlatformDeepseek, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true, GroupIDs: []int64{groupID}, Credentials: map[string]any{"api_key": "fixture-only", "base_url": "https://provider.example/v1", "api_protocol": "chat_completions"}, Extra: map[string]any{"deepseek_tools_enabled": true, "deepseek_search_cost_per_call": .005, "deepseek_fetch_cost_per_call": .005}}
+	journal := &deepSeekJournalFixture{}
+	svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: deepSeekHTTPFixture{fn: upstream}, accountRepo: deepSeekAccountFixture{account: account}, usageBillingRepo: journal, billingService: newTestBillingService(), billingCacheService: &BillingCacheService{cfg: cfg, cache: newMemInflightCache(10)}}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(wire)))

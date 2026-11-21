@@ -177,7 +177,17 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 	if account.IsOpenCodeGo() && IsOpenCodeUnsupportedModel(routingModel) {
 		return nil, writeOpenCodeUnsupportedModelError(c, false, routingModel)
 	}
-	switch s.resolveUpstreamProtocolFor(ctx, account, inbound, routingModel) {
+	upstreamProtocol := s.resolveUpstreamProtocolFor(ctx, account, inbound, routingModel)
+	if c.GetBool(deepSeekInternalTurn) && (inbound != APIProtocolChatCompletions || upstreamProtocol != APIProtocolChatCompletions) {
+		// The native Chat sender checks its final body. Keep the size check
+		// before conversion on other routes for hosted Chat turns.
+		var err error
+		body, err = fitDeepSeekHostedChatBody(body, s.deepSeekHostedBodyLimit())
+		if err != nil {
+			return nil, err
+		}
+	}
+	switch upstreamProtocol {
 	case APIProtocolAnthropic:
 		if convertResponsesShape {
 			return s.forwardResponsesViaNativeAnthropic(ctx, c, account, body, "")
@@ -190,9 +200,9 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 			if err != nil {
 				return nil, err
 			}
-			return s.forwardAsRawChatCompletions(ctx, c, account, chatBody, defaultMappedModel)
+			body = chatBody
 		}
-		return s.forwardAsRawChatCompletions(ctx, c, account, body, defaultMappedModel)
+		return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, inbound, time.Now())
 	}
 	// 上游为 Responses（含 adaptive 下 Responses 形状入站且供应商有原生
 	// Responses 端点）：走下方 Chat Completions ↔ Responses 转换链。
@@ -446,7 +456,7 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 				zap.Int("upstream_status", resp.StatusCode),
 				zap.String("upstream_message", upstreamMsg),
 			)
-			return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, startTime)
+			return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, inbound, startTime)
 		}
 		responsesMode, _ := account.Extra[openai_compat.ExtraKeyResponsesMode].(string)
 		if account.IsOpenAIApiKey() &&
@@ -463,7 +473,7 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 				zap.Int64("account_id", account.ID),
 				zap.Int("upstream_status", resp.StatusCode),
 			)
-			return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, startTime)
+			return s.forwardAsRawChatCompletionsWithStartTime(ctx, c, account, body, defaultMappedModel, inbound, startTime)
 		}
 		if foErr := s.failoverOpenAIUpstreamHTTPError(ctx, c, account, resp, respBody, upstreamMsg, upstreamModel); foErr != nil {
 			return nil, foErr

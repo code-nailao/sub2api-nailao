@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // A draining background owner keeps its listener open while its background
@@ -195,6 +196,23 @@ func Stopping(name string) func() {
 				delete(r.stopping, name)
 			}
 		})
+	}
+}
+
+// BeginScheduledBackup reports the accepted backup's existing deadline to the
+// release tool. It returns nil when draining has already begun.
+func (r *Runtime) BeginScheduledBackup(deadline time.Time) func() {
+	r.mu.Lock()
+	if r.drain {
+		r.mu.Unlock()
+		return nil
+	}
+	r.scheduledBackupDeadline = deadline
+	r.mu.Unlock()
+	return func() {
+		r.mu.Lock()
+		r.scheduledBackupDeadline = time.Time{}
+		r.mu.Unlock()
 	}
 }
 
