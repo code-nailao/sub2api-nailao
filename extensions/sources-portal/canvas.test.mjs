@@ -244,6 +244,35 @@ test('an unrelated 409 keeps the released wording', async () => {
   assert.equal(f.settings.length, 0);
 });
 
+test('a normal failure after a stale connection keeps the resave entry', async () => {
+  let failNormal = false;
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.group_id === CUSTOM_ID
+    ? staleConnection
+    : failNormal ? { ok: false, status: 503 } : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.select.value = String(CUSTOM_ID);
+  await f.select.onchange();
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+  failNormal = true;
+  f.select.value = '26';
+  await f.select.onchange();
+  assert.equal(f.elements['#message'].textContent, '授权暂不可用，请稍后重试；不会自动换组或创建新任务。');
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+  f.elements['#canvas-retry'].onclick();
+  assert.equal(f.settings.at(-1).kind, 'custom');
+});
+
+test('a new acknowledged configuration clears the resave entry', async () => {
+  const f = await fixture({ custom: 'configured', connection: staleOnly });
+  f.select.value = String(CUSTOM_ID);
+  await f.select.onchange();
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+  f.select.value = '26';
+  await f.select.onchange();
+  await f.ack();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
+});
+
 test('non-stale connection failures keep the released wording', async () => {
   const f = await fixture({ connection: () => ({ ok: false, status: 503 }) });
   assert.equal(f.document.body.dataset.state, 'recovery');

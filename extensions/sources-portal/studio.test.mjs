@@ -378,6 +378,37 @@ test('an unrelated 409 keeps the released wording', async () => {
   assert.equal(f.settings.length, 0);
 });
 
+test('a normal failure after a stale connection keeps the resave entry', async () => {
+  let stale = true;
+  const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID),
+    connection: () => stale ? staleConnection : { ok: false, status: 503 } });
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  stale = false;
+  f.select.value = '26';
+  f.select.onchange();
+  await flush();
+  assert.equal(f.message.textContent, '暂时无法连接此分组，请重试。已有作品和输入内容已保留。');
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  f.retry.onclick();
+  assert.equal(f.settings.at(-1).kind, 'custom');
+});
+
+test('a new acknowledged configuration clears the resave entry', async () => {
+  let stale = true;
+  const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID),
+    connection: (options, config) => stale ? staleConnection : { ok: true, status: 200, data: config(options.body.group_id) } });
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  stale = false;
+  f.select.value = '26';
+  f.select.onchange();
+  await flush();
+  await f.ackConnection();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackShell();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.retry.textContent, '重试连接');
+});
+
 test('non-stale connection failures keep the released wording', async () => {
   const f = await fixture({ connection: () => ({ ok: false, status: 503 }) });
   assert.equal(f.document.body.dataset.state, 'recovery');

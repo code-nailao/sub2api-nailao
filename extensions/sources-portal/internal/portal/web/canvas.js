@@ -18,7 +18,7 @@ const customButton = document.querySelector("#canvas-custom");
 const manageButton = document.querySelector("#canvas-manage");
 const ownKeyButton = document.querySelector("#canvas-own-key");
 let studioURL, configuration, hostConfig;
-let ack = false, generation = 0, locked = false, connecting = false, bootstrapping = false, resaveHint = false;
+let ack = false, generation = 0, locked = false, connecting = false, bootstrapping = false, resaveHint = false, resaveClearRequestId = null;
 let sendTimer, checkTimer, startupTimer;
 const granted = new Map();
 // The user's own-key connection is addressed like a group, by a reserved ID.
@@ -26,8 +26,7 @@ let custom = { groupId: 0, enabled: false, configured: false };
 const validRequestID = (value) => typeof value === "string" && /^[\w-]{16,80}$/.test(value);
 const CUSTOM_CONNECTION_NEEDS_UPDATE = "custom_connection_needs_update";
 
-function showState(state, text, resave = false) {
-  resaveHint = resave;
+function showState(state, text) {
   document.body.dataset.state = state;
   document.body.setAttribute("aria-busy", String(state === "loading"));
   statusPanel.hidden = state === "ready";
@@ -36,7 +35,9 @@ function showState(state, text, resave = false) {
   statusTitle.textContent = state === "loading" ? "正在打开无限画布" : locked ? "请重新进入画布" : "画布连接需要处理";
   retry.hidden = locked;
   retry.disabled = connecting || bootstrapping;
-  retry.textContent = resave ? "打开自定义连接" : "重试连接";
+  // The re-save entry stays until a new configuration is acknowledged or the
+  // user handles the connection, even if the next attempt fails differently.
+  retry.textContent = resaveHint ? "打开自定义连接" : "重试连接";
   login.hidden = !locked;
   if (text) message.textContent = text;
 }
@@ -46,9 +47,9 @@ function notifyHost(ready) {
     requestId: hostConfig.requestId, revision: hostConfig.revision,
     shellMode: hostConfig.shellMode, integrated: ready }, location.origin);
 }
-function recover(text, resave = false) {
+function recover(text) {
   clearTimeout(startupTimer);
-  showState("recovery", text, resave);
+  showState("recovery", text);
 }
 function armStartupTimeout() {
   clearTimeout(startupTimer);
@@ -162,7 +163,7 @@ window.addEventListener("message", async (event) => {
     } catch (error) {
       if (current !== generation || target !== frame.contentWindow || locked) return;
       target.postMessage({ type: "sub2api:canvas-restore-error", connectionId, requestId }, studioURL.origin);
-      if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) recover(error.message, true);
+      if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) { resaveHint = true; resaveClearRequestId = null; recover(error.message); }
     }
     return;
   }
@@ -173,6 +174,7 @@ window.addEventListener("message", async (event) => {
   ack = true;
   clearInterval(sendTimer);
   clearTimeout(startupTimer);
+  if (data.payload.requestId === resaveClearRequestId) { resaveHint = false; resaveClearRequestId = null; }
   // A stale custom connection keeps its hint instead of revealing the page.
   if (!resaveHint) { frame.hidden = false; showState("ready"); }
   applyAppearance();
@@ -196,6 +198,8 @@ async function connect() {
     configuration = { ...config,
       connections: [...granted.values()].flatMap((item) => item.connections),
       capabilities: [...granted.values()].flatMap((item) => item.capabilities), requestId: crypto.randomUUID() };
+    // Only this new configuration's acknowledgement clears a re-save hint.
+    resaveClearRequestId = configuration.requestId;
     ack = false;
     if (!frame.getAttribute("src")) frame.src = studioURL.href;
     else startSending(current);
@@ -206,7 +210,8 @@ async function connect() {
     ack = previousAck;
     if (previous) select.value = previous.selectedConnectionId.slice(6);
     frame.hidden = !previousAck;
-    recover(error.message, error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE);
+    if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) { resaveHint = true; resaveClearRequestId = null; }
+    recover(error.message);
     return false;
   } finally {
     if (current === generation && !locked) {
@@ -284,6 +289,9 @@ function openCustomConnectionSettings() {
   if (locked) return;
   connectionMenu.open = false;
   openCustomSettings({ onSaved: (configured) => {
+    // Saving or removing is the explicit handling that clears the hint.
+    resaveHint = false;
+    resaveClearRequestId = null;
     // A changed or removed connection must not be resent from the earlier grant.
     granted.delete(`group-${custom.groupId}`);
     void reloadGroups(configured ? String(custom.groupId) : "");

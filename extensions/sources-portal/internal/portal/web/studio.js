@@ -28,9 +28,8 @@ let generation = 0, shellRevision = 0, appliedShellRevision = 0;
 let shellReady = false, integrated = false, locked = false, selectionUncertain = false;
 let connectionPending, shellPending, connectionTimer, shellTimer, checkTimer;
 let connectionApplied = false, bootstrapPending = false, initialGroupId = null;
-let startupTimer, resaveHint = false;
-function showState(state, text, resave = false) {
-  resaveHint = resave;
+let startupTimer, resaveHint = false, clearHintOnNextShellAck = false;
+function showState(state, text) {
   document.body.dataset.state = state;
   document.body.setAttribute("aria-busy", String(state === "loading"));
   loadingPanel.hidden = state === "ready";
@@ -39,13 +38,15 @@ function showState(state, text, resave = false) {
   statusTitle.textContent = state === "loading" ? "正在打开图片工作台" : locked ? "请重新进入工作台" : "工作台连接需要处理";
   retry.hidden = locked;
   retry.disabled = Boolean(connectionPending) || bootstrapPending;
-  retry.textContent = resave ? "打开自定义连接" : "重试连接";
+  // The re-save entry stays until a new configuration is acknowledged or the
+  // user handles the connection, even if the next attempt fails differently.
+  retry.textContent = resaveHint ? "打开自定义连接" : "重试连接";
   login.hidden = !locked;
   if (text) message.textContent = text;
 }
-function recoverView(text, resave = false) {
+function recoverView(text) {
   clearTimeout(startupTimer);
-  showState("recovery", text, resave);
+  showState("recovery", text);
   // Only a connection that was actually acknowledged may use an older peer.
   // This is a compatibility recovery, never a shortcut around authentication.
   if (connectionApplied && !locked) frame.hidden = false;
@@ -290,8 +291,9 @@ async function connect(groupId, request) {
     selectionResult(pending, "error", error.message);
     message.textContent = error.message;
     const resave = error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE;
+    if (resave) { resaveHint = true; clearHintOnNextShellAck = false; }
     // A stale custom connection needs its own dialog, not a plain retry.
-    if (!integrated || resave) recoverView(error.message, resave);
+    if (!integrated || resave) recoverView(error.message);
     if (resave) frame.hidden = true;
     renderLegacyGroups();
     publishShell();
@@ -333,6 +335,8 @@ window.addEventListener("message", async (event) => {
     shellPending = null;
     clearInterval(shellTimer);
     appliedShellRevision = pending.revision;
+    // The current document applied a configuration authorized after the 409.
+    if (clearHintOnNextShellAck) { resaveHint = false; clearHintOnNextShellAck = false; }
     // A stale custom connection keeps its hint instead of revealing the page.
     if (!resaveHint) { frame.hidden = false; message.textContent = ""; }
     setIntegrated(true);
@@ -374,7 +378,8 @@ window.addEventListener("message", async (event) => {
     try { localStorage.setItem(storageKey, String(selectedGroupId)); } catch { /* Storage is optional. */ }
   }
   connectionApplied = true;
-  resaveHint = false;
+  // Only the acknowledgement of this new configuration clears the re-save hint.
+  clearHintOnNextShellAck = true;
   // Do not reveal the old intermediate surface between connection and shell ACK.
   if (integrated || document.body.dataset.state === "recovery") frame.hidden = false;
   message.textContent = integrated ? "" : "连接已建立，正在准备工作台…";
