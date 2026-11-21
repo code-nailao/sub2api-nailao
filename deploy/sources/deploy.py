@@ -1172,27 +1172,26 @@ class Deployer:
                     # that still answers (the candidate's while it drains)
                     # until the previous background is ready to take over.
                     self.switch_to(previous, admin=target.view())
-                except DeployError as err:
-                    raise FallbackFailed(f"guard failed ({reason}) and switching back failed ({err})") from err
+                except BaseException as err:
+                    failure = FallbackFailed(
+                        f"guard failed ({reason}) and switching serving back failed ({err}); admin still "
+                        f"points at slot {target.slot}. The admin entry needs a person to check live routing")
+                    self.record_guard_failure(target, failure)
+                    raise failure from err
                 self.log(f"   handing the background back to the previous release; admin stays on slot "
                          f"{target.slot} until slot {previous['slot']}'s background answers")
                 try:
                     recovery_deadline = self.hand_back(target, previous, check_health=True)
-                except (DeployError, OSError, subprocess.SubprocessError) as err:
-                    raise self.rollback_admin_owner(target, previous, reason, err) from err
-                # The owner can exit or lose the lock between readiness and
-                # the reload. Only a confirmed probe may receive admin.
-                ready, why = self.admin_owner_status(previous)
-                if not ready:
-                    raise self.rollback_admin_owner(
-                        target, previous, reason,
-                        DeployError(f"the previous background is not the admin owner ({why})")) from None
-                try:
+                    # The owner can exit or lose the lock between readiness and
+                    # the reload. Only a confirmed probe may receive admin.
+                    ready, why = self.admin_owner_status(previous)
+                    if not ready:
+                        raise DeployError(f"the previous background is not the admin owner ({why})")
                     self.switch_to(previous)
-                except DeployError as err:
-                    raise FallbackFailed(f"guard failed ({reason}); the previous release owns the background again "
-                                         f"but admin routing was not moved to slot {previous['slot']} ({err}); "
-                                         "verify live routing before clearing in_progress") from err
+                except BaseException as err:
+                    # An interrupt belongs here too: whatever ended the step,
+                    # the failure is recorded and admin keeps an owner.
+                    raise self.rollback_admin_owner(target, previous, reason, err) from err
                 restored = f"guard failed ({reason}); the previous release serves traffic and owns the background again"
                 protect = finish_handoff_cleanup(ignore=True) if recovery_deadline is not None else contextlib.nullcontext()
                 with protect:
@@ -1224,22 +1223,16 @@ class Deployer:
 
     def admin_owner_status(self, view: dict[str, Any]) -> tuple[bool, str]:
         """Probe only: is this background the admin owner right now, and if
-        not, why. A failed probe means 'not an owner now', never an error."""
+        not, why. The answer comes from the runtime lock and its health, never
+        from Docker visibility: a container whose state cannot be read may
+        still be the one answering admin."""
         name = view["containers"]["background"]
         try:
-            info = self.ops.inspect(name)
-        except Exception as err:  # noqa: BLE001 - a probe failure disqualifies the candidate
-            return False, f"{name}: inspect failed ({err})"
-        if not info:
-            return False, f"{name}: container is missing"
-        if not (info.get("State") or {}).get("Running"):
-            return False, f"{name}: container is stopped"
-        try:
             runtime = self.owner_runtime(view) or {}
-        except Exception as err:  # noqa: BLE001
-            return False, f"{name}: runtime probe failed ({err})"
+        except Exception as err:  # noqa: BLE001 - a probe failure disqualifies the candidate
+            return False, f"{name}: runtime probe failed ({err}); {self.docker_state_hint(view)}"
         if runtime.get("role") != "background" or not runtime.get("owns_background"):
-            return False, f"{name}: does not hold the background lock"
+            return False, f"{name}: does not hold the background lock; {self.docker_state_hint(view)}"
         if not (runtime.get("ready") or (runtime.get("draining")
                                          and runtime.get("admin_during_drain") == "read-only")):
             return False, f"{name}: not ready for admin reads"
@@ -1249,6 +1242,20 @@ class Deployer:
         except Exception as err:  # noqa: BLE001
             return False, f"{name}: health probe failed ({err})"
         return True, f"{name}: holds the background lock and answers"
+
+    def docker_state_hint(self, view: dict[str, Any]) -> str:
+        """Wording for a rejection reason only. Docker's view never decides
+        ownership: an unreadable state is reported, not treated as absence."""
+        name = view["containers"]["background"]
+        try:
+            info = self.ops.inspect(name)
+        except Exception as err:  # noqa: BLE001
+            return f"docker state unknown ({err})"
+        if not info:
+            return "container is missing"
+        if not (info.get("State") or {}).get("Running"):
+            return "container is stopped"
+        return "container is running"
 
     def answering_admin_owner(self, views: dict[str, dict[str, Any]]) -> tuple[dict[str, Any] | None, dict[str, str]]:
         """Return the first background the probes confirm as admin owner,

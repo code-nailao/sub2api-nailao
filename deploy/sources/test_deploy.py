@@ -793,11 +793,40 @@ class DeployTest(unittest.TestCase):
         self.assertEqual("guard", progress["step"])
         self.assertIn("failed", progress, "a probe timeout must still record the failure")
         self.assertIn("failed_at", progress)
-        self.assertIn("inspect failed", progress["failed"])
+        self.assertIn("timed out", progress["failed"], "the reason must name the failed probe")
         self.assertIsInstance(ctx.exception, deploy.FallbackFailed)
         upstream = self.ops.files[self.cfg.upstream_file]
         self.assertIn(f"127.0.0.1:{candidate_admin};", upstream)
         self.assertNotIn(f"127.0.0.1:{previous_admin};", upstream)
+
+    def test_guard_admin_owner_survives_an_unreadable_docker_state(self):
+        """Docker cannot report the background, yet it holds the lock and
+        answers /health. Ownership comes from the probes, not Docker's view."""
+        self.ops.memory_after_switch = 20 * GIB
+        deployer = deploy.Deployer(self.cfg, self.ops)
+
+        def unreadable(name, **kw):
+            raise subprocess.TimeoutExpired(["docker", "inspect", name], 30)
+
+        with mock.patch.object(self.ops, "inspect", unreadable):
+            owner, why = deployer.admin_owner_status(LEGACY)
+        self.assertTrue(owner, why)
+        self.assertIn("holds the background lock and answers", why)
+
+    def test_guard_interrupt_still_records_the_failure(self):
+        """Ctrl-C anywhere in the cleanup must record the failure first."""
+        self.ops.memory_after_switch = 20 * GIB
+        with mock.patch.object(deploy.Deployer, "hand_back",
+                               side_effect=deploy.DeployError("fixture: drain timeout")), \
+                mock.patch.object(deploy.Deployer, "settle_admin_owner",
+                                  side_effect=KeyboardInterrupt):
+            with self.assertRaises(deploy.FallbackFailed):
+                self.deploy()
+
+        progress = self.state()["in_progress"]
+        self.assertEqual("guard", progress["step"])
+        self.assertIn("failed", progress, "an interrupt must still record the failure")
+        self.assertIn("failed_at", progress)
 
     def test_guard_counts_connect_failures_only_for_new_ports(self):
         line = 'connect() failed (111) while connecting to upstream, upstream: "http://127.0.0.1:{}/v1"'
