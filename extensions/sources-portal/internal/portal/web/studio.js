@@ -28,13 +28,15 @@ let custom = { groupId: 0, setupId: 0, enabled: false, configured: false }, mana
 let selectedGroupId = null, authorizationName = "";
 let shellRevision = 0, appliedShellRevision = 0;
 let shellReady = false, integrated = false, locked = false, selectionUncertain = false;
-// A document gives the page a small fixed set of facts: its child announces
-// itself at most twice (a starting client sends two) and its frame loads once,
-// in either order. Anything beyond that set belongs to another document. This
-// reads a slow start (an early announcement, a late load, a second
-// announcement) and a reload (its announcements before or after its load)
-// without guessing at the order they arrive in.
-let announcements = 0, frameLoaded = false;
+// A document gives the page a small fixed set of facts, counted for the frame
+// document it belongs to: it announces itself at most twice (a starting client
+// sends two), its frame loads once, and both announcements come before it asks
+// for a group. Anything beyond that set belongs to another document. This reads
+// a slow start (an early announcement, a late load, a second announcement) and
+// a reload (its announcements before or after its load) without guessing at the
+// order they arrive in, and a document that has already asked for a group
+// cannot announce again, so its replacement is recognised before its load.
+let announcements = 0, frameLoaded = false, askedForGroup = false;
 let connectionPending, shellPending, connectionTimer, shellTimer, checkTimer;
 let connectionApplied = false, initialGroupId = null;
 let bootstrapRound, compatibilityTimer, expiredLegacyAttempt, needsCustomResave = false;
@@ -44,7 +46,7 @@ const isCurrent = (started) => !locked && rounds.isCurrent(started);
 const isConnecting = () => Boolean(connectionPending) && isCurrent(connectionPending.attempt);
 const isBootstrapping = () => Boolean(bootstrapRound) && isCurrent(bootstrapRound);
 const ordinaryGroups = () => groups.filter(({ id }) => id !== custom.groupId);
-const connectionTimeout = "连接用时较长。可以重试连接，或稍后从主站重新进入。已有作品与草稿会保留。";
+const connectionTimeout = "连接用时较长。可以重试连接，或稍后从主站重新进入；已有作品与草稿不会被清空。";
 
 function updateControls() {
   // The native menu and the retry stay usable through every wait, so a stuck
@@ -368,6 +370,7 @@ function startDocument() {
   appliedShellRevision = 0;
   announcements = 0;
   frameLoaded = false;
+  askedForGroup = false;
   if (integrated) setIntegrated(false);
   frame.hidden = true;
 }
@@ -392,6 +395,10 @@ function connectionTimedOut(pending, text) {
 }
 async function connect(groupId, request) {
   if (locked || isConnecting() || isBootstrapping() || !groups.some((group) => group.id === groupId)) return;
+  // This document has now asked for a group. The released client announces
+  // itself only while it starts, before it can ask, so its announcements are
+  // over; a later one is the document that replaced it.
+  if (request) askedForGroup = true;
   // A selection the child made ends with that child's document; the page's own
   // menu outlives it. The attempt follows the request and the delivery record
   // is written when it is actually sent.
@@ -474,6 +481,11 @@ window.addEventListener("message", async (event) => {
     document.documentElement.style.colorScheme = data.theme;
     document.documentElement.dataset.theme = data.theme;
     publishShell();
+    // The host's bridge drops an answer for a revision it has replaced. While
+    // the page needs a resave, every accepted configuration must be answered
+    // again with the revision it now holds, until the current document is
+    // acknowledged or the user saves the connection.
+    if (needsCustomResave) notifyHost(false);
     return;
   }
   if (!studioURL || event.source !== frame.contentWindow || event.origin !== studioURL.origin || !data) return;
@@ -487,7 +499,9 @@ window.addEventListener("message", async (event) => {
     // whose announcements arrived before its load. Two announcements and one
     // load, in any order, are the same document: a client that starts slowly
     // and announces itself again after applying the shell changes nothing.
-    if (announcements >= 2) startDocument();
+    // A document that asked for a group has finished announcing, so this is
+    // its replacement even when the replacement's load has not arrived yet.
+    if (announcements >= 2 || askedForGroup) startDocument();
     announcements++;
     shellReady = true;
     // A shell this document already applied, or has in flight, needs no

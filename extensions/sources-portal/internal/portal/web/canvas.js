@@ -110,7 +110,7 @@ function begin(phase, state, text) {
   clearInterval(sendTimer);
   sendTimer = undefined;
   rounds.deadline(operation.started, 20000, () => {
-    fail(operation, "连接用时较长。可以重试连接。已有画布和任务会保留。");
+    fail(operation, "连接用时较长。可重试连接；已有画布和任务会保留。");
   });
   showState(state, text);
   return operation;
@@ -206,7 +206,7 @@ function startSending(operation, candidate = connection) {
     if (timer !== sendTimer || !isConfirming(operation, candidate)) return;
     if (++attempts > 30) {
       rounds.retire();
-      fail(operation, "画布尚未确认连接。可以重试确认。已有任务会保留。");
+      fail(operation, "画布尚未确认连接。可重试确认；不会重新生成或重复提交任务。");
       return;
     }
     send();

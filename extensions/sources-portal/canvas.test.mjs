@@ -80,6 +80,7 @@ test('lost connection ACK retries the same configuration without a second author
   const timer = [...f.timers.values()].find(t => t.delay === 500);
   for (let i = 0; i < 31; i++) timer.callback();
   assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.elements['#message'].textContent, '画布尚未确认连接。可重试确认；不会重新生成或重复提交任务。');
   f.elements['#canvas-retry'].onclick();
   const resent = f.last('sub2api:media-studio-config').payload;
   assert.deepEqual(resent.connections, pending.payload.connections);

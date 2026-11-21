@@ -611,6 +611,27 @@ test('a Studio resave confirmed by an answer tells the host before any acknowled
   assert.equal(f.parentMessages.at(-1).integrated, false);
 });
 
+test('a host revision after a resave is told again that the page is not integrated', async () => {
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.group_id === CUSTOM_ID
+    ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  const shell = await f.integrate();
+  assert.equal(f.parentMessages.at(-1).integrated, true);
+  f.send(select(CUSTOM_ID, shell.revision, 'resave-before-theme-0001'));
+  await flush();
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  assert.deepEqual([f.parentMessages.at(-1).revision, f.parentMessages.at(-1).integrated], [1, false]);
+
+  // The host moved to a new revision for a theme change before the child
+  // acknowledged anything. Its bridge drops a report for the old revision, so
+  // the page must state its answer again for the revision it now holds.
+  f.host(2, 'embedded', { theme: 'light' });
+  const report = f.parentMessages.at(-1);
+  assert.equal(report.requestId, 'host-request-00000002');
+  assert.equal(report.revision, 2);
+  assert.equal(report.integrated, false);
+});
+
 test('a Studio deadline from before a restart cannot answer for the new shell', async () => {
   const old = Promise.withResolvers();
   const f = await fixture({ connection: (options, config) => options.body.group_id === 27
@@ -748,6 +769,40 @@ test('a real reload after the workbench document loaded is still a new document'
   // The old document's switch result is not delivered to the new one.
   assert.equal(f.studioMessages.some((item) => item.type === 'sub2api:image-studio-select-group-result' &&
     item.requestId === 'switch-before-reload-1'), false);
+});
+
+test('a reload whose single announcement arrives before its load starts a new document', async () => {
+  const answer = Promise.withResolvers();
+  const f = await fixture({ custom: 'configured', connection: (options, config) =>
+    options.body.group_id === CUSTOM_ID ? answer.promise : { ok: true, status: 200, data: config(options.body.group_id) } });
+  // A connected document: it announced itself once and loaded once.
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackConnection();
+  f.loaded();
+  const shell = await f.ackShell();
+  assert.equal(f.document.body.dataset.integrated, 'true');
+  // A switch the child asked for is still waiting for its answer.
+  f.send(select(CUSTOM_ID, shell.revision, 'switch-before-reload-2'));
+  await flush();
+  const results = () => f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-select-group-result');
+  const before = results().length;
+
+  // The child reloads: its single announcement arrives before its load. A
+  // document that has already asked for a group cannot announce again, so this
+  // announcement belongs to the document that replaced it.
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await flush();
+  const restarted = f.last('sub2api:image-studio-shell-config');
+  assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.frame.hidden, true);
+
+  // The old request's 409 ends with the document that owned it.
+  answer.resolve({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } });
+  await flush();
+  assert.equal(results().length, before, 'the old answer is not delivered to the new document');
+  assert.doesNotMatch(f.message.textContent, /重新保存自定义连接/);
+  assert.equal(f.retry.textContent, '重试连接');
 });
 
 test('a slow-starting shell that announces itself twice keeps the confirmed workspace', async () => {
