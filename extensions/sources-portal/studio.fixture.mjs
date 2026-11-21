@@ -21,10 +21,20 @@ export async function createStudioFixture({ remembered, groupList = initialGroup
   window.parent = parent;
   let frameSets = 0;
   function makeFrame(src = '') {
-    const contentWindow = { postMessage: (data, target) => { assert.equal(target, studioOrigin); studioMessages.push(data); } };
+    // A frame without an address shows its own about:blank document; once it
+    // points at the workbench, that document is on another origin and cannot
+    // be read from the page.
+    let empty = !src;
+    const contentWindow = { get location() {
+        if (!empty) throw Error('cross-origin frame');
+        return { href: 'about:blank' };
+      },
+      postMessage: (data, target) => { assert.equal(target, studioOrigin); studioMessages.push(data); } };
     const element = Object.assign(new EventTarget(), { contentWindow, hidden: true,
+      // A load of the empty document the frame still holds, not of the workbench.
+      blank: () => { const was = empty; empty = true; element.dispatchEvent(new Event('load')); empty = was; },
       cloneNode: () => makeFrame(src), replaceWith: (next) => { frame = elements['#studio'] = next; frameSets++; } });
-    Object.defineProperty(element, 'src', { get: () => src, set: (value) => { src = value; frameSets++; } });
+    Object.defineProperty(element, 'src', { get: () => src, set: (value) => { src = value; empty = value === 'about:blank'; frameSets++; } });
     return element;
   }
   let frame = makeFrame();
@@ -95,8 +105,8 @@ export async function createStudioFixture({ remembered, groupList = initialGroup
   const host = (revision = 1, shellMode = 'standalone') => send({ type: 'sources:studio-host-config', version: 1, requestId: 'host-request-' + String(revision).padStart(8, '0'), revision, shellMode, standaloneUrl: origin + '/custom/images?studio_view=standalone', theme: 'dark', lang: 'zh' }, { from: parent, fromOrigin: origin });
   const last = (type) => studioMessages.filter((item) => item.type === type).at(-1);
   const loaded = () => frame.dispatchEvent(new Event('load'));
-  // The frame's empty document: a frame that was never given an address.
-  const blankLoad = () => makeFrame().dispatchEvent(new Event('load'));
+  // The frame's empty document reports itself; it is not a workbench document.
+  const blankLoad = () => frame.blank();
   const ackConnection = async () => {
     const data = last('sub2api:image-studio-config');
     assert.ok(data);

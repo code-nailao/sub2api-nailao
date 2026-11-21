@@ -34,7 +34,7 @@ let shellReady = false, integrated = false, locked = false, selectionUncertain =
 // reads a slow start (an early announcement, a late load, a second
 // announcement) and a reload (its announcements before or after its load)
 // without guessing at the order they arrive in.
-let announcements = 0, frameLoaded = false, navigated = false;
+let announcements = 0, frameLoaded = false;
 let connectionPending, shellPending, connectionTimer, shellTimer, checkTimer;
 let connectionApplied = false, initialGroupId = null;
 let bootstrapRound, compatibilityTimer, expiredLegacyAttempt, needsCustomResave = false;
@@ -323,9 +323,15 @@ function bindFrameLoad(target) {
     // The first load is this document's own, even when it arrives after the
     // child announced itself. A later load in a document that has already
     // spoken is a replacement.
-    // Until the page has sent the frame to the workbench, a load is the
-    // document the frame was born with, not a workbench document.
-    if (!navigated) return;
+    // The frame is born on an empty document of its own. Only a load of the
+    // workbench document belongs to this page: that document is served from
+    // the workbench origin, while the empty one is the page's own about:blank.
+    let href;
+    try { href = target.contentWindow.location.href; } catch { href = ""; }
+    if (!href) {
+      // Reading a workbench document's address is refused from here.
+    } else if (href === "about:blank") return;
+    else if (!studioURL || href !== studioURL.href) return;
     if (frameLoaded && announcements > 0) startDocument();
     else if (frameLoaded) return; // the empty document reported itself twice
     frameLoaded = true;
@@ -362,7 +368,6 @@ function startDocument() {
   appliedShellRevision = 0;
   announcements = 0;
   frameLoaded = false;
-  navigated = false;
   if (integrated) setIntegrated(false);
   frame.hidden = true;
 }
@@ -370,7 +375,6 @@ function replaceFrame() {
   const previous = frame;
   frame = previous.cloneNode(false);
   startDocument();
-  navigated = true;
   shellReady = false;
   shellRevision = 0;
   bindFrameLoad(frame);
@@ -443,7 +447,12 @@ async function connect(groupId, request) {
     rounds.finish(pending.attempt);
     connectionPending = null;
     selectionResult(pending, "error", error.message);
-    if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) needsCustomResave = true;
+    if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) {
+      needsCustomResave = true;
+      // The page has decided this connection cannot be used. The host learns
+      // it now, not after an acknowledgement that may never come.
+      setIntegrated(false);
+    }
     if (!integrated || needsCustomResave) recoverView(error.message);
     else message.textContent = error.message;
     renderLegacyGroups();

@@ -595,6 +595,22 @@ test('an integrated Studio keeps the resave action visible after a failed switch
   assert.equal(f.frame.hidden, false);
 });
 
+test('a Studio resave confirmed by an answer tells the host before any acknowledgement', async () => {
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.group_id === CUSTOM_ID
+    ? { ok: false, status: 409, data: { error: 'custom_connection_needs_update' } }
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  const shell = await f.integrate();
+  assert.equal(f.parentMessages.at(-1).integrated, true);
+
+  // Switching to the invalid custom connection is answered at once, and no
+  // shell acknowledgement is waited for afterwards.
+  f.send(select(CUSTOM_ID, shell.revision, 'resave-now-request-0001'));
+  await flush();
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.parentMessages.at(-1).integrated, false);
+});
+
 test('a Studio deadline from before a restart cannot answer for the new shell', async () => {
   const old = Promise.withResolvers();
   const f = await fixture({ connection: (options, config) => options.body.group_id === 27
@@ -691,12 +707,12 @@ test('a page configuration keeps the released client shape, and a restart voids 
 
 test('the empty frame load before the workbench starts is not a document', async () => {
   const f = await fixture();
-  // The iframe is born without an address, so its empty document loads. A
-  // slow store announces itself, the connection is confirmed, the workbench
-  // document loads, and the store's second announcement follows. That order
-  // must leave the document and its confirmed connection alone.
-  f.blankLoad();
+  // The iframe's empty document reports itself on the frame the page listens
+  // to. A slow store announces itself, the connection is confirmed, the
+  // workbench document loads, and the store's second announcement follows.
+  // That order must leave the document and its confirmed connection alone.
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  f.blankLoad();
   await f.ackConnection();
   const shell = await f.ackShell();
   f.loaded();
@@ -709,12 +725,18 @@ test('the empty frame load before the workbench starts is not a document', async
 });
 
 test('a real reload after the workbench document loaded is still a new document', async () => {
+  // A document that announced itself once and loaded once.
   const f = await fixture();
-  const shell = await f.integrate();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackConnection();
   f.loaded();
+  const shell = await f.ackShell();
   assert.equal(f.document.body.dataset.integrated, 'true');
+  // A switch that has not been answered belongs to the document that started it.
+  f.send(select(27, shell.revision, 'switch-before-reload-1'));
+  await flush();
 
-  // The child reloads: its document loads again and announces itself.
+  // The child reloads: its document loads again and it announces itself once.
   f.loaded();
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   await flush();
@@ -722,6 +744,10 @@ test('a real reload after the workbench document loaded is still a new document'
   assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
   assert.equal(f.document.body.dataset.integrated, 'false');
   assert.equal(f.retry.hidden, false);
+  assert.equal(f.frame.hidden, true);
+  // The old document's switch result is not delivered to the new one.
+  assert.equal(f.studioMessages.some((item) => item.type === 'sub2api:image-studio-select-group-result' &&
+    item.requestId === 'switch-before-reload-1'), false);
 });
 
 test('a slow-starting shell that announces itself twice keeps the confirmed workspace', async () => {
