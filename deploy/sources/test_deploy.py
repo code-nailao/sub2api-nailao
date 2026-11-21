@@ -1804,6 +1804,91 @@ class DeployTest(unittest.TestCase):
         run(["docker", "start", previous_primary], mutate=True)
         self.assertIn(["shared_alias_conflict"], [item["alert"] for item in deploy.watch_once(self.cfg, self.ops, {})])
 
+    def test_release_records_the_shared_alias_window_until_the_old_slot_exits(self):
+        self.deploy()
+        source = self.state()["current"]
+        target = self.cfg.slot_view("b")
+        run = self.ops.run
+        created = []
+
+        def sample(args, **kw):
+            result = run(args, **kw)
+            if (args[:2] == ["docker", "create"]
+                    and args[args.index("--name") + 1] == target["containers"]["serving"]):
+                created.append(self.state()["in_progress"]["alias_overlap"])
+            return result
+
+        with mock.patch.object(self.ops, "run", sample):
+            self.deploy(image="another@sha256:3")
+        self.assertTrue(created)
+        for overlap in created:
+            self.assertEqual("publish_at_create", overlap["reason"])
+            self.assertEqual({source["slot"], target["slot"]}, set(overlap["slots"]))
+            self.assertEqual("start serving", overlap["stage"])
+            self.assertIn("started_at", overlap)
+        state = self.state()
+        self.assertIsNone(state["in_progress"])
+        self.assertEqual(source["slot"], state["retiring_serving"]["slot"])
+        self.assertEqual({role: self.ops.inspect(name)["Id"] for role, name in source["containers"].items()
+                          if role in deploy.SERVING_ROLES},
+                         {role: item["id"] for role, item in state["retiring_serving"]["containers"].items()})
+        self.assertIn("recorded_at", state["retiring_serving"])
+        self.assertEqual(source["slot"], deploy.status(self.cfg, self.ops)["retiring_serving"]["slot"])
+
+        held = self.hold()
+        candidates = {item["id"] for item in held["containers"].values()}
+        handoffs = []
+
+        def sample_resume(args, **kw):
+            result = run(args, **kw)
+            if args[:2] == ["docker", "start"] and args[-1] in candidates:
+                overlap = self.state()["in_progress"].get("alias_overlap")
+                if overlap is not None:
+                    handoffs.append(overlap)
+            return result
+
+        with mock.patch.object(self.ops, "run", sample_resume):
+            deploy.Deployer(self.cfg, self.ops).resume()
+        self.assertTrue(handoffs)
+        for overlap in handoffs:
+            self.assertEqual("alias_handoff", overlap["reason"])
+            self.assertEqual({held["current"]["slot"], held["target"]["slot"]}, set(overlap["slots"]))
+            self.assertEqual("publish shared alias", overlap["stage"])
+            self.assertIn("started_at", overlap)
+        self.assertIsNone(self.state()["in_progress"])
+        self.assert_live_release(held["target"])
+
+    def test_watch_alerts_when_shared_alias_overlap_is_not_covered_by_the_record(self):
+        self.deploy()
+        self.deploy(image="another@sha256:3")
+        state = self.state()
+        current, peer = state["current"], state["previous"]
+        # Bring the previous slot back so both slots advertise the alias.
+        self.ops.run(["docker", "start", peer["containers"]["serving"]], mutate=True)
+        pid = os.getpid()
+        self.ops.files["/proc/sys/kernel/random/boot_id"] = "fixture-boot\n"
+        self.ops.files[f"/proc/{pid}/stat"] = f"{pid} (release) R " + "0 " * 20
+        base = {"phase": "deploying", "step": "publish shared alias", "target": peer,
+                "origin": {"current": current, "previous": peer},
+                "process": {"pid": pid, "boot_id": "fixture-boot", "started_at_tick": "0"}}
+
+        def alerts(overlap=None):
+            progress = dict(base)
+            if overlap is not None:
+                progress["alias_overlap"] = overlap
+            deploy.save_state(self.cfg, {**state, "in_progress": progress})
+            return [item["alert"] for item in deploy.watch_once(self.cfg, self.ops, {})]
+
+        def record(**changes):
+            return {"reason": "alias_handoff", "stage": "publish shared alias",
+                    "slots": [current["slot"], peer["slot"]],
+                    "started_at": "2026-01-01T00:00:00+00:00", **changes}
+
+        self.assertIn(["shared_alias_conflict"], alerts())
+        self.assertIn(["shared_alias_conflict"], alerts(record(slots=[current["slot"], "elsewhere"])))
+        self.assertIn(["shared_alias_conflict"], alerts(record(ended_at="2026-01-01T00:00:05+00:00")))
+        self.assertNotIn(["shared_alias_conflict"], alerts(record()))
+
     def test_watch_reports_an_instance_restarted_before_retirement_finishes(self):
         self.deploy()
         primary = self.state()["current"]["containers"]["serving"]
