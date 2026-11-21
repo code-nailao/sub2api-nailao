@@ -804,6 +804,29 @@ def planned_alias_overlap(progress: dict[str, Any], current: dict[str, Any], pee
             and containers.get(peer["slot"]) == peer["containers"])
 
 
+def alias_slot_views(cfg: Config, state: dict[str, Any], progress: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Every slot the tool can account for, so watch does not miss a third provider."""
+    views: dict[str, dict[str, Any]] = {}
+
+    def add(view: Any) -> None:
+        if isinstance(view, dict) and view.get("slot") and view.get("containers"):
+            views.setdefault(view["slot"], view)
+
+    add(state.get("current"))
+    add(state.get("previous"))
+    if progress:
+        add(progress.get("target"))
+        origin = progress.get("origin") or {}
+        add(origin.get("current"))
+        add(origin.get("previous"))
+        hold = progress.get("hold") or {}
+        add(hold.get("current"))
+        add(hold.get("target"))
+    for slot in cfg.slots:
+        add(cfg.slot_view(slot))
+    return views
+
+
 class Deployer:
     def __init__(self, cfg: Config, ops: Ops):
         self.cfg = cfg
@@ -1973,6 +1996,7 @@ class Deployer:
 
     def _rollback(self) -> None:
         state = load_main_state(self.cfg)
+        self.close_retired_alias_overlap(state)
         self.require_idle(state)
         current, previous = state.get("current"), state.get("previous")
         if not current or not previous:
@@ -2070,6 +2094,48 @@ class Deployer:
             return
         self._save_progress(state, {**progress, "alias_overlap": {**record, "ended_at": now()}})
 
+    def observed_alias_overlap(self, record: Any) -> Any:
+        """Return the window with `ended_at` once every recorded instance has exited."""
+        if not isinstance(record, dict) or record.get("ended_at"):
+            return record
+        retiring = record.get("retiring") or {}
+        containers = retiring.get("containers") or {}
+        slot = retiring.get("slot")
+        names = retiring.get("names") or {}
+        if not names and slot:
+            try:
+                names = self.cfg.slot_view(slot).get("containers") or {}
+            except KeyError:
+                # An adopted slot such as "legacy" is not in the configured slots.
+                names = {}
+        if not containers or not names:
+            return record
+        for role, identity in containers.items():
+            name = names.get(role)
+            if not name:
+                continue
+            try:
+                info = self.ops.inspect(name) or {}
+            except (DeployError, OSError, subprocess.SubprocessError):
+                return record
+            if info.get("Id") and identity.get("id") and info["Id"] != identity["id"]:
+                # The recorded instance was replaced, so it has exited.
+                continue
+            state = info.get("State") or {}
+            if state.get("Running") or state.get("Restarting"):
+                return record
+        return {**record, "ended_at": now()}
+
+    def close_retired_alias_overlap(self, state: dict[str, Any]) -> None:
+        """Persist the end of an ordinary-release window once its instances have exited."""
+        record = state.get("alias_overlap")
+        closed = self.observed_alias_overlap(record)
+        if closed == record:
+            return
+        state["alias_overlap"] = closed
+        if not self.ops.dry_run:
+            save_state(self.cfg, state)
+
     def retire_and_transfer(self, state: dict[str, Any], route: MainRoute, retiring: dict[str, Any], *,
                             alias_plan: dict[str, list[str]] | None = None, allow_draining: bool = False) -> None:
         # Fresh reloads can briefly answer on both worker generations.
@@ -2132,18 +2198,18 @@ class Deployer:
                     raise DeployError("the shared alias is not active on all expected networks")
             except (Exception, KeyboardInterrupt) as err:
                 raise AliasPublicationFailed(str(err) or type(err).__name__) from err
+        if old_aliases:
+            # Confirm coverage before anything is stopped: a gap discovered
+            # afterwards would already have removed the last provider.
+            if not self.alias_networks(retiring).issubset(self.alias_networks(route.serving)):
+                raise FallbackFailed("the receiving slot does not provide the shared alias on every "
+                                     "network. Both serving pairs were kept")
         self.retire_serving(retiring, state=state)
         if old_aliases:
             # Let in-flight requests finish before removing the old alias
             # configuration, including from stopped containers that can restart.
             for cid in old_ids.values():
                 self.wait_exit(cid, self.cfg.ready_timeout)
-            # Withdraw only after the receiving slot advertises on every network
-            # the retiring slot is about to lose; a gap would answer 502.
-            required = {(endpoint.network, endpoint.network_ref) for endpoint in old_aliases}
-            if not required.issubset(self.alias_networks(route.serving)):
-                raise FallbackFailed("the receiving slot does not provide the shared alias on every "
-                                     "network. Both serving pairs were kept")
             self.configure_rollback_aliases(old_target, old_ids, old_aliases, shared=False)
             self.end_alias_overlap(state, [retiring["slot"], route.serving["slot"]])
 
@@ -2627,6 +2693,7 @@ class Deployer:
 
     def _resume(self) -> None:
         state = load_main_state(self.cfg)
+        self.close_retired_alias_overlap(state)
         preparation = state.get("in_progress") or {}
         if preparation.get("step") == "prepare held slot":
             if self.ops.dry_run:
@@ -2721,6 +2788,7 @@ class Deployer:
 
     def _abort_hold(self) -> None:
         state = load_main_state(self.cfg)
+        self.close_retired_alias_overlap(state)
         progress = state.get("in_progress") or {}
         if progress.get("step") == "prepare held slot":
             if not self.ops.dry_run:
@@ -3057,8 +3125,19 @@ class Deployer:
         view["deployed_at"] = now()
         if signalled and (state.get("in_progress") or {}).get("publish_aliases_at_create"):
             # A successful ordinary release does not wait for old streams to
-            # finish. Watch may still see these exact instances on the alias.
-            state["retiring_serving"] = {"slot": current["slot"], "containers": signalled, "recorded_at": now()}
+            # finish. Watch may still see these exact instances on the alias,
+            # so keep the window until the recorded instances are observed gone.
+            retiring = {"slot": current["slot"], "containers": signalled, "recorded_at": now(),
+                        "names": {role: current["containers"][role] for role in signalled}}
+            state["retiring_serving"] = retiring
+            window = (state.get("in_progress") or {}).get("alias_overlap") or {}
+            state["alias_overlap"] = {
+                "reason": window.get("reason", "publish_at_create"),
+                "slots": window.get("slots") or [current["slot"], target.slot],
+                "stage": window.get("stage", "start serving"),
+                "started_at": window.get("started_at", now()),
+                "retiring": retiring,
+            }
         else:
             state.pop("retiring_serving", None)
         state.update(previous=current, current=view)
@@ -3084,6 +3163,12 @@ class Deployer:
         if publish_aliases_at_create and not prior.get("publish_aliases_at_create"):
             origin_current = original.get("current") or {}
             if origin_current.get("slot") and origin_current["slot"] != target.slot:
+                # Preflight just proved no container in this slot is running,
+                # so an earlier ordinary window there has ended.
+                earlier = state.get("alias_overlap")
+                if (isinstance(earlier, dict) and not earlier.get("ended_at")
+                        and (earlier.get("retiring") or {}).get("slot") == target.slot):
+                    state["alias_overlap"] = {**earlier, "ended_at": now()}
                 # The target registers at create while the current slot still
                 # serves; this window ends when the retired instances exit.
                 progress["alias_overlap"] = alias_overlap_record(
@@ -3185,6 +3270,10 @@ def status(cfg: Config, ops: Ops) -> dict[str, Any]:
     if state.get("retiring_serving"):
         # The ordinary release does not wait for the retired instances to exit.
         report["retiring_serving"] = dict(state["retiring_serving"])
+    if isinstance(state.get("alias_overlap"), dict):
+        # Read-only: the persisted record closes on the next release command,
+        # so status derives the end from the recorded instances instead.
+        report["alias_overlap"] = deployer.observed_alias_overlap(dict(state["alias_overlap"]))
     if progress and progress["phase"] in ("deploying", "aborting"):
         report["in_progress"]["process_running"] = release_running(ops, progress)
     if progress and progress["phase"] in ("held", "aborting") and "held_at" in progress:
@@ -3250,23 +3339,39 @@ def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]
     peer = progress.get("target")
     if not peer or peer["slot"] == current["slot"]:
         peer = state.get("previous")
+    # Steady state allows only the current slot. A recorded handoff also
+    # allows the named peer, but only the recorded instances may keep draining.
+    allowed = {current["slot"]}
+    retiring_slot = None
+    retiring = None
     if peer and peer["slot"] != current["slot"]:
         overlap_expected = (phase in ("deploying", "aborting") and active_release
                             and planned_alias_overlap(progress, current, peer))
-        retired = state.get("retiring_serving") or {}
-        retiring = retired.get("containers") if not progress and retired.get("slot") == peer["slot"] else None
-        roles = SERVING_ROLES
         if overlap_expected:
-            # Once a role is marked for TERM, only that same container start
-            # may continue draining on the alias. Other roles have yet to retire.
-            marking = progress.get("retiring_serving") or {}
-            retiring = marking.get("containers") if marking.get("slot") == peer["slot"] else None
-            roles = tuple(retiring or ())
-        if roles:
-            with contextlib.suppress(DeployError, OSError, subprocess.SubprocessError):
-                if (deployer.alias_networks(current)
-                        and deployer.alias_networks(peer, retiring=retiring, roles=roles)):
-                    alerts.append({"alert": ["shared_alias_conflict"], "at": now(), "slots": [current["slot"], peer["slot"]]})
+            allowed.add(peer["slot"])
+            marking = (progress.get("retiring_serving") or {}) if progress else (state.get("retiring_serving") or {})
+            if marking.get("slot") == peer["slot"]:
+                retiring_slot, retiring = peer["slot"], marking.get("containers")
+        elif not progress:
+            # A finished ordinary release may still have its retired instances
+            # draining; only those exact instances are exempt.
+            retired = state.get("retiring_serving") or {}
+            if retired.get("slot") == peer["slot"]:
+                allowed.add(peer["slot"])
+                retiring_slot, retiring = peer["slot"], retired.get("containers")
+    conflict = set()
+    with contextlib.suppress(DeployError, OSError, subprocess.SubprocessError):
+        for slot, view in alias_slot_views(cfg, state, progress).items():
+            if slot == retiring_slot:
+                # Once a role is marked for TERM, only that same container
+                # start may continue draining on the alias.
+                roles = tuple(retiring or ())
+                if roles and deployer.alias_networks(view, retiring=retiring, roles=roles):
+                    conflict.add(slot)
+            elif slot not in allowed and deployer.alias_networks(view):
+                conflict.add(slot)
+    if conflict:
+        alerts.append({"alert": ["shared_alias_conflict"], "at": now(), "slots": sorted(conflict)})
     t = ops.monotonic()
     for role, name in current["containers"].items():
         token = None

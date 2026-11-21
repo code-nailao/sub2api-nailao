@@ -1889,6 +1889,88 @@ class DeployTest(unittest.TestCase):
         self.assertIn(["shared_alias_conflict"], alerts(record(ended_at="2026-01-01T00:00:05+00:00")))
         self.assertNotIn(["shared_alias_conflict"], alerts(record()))
 
+    def test_guard_rollback_keeps_retiring_slot_until_alias_coverage_is_confirmed(self):
+        self.deploy()
+        source = self.state()["current"]
+        self.ops.public_status_after_reload = 503
+        drain = deploy.Deployer.wait_for_nginx_drain
+        injected = {}
+
+        def lose_network(deployer, state, route):
+            if not injected:
+                injected["slot"] = route.serving["slot"]
+                for role in deploy.SERVING_ROLES:
+                    networks = self.ops.containers[source["containers"][role]]["NetworkSettings"]["Networks"]
+                    networks.pop(self.cfg.networks[1], None)
+            return drain(deployer, state, route)
+
+        with mock.patch.object(deploy.Deployer, "wait_for_nginx_drain", lose_network):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "shared alias|switching back failed"):
+                self.deploy(image="another@sha256:3")
+        self.assertTrue(injected)
+        failed = self.state()["in_progress"]["target"]
+        for role in deploy.SERVING_ROLES:
+            info = self.ops.inspect(failed["containers"][role])
+            self.assertTrue(info["State"]["Running"], role)
+            self.assertTrue(all(self.cfg.serving_alias in (endpoint.get("Aliases") or ())
+                                for endpoint in info["NetworkSettings"]["Networks"].values()), role)
+        self.assert_release_failure("failed")
+        self.assert_live_release(source)
+
+    def test_ordinary_release_keeps_alias_window_open_until_retired_instances_exit(self):
+        self.deploy()
+        source = self.state()["current"]
+        for role in deploy.SERVING_ROLES:
+            self.ops.drain_seconds[source["containers"][role]] = 30
+        self.deploy(image="another@sha256:3")
+        state = self.state()
+        self.assertIsNone(state["in_progress"])
+        overlap = state["alias_overlap"]
+        self.assertNotIn("ended_at", overlap)
+        self.assertEqual({source["slot"], state["current"]["slot"]}, set(overlap["slots"]))
+        self.assertIn("retiring", overlap)
+        report = deploy.status(self.cfg, self.ops)
+        self.assertIn("alias_overlap", report)
+        self.assertNotIn("ended_at", report["alias_overlap"])
+        runner = deploy.Deployer(self.cfg, self.ops)
+        self.assertTrue(runner.alias_networks(source))
+        self.assertTrue(runner.alias_networks(state["current"]))
+        self.ops.sleep(31)
+        self.assertIn("ended_at", deploy.status(self.cfg, self.ops)["alias_overlap"])
+        with mock.patch.object(deploy.Deployer, "require_idle", side_effect=deploy.DeployError("fixture stop")):
+            with self.assertRaisesRegex(deploy.DeployError, "fixture stop"):
+                deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertIn("ended_at", self.state()["alias_overlap"])
+
+    def test_watch_reports_a_third_slot_sharing_the_alias_inside_a_recorded_window(self):
+        self.deploy()
+        state = self.state()
+        current = state["current"]
+        target = self.cfg.slot_view("b")
+        for role in deploy.SERVING_ROLES:
+            legacy = self.ops.containers[LEGACY["containers"][role]]
+            for network in self.cfg.networks:
+                legacy["NetworkSettings"]["Networks"][network] = {"Aliases": [self.cfg.serving_alias]}
+            self.ops.run(["docker", "start", LEGACY["containers"][role]], mutate=True)
+            name = target["containers"][role]
+            self.ops.add(name, target["ports"][role])
+            for network in self.cfg.networks:
+                self.ops.containers[name]["NetworkSettings"]["Networks"][network] = {
+                    "Aliases": [self.cfg.serving_alias]}
+        pid = os.getpid()
+        self.ops.files["/proc/sys/kernel/random/boot_id"] = "fixture-boot\n"
+        self.ops.files[f"/proc/{pid}/stat"] = f"{pid} (release) R " + "0 " * 20
+        deploy.save_state(self.cfg, {**state, "in_progress": {
+            "phase": "deploying", "step": "switch", "target": target,
+            "origin": {"current": current, "previous": LEGACY},
+            "alias_overlap": {"reason": "publish_at_create", "slots": [current["slot"], target["slot"]],
+                              "stage": "start serving", "started_at": "2026-01-01T00:00:00+00:00"},
+            "process": {"pid": pid, "boot_id": "fixture-boot", "started_at_tick": "0"}}})
+        conflicts = [item for item in deploy.watch_once(self.cfg, self.ops, {})
+                     if item.get("alert") == ["shared_alias_conflict"]]
+        self.assertTrue(conflicts)
+        self.assertIn("legacy", conflicts[0]["slots"])
+
     def test_watch_reports_an_instance_restarted_before_retirement_finishes(self):
         self.deploy()
         primary = self.state()["current"]["containers"]["serving"]
