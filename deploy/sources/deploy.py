@@ -947,8 +947,8 @@ class Deployer:
         status, body = self.ops.http_json(f"http://127.0.0.1:{port}/internal/sources/runtime", token=token, timeout=timeout)
         return body if status == 200 and isinstance(body, dict) else None
 
-    def health(self, port: int) -> bool:
-        return self.ops.http_json(f"http://127.0.0.1:{port}/health")[0] == 200
+    def health(self, port: int, *, timeout: float = RUNTIME_STATUS_TIMEOUT_SECONDS) -> bool:
+        return self.ops.http_json(f"http://127.0.0.1:{port}/health", timeout=timeout)[0] == 200
 
     def recovery_timeout(self, deadline: float | None, maximum: float) -> float:
         if deadline is None:
@@ -983,7 +983,10 @@ class Deployer:
             else:
                 last = self.runtime(port, token)
             if last and last.get("ready") and last.get("role") == role:
-                if (role != "background" or last.get("owns_background")) and (not check_health or self.health(port)):
+                health_timeout = self.recovery_timeout(ready_until if deadline is not None else None,
+                                                       RUNTIME_STATUS_TIMEOUT_SECONDS)
+                if (role != "background" or last.get("owns_background")) and (
+                        not check_health or self.health(port, timeout=health_timeout)):
                     return last
             delay = poll if deadline is None else min(poll, max(0, ready_until - self.ops.monotonic()))
             self.ops.sleep(delay)
@@ -997,7 +1000,7 @@ class Deployer:
             timeout = min(timeout, deadline - self.ops.monotonic())
             if timeout <= 0:
                 return None, False
-        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+        with contextlib.suppress(DeployError, OSError, ValueError, subprocess.SubprocessError):
             info = self.ops.inspect(name, timeout=timeout)
             if info is not None:
                 return info, False
@@ -1005,7 +1008,7 @@ class Deployer:
             timeout = min(DOCKER_STATUS_TIMEOUT_SECONDS, deadline - self.ops.monotonic())
             if timeout <= 0:
                 return None, False
-        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+        with contextlib.suppress(DeployError, OSError, ValueError, subprocess.SubprocessError):
             return None, self.ops.container_missing(name, timeout=timeout)
         return None, False
 
@@ -1800,10 +1803,12 @@ class Deployer:
         return observed[name]
 
     def check_rollback_serving(self, view: dict[str, Any], *, observed: dict[str, dict[str, Any]] | None = None,
-                               roles: tuple[str, ...] = SERVING_ROLES) -> None:
+                               roles: tuple[str, ...] = SERVING_ROLES,
+                               deadline: float | None = None) -> None:
         for role in roles:
             info = self.serving_info(view, role, observed)
-            if not info.get("State", {}).get("Running") or not self.health(view["ports"][role]):
+            timeout = self.recovery_timeout(deadline, RUNTIME_STATUS_TIMEOUT_SECONDS)
+            if not info.get("State", {}).get("Running") or not self.health(view["ports"][role], timeout=timeout):
                 raise DeployError(f"rollback {role} on slot {view['slot']} is not answering health checks")
 
     def background_answering(self, view: dict[str, Any], *, allow_draining: bool = False,
@@ -1812,23 +1817,26 @@ class Deployer:
         responding = runtime.get("ready") or (allow_draining and runtime.get("draining")
                                                and runtime.get("admin_during_drain") == "read-only")
         return bool(runtime.get("role") == "background" and runtime.get("owns_background") and responding
-                    and self.health(view["ports"]["background"]))
+                    and self.health(view["ports"]["background"],
+                                    timeout=self.recovery_timeout(deadline, RUNTIME_STATUS_TIMEOUT_SECONDS)))
 
     def check_rollback_route(self, route: MainRoute, *, allow_draining: bool = False,
                              require_standby: bool = True, observed: dict[str, dict[str, Any]] | None = None,
                              allow_missing_background: bool = False,
                              allow_unconfirmed_background: bool = False,
-                             allow_unready_background: bool = False) -> None:
+                             allow_unready_background: bool = False,
+                             deadline: float | None = None) -> None:
         roles = route.serving_roles()
         if not require_standby and "serving" in roles:
             roles = ("serving",)
-        self.check_rollback_serving(route.serving, observed=observed, roles=roles)
-        runtime = self.owner_runtime(route.admin)
+        self.check_rollback_serving(route.serving, observed=observed, roles=roles, deadline=deadline)
+        runtime = self.owner_runtime(route.admin, deadline=deadline)
         answering = ((runtime or {}).get("ready")
                      or (allow_unready_background and (runtime or {}).get("role") == "background")
                      or (allow_draining and (runtime or {}).get("draining")
                          and (runtime or {}).get("admin_during_drain") == "read-only"))
-        healthy = self.health(route.admin["ports"]["background"])
+        healthy = self.health(route.admin["ports"]["background"],
+                              timeout=self.recovery_timeout(deadline, RUNTIME_STATUS_TIMEOUT_SECONDS))
         owner = ((runtime or {}).get("role") == "background" and (runtime or {}).get("owns_background")
                  and answering and (healthy or allow_unready_background))
         if not owner:
@@ -1887,7 +1895,8 @@ class Deployer:
                         observed: dict[str, dict[str, Any]] | None = None,
                         allow_missing_background: bool = False,
                         allow_unconfirmed_background: bool = False,
-                        allow_unready_background: bool = False) -> None:
+                        allow_unready_background: bool = False,
+                        deadline: float | None = None) -> None:
         """Check the written route, loaded generation, alias owner and readiness for a transition.
 
         Before reload, `disk` and `ready` describe the destination, while the
@@ -1950,7 +1959,8 @@ class Deployer:
                                       require_standby=require_standby, observed=observed,
                                       allow_missing_background=allow_missing_background,
                                       allow_unconfirmed_background=allow_unconfirmed_background,
-                                      allow_unready_background=allow_unready_background)
+                                      allow_unready_background=allow_unready_background,
+                                      deadline=deadline)
 
     def current_route(self, state: dict[str, Any], current: dict[str, Any], peer: dict[str, Any], *,
                       install_probe: bool = True) -> MainRoute:
@@ -2430,7 +2440,7 @@ class Deployer:
                            wait: bool = True, deadline: float | None = None) -> bool:
         """Disable restarts and let this exact serving container finish current requests."""
         name = target.containers[role]
-        info = self.ops.inspect(name)
+        info = self.ops.inspect(name, timeout=self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS))
         if not info and allow_missing:
             return False
         if not info or info.get("Id") != cid:
@@ -2452,10 +2462,15 @@ class Deployer:
                 self.ops.run(["docker", "kill", "--signal=TERM", cid], mutate=True,
                              timeout=self.recovery_timeout(deadline, 600))
             except DeployError:
-                if (self.ops.inspect(cid) or {}).get("State", {}).get("Running"):
+                if (self.ops.inspect(
+                        cid, timeout=self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS))
+                        or {}).get("State", {}).get("Running"):
                     raise
             if wait and not self.ops.dry_run:
-                self.wait_exit(cid, self.ops.monotonic() + self.cfg.ready_timeout, poll=HANDOFF_POLL_SECONDS)
+                exit_deadline = self.ops.monotonic() + self.cfg.ready_timeout
+                if deadline is not None:
+                    exit_deadline = min(exit_deadline, deadline)
+                self.wait_exit(cid, exit_deadline, poll=HANDOFF_POLL_SECONDS)
         return True
 
     def drain_serving_group(self, target: Target, identities: dict[str, str], *,
@@ -2493,7 +2508,8 @@ class Deployer:
         if self.stop_owned_serving(target, role, cid, allow_missing=True, deadline=deadline):
             self.ops.run(["docker", "rm", cid], mutate=True,
                          timeout=self.recovery_timeout(deadline, 600))
-        if not self.ops.dry_run and self.ops.inspect(name):
+        if not self.ops.dry_run and self.ops.inspect(
+                name, timeout=self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS)):
             raise DeployError(f"{name} still exists")
 
     def drain_serving(self, port: int, token: str, instance_id: str, *, deadline: float | None) -> None:
@@ -2645,14 +2661,18 @@ class Deployer:
         state = load_main_state(self.cfg)
         current = state.get("current")
         previous = state.get("previous")
+        try:
+            self.require_idle(state)
+        except DeployError:
+            # A finished window is audit state, not a slot change: close it
+            # even when the pause refuses the rollback.
+            self.close_retired_alias_overlap(state)
+            raise
         # Refuse before any bookkeeping write so a refused command leaves the
         # state byte-for-byte unchanged.
         if current:
             self.check_running_backup(current, allow_running_backup)
-        # A finished window is audit state, not a slot change: close it even
-        # when the release is then refused.
         self.close_retired_alias_overlap(state)
-        self.require_idle(state)
         if not current or not previous:
             raise DeployError("no previous release recorded; nothing to roll back to")
         for role in ROLES:
@@ -2809,7 +2829,7 @@ class Deployer:
                             alias_plan: dict[str, list[str]] | None = None, allow_draining: bool = False,
                             deadline: float | None = None, require_known_state: bool = False) -> None:
         # Fresh reloads can briefly answer on both worker generations.
-        self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True)
+        self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True, deadline=deadline)
         if self.ops.dry_run:
             self.retire_serving(retiring)
             return
@@ -2821,7 +2841,9 @@ class Deployer:
         new_aliases: list[ServingEndpoint] = []
         for target, identities, endpoints in ((old_target, old_ids, old_aliases), (new_target, new_ids, new_aliases)):
             for role in SERVING_ROLES:
-                info = self.ops.inspect(target.containers[role]) or {}
+                info = self.ops.inspect(
+                    target.containers[role],
+                    timeout=self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS)) or {}
                 if not info:
                     continue
                 identities[role] = info["Id"]
@@ -2859,11 +2881,13 @@ class Deployer:
         expected_aliases = {(ep.network, ep.network_ref) for ep in new_aliases}
         if alias_plan:
             try:
-                route = self.publish_routed_aliases(state, route, retiring, new_ids, new_aliases, allow_draining=allow_draining)
+                route = self.publish_routed_aliases(state, route, retiring, new_ids, new_aliases,
+                                                    allow_draining=allow_draining, deadline=deadline)
                 if old_aliases:
                     self.ops.sleep(ALIAS_DNS_GRACE_SECONDS)
                 self.wait_for_nginx_drain(state, route)
-                self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True)
+                self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True,
+                                     deadline=deadline)
                 if not expected_aliases.issubset(self.alias_networks(route.serving)):
                     raise DeployError("the shared alias is not active on all expected networks")
             except (Exception, KeyboardInterrupt) as err:
@@ -2886,13 +2910,14 @@ class Deployer:
                 if deadline is not None:
                     exit_deadline = min(exit_deadline, deadline)
                 self.wait_exit(cid, exit_deadline, poll=HANDOFF_POLL_SECONDS)
-            self.configure_rollback_aliases(old_target, old_ids, old_aliases, shared=False)
+            self.configure_rollback_aliases(old_target, old_ids, old_aliases, shared=False, deadline=deadline)
             self.end_alias_overlap(state, [retiring["slot"], route.serving["slot"]])
 
     def publish_routed_aliases(self, state: dict[str, Any], route: MainRoute, retiring: dict[str, Any],
                                identities: dict[str, str], endpoints: list[ServingEndpoint], *,
-                               allow_draining: bool = False) -> MainRoute:
-        self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True)
+                               allow_draining: bool = False,
+                               deadline: float | None = None) -> MainRoute:
+        self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True, deadline=deadline)
         if self.alias_networks(retiring) and not planned_alias_overlap(state["in_progress"], route.serving, retiring):
             raise RoutingUnconfirmed("the shared alias was not withdrawn from the old slot")
         target = Target.from_view(route.serving, self.cfg.runtime_token_file)
@@ -2915,12 +2940,14 @@ class Deployer:
             cid = identities[role]
             # Let the routed peer accept new work; this instance still has all
             # its endpoints until the requests already on it finish.
-            self.stop_owned_serving(target, role, cid)
-            self.configure_rollback_aliases(target, identities, selected, shared=True)
-            self.ops.run(["docker", "start", cid], mutate=True)
+            self.stop_owned_serving(target, role, cid, deadline=deadline)
+            self.configure_rollback_aliases(target, identities, selected, shared=True, deadline=deadline)
+            self.ops.run(["docker", "start", cid], mutate=True,
+                         timeout=self.recovery_timeout(deadline, 600))
             self.wait_ready(target.ports[role], self.token_for(route.serving, role), "serving", self.cfg.ready_timeout,
-                            container=cid, check_health=True)
-            self.ops.run(["docker", "update", "--restart=unless-stopped", cid], mutate=True)
+                            container=cid, check_health=True, deadline=deadline)
+            self.ops.run(["docker", "update", "--restart=unless-stopped", cid], mutate=True,
+                         timeout=self.recovery_timeout(deadline, 600))
         if active.excluded_serving is not None:
             complete = MainRoute(route.serving, route.admin)
             self.apply_route(state, active, complete, retiring, allow_draining=allow_draining)
@@ -2928,12 +2955,14 @@ class Deployer:
         return active
 
     def configure_rollback_aliases(self, target: Target, identities: dict[str, str],
-                                   endpoints: list[ServingEndpoint], *, shared: bool) -> None:
+                                   endpoints: list[ServingEndpoint], *, shared: bool,
+                                   deadline: float | None = None) -> None:
         if self.ops.dry_run:
             return
         for endpoint in endpoints:
             cid = identities[endpoint.role]
-            info = self.ops.inspect(target.containers[endpoint.role]) or {}
+            info = self.ops.inspect(target.containers[endpoint.role],
+                                    timeout=self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS)) or {}
             state = info.get("State", {})
             if info.get("Id") != cid:
                 raise DeployError(f"cannot safely configure the rollback {endpoint.role} network")
@@ -2944,14 +2973,17 @@ class Deployer:
             if state.get("Running") or state.get("Restarting"):
                 raise DeployError(f"cannot reconnect the {endpoint.role} network until it stops")
             if current is not None:
-                self.ops.run(["docker", "network", "disconnect", endpoint.network_ref, cid], mutate=True)
-            self.connect_serving_endpoint(endpoint, cid, aliases)
+                self.ops.run(["docker", "network", "disconnect", endpoint.network_ref, cid], mutate=True,
+                             timeout=self.recovery_timeout(deadline, 600))
+            self.connect_serving_endpoint(endpoint, cid, aliases, deadline=deadline)
 
-    def connect_serving_endpoint(self, endpoint: ServingEndpoint, cid: str, aliases: tuple[str, ...]) -> None:
+    def connect_serving_endpoint(self, endpoint: ServingEndpoint, cid: str, aliases: tuple[str, ...],
+                                 *, deadline: float | None = None) -> None:
         options = [arg for alias in aliases for arg in ("--alias", alias)]
-        self.ops.run(["docker", "network", "connect", *options, *endpoint.options, endpoint.network_ref, cid], mutate=True)
+        self.ops.run(["docker", "network", "connect", *options, *endpoint.options, endpoint.network_ref, cid],
+                     mutate=True, timeout=self.recovery_timeout(deadline, 600))
         if not self.ops.dry_run:
-            info = self.ops.inspect(cid) or {}
+            info = self.ops.inspect(cid, timeout=self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS)) or {}
             actual = info.get("NetworkSettings", {}).get("Networks", {}).get(endpoint.network)
             if not endpoint.matches(actual, aliases):
                 raise DeployError(f"{endpoint.role} network configuration is unconfirmed")
@@ -3363,12 +3395,17 @@ class Deployer:
             raise FallbackFailed("the paused candidates still advertise the shared alias")
         return held
 
-    def resume(self) -> None:
-        self._resume()
+    def resume(self, *, allow_running_backup: bool = False) -> None:
+        self._resume(allow_running_backup=allow_running_backup)
 
-    def _resume(self) -> None:
+    def _resume(self, *, allow_running_backup: bool = False) -> None:
         state = load_main_state(self.cfg)
         self.close_retired_alias_overlap(state)
+        current = state.get("current")
+        if current:
+            # A backup started after the pause must finish (or be explicitly
+            # allowed) before the handoff sends TERM to its owner.
+            self.check_running_backup(current, allow_running_backup)
         preparation = state.get("in_progress") or {}
         if preparation.get("step") == "prepare held slot":
             if self.ops.dry_run:
@@ -3506,6 +3543,17 @@ class Deployer:
             if active.serving["slot"] != current["slot"] or active.admin["slot"] != current["slot"]:
                 raise RoutingUnconfirmed("the original route did not take traffic")
             self.wait_for_nginx_drain(state, active)
+            # The same invariant as release cleanup: never take the last live
+            # shared-alias provider away while aborting.
+            for role in SERVING_ROLES:
+                name = target.containers.get(role)
+                if not name:
+                    continue
+                network = self.sole_alias_network(name, state, extra=(target.view(),))
+                if network is not None:
+                    where = f"network {network[0]}" if network[0] != "unknown" else "a network (state unconfirmed)"
+                    raise SoleAliasProviderKept(f"{name} is the only serving instance advertising the "
+                                                f"shared alias on {where}; kept running.")
             candidates = state["in_progress"].get("candidate_ids", {})
             self.recover_held_creates(progress, target, owned)
             if owned != progress.get("owned", {}) and progress.get("hold_creation_id"):
@@ -3922,12 +3970,17 @@ class Deployer:
                             where = f"network {network[0]}" if network[0] != "unknown" else "a network (state unconfirmed)"
                             raise SoleAliasProviderKept(f"{name} is the only serving instance advertising the "
                                                         f"shared alias on {where}; kept running.")
-                        result = self.ops.run(["docker", "rm", "-f", name], mutate=True, check=False,
-                                              timeout=self.recovery_timeout(deadline, 600))
-                        if result.returncode:
-                            timeout = self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS)
-                            if not self.ops.container_missing(name, timeout=timeout):
-                                raise DeployError(f"could not remove {name} (exit {result.returncode})")
+                        cid = owned.get(role)
+                        if not cid:
+                            info, removed = self.inspect_or_missing(name, deadline=deadline)
+                            if removed:
+                                continue
+                            if not info or not info.get("Id"):
+                                raise DeployError(f"could not confirm the identity of {name} before cleanup")
+                            cid = info["Id"]
+                        # Drain and confirm the exit before removing; the deadline
+                        # only bounds the wait, and an unconfirmed exit is kept.
+                        self.remove_owned_serving(target, role, cid, deadline=deadline)
                 except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as cleanup_err:
                     failure = FallbackFailed(f"{err}. Incomplete serving cleanup: {cleanup_err}. "
                                              "Check the target slot before clearing in_progress.")
@@ -3942,6 +3995,12 @@ class Deployer:
                     route = self.current_route(state, state["current"], target.view())
                     self.verify_topology(state, route, target.view(), require_standby=False)
                 for role, cid in owned.items():
+                    name = target.containers[role]
+                    network = self.sole_alias_network(name, state, extra=(target.view(),))
+                    if network is not None:
+                        where = f"network {network[0]}" if network[0] != "unknown" else "a network (state unconfirmed)"
+                        raise SoleAliasProviderKept(f"{name} is the only serving instance advertising the "
+                                                    f"shared alias on {where}; kept running.")
                     self.remove_owned_serving(target, role, cid)
             except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as cleanup_err:
                 failure = FallbackFailed(f"cleanup incomplete ({cleanup_err}); inspect status and remove the "
@@ -4296,7 +4355,9 @@ def main(argv: list[str] | None = None) -> int:
     p_rollback = sub.add_parser("rollback", help="switch back to the previous slot")
     p_rollback.add_argument("--allow-running-backup", action="store_true",
                             help="roll back while a scheduled backup is running")
-    sub.add_parser("resume", help="validate the paused release and continue switching")
+    p_resume = sub.add_parser("resume", help="validate the paused release and continue switching")
+    p_resume.add_argument("--allow-running-backup", action="store_true",
+                          help="resume while a scheduled backup is running")
     sub.add_parser("abort", help="stop and remove the paused release's serving containers")
     sub.add_parser("status", help="show current and previous release")
     sub.add_parser("watch", help="resident sampler; one JSON line per alert")
@@ -4366,7 +4427,7 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "rollback":
                 deployer.rollback(allow_running_backup=args.allow_running_backup)
             elif args.command == "resume":
-                deployer.resume()
+                deployer.resume(allow_running_backup=args.allow_running_backup)
             elif args.command == "abort":
                 deployer.abort()
         return 0

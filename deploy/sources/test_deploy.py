@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import http.client
 import http.server
+import inspect
 import io
 import json
 import multiprocessing
@@ -393,6 +394,17 @@ class DeployTest(unittest.TestCase):
         self.assertEqual([view["containers"]["background"]], [n for n, r in roles if r.get("owns_background")])
         self.assertTrue(dict(roles)[view["containers"]["background"]]["ready"])
 
+    def assert_alias_provider_kept(self, target):
+        progress = self.state().get("in_progress")
+        self.assertIsNotNone(progress)
+        self.assertIn("shared alias", progress.get("failed") or progress.get("reason") or "")
+        runner = deploy.Deployer(self.cfg, self.ops)
+        self.assertTrue(runner.alias_networks(target), "the kept target must still provide the alias")
+        for role in deploy.SERVING_ROLES:
+            name = (target.get("containers") or {}).get(role)
+            if name and name in self.ops.containers:
+                self.assertTrue(self.ops.containers[name]["State"]["Running"], f"{role} must stay running")
+
     def assert_release_failure(self, phase, reason=None):
         progress = deploy.status(self.cfg, self.ops)["in_progress"]
         self.assertIsNotNone(progress)
@@ -643,12 +655,12 @@ class DeployTest(unittest.TestCase):
         self.assert_loaded_interfaces(current, current, admin_healthy=restores_owner)
         if restores_owner:
             self.assert_live_release(current)
-        if restores_owner:
+        if restores_owner and command != "main":
             self.assert_no_shared_serving(target)
         self.assertNotIn([self.cfg.nginx_bin, "-s", "reload"], self.ops.commands)
         if command == "main":
-            self.assertIsNone(self.state()["in_progress"])
-            self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
+            self.assert_alias_provider_kept(target)
+            self.assertTrue(deploy.watch_once(self.cfg, self.ops, {}))
         else:
             self.assert_release_failure("failed", "state write" if failure == "state" else "KeyboardInterrupt")
         if not restores_owner:
@@ -2510,11 +2522,11 @@ class DeployTest(unittest.TestCase):
                     self.assert_release_failure("failed", "simulated port binding failure")
                     deploy.save_state(self.cfg, {**self.state(), "in_progress": None})
                 else:
-                    self.assertIsNone(self.state()["in_progress"])
+                    self.assert_alias_provider_kept(self.cfg.slot_view("a"))
                 info = self.ops.inspect(LEGACY["containers"]["background"])
                 self.assertEqual("unless-stopped", info["HostConfig"]["RestartPolicy"]["Name"])
 
-    def test_main_old_background_exit_query_error_restarts_exited_owner(self):
+    def test_main_old_background_exit_query_error_is_retried(self):
         old = LEGACY["containers"]["background"]
         inspect = self.ops.inspect
         failed = False
@@ -2528,11 +2540,13 @@ class DeployTest(unittest.TestCase):
             return info
 
         with mock.patch.object(self.ops, "inspect", fail_after_term):
-            with self.assertRaisesRegex(deploy.DeployError, "simulated exit query failure"):
-                self.deploy()
+            # The unreadable inspection falls back to the container list and
+            # the next read confirms the exit, so the release continues.
+            self.deploy()
         self.assertTrue(failed)
-        self.assert_live_release(LEGACY)
+        self.assertEqual("a", self.state()["current"]["slot"])
         self.assertIsNone(self.state()["in_progress"])
+        self.assertFalse(self.ops.containers[old]["State"]["Running"])
 
     def test_main_background_restore_failure_records_gap(self):
         target = self.cfg.slot_view("a")
@@ -3267,7 +3281,7 @@ class DeployTest(unittest.TestCase):
                 contextlib.redirect_stderr(stderr):
             self.assertEqual(1, deploy.main(["main", "fixture-image:nginx-fails"]))
         self.assert_live_release(LEGACY)
-        self.assertIsNone(self.state()["in_progress"])
+        self.assert_alias_provider_kept(self.cfg.slot_view("a"))
         history.assert_called_once()
         self.assertEqual("failed", history.call_args.args[1]["result"])
         self.assertIn("warning", stderr.getvalue())
@@ -3559,10 +3573,9 @@ class DeployTest(unittest.TestCase):
         self.assert_loaded_interfaces(LEGACY, LEGACY)
         self.assertEqual(before, Path(self.cfg.state_file).read_bytes())
         self.assert_release_failure("held")
-        deploy.Deployer(self.cfg, self.ops).abort()
-        self.assertIsNone(self.state()["in_progress"])
-        for role in deploy.SERVING_ROLES:
-            self.assertIsNone(self.ops.inspect(held["target"]["containers"][role]))
+        with self.assertRaisesRegex(deploy.DeployError, "abort incomplete"):
+            deploy.Deployer(self.cfg, self.ops).abort()
+        self.assert_alias_provider_kept(held["target"])
         self.assert_live_release(LEGACY)
 
     def test_resume_refuses_a_changed_current_release_or_unexpected_background(self):
@@ -3869,7 +3882,7 @@ class DeployTest(unittest.TestCase):
         self.assertTrue(attempted)
         self.assertFalse(self.ops.switched)
         self.assert_live_release(LEGACY)
-        self.assertIsNone(self.state()["in_progress"])
+        self.assert_alias_provider_kept(self.cfg.slot_view("a"))
 
     def test_main_unreadable_upstream_keeps_routing_and_returns_background(self):
         read = self.ops.read_bytes
@@ -4004,7 +4017,7 @@ class DeployTest(unittest.TestCase):
                 self.deploy()
         self.assertTrue(old["State"]["Running"])
         self.assertEqual(policy, old["HostConfig"]["RestartPolicy"])
-        self.assertIsNone(self.state()["in_progress"])
+        self.assert_alias_provider_kept(self.cfg.slot_view("a"))
         self.assert_live_release(LEGACY)
 
     def test_main_handoff_readiness_failure_restores_original_retry_limit(self):
@@ -4015,7 +4028,7 @@ class DeployTest(unittest.TestCase):
         with self.assertRaisesRegex(deploy.DeployError, "is running again"):
             self.deploy()
         self.assertEqual(policy, old["HostConfig"]["RestartPolicy"])
-        self.assertIsNone(self.state()["in_progress"])
+        self.assert_alias_provider_kept(self.cfg.slot_view("a"))
         self.assert_live_release(LEGACY)
 
     def test_main_switch_failure_restores_original_background_restart_policy(self):
@@ -4026,7 +4039,7 @@ class DeployTest(unittest.TestCase):
         with self.assertRaisesRegex(deploy.DeployError, "nginx -t rejected"):
             self.deploy()
         self.assertEqual(policy, old["HostConfig"]["RestartPolicy"])
-        self.assertIsNone(self.state()["in_progress"])
+        self.assert_alias_provider_kept(self.cfg.slot_view("a"))
         self.assert_live_release(LEGACY)
 
     def test_abort_restores_original_policy_after_handoff_recovery_fails(self):
@@ -4218,7 +4231,7 @@ class DeployTest(unittest.TestCase):
         self.assertNotIn("sources-main-a-serving", self.ops.containers, "unused new serving is removed")
         self.assertFalse(self.ops.switched, "traffic never moved")
         self.assertEqual("legacy", self.state()["current"]["slot"])
-        self.assertIsNone(self.state()["in_progress"])
+        self.assert_alias_provider_kept(self.cfg.slot_view("a"))
 
     def test_guard_failure_returns_traffic_and_background(self):
         self.cfg.serving_alias = ""
@@ -4531,7 +4544,7 @@ class DeployTest(unittest.TestCase):
                 self.deploy()
         self.assertTrue(interrupted)
         self.assertTrue(self.ops.containers[old]["State"]["Running"])
-        self.assertIsNone(self.state()["in_progress"])
+        self.assert_alias_provider_kept(self.cfg.slot_view("a"))
         self.assertNotIn(["docker", "start", successor], self.ops.commands)
 
     def test_stuck_background_without_backup_releases_publish_lock(self):
@@ -4789,9 +4802,8 @@ class DeployTest(unittest.TestCase):
         with deploy.release_lock(self.cfg.lock_file):
             self.assertLess(self.ops.clock - term_at, 33, "serving cleanup outlasted background recovery")
             self.assertEqual(current, self.state()["current"])
-            failure = self.state()["in_progress"]["failed"]
-            self.assertIn("serving cleanup", failure)
-        self.assertEqual(target_serving[:1], cleanup_attempts)
+            self.assert_alias_provider_kept(self.cfg.slot_view("a"))
+        self.assertEqual([], cleanup_attempts)
         self.assertTrue(self.ops.containers[old]["State"]["Running"])
         self.assertFalse(self.ops.switched)
 
@@ -4884,7 +4896,7 @@ class DeployTest(unittest.TestCase):
         self.assertEqual("always", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
         self.assertNotIn(["docker", "start", old], self.ops.commands)
         self.assertFalse(self.ops.switched)
-        self.assertIsNone(self.state()["in_progress"])
+        self.assert_alias_provider_kept(self.cfg.slot_view("a"))
 
     def test_failed_term_with_unreadable_old_runtime_releases_publish_lock(self):
         current = self.state()["current"]
@@ -5372,7 +5384,7 @@ class DeployTest(unittest.TestCase):
                 self.deploy()
         with deploy.release_lock(self.cfg.lock_file):
             self.assertEqual(current, self.state()["current"])
-            self.assertIsNone(self.state()["in_progress"])
+            self.assert_alias_provider_kept(self.cfg.slot_view("a"))
         self.assertTrue(self.ops.containers[old]["State"]["Running"])
         self.assertEqual("always", self.ops.containers[old]["HostConfig"]["RestartPolicy"]["Name"])
         self.assertNotIn(["docker", "kill", "--signal=TERM", old], self.ops.commands)
@@ -5501,8 +5513,8 @@ class DeployTest(unittest.TestCase):
                 self.assertTrue(self.ops.containers[candidate_standby]["State"]["Running"])
             else:
                 self.assertEqual(current, self.state()["current"])
-                self.assertIn("serving cleanup", self.state()["in_progress"]["failed"])
-                self.assertEqual([candidate_serving], cleanup_attempts)
+                self.assert_alias_provider_kept(self.cfg.slot_view("a"))
+                self.assertEqual([], cleanup_attempts)
         self.assertTrue(self.ops.containers[previous_bg]["State"]["Running"])
         self.assertFalse(self.ops.containers[candidate_bg]["State"]["Running"])
         if not guard_failure:
@@ -5963,6 +5975,124 @@ class DeployTest(unittest.TestCase):
         self.assertEqual("legacy", state["current"]["slot"])
         self.assertEqual("/rel/bg/runtime.token", state["current"]["runtime_token_files"]["background"])
 
+
+    def test_inspect_error_falls_back_to_the_container_list(self):
+        runner = deploy.Deployer(self.cfg, self.ops)
+        with mock.patch.object(self.ops, "inspect", side_effect=deploy.DeployError("daemon read failed")), \
+                mock.patch.object(self.ops, "container_missing", return_value=False) as missing:
+            self.assertEqual((None, False), runner.inspect_or_missing("old-serving"))
+            missing.assert_called_once()
+        with mock.patch.object(self.ops, "inspect", side_effect=deploy.DeployError("daemon read failed")), \
+                mock.patch.object(self.ops, "container_missing", return_value=True) as missing:
+            self.assertEqual((None, True), runner.inspect_or_missing("old-serving"))
+            missing.assert_called_once()
+
+    def test_guard_cleanup_bounds_disconnect_and_health_to_the_recovery_deadline(self):
+        view = self.cfg.slot_view("a")
+        name = view["containers"]["serving"]
+        self.ops.add(name, view["ports"]["serving"], running=False)
+        cid = self.ops.inspect(name)["Id"]
+        self.ops.containers[name]["NetworkSettings"]["Networks"]["app-data"] = {
+            "EndpointID": "fixture-endpoint", "Aliases": ["old-alias"]}
+        endpoint = deploy.ServingEndpoint("serving", "app-data", "app-data",
+                                          (self.cfg.serving_alias,), ())
+        seen = []
+        run = self.ops.run
+        http_json = self.ops.http_json
+
+        def record(args, **kwargs):
+            if args[:3] == ["docker", "network", "disconnect"]:
+                seen.append(kwargs.get("timeout"))
+            return run(args, **kwargs)
+
+        def record_health(url, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            return http_json(url, **kwargs)
+
+        deadline = self.ops.monotonic() + 4
+        running = self.state()["current"]
+        with mock.patch.object(self.ops, "run", record), mock.patch.object(self.ops, "http_json", record_health):
+            deploy.Deployer(self.cfg, self.ops).configure_rollback_aliases(
+                deploy.Target.from_view(view, self.cfg.runtime_token_file), {"serving": cid}, [endpoint],
+                shared=False, deadline=deadline)
+            deploy.Deployer(self.cfg, self.ops).check_rollback_serving(running, deadline=deadline)
+        self.assertEqual(3, len(seen), seen)
+        for timeout in seen:
+            self.assertIsNotNone(timeout, "a bounded cleanup must pass its remaining budget")
+            self.assertLessEqual(timeout, 4)
+
+    def test_rollback_during_a_hold_reports_resume_or_abort_even_with_a_backup(self):
+        self.hold()
+        old = self.state()["current"]["containers"]["background"]
+        self.ops.runtime_extra[old] = {"scheduled_backup_remaining_seconds": 5}
+        with self.assertRaisesRegex(deploy.DeployError, "resume.*abort"):
+            deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertEqual("held", self.state()["in_progress"]["phase"])
+
+    def test_resume_checks_the_running_backup_before_sigterm(self):
+        self.hold()
+        old = self.state()["current"]["containers"]["background"]
+        self.ops.runtime_extra[old] = {"scheduled_backup_remaining_seconds": 5}
+        with self.assertRaisesRegex(deploy.DeployError, "scheduled backup"):
+            deploy.Deployer(self.cfg, self.ops).resume()
+        self.assertEqual("held", self.state()["in_progress"]["phase"])
+        self.assertNotIn(["docker", "kill", "--signal=TERM", old], self.ops.commands)
+        self.ops.runtime_extra[old] = {"scheduled_backup_remaining_seconds": 0}
+        with mock.patch.object(deploy, "MainOps", return_value=self.ops), \
+                mock.patch.object(deploy.Config, "load", return_value=self.cfg):
+            self.assertEqual(0, deploy.main(["resume", "--allow-running-backup"]))
+        self.assertTrue(any("scheduled backup is running" in line for line in self.ops.logs))
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_abort_cleanup_keeps_the_last_alias_provider_without_a_deadline(self):
+        self.ops.nginx_test_rc = 1
+        with self.assertRaises(deploy.DeployError):
+            self.deploy()
+        progress = self.state()["in_progress"]
+        self.assertIsNotNone(progress)
+        self.assertIn("shared alias", progress["failed"])
+        self.assertTrue(self.ops.containers[self.cfg.container("a", "standby")]["State"]["Running"])
+
+    def test_bounded_abort_drains_serving_before_removing_it(self):
+        old = self.state()["current"]["containers"]["background"]
+        candidate = self.cfg.container("a", "serving")
+        self.ops.drain_seconds[old] = 8
+        self.ops.drain_seconds[candidate] = 60
+        self.cfg.background_exit_timeout = 2
+        with self.assertRaises(deploy.DeployError):
+            self.deploy()
+        cid = self.ops.containers[candidate]["Id"]
+        term = ["docker", "kill", "--signal=TERM", cid]
+        self.assertIn(term, self.ops.commands)
+        after = self.ops.commands[self.ops.commands.index(term) + 1:]
+        self.assertNotIn(["docker", "rm", "-f", candidate], after)
+        self.assertNotIn(["docker", "rm", cid], after)
+        self.assertIn(candidate, self.ops.containers)
+        self.assertIn("serving", self.state()["in_progress"]["failed"].lower())
+
+    def test_main_ops_public_signatures_match_and_accept_timeouts(self):
+        for name in dir(deploy.Ops):
+            if name.startswith("_") or not callable(getattr(deploy.Ops, name)):
+                continue
+            override = getattr(deploy.MainOps, name, None)
+            if override is None:
+                continue
+            self.assertEqual(inspect.signature(getattr(deploy.Ops, name)),
+                             inspect.signature(override), name)
+        ops = deploy.MainOps(dry_run=False, log=lambda message: None)
+        calls = []
+
+        def run(args, *, mutate, timeout=600, check=True):
+            calls.append((args, timeout))
+            if args[:2] == ["docker", "inspect"]:
+                return subprocess.CompletedProcess(args, 0, json.dumps([{"Id": "fixture-id"}]), "")
+            return subprocess.CompletedProcess(args, 0, "other\n", "")
+
+        with mock.patch.object(ops, "run", side_effect=run):
+            self.assertEqual({"Id": "fixture-id"}, ops.inspect("fixture", timeout=7))
+            self.assertTrue(ops.container_missing("fixture", timeout=3))
+        self.assertIn((["docker", "inspect", "fixture"], 7), calls)
+        self.assertIn((["docker", "container", "ls", "--all", "--format", "{{.Names}}"], 3), calls)
 
 if __name__ == "__main__":
     unittest.main()
