@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 type Role string
@@ -130,10 +131,11 @@ type Runtime struct {
 	// Background owner handoff (handoff.go): in-flight admin requests a
 	// draining owner would refuse, cancel functions of upgraded admin
 	// connections, and cleanup steps that have not finished yet.
-	writes   int
-	upgrades map[uint64]context.CancelFunc
-	upgradeN uint64
-	stopping map[string]int
+	writes                  int
+	upgrades                map[uint64]context.CancelFunc
+	upgradeN                uint64
+	stopping                map[string]int
+	scheduledBackupDeadline time.Time
 }
 
 func (r *Runtime) AttachAdmission(g *AdmissionGate, release, inspect func(string) (int, error)) {

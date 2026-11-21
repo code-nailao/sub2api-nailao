@@ -29,9 +29,10 @@ type Status struct {
 	// owner still answers, in-flight admin requests it would refuse while
 	// draining (writes and side-effect reads), and cleanup steps that have not
 	// finished.
-	AdminDuringDrain  string   `json:"admin_during_drain,omitempty"`
-	ActiveAdminWrites int      `json:"active_admin_writes,omitempty"`
-	Stopping          []string `json:"stopping,omitempty"`
+	AdminDuringDrain                string   `json:"admin_during_drain,omitempty"`
+	ActiveAdminWrites               int      `json:"active_admin_writes,omitempty"`
+	Stopping                        []string `json:"stopping,omitempty"`
+	ScheduledBackupRemainingSeconds *int     `json:"scheduled_backup_remaining_seconds,omitempty"`
 }
 
 func (r *Runtime) Status() Status {
@@ -45,6 +46,12 @@ func (r *Runtime) Status() Status {
 		OwnsBackground: r.owner != nil, ActiveHTTP: r.http, ActiveImages: r.images,
 		Hijacked: r.hijack, UnresolvedImages: r.failed, BackgroundServices: services}
 	r.handoffStatusLocked(&status)
+	if !r.scheduledBackupDeadline.IsZero() {
+		// Zero still signals an active backup winding down after its deadline.
+		remaining := max(time.Until(r.scheduledBackupDeadline), 0)
+		seconds := int((remaining + time.Second - 1) / time.Second)
+		status.ScheduledBackupRemainingSeconds = &seconds
+	}
 	if r.admission != nil {
 		admission := r.admission.Status()
 		status.Admission = &admission

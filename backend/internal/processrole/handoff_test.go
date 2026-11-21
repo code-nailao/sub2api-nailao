@@ -334,3 +334,25 @@ func TestStoppingStepsAreReportedUntilDone(t *testing.T) {
 		t.Fatalf("stopping after all steps finished = %v", got)
 	}
 }
+
+func TestScheduledBackupStatusSurvivesDrain(t *testing.T) {
+	r := New(Config{Role: Background})
+	if got := r.Status().ScheduledBackupRemainingSeconds; got != nil {
+		t.Fatalf("idle owner reports an active backup: %d", *got)
+	}
+	finish := r.BeginScheduledBackup(time.Now().Add(-time.Second))
+	if finish == nil {
+		t.Fatal("ready owner rejected the scheduled backup")
+	}
+	r.Drain()
+	if got := r.Status().ScheduledBackupRemainingSeconds; got == nil || *got != 0 {
+		t.Fatalf("draining owner must still report a backup cleaning up at its deadline, got %v", got)
+	}
+	if r.BeginScheduledBackup(time.Now().Add(time.Minute)) != nil {
+		t.Fatal("draining owner accepted new scheduled backup work")
+	}
+	finish()
+	if got := r.Status().ScheduledBackupRemainingSeconds; got != nil {
+		t.Fatalf("completed backup still appears active: %d", *got)
+	}
+}

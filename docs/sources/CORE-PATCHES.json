@@ -1135,19 +1135,21 @@
     },
     {
       "path": "backend/internal/processrole/handoff.go",
-      "sha256": "7926d6fea53b07b96bac7be59a642b66b5df0c24c16d559621c9cac6db429651",
+      "sha256": "a0c6dbbef6324314cfb747a05a37cff430d1439b522df98d2dd04eadc2a2a880",
       "features": [
-        "background_handoff_read_only"
+        "background_handoff_read_only",
+        "scheduled_backup_handoff"
       ],
-      "reason": "Read-only drain of the background owner: after Drain it answers admin GET and HEAD only, except reviewed reads that reach an upstream provider or the stopped media engine store; everything else is refused with 503, the native error envelope and Retry-After before any handler runs. Counts the admin requests it would refuse while draining (writes, MCP and the refused reads, but not upgrades) that were admitted before Drain and waits for them, cancels the contexts of upgraded admin connections, and reports cleanup steps still stopping."
+      "reason": "Read-only drain of the background owner: after Drain it answers admin GET and HEAD only, except reviewed reads that reach an upstream provider or the stopped media engine store; everything else is refused with 503, the native error envelope and Retry-After before any handler runs. Counts the admin requests it would refuse while draining (writes, MCP and the refused reads, but not upgrades) that were admitted before Drain and waits for them, cancels the contexts of upgraded admin connections, and reports cleanup steps still stopping. Tracks the active scheduled backup deadline and stops admitting new scheduled backup creation when the process starts draining."
     },
     {
       "path": "backend/internal/processrole/handoff_test.go",
-      "sha256": "5ade9c966e1f15f885ccbfe206c42364d1af394533b7c5e84111604198986a6f",
+      "sha256": "ee5214719e5fb91b814ea5fa6de1d69dd44de26dd5f117575fa30b6520e0015f",
       "features": [
-        "background_handoff_read_only"
+        "background_handoff_read_only",
+        "scheduled_backup_handoff"
       ],
-      "reason": "Covers the read-only drain policy, the unchanged serving and standalone behaviour, waiting for writes and refused reads admitted before Drain while an open upgrade is not waited for, cancelling only upgraded admin requests and the stopping report."
+      "reason": "Covers the read-only drain policy, the unchanged serving and standalone behaviour, waiting for writes and refused reads admitted before Drain while an open upgrade is not waited for, cancelling only upgraded admin requests and the stopping report. Checks that the runtime keeps reporting an active scheduled backup while draining and clears the status once creation has finished."
     },
     {
       "path": "backend/internal/processrole/mcp_test.go",
@@ -1159,22 +1161,24 @@
     },
     {
       "path": "backend/internal/processrole/role.go",
-      "sha256": "077d589b61fcf0cc969ed5fb94edca72cc6cb7aa62f8394fd74959283c6176d1",
+      "sha256": "26d60e6fd5f17a9273f7a8f5e0d2b23cad92d786317bac8ea07e38dd67c4698b",
       "features": [
         "native_process_lifecycle",
-        "background_handoff_read_only"
+        "background_handoff_read_only",
+        "scheduled_backup_handoff"
       ],
-      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. The runtime holds the handoff state: in-flight admin writes, cancel functions of upgraded admin connections and cleanup steps still stopping."
+      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. The runtime holds the handoff state: in-flight admin writes, cancel functions of upgraded admin connections and cleanup steps still stopping. Keeps the active scheduled backup deadline in the runtime handoff state."
     },
     {
       "path": "backend/internal/processrole/runtime.go",
-      "sha256": "87ec32a5d9be8978711b2791615d911755aad8aa8540018c952f931b5f241d8d",
+      "sha256": "ddbadf5a65da67bee7a292cbc164e678b2d82ef8b08f99f9556e3e5d28060c1c",
       "features": [
         "native_process_lifecycle",
         "account_wallet_refresh",
-        "background_handoff_read_only"
+        "background_handoff_read_only",
+        "scheduled_backup_handoff"
       ],
-      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Background admin requests pass the handoff admission check before the handler, and the runtime status reports admin_during_drain, active_admin_writes and stopping for the background role."
+      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Background admin requests pass the handoff admission check before the handler, and the runtime status reports admin_during_drain, active_admin_writes and stopping for the background role. Reports the remaining scheduled backup time on the authenticated runtime endpoint for release preflight and handoff waits."
     },
     {
       "path": "backend/internal/processrole/runtime_test.go",
@@ -2292,19 +2296,30 @@
       "path": "backend/internal/service/backup_service.go",
       "features": [
         "backup_execution_deadline",
-        "backup_bounded_disk"
+        "backup_bounded_disk",
+        "scheduled_backup_handoff",
+        "backup_connection_credentials"
       ],
-      "sha256": "2367281971898300800b311b88e4bf934c67bc4a29e9e2f7f64266a82cb839a0",
-      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space."
+      "sha256": "c7e8430f1983a7f5eb14b4e758621e648f7df04080f583f9c09c457dd00d1c3b",
+      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Lets admitted scheduled backup creation keep its own deadline during shutdown, while retention cleanup remains cancellable under the original shutdown grace period. Reuses a saved S3 secret for connection tests when the endpoint and access key match. An explicit endpoint can be tried with a different signing region. An implicit endpoint still requires a matching region. A bucket change is allowed when both configurations use path-style addressing. The addressing mode can change. An optional trailing slash matches at the root or in path-style addressing. A non-empty virtual-hosted path must match verbatim."
     },
     {
       "path": "backend/internal/service/backup_service_test.go",
       "features": [
         "backup_execution_deadline",
-        "backup_bounded_disk"
+        "backup_bounded_disk",
+        "backup_connection_credentials"
       ],
-      "sha256": "db062a6b4fc725c0bf4fb4142c00a71e514178de040497fd8d9e74dcbb9390fd",
-      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Tests for this behaviour."
+      "sha256": "a0ceadac4c1534aff3a95b93f233dc3492303df9967e3ac6a59e005bb6ec317b",
+      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Tests for this behaviour. Covers saved-secret reuse for either addressing mode at the saved S3 target and for bucket changes in path style. Rejects endpoint, access key and virtual-hosted bucket changes, as well as region changes when the endpoint is implicit. Verifies that a signing region change for an explicit endpoint leaves the signed request destination unchanged. Uses the S3 SDK with an in-memory transport to verify the signed request paths in both addressing modes, including refusal to reuse secrets if a slash changes the virtual-hosted path."
+    },
+    {
+      "path": "backend/internal/service/backup_shutdown_test.go",
+      "features": [
+        "scheduled_backup_handoff"
+      ],
+      "sha256": "d608234e6b4993395acc030c2212b24b9600f07778c3082c198b5d577c0fd84f",
+      "reason": "Uses virtual time to exercise shutdown with an active scheduled backup that finishes before or after the normal wait, and with interrupted retention after a completed backup."
     },
     {
       "path": "backend/internal/service/batch_image_worker_runtime.go",
@@ -2525,6 +2540,22 @@
       ]
     },
     {
+      "path": "backend/internal/service/deepseek_chat_tool_pairing.go",
+      "features": [
+        "deepseek_chat_tool_pairing"
+      ],
+      "reason": "Repairs native DeepSeek Chat tool history. Protects a complete adjacent parallel block before resolving surplus results. For other calls, matches reused IDs within each call occurrence, gives adjacent results priority, and breaks ties by preferring content absent from earlier candidates for that ID, including discarded results. Writes results and empty placeholders in tool call order for blocks needing repair. Preserves intact adjacent blocks with their original bytes and separators while repairing other messages.",
+      "sha256": "eb923c7294331351ef2ebaf7bd30f519710d3d4d1cd7005757f8bab58f153149"
+    },
+    {
+      "path": "backend/internal/service/deepseek_chat_tool_pairing_test.go",
+      "features": [
+        "deepseek_chat_tool_pairing"
+      ],
+      "reason": "Checks streaming and buffered Chat payloads for orphan, missing, and displaced results, adjacency priority and discarded candidates with reused IDs, parallel call order and byte preservation. Covers direct DeepSeek, mapped DeepSeek models on both OpenCode Go account paths, non-DeepSeek models on shared upstreams and Responses-shaped input. Checks aligned native Chat histories without reasoning content for disabled and forced-off thinking, mapped GLM over OpenCode, and enabled DeepSeek thinking. Covers direct thinking aliases, byte preservation across hosted Chat turns, and unusable call IDs in the same assistant message. Covers tool pairing for direct model aliases, intact blocks during hosted repair, and hosted continuation size limits. Covers surplus results after a complete parallel block and rejection or compaction when hosted Chat exceeds the limit after its final body edits. Verifies that removing surplus or orphan results avoids premature compaction or rejection, and that Chat converted to other protocols keeps its pre-conversion limit.",
+      "sha256": "9441c80dbd7ffc1c2c150608d8ff09e389a7c192b29629cae07229a2d6e309be"
+    },
+    {
       "path": "backend/internal/service/deepseek_forced_tool_choice.go",
       "features": [
         "deepseek_tool_compat"
@@ -2543,10 +2574,11 @@
     {
       "path": "backend/internal/service/deepseek_request_json.go",
       "features": [
-        "deepseek_in_chat_tool_types"
+        "deepseek_in_chat_tool_types",
+        "deepseek_chat_tool_pairing"
       ],
-      "sha256": "9185a4e8a3f545aabe06730d09de5e2bc1c7d46132d9f3f407a31c17c9a7e935",
-      "reason": "Scans the Chat request envelope once for groups with tools turned off. Filters web tools by type prefix and rejects duplicates only in the tool fields. Adds the unavailable notice to the last messages field or to input for raw Responses-shaped requests. Normalizes tool choices by type and name, gives explicitly named surviving tools priority, and downgrades choices for removed tools and bare tool or function selectors. Preserves unrelated bytes and drops required when filtering empties the tool list."
+      "sha256": "b586c8bde5e422fe77a40300cd0d0010759072c0847550677aebb4796a36f74a",
+      "reason": "Scans the Chat request envelope once for groups with tools turned off. Filters web tools by type prefix and rejects duplicates only in the tool fields. Adds the unavailable notice to the last messages field or to input for raw Responses-shaped requests. Normalizes tool choices by type and name, gives explicitly named surviving tools priority, and downgrades choices for removed tools and bare tool or function selectors. Preserves unrelated bytes and drops required when filtering empties the tool list. The shared scanner also recognizes array scalar boundaries and escaped tool_call_id keys for Chat history pairing."
     },
     {
       "path": "backend/internal/service/deepseek_stream_timing_test.go",
@@ -2655,20 +2687,22 @@
       "path": "backend/internal/service/deepseek_tools_failures_test.go",
       "features": [
         "deepseek_builtin_tools",
-        "deepseek_in_chat_tool_types"
+        "deepseek_in_chat_tool_types",
+        "deepseek_chat_tool_pairing"
       ],
-      "sha256": "ca9bc295912df07edb721024795760c0b7a88415abfe58544f5d8fdbe12fb3ee",
-      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook. Tests for this behaviour."
+      "sha256": "9416c3ae8be5e58afed318629f44722ddb6c056170e98061a647560450589010",
+      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook. Tests for this behaviour. Shares the hosted fixture with raw Chat requests for byte comparisons. The shared fixture accepts gateway size limits for continuation tests."
     },
     {
       "path": "backend/internal/service/deepseek_tools_hosted.go",
       "features": [
         "deepseek_builtin_tools",
         "deepseek_tool_compat",
-        "deepseek_in_chat_tool_types"
+        "deepseek_in_chat_tool_types",
+        "deepseek_chat_tool_pairing"
       ],
-      "sha256": "0ff94253dfef90d49fc63689469879aaf32ca0832d19564cc3c2affabf1af102",
-      "reason": "Runs optional hosted search and fetch with existing eligibility, streaming and usage checkpoint rules. Routes disabled-group Chat requests, including Responses-shaped bodies on fixed Chat accounts, through the bounded web-tool filter. Marks local validation rejections and interruptions so they do not count as account failures. Optional setup failures use ordinary forwarding after removing unavailable declarations and adding a notice."
+      "sha256": "1ba4de1b70c2f7487120065b540bbc0810b64a530ce3f6419486dfb0b786497e",
+      "reason": "Runs optional hosted search and fetch with existing eligibility, streaming and usage checkpoint rules. Routes disabled-group Chat requests, including Responses-shaped bodies on fixed Chat accounts, through the bounded web-tool filter. Marks local validation rejections and interruptions so they do not count as account failures. Optional setup failures use ordinary forwarding after removing unavailable declarations and adding a notice. Keeps original native Chat messages as raw JSON, followed by appended hosted tool messages. Defers native Chat size enforcement to the final send after tool pairing and reasoning edits. Hosted Responses and Messages retain the assembled body limit, and hosted Chat conversions enforce it before conversion. A local size rejection keeps the hosted turn result available for settlement and bypasses retry handling."
     },
     {
       "path": "backend/internal/service/deepseek_tools_in_chat_test.go",
@@ -2982,28 +3016,31 @@
       "path": "backend/internal/service/openai_gateway_cc_pipeline.go",
       "features": [
         "deepseek_chat_transport_safety",
-        "deepseek_tool_compat"
+        "deepseek_tool_compat",
+        "deepseek_chat_tool_pairing"
       ],
-      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point. For DeepSeek groups with tools off, a Chat transport error permits failover only when delivery tracking confirms the request did not obtain a connection or write request bytes. Makes the protected POST body non-replayable by the underlying HTTP client, including HTTP/2 retries after REFUSED_STREAM.",
-      "sha256": "b80a7dc9a0dbfd99d1e47875c9001016475ac9560986778574725ae439d3c218"
+      "reason": "Turns DeepSeek thinking off for the one request that forces a tool call, because the provider rejects a forced tool_choice while thinking is on; other requests and other providers are forwarded unchanged. One call at the shared Chat Completions outbound point. For DeepSeek groups with tools off, a Chat transport error permits failover only when delivery tracking confirms the request did not obtain a connection or write request bytes. Makes the protected POST body non-replayable by the underlying HTTP client, including HTTP/2 retries after REFUSED_STREAM. Uses the inbound protocol to keep the existing bridge preparation. In native Chat it respects the final thinking state after forced tool selection and supports aliases on direct DeepSeek routes. Shared OpenCode routes still require a mapped DeepSeek model before adding reasoning placeholders. Native Chat reasoning and tool pairing share the same DeepSeek route classification. Checks the final hosted native Chat body after all edits, attempting JSON whitespace compaction only when it exceeds the configured limit.",
+      "sha256": "e79061b59d7484f4ea8785ab423467abe957d97893db69e8a008bae7135fec23"
     },
     {
       "path": "backend/internal/service/openai_gateway_chat_completions.go",
       "features": [
         "deepseek_builtin_tools",
         "upstream_022_request_speed_gateway",
-        "deepseek_in_chat_tool_types"
+        "deepseek_in_chat_tool_types",
+        "deepseek_chat_tool_pairing"
       ],
-      "sha256": "40f303b7c9b836906012dcf570c3e102504150db2e68bf2cdec3e5655e4b89db",
-      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook."
+      "sha256": "3756f0c277f36f31a413e6a007e83d94035f30b51480683099a4d0ed9ad24a42",
+      "reason": "Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling. Recognizes the provider's own web tool types (deepseek_web_search as search, deepseek_read_url as fetch) in the hosted DeepSeek tool loop for all three protocols; removes them before forwarding when the loop does not take a request, so the provider never runs tool calls the gateway does not bill; answers a request whose declared web tools cannot be set up as an ordinary one without them and with a notice instead of an error; and removes the unused native tool passthrough with its hook in shared response handling and its account switch. The three forwarding entry points take the body to forward from the hook. Passes the inbound protocol to raw Chat forwarding to scope tool history pairing to native Chat. Routes hosted Chat to the final send limit for native Chat and preserves the assembled body limit before converting to another protocol."
     },
     {
       "path": "backend/internal/service/openai_gateway_chat_completions_raw.go",
       "features": [
-        "grok_content_rejection_billing"
+        "grok_content_rejection_billing",
+        "deepseek_chat_tool_pairing"
       ],
-      "sha256": "c057c67443e8140621fc3c0bd657578dd4eadaea9c4b7f6dc539821cfe7dd949",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks."
+      "sha256": "ae710ca42275ab6dbb37ddb7d386a3cdc315441507ec01c8187a4d175cbecd18",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Normalizes tool call and result pairing in native Chat for direct DeepSeek routes including aliases, and for mapped DeepSeek models on recognized OpenCode routes. Responses-shaped input keeps the existing conversion. Passes the inbound protocol to the shared sender for native Chat reasoning checks."
     },
     {
       "path": "backend/internal/service/openai_gateway_forward.go",
@@ -3038,10 +3075,11 @@
     {
       "path": "backend/internal/service/openai_gateway_messages_chat_fallback.go",
       "features": [
-        "upstream_022_request_speed_gateway"
+        "upstream_022_request_speed_gateway",
+        "deepseek_chat_tool_pairing"
       ],
-      "sha256": "464bad8d7d9fb7f6084f0cbf529bf5e5e115f295af05413e972f947dd808e24b",
-      "reason": "Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling."
+      "sha256": "a8e217cc8bcccc5025ca003293669937ecc3a2a4e9ed040815b2837885838699",
+      "reason": "Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling. Identifies the Messages bridge to the shared Chat sender so existing reasoning compatibility is retained."
     },
     {
       "path": "backend/internal/service/openai_gateway_passthrough.go",
@@ -3094,6 +3132,14 @@
       ],
       "sha256": "e7442cdb21a0a03f081717e29ad00fe0dea148ffa94b4d8da34bfa69b2d2d40f",
       "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling."
+    },
+    {
+      "path": "backend/internal/service/openai_gateway_responses_chat_fallback.go",
+      "features": [
+        "deepseek_chat_tool_pairing"
+      ],
+      "reason": "Identifies the Responses bridge to the shared Chat sender so existing reasoning placeholders are retained when native Chat gets stricter placeholder checks. Provides the shared native Chat DeepSeek route classification used for both tool pairing and reasoning placeholders.",
+      "sha256": "02fd75118bead01ba29baea02d46466edd877ebfc44d96171bc4409a5f62efdc"
     },
     {
       "path": "backend/internal/service/openai_gateway_scheduling.go",
@@ -3165,6 +3211,14 @@
       ],
       "sha256": "c096203e07d9bbf1bebfe19ae4e516985e83b825b6148f69f4df87df0e2673d5",
       "reason": "Routes a key that selects a request-speed tier only to the supplier accounts fixed for that tier, keeping selection, retries and failover inside the tier for HTTP, SSE and WebSocket, while ordinary groups keep upstream scheduling."
+    },
+    {
+      "path": "backend/internal/service/openai_opencode_session_test.go",
+      "features": [
+        "deepseek_chat_tool_pairing"
+      ],
+      "reason": "Identifies native Chat in the OpenCode session header test after the shared Chat sender learns the inbound protocol.",
+      "sha256": "db40bad0fe16f21337b1af36d0b08ad4696563c6df79befe53dc41f6ac0a38fb"
     },
     {
       "path": "backend/internal/service/openai_request_speed.go",

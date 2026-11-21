@@ -1,6 +1,7 @@
 package service
 
 import (
+	"cmp"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -23,6 +25,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/processrole"
 )
 
 const (
@@ -172,9 +175,10 @@ type BackupService struct {
 	storeFactory            BackupObjectStoreFactory
 	dumper                  DBDumper
 
-	opMu      sync.Mutex // 保护 backingUp/restoring 标志
-	backingUp bool
-	restoring bool
+	opMu                sync.Mutex // 保护操作的登记与停止
+	backingUp           bool
+	restoring           bool
+	scheduledBackupDone chan struct{} // 创建完成；不包括清理过期备份
 
 	storeMu sync.Mutex // 保护 store/s3Cfg 缓存
 	store   BackupObjectStore
@@ -338,7 +342,10 @@ func (s *BackupService) cleanupStaleBackupObjects(ctx context.Context, record *B
 
 // Stop 停止定时备份并等待活跃操作完成
 func (s *BackupService) Stop() {
+	s.opMu.Lock()
 	s.shuttingDown.Store(true)
+	scheduledDone := s.scheduledBackupDone
+	s.opMu.Unlock()
 
 	var cronStopped context.Context
 	s.cronMu.Lock()
@@ -347,7 +354,7 @@ func (s *BackupService) Stop() {
 	}
 	s.cronMu.Unlock()
 
-	// 等待活跃备份/恢复完成（最多 5 分钟）
+	// 先给所有在途操作五分钟；只有定时备份的创建阶段可以继续等待。
 	done := make(chan struct{})
 	go func() {
 		if cronStopped != nil {
@@ -360,14 +367,18 @@ func (s *BackupService) Stop() {
 	case <-done:
 		logger.LegacyPrintf("service.backup", "[Backup] all active operations finished")
 	case <-time.After(5 * time.Minute):
-		logger.LegacyPrintf("service.backup", "[Backup] shutdown timeout after 5min, cancelling active operations")
+		logger.LegacyPrintf("service.backup", "[Backup] shutdown grace expired, cancelling interruptible operations")
 		if s.bgCancel != nil {
-			s.bgCancel() // 取消所有后台操作
+			s.bgCancel() // 定时备份的创建阶段有独立截止时间
 		}
-		// 给 goroutine 时间响应取消并完成清理
+		if scheduledDone != nil {
+			// Wait before closing the database and releasing background ownership.
+			<-scheduledDone
+		}
+		// 给其他 goroutine 时间响应取消并完成清理
 		select {
 		case <-done:
-			logger.LegacyPrintf("service.backup", "[Backup] active operations cancelled and cleaned up")
+			logger.LegacyPrintf("service.backup", "[Backup] all active operations finished")
 		case <-time.After(10 * time.Second):
 			logger.LegacyPrintf("service.backup", "[Backup] goroutine cleanup timed out")
 		}
@@ -442,11 +453,35 @@ func (s *BackupService) UpdateS3Config(ctx context.Context, cfg BackupS3Config) 
 	return &cfg, nil
 }
 
+// sameBackupS3Endpoint allows an optional slash at the root or when the SDK
+// appends a bucket to the base path. Virtual-hosted HeadBucket keeps a
+// non-empty base path exactly as supplied.
+func sameBackupS3Endpoint(a, b string, forcePathStyle bool) bool {
+	if a == b {
+		return true
+	}
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	if b != a+"/" || strings.ContainsAny(a, "?#") {
+		return false
+	}
+	endpoint, err := url.Parse(a)
+	return err == nil && (endpoint.Scheme == "http" || endpoint.Scheme == "https") &&
+		endpoint.Hostname() != "" && endpoint.User == nil && !strings.HasSuffix(endpoint.Path, "/") &&
+		(forcePathStyle || endpoint.Path == "")
+}
+
 func (s *BackupService) TestS3Connection(ctx context.Context, cfg BackupS3Config) error {
-	// 如果没提供 secret，用已保存的
+	// A custom endpoint fixes the address even when the signing region changes.
+	// Without one, the region selects the endpoint. Virtual-host addressing
+	// also puts the bucket in the host name.
 	if cfg.SecretAccessKey == "" {
 		old, _ := s.loadS3Config(ctx)
-		if old != nil {
+		if old != nil && sameBackupS3Endpoint(old.Endpoint, cfg.Endpoint, cfg.ForcePathStyle) &&
+			old.AccessKeyID == cfg.AccessKeyID &&
+			(cfg.Endpoint != "" || cmp.Or(old.Region, "auto") == cmp.Or(cfg.Region, "auto")) &&
+			(old.Bucket == cfg.Bucket || (old.ForcePathStyle && cfg.ForcePathStyle)) {
 			cfg.SecretAccessKey = old.SecretAccessKey
 		}
 	}
@@ -550,7 +585,13 @@ func (s *BackupService) removeCronSchedule() {
 }
 
 func (s *BackupService) runScheduledBackup() {
+	s.opMu.Lock()
+	if s.shuttingDown.Load() {
+		s.opMu.Unlock()
+		return
+	}
 	s.wg.Add(1)
+	s.opMu.Unlock()
 	defer s.wg.Done()
 
 	ctx, cancel := context.WithTimeout(s.bgCtx, backupExecutionTimeout)
@@ -578,7 +619,12 @@ func (s *BackupService) runScheduledBackup() {
 	}
 
 	logger.LegacyPrintf("service.backup", "[Backup] 开始执行定时备份, 过期天数: %d", expireDays)
-	record, err := s.createBackup(ctx, "scheduled", expireDays, schedule)
+	// Give the dump, upload and record commit their original deadline even
+	// after Stop cancels retention cleanup and other interruptible work.
+	deadline, _ := ctx.Deadline()
+	backupCtx, finish := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	defer finish()
+	record, err := s.createBackup(backupCtx, "scheduled", expireDays, schedule)
 	if err != nil {
 		if errors.Is(err, ErrBackupInProgress) {
 			logger.LegacyPrintf("service.backup", "[Backup] 定时备份跳过: 已有备份正在进行中")
@@ -590,7 +636,7 @@ func (s *BackupService) runScheduledBackup() {
 	logger.LegacyPrintf("service.backup", "[Backup] 定时备份完成: id=%s size=%d", record.ID, record.SizeBytes)
 
 	// 清理过期备份（复用已加载的 schedule）
-	if schedule == nil {
+	if ctx.Err() != nil {
 		return
 	}
 	if err := s.cleanupOldBackups(ctx, schedule); err != nil {
@@ -607,21 +653,36 @@ func (s *BackupService) CreateBackup(ctx context.Context, triggeredBy string, ex
 }
 
 func (s *BackupService) createBackup(ctx context.Context, triggeredBy string, expireDays int, schedule *BackupScheduleConfig) (*BackupRecord, error) {
+	s.opMu.Lock()
 	if s.shuttingDown.Load() {
+		s.opMu.Unlock()
 		return nil, infraerrors.ServiceUnavailable("SERVER_SHUTTING_DOWN", "server is shutting down")
 	}
-
-	s.opMu.Lock()
 	if s.backingUp {
 		s.opMu.Unlock()
 		return nil, ErrBackupInProgress
+	}
+	var finishScheduled func()
+	if schedule != nil {
+		deadline, _ := ctx.Deadline()
+		finishScheduled = processrole.Default().BeginScheduledBackup(deadline)
+		if finishScheduled == nil {
+			s.opMu.Unlock()
+			return nil, infraerrors.ServiceUnavailable("SERVER_SHUTTING_DOWN", "server is shutting down")
+		}
+		s.scheduledBackupDone = make(chan struct{})
 	}
 	s.backingUp = true
 	s.opMu.Unlock()
 	defer func() {
 		s.opMu.Lock()
+		defer s.opMu.Unlock()
 		s.backingUp = false
-		s.opMu.Unlock()
+		if finishScheduled != nil {
+			finishScheduled()
+			close(s.scheduledBackupDone)
+			s.scheduledBackupDone = nil
+		}
 	}()
 
 	s3Cfg, err := s.loadS3Config(ctx)
