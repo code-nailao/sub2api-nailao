@@ -133,7 +133,7 @@ func (s *deepSeekChatCursor) skipValue() (bool, error) {
 		}
 	case 't', 'f', 'n', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
 		start := s.pos
-		for b := s.peek(); b != 0 && !deepSeekJSONSpace(b) && b != ',' && b != '}'; b = s.peek() {
+		for b := s.peek(); b != 0 && !deepSeekJSONSpace(b) && b != ',' && b != '}' && b != ']'; b = s.peek() {
 			s.pos++
 		}
 		if s.pos == start || s.err != nil {
@@ -148,7 +148,7 @@ func (s *deepSeekChatCursor) skipValue() (bool, error) {
 func deepSeekChatFieldName(raw []byte) string {
 	// A relevant key, even with every character Unicode-escaped, is short.
 	// Avoid decoding arbitrary top-level keys that cannot match it.
-	if len(raw) > 2+6*len("tool_choice") {
+	if len(raw) > 2+6*len("tool_call_id") {
 		return ""
 	}
 	var name string
