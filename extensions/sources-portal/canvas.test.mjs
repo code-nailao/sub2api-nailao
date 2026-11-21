@@ -273,6 +273,24 @@ test('a new acknowledged configuration clears the resave entry', async () => {
   assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
 });
 
+test('removing a stale custom connection clears the resave entry at once', async () => {
+  const f = await fixture({ custom: 'configured', connection: staleOnly });
+  f.host(); f.loaded(); await f.ack();
+  f.select.value = String(CUSTOM_ID);
+  await f.select.onchange();
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+  f.elements['#canvas-retry'].onclick();
+  const dialog = f.settings.at(-1);
+  assert.equal(dialog.kind, 'custom');
+  f.state.custom = 'available';
+  dialog.onSaved(false);
+  await flush(); await flush();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
+  assert.equal(f.elements['#canvas-recovery'].hidden, true);
+  assert.equal(f.frame.hidden, false);
+});
+
 test('non-stale connection failures keep the released wording', async () => {
   const f = await fixture({ connection: () => ({ ok: false, status: 503 }) });
   assert.equal(f.document.body.dataset.state, 'recovery');

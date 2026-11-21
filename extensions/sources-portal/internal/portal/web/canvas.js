@@ -292,8 +292,24 @@ function openCustomConnectionSettings() {
     // Saving or removing is the explicit handling that clears the hint.
     resaveHint = false;
     resaveClearRequestId = null;
+    const removedId = `group-${custom.groupId}`;
+    if (configured) {
+      // The refresh below connects to the newly saved connection.
+      showState("loading", "正在连接所选分组…");
+    } else if (configuration && ack && configuration.selectedConnectionId !== removedId) {
+      // The acknowledged page still uses another connection; render it now
+      // instead of leaving the re-save button until the list refresh.
+      frame.hidden = false;
+      showState("ready");
+      notifyHost(true);
+    } else {
+      // The page was using the removed connection: drop it and reconnect.
+      if (configuration?.selectedConnectionId === removedId) { configuration = null; ack = false; }
+      frame.hidden = true;
+      recover("自定义连接已移除，正在刷新分组…");
+    }
     // A changed or removed connection must not be resent from the earlier grant.
-    granted.delete(`group-${custom.groupId}`);
+    granted.delete(removedId);
     void reloadGroups(configured ? String(custom.groupId) : "");
   } });
 }
