@@ -17,6 +17,7 @@ const ownKeyButton = document.querySelector("#use-own-key");
 const manageRecoveryButton = document.querySelector("#manage-groups-recovery");
 const params = new URLSearchParams(location.search);
 const validRequestID = (value) => typeof value === "string" && /^[\w-]{16,80}$/.test(value);
+const CUSTOM_CONNECTION_NEEDS_UPDATE = "custom_connection_needs_update";
 let studioURL, mainOrigin, storageKey, hostConfig;
 let groups = [], viewer = { displayName: "", balance: null };
 // custom is the user's own-key connection, addressed like a group by a reserved
@@ -27,8 +28,9 @@ let generation = 0, shellRevision = 0, appliedShellRevision = 0;
 let shellReady = false, integrated = false, locked = false, selectionUncertain = false;
 let connectionPending, shellPending, connectionTimer, shellTimer, checkTimer;
 let connectionApplied = false, bootstrapPending = false, initialGroupId = null;
-let startupTimer;
-function showState(state, text) {
+let startupTimer, resaveHint = false;
+function showState(state, text, resave = false) {
+  resaveHint = resave;
   document.body.dataset.state = state;
   document.body.setAttribute("aria-busy", String(state === "loading"));
   loadingPanel.hidden = state === "ready";
@@ -37,12 +39,13 @@ function showState(state, text) {
   statusTitle.textContent = state === "loading" ? "正在打开图片工作台" : locked ? "请重新进入工作台" : "工作台连接需要处理";
   retry.hidden = locked;
   retry.disabled = Boolean(connectionPending) || bootstrapPending;
+  retry.textContent = resave ? "打开自定义连接" : "重试连接";
   login.hidden = !locked;
   if (text) message.textContent = text;
 }
-function recoverView(text) {
+function recoverView(text, resave = false) {
   clearTimeout(startupTimer);
-  showState("recovery", text);
+  showState("recovery", text, resave);
   // Only a connection that was actually acknowledged may use an older peer.
   // This is a compatibility recovery, never a shortcut around authentication.
   if (connectionApplied && !locked) frame.hidden = false;
@@ -66,7 +69,8 @@ function notifyHost(ready) {
 }
 function setIntegrated(ready) {
   integrated = ready;
-  if (ready) { clearTimeout(startupTimer); showState("ready"); }
+  // A shell acknowledgement does not fix a stale custom connection.
+  if (ready && !resaveHint) { clearTimeout(startupTimer); showState("ready"); }
   document.body.dataset.integrated = String(ready);
   renderLegacyGroups();
   notifyHost(ready);
@@ -96,6 +100,10 @@ window.addEventListener("sources:locked", () => lock("主站已退出或切换�
 
 async function api(path, body) {
   const result = await authorizedJSON(path, { method: body ? "POST" : "GET", body });
+  if (path === "/api/studio/connection" && result.status === 409 && result.data?.error === CUSTOM_CONNECTION_NEEDS_UPDATE) {
+    throw Error(typeof result.data.message === "string" && result.data.message
+      ? result.data.message : "密钥所在的分组已经变化，请重新保存自定义连接。", { cause: CUSTOM_CONNECTION_NEEDS_UPDATE });
+  }
   if (!result.ok) throw Error(result.status === 401
     ? "登录已失效，请重新登录主站后打开。"
     : result.status === 403 ? "此分组的授权已撤销或过期，请在主站 API 密钥页面核对。"
@@ -172,6 +180,7 @@ function recoverShell() {
 reconnect.onclick = recoverShell;
 retry.onclick = () => {
   if (locked || connectionPending || bootstrapPending) return;
+  if (resaveHint) { openSettings("custom"); return; }
   if (!studioURL) { void bootstrap(); return; }
   if (selectionUncertain || !connectionApplied) {
     const groupId = selectedGroupId ?? initialGroupId;
@@ -221,9 +230,11 @@ function publishShell() {
     if (++attempts > 30) {
       clearInterval(shellTimer);
       shellPending = null;
-      message.textContent = "连接暂未确认，请点击“恢复连接”重试。";
-      setIntegrated(false);
-      recoverView(message.textContent);
+      if (!resaveHint) {
+        message.textContent = "连接暂未确认，请点击“恢复连接”重试。";
+        setIntegrated(false);
+        recoverView(message.textContent);
+      }
       return;
     }
     postStudio(pending);
@@ -278,7 +289,10 @@ async function connect(groupId, request) {
     connectionPending = null;
     selectionResult(pending, "error", error.message);
     message.textContent = error.message;
-    if (!integrated) recoverView(error.message);
+    const resave = error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE;
+    // A stale custom connection needs its own dialog, not a plain retry.
+    if (!integrated || resave) recoverView(error.message, resave);
+    if (resave) frame.hidden = true;
     renderLegacyGroups();
     publishShell();
   }
@@ -319,8 +333,8 @@ window.addEventListener("message", async (event) => {
     shellPending = null;
     clearInterval(shellTimer);
     appliedShellRevision = pending.revision;
-    frame.hidden = false;
-    message.textContent = "";
+    // A stale custom connection keeps its hint instead of revealing the page.
+    if (!resaveHint) { frame.hidden = false; message.textContent = ""; }
     setIntegrated(true);
     return;
   }
@@ -360,6 +374,7 @@ window.addEventListener("message", async (event) => {
     try { localStorage.setItem(storageKey, String(selectedGroupId)); } catch { /* Storage is optional. */ }
   }
   connectionApplied = true;
+  resaveHint = false;
   // Do not reveal the old intermediate surface between connection and shell ACK.
   if (integrated || document.body.dataset.state === "recovery") frame.hidden = false;
   message.textContent = integrated ? "" : "连接已建立，正在准备工作台…";
@@ -385,7 +400,7 @@ async function refreshMetadata() {
   } catch (error) {
     if (locked) return;
     viewer = { displayName: viewer.displayName, balance: null };
-    message.textContent = error.message;
+    if (!resaveHint) message.textContent = error.message;
     publishShell();
   }
 }

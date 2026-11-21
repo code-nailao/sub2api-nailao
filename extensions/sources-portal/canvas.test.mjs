@@ -196,3 +196,61 @@ test('group settings refresh the menu without reconnecting the selected group', 
   user.elements['#canvas-manage'].onclick();
   assert.equal(user.settings.length, 0);
 });
+
+const staleConnection = { ok: false, status: 409,
+  data: { error: 'custom_connection_needs_update', message: '这把密钥所在的分组已经变化，请重新打开“自定义连接”保存一次。' } };
+const staleOnly = (options, config) => options.body.group_id === CUSTOM_ID
+  ? staleConnection
+  : { ok: true, status: 200, data: config(options.body.group_id) };
+
+test('a stale own-key connection asks to resave and opens its dialog', async () => {
+  const f = await fixture({ custom: 'configured', connection: staleOnly });
+  f.select.value = String(CUSTOM_ID);
+  await f.select.onchange();
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.elements['#message'].textContent, staleConnection.data.message);
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+  f.elements['#canvas-retry'].onclick();
+  assert.equal(f.settings.at(-1).kind, 'custom');
+});
+
+test('a stale connection hint stays after the page acknowledgement', async () => {
+  const f = await fixture({ custom: 'configured', connection: staleOnly });
+  f.host(); f.loaded(); await f.ack();
+  f.select.value = String(CUSTOM_ID);
+  await f.select.onchange();
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  await f.ack();
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+});
+
+test('a stale restore request asks to resave instead of only failing', async () => {
+  const f = await fixture({ custom: 'configured', connection: (options, config) => options.body.restore_only === true
+    ? staleConnection
+    : { ok: true, status: 200, data: config(options.body.group_id) } });
+  f.host(); f.loaded(); await f.ack();
+  f.send({ type: 'sub2api:canvas-restore-connection', connectionId: `group-${CUSTOM_ID}`, requestId: crypto.randomUUID() });
+  await flush(); await flush();
+  assert.equal(f.last('sub2api:canvas-restore-error')?.connectionId, `group-${CUSTOM_ID}`);
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.elements['#canvas-retry'].textContent, '打开自定义连接');
+});
+
+test('an unrelated 409 keeps the released wording', async () => {
+  const f = await fixture({ connection: () => ({ ok: false, status: 409, data: { error: 'settings_changed' } }) });
+  assert.equal(f.elements['#message'].textContent, '授权暂不可用，请稍后重试；不会自动换组或创建新任务。');
+  assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
+  assert.equal(f.settings.length, 0);
+});
+
+test('non-stale connection failures keep the released wording', async () => {
+  const f = await fixture({ connection: () => ({ ok: false, status: 503 }) });
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.elements['#message'].textContent, '授权暂不可用，请稍后重试；不会自动换组或创建新任务。');
+  assert.equal(f.elements['#canvas-retry'].textContent, '重试连接');
+  f.elements['#canvas-retry'].onclick();
+  await flush();
+  assert.equal(f.settings.length, 0);
+  assert.equal(connections(f).length, 2);
+});
