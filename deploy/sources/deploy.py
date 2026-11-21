@@ -569,8 +569,8 @@ class Ops:
 
 
 class MainOps(Ops):
-    def inspect(self, name: str) -> dict[str, Any] | None:
-        proc = self.run(["docker", "inspect", name], mutate=False, check=False, timeout=30)
+    def inspect(self, name: str, *, timeout: float = 30) -> dict[str, Any] | None:
+        proc = self.run(["docker", "inspect", name], mutate=False, check=False, timeout=timeout)
         if proc.returncode != 0:
             if re.search(r"^Error(?: response from daemon)?: No such (?:object|container):", proc.stderr, re.M):
                 return None
