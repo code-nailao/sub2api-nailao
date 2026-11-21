@@ -654,7 +654,7 @@ class DeployTest(unittest.TestCase):
         self.assertIn(f"127.0.0.1:{previous_admin};", upstream,
                       "admin moves to the background that holds the lock and answers")
         self.assertNotIn(f"127.0.0.1:{candidate_admin};", upstream)
-        self.assertIn("whose background holds the lock and answers", message)
+        self.assertIn("admin was moved to slot legacy, whose background answers", message)
         deployer = deploy.Deployer(self.cfg, self.ops)
         self.assertTrue(deployer.background_answering(LEGACY))
         self.assertFalse(deployer.background_answering(target))
