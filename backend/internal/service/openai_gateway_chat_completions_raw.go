@@ -133,7 +133,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	}
 	upstreamBody = updatedBody
 	if inboundProtocol == APIProtocolChatCompletions && targetsDeepSeekChatModel(account, upstreamBody) {
-		pairedBody, err := normalizeDeepSeekChatToolPairing(ctx, upstreamBody)
+		pairedBody, err := normalizeDeepSeekChatToolPairingForRequest(ctx, c.Request, upstreamBody)
 		if err != nil {
 			return nil, rejectDeepSeekChatFilter(c, err)
 		}
