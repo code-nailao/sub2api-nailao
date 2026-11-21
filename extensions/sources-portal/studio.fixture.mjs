@@ -123,9 +123,8 @@ export async function createStudioFixture({ remembered, groupList = initialGroup
   const integrate = async () => {
     host();
     if (last('sub2api:image-studio-config')) await ackConnection();
-    // The released client announces itself on mount and again when its store
-    // opens, both before the first shell lands.
-    send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+    // A document counts one announcement. A second announcement is a new
+    // document, so tests that model one document send one.
     send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
     return ackShell();
   };

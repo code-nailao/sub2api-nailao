@@ -28,17 +28,14 @@ let custom = { groupId: 0, setupId: 0, enabled: false, configured: false }, mana
 let selectedGroupId = null, authorizationName = "";
 let shellRevision = 0, appliedShellRevision = 0;
 let shellReady = false, integrated = false, locked = false, selectionUncertain = false;
-// A document gives the page a small fixed set of facts, counted for the frame
-// document it belongs to: it announces itself at most twice (a starting client
-// sends two), its frame loads once, and both announcements come before it asks
-// for a group. Anything beyond that set belongs to another document. This reads
-// a slow start (an early announcement, a late load, a second announcement) and
-// a reload (its announcements before or after its load) without guessing at the
-// order they arrive in, and a document that has already asked for a group
-// cannot announce again, so its replacement is recognised before its load.
-let announcements = 0, frameLoaded = false, askedForGroup = false;
+// A frame document counts exactly one announcement and one load. The first of
+// either event to arrive belongs to the document the page is showing; anything
+// that arrives after the document already counted an event belongs to the
+// document that replaced it. A replacement is preferred over reusing old state:
+// it can only cost a short disconnect and a fresh handshake.
+let countedReady = false, countedLoad = false;
 let connectionPending, shellPending, connectionTimer, shellTimer, checkTimer;
-let connectionApplied = false, initialGroupId = null;
+let connectionApplied = false, initialGroupId = null, appliedConnection;
 let bootstrapRound, compatibilityTimer, expiredLegacyAttempt, needsCustomResave = false;
 const rounds = connectionRounds();
 // Every staleness decision goes through the token the request started with.
@@ -322,9 +319,6 @@ function sendConnection(pending) {
 function bindFrameLoad(target) {
   target.addEventListener("load", () => {
     if (locked || frame !== target) return;
-    // The first load is this document's own, even when it arrives after the
-    // child announced itself. A later load in a document that has already
-    // spoken is a replacement.
     // The frame is born on an empty document of its own. Only a load of the
     // workbench document belongs to this page: that document is served from
     // the workbench origin, while the empty one is the page's own about:blank.
@@ -334,9 +328,11 @@ function bindFrameLoad(target) {
       // Reading a workbench document's address is refused from here.
     } else if (href === "about:blank") return;
     else if (!studioURL || href !== studioURL.href) return;
-    if (frameLoaded && announcements > 0) startDocument();
-    else if (frameLoaded) return; // the empty document reported itself twice
-    frameLoaded = true;
+    // A load is this document's own only when the document has counted no
+    // event yet. A load after its announcement belongs to the document that
+    // replaced it, whatever order the two documents' events arrive in.
+    if (countedReady || countedLoad) startDocument();
+    countedLoad = true;
     sendConnection(connectionPending);
     if (shellPending && isCurrent(shellPending.started)) postStudio(shellPending.config);
     else if (!integrated) publishShell();
@@ -349,28 +345,48 @@ function startDocument() {
   shellPending = null;
   clearInterval(shellTimer);
   if (connectionPending) {
-    if (connectionPending.fromChild || connectionPending.sent) {
-      // A selection the old child made, or a configuration already handed to
-      // the old document: neither answer can belong to the new one. The page
-      // drops the request and its deadline together, so a late timeout cannot
-      // rewrite the document that replaced it either.
+    if (connectionPending.fromChild) {
+      // A selection the old child made ends with that child's document: neither
+      // its answer nor its deadline can belong to the new one.
       clearInterval(connectionTimer);
       rounds.retire();
       connectionPending = undefined;
     } else {
-      // The page's own request has not been delivered yet; it is still owed.
-      connectionPending.attempt = rounds.readdress(connectionPending.attempt);
-      connectionPending.target = undefined;
+      // The page's own request belongs to the page, not to one document. It is
+      // delivered again to whichever document now shows the workbench, with a
+      // fresh delivery record and its own deadline.
+      const pending = connectionPending;
+      pending.attempt = rounds.readdress(pending.attempt);
+      pending.sent = undefined;
+      pending.target = undefined;
+      rounds.deadline(pending.attempt, 20000, () => {
+        if (connectionPending === pending) connectionTimedOut(pending, connectionTimeout);
+      });
     }
+  }
+  if (!connectionPending && appliedConnection && !needsCustomResave && !locked) {
+    // The new document has not seen the configuration the previous one
+    // confirmed. It is delivered again as the page's own request, without a
+    // new authorization; the current document's answer is what makes the page
+    // integrated. A connection that needs a resave is not delivered again.
+    const pending = connectionPending = {
+      groupId: appliedConnection.groupId,
+      attempt: rounds.beginAttempt("page"),
+      fromChild: false,
+      restoreOnly: appliedConnection.restoreOnly,
+      config: appliedConnection.config,
+    };
+    rounds.deadline(pending.attempt, 20000, () => {
+      if (connectionPending === pending) connectionTimedOut(pending, connectionTimeout);
+    });
   }
   // Confirmations, including one the page had to wait for, belong to the
   // document that gave them.
   connectionApplied = false;
   selectionUncertain = false;
   appliedShellRevision = 0;
-  announcements = 0;
-  frameLoaded = false;
-  askedForGroup = false;
+  countedReady = false;
+  countedLoad = false;
   if (integrated) setIntegrated(false);
   frame.hidden = true;
 }
@@ -395,10 +411,6 @@ function connectionTimedOut(pending, text) {
 }
 async function connect(groupId, request) {
   if (locked || isConnecting() || isBootstrapping() || !groups.some((group) => group.id === groupId)) return;
-  // This document has now asked for a group. The released client announces
-  // itself only while it starts, before it can ask, so its announcements are
-  // over; a later one is the document that replaced it.
-  if (request) askedForGroup = true;
   // A selection the child made ends with that child's document; the page's own
   // menu outlives it. The attempt follows the request and the delivery record
   // is written when it is actually sent.
@@ -421,7 +433,9 @@ async function connect(groupId, request) {
   else message.textContent = connectingText;
   updateControls();
   const waiting = (token) => connectionPending === pending && isCurrent(token);
-  const authorizationCurrent = () => waiting(attempt);
+  // A new document re-addresses the page's own attempt; the answer it is owed
+  // is judged against the attempt as it stands now, not the one this call began.
+  const authorizationCurrent = () => waiting(pending.attempt);
   try {
     let config = cached;
     if (config) await currentToken();
@@ -431,15 +445,15 @@ async function connect(groupId, request) {
     // never arrived. A new frame also isolates retries from old legacy ACKs.
     if (replacePeer) replaceFrame();
     if (pending.sent && !isCurrent(pending.sent)) pending.sent = undefined;
-    if (needsCustomResave) {
-      needsCustomResave = false;
-      recoverView("已收到工作台连接配置，正在等待确认…");
-    }
+    // A configuration is not the answer yet: the resave state ends only when
+    // the current document acknowledges this configuration.
+    if (needsCustomResave) recoverView("已收到工作台连接配置，正在等待确认…");
     pending.config = config;
     sendConnection(pending);
     let attempts = 0;
     const timer = setInterval(() => {
-      if (!waiting(pending.attempt) || !isCurrent(pending.sent) || timer !== connectionTimer) return;
+      // A new document voids the delivery record, not the request: resend it.
+      if (!waiting(pending.attempt) || (pending.sent && !isCurrent(pending.sent)) || timer !== connectionTimer) return;
       if (++attempts > 30) {
         rounds.retire();
         connectionTimedOut(pending, "连接尚未确认，请重新选择分组。");
@@ -450,15 +464,22 @@ async function connect(groupId, request) {
     connectionTimer = timer;
     updateControls();
   } catch (error) {
+    // Only the document that started this request may be changed by it. Once
+    // the document has been replaced, the answer is dropped: no page state and
+    // no message goes to the document that replaced it.
     if (!authorizationCurrent()) return;
     rounds.finish(pending.attempt);
     connectionPending = null;
-    selectionResult(pending, "error", error.message);
     if (error.cause === CUSTOM_CONNECTION_NEEDS_UPDATE) {
+      // "Needs a resave" is the page's own state about the stored connection.
+      // The page renders its entry itself; the request is not answered into a
+      // child document that may have replaced the one that asked.
       needsCustomResave = true;
       // The page has decided this connection cannot be used. The host learns
       // it now, not after an acknowledgement that may never come.
       setIntegrated(false);
+    } else {
+      selectionResult(pending, "error", error.message);
     }
     if (!integrated || needsCustomResave) recoverView(error.message);
     else message.textContent = error.message;
@@ -495,14 +516,11 @@ window.addEventListener("message", async (event) => {
     return;
   }
   if (data.type === "sub2api:image-studio-shell-ready" && data.version === 1) {
-    // A document announces itself twice at most. More than that is a reload
-    // whose announcements arrived before its load. Two announcements and one
-    // load, in any order, are the same document: a client that starts slowly
-    // and announces itself again after applying the shell changes nothing.
-    // A document that asked for a group has finished announcing, so this is
-    // its replacement even when the replacement's load has not arrived yet.
-    if (announcements >= 2 || askedForGroup) startDocument();
-    announcements++;
+    // A document counts one announcement. An announcement after the document
+    // has already counted one, or has loaded, belongs to the document that
+    // replaced it, even when that replacement's load has not arrived yet.
+    if (countedReady || countedLoad) startDocument();
+    countedReady = true;
     shellReady = true;
     // A shell this document already applied, or has in flight, needs no
     // replacement here.
@@ -566,7 +584,12 @@ window.addEventListener("message", async (event) => {
     try { localStorage.setItem(storageKey, String(selectedGroupId)); } catch { /* Storage is optional. */ }
   }
   connectionApplied = true;
+  appliedConnection = { groupId: pending.groupId, config: pending.config, restoreOnly: pending.restoreOnly };
   rounds.accepted();
+  // The current document accepted a new configuration for the connection, so
+  // the page no longer needs a resave. A document that is replaced before this
+  // answer never reaches this point; the state stays until one does.
+  needsCustomResave = false;
   if (!integrated) waitForCompatibleShell();
   // Do not reveal the old intermediate surface between connection and shell ACK.
   if (integrated || document.body.dataset.state === "recovery") frame.hidden = false;

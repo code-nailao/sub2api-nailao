@@ -525,9 +525,13 @@ test('Studio keeps stale connection recovery through a network error until a new
   f.select.value = String(alternate);
   f.select.onchange();
   await flush();
-  assert.equal(f.retry.textContent, '重试连接');
   await f.ackConnection();
+  // The resave entry ends when the current document accepts a configuration.
+  assert.equal(f.retry.textContent, '重试连接');
+  // A repeated announcement starts a new document. The page delivers the
+  // confirmed configuration again, and the new document confirms it.
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackConnection();
   await f.ackShell();
   assert.equal(f.document.body.dataset.state, 'ready');
   assert.equal(f.loadingPanel.hidden, true);
@@ -579,9 +583,11 @@ test('an integrated Studio keeps the resave action visible after a failed switch
   const shell = await f.integrate();
   f.send(select(CUSTOM_ID, shell.revision, 'resave-connection-request'));
   await flush();
-  const result = f.last('sub2api:image-studio-select-group-result');
-  assert.equal(result.status, 'error');
-  assert.match(result.message, /重新保存自定义连接/);
+  // The resave entry is the page's own state, not an answer posted into the
+  // child, so the child receives no result message for that request.
+  assert.equal(f.last('sub2api:image-studio-select-group-result'), undefined);
+  assert.match(f.message.textContent, /重新保存自定义连接/);
+  assert.equal(f.retry.textContent, '打开自定义连接');
   await f.ackShell();
   assert.equal(f.loadingPanel.hidden, false);
   assert.equal(f.retry.textContent, '打开自定义连接');
@@ -645,11 +651,14 @@ test('a Studio deadline from before a restart cannot answer for the new shell', 
 
   f.loaded();
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  // The new document is delivered the configuration the old one confirmed,
+  // without a second authorization.
+  assert.equal(connections(f), 2);
+  await f.ackConnection();
   const restarted = await f.ackShell();
   assert.ok(restarted.revision > shell.revision);
-  // A restarted child is a new document: the connection confirmed by the old
-  // one is not carried into it, and its recovery action stays visible.
-  assert.equal(f.document.body.dataset.integrated, 'false');
+  // The confirmed connection is restored in the new document, not carried over.
+  assert.equal(f.document.body.dataset.integrated, 'true');
   assert.equal(f.retry.hidden, false);
 
   // The old request's deadline ended with the document that owned it.
@@ -659,7 +668,7 @@ test('a Studio deadline from before a restart cannot answer for the new shell', 
   assert.equal(f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-select-group-result').length, resultsBefore);
   assert.equal(f.retry.textContent, '重试连接');
   assert.doesNotMatch(f.message.textContent, /重新保存自定义连接/);
-  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.document.body.dataset.integrated, 'true');
 });
 
 test('a Studio selection made by a shell that already restarted is not applied', async () => {
@@ -679,6 +688,7 @@ test('a Studio selection made by a shell that already restarted is not applied',
   // The shell restarts before the page hears back.
   f.loaded();
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackConnection();
   const restarted = await f.ackShell();
   assert.ok(restarted.revision > shell.revision);
 
@@ -687,12 +697,13 @@ test('a Studio selection made by a shell that already restarted is not applied',
   await flush();
   assert.doesNotMatch(f.message.textContent, /重新保存自定义连接/);
   assert.equal(f.retry.textContent, '重试连接');
-  // The restarted child has not confirmed anything, whatever the old one did.
-  assert.equal(f.document.body.dataset.integrated, 'false');
+  // The old selection is not applied. The restarted child confirms only the
+  // configuration the page delivered itself.
+  assert.equal(f.document.body.dataset.integrated, 'true');
   assert.equal(f.retry.hidden, false);
 });
 
-test('a page configuration keeps the released client shape, and a restart voids it', async () => {
+test('a page configuration keeps the released client shape and is delivered again after a restart', async () => {
   const f = await fixture();
   const initial = f.last('sub2api:image-studio-config');
   assert.ok(initial);
@@ -701,169 +712,210 @@ test('a page configuration keeps the released client shape, and a restart voids 
   assert.equal('requestId' in initial, false);
   assert.equal('revision' in initial, false);
 
-  // The announcements a starting shell sends are not restarts: the page's own
-  // connection still belongs to this document and is confirmed by its answer.
-  f.loaded();
+  // One document, confirmed by its own answer.
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   await f.ackConnection();
-  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   const shell = await f.ackShell();
   assert.equal(f.document.body.dataset.integrated, 'true');
   assert.equal(f.frame.hidden, false);
 
-  // A reload after that shell, announced by the child, is a new document.
-  // Neither the old confirmation nor the old answer applies to it.
-  f.loaded();
+  // A repeated announcement is a new document. The page delivers the same
+  // configuration again, still without request metadata, and waits for this
+  // document's answer before reporting anything as integrated.
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await flush();
+  const redelivered = f.last('sub2api:image-studio-config');
+  assert.equal('requestId' in redelivered, false);
+  assert.equal('revision' in redelivered, false);
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.frame.hidden, true);
+  await f.ackConnection();
   const restarted = await f.ackShell();
   assert.ok(restarted.revision > shell.revision);
-  assert.equal(f.document.body.dataset.integrated, 'false');
-  assert.equal(f.frame.hidden, true);
-  f.send({ type: 'sub2api:image-studio-config-applied', payload: { status: 'applied',
-    profileId: `sub2api-image-studio-${initial.payload.selectedConnectionId}` } });
-  await flush();
-  assert.equal(f.document.body.dataset.integrated, 'false');
-  assert.equal(f.frame.hidden, true);
+  assert.equal(f.document.body.dataset.integrated, 'true');
 });
 
 test('the empty frame load before the workbench starts is not a document', async () => {
   const f = await fixture();
   // The iframe's empty document reports itself on the frame the page listens
-  // to. A slow store announces itself, the connection is confirmed, the
-  // workbench document loads, and the store's second announcement follows.
-  // That order must leave the document and its confirmed connection alone.
+  // to. It is ignored: only the workbench document's own events count.
+  f.blankLoad();
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   f.blankLoad();
   await f.ackConnection();
   const shell = await f.ackShell();
-  f.loaded();
-  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
-  await flush();
   assert.equal(f.document.body.dataset.state, 'ready');
   assert.equal(f.document.body.dataset.integrated, 'true');
   assert.equal(f.frame.hidden, false);
   assert.equal(f.last('sub2api:image-studio-shell-config').revision, shell.revision, 'the shell is not replaced');
 });
 
-test('a real reload after the workbench document loaded is still a new document', async () => {
-  // A document that announced itself once and loaded once.
-  const f = await fixture();
-  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
-  await f.ackConnection();
-  f.loaded();
-  const shell = await f.ackShell();
-  assert.equal(f.document.body.dataset.integrated, 'true');
-  // A switch that has not been answered belongs to the document that started it.
-  f.send(select(27, shell.revision, 'switch-before-reload-1'));
-  await flush();
-
-  // The child reloads: its document loads again and it announces itself once.
-  f.loaded();
-  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
-  await flush();
-  const restarted = f.last('sub2api:image-studio-shell-config');
-  assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
-  assert.equal(f.document.body.dataset.integrated, 'false');
-  assert.equal(f.retry.hidden, false);
-  assert.equal(f.frame.hidden, true);
-  // The old document's switch result is not delivered to the new one.
-  assert.equal(f.studioMessages.some((item) => item.type === 'sub2api:image-studio-select-group-result' &&
-    item.requestId === 'switch-before-reload-1'), false);
-});
-
-test('a reload whose single announcement arrives before its load starts a new document', async () => {
+test('a real reload of a connected document starts a new document', async () => {
   const answer = Promise.withResolvers();
   const f = await fixture({ custom: 'configured', connection: (options, config) =>
     options.body.group_id === CUSTOM_ID ? answer.promise : { ok: true, status: 200, data: config(options.body.group_id) } });
-  // A connected document: it announced itself once and loaded once.
+  // A connected document counted its announcement once.
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   await f.ackConnection();
-  f.loaded();
   const shell = await f.ackShell();
   assert.equal(f.document.body.dataset.integrated, 'true');
-  // A switch the child asked for is still waiting for its answer.
-  f.send(select(CUSTOM_ID, shell.revision, 'switch-before-reload-2'));
+  // A switch that has not been answered belongs to the document that started it.
+  f.send(select(CUSTOM_ID, shell.revision, 'switch-before-reload-1'));
   await flush();
   const results = () => f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-select-group-result');
   const before = results().length;
 
-  // The child reloads: its single announcement arrives before its load. A
-  // document that has already asked for a group cannot announce again, so this
-  // announcement belongs to the document that replaced it.
-  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  // The child reloads: its document loads again. That load cannot belong to a
+  // document that already counted an event.
+  f.loaded();
   await flush();
-  const restarted = f.last('sub2api:image-studio-shell-config');
-  assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
   assert.equal(f.document.body.dataset.integrated, 'false');
-  assert.equal(f.frame.hidden, true);
+  // The page delivers the confirmed configuration to the new document; only
+  // this document's answer makes the page integrated again.
+  await f.ackConnection();
+  const restarted = await f.ackShell();
+  assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
+  assert.equal(f.document.body.dataset.integrated, 'true');
 
-  // The old request's 409 ends with the document that owned it.
+  // The old document's answer ends with the old document.
   answer.resolve({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } });
   await flush();
   assert.equal(results().length, before, 'the old answer is not delivered to the new document');
   assert.doesNotMatch(f.message.textContent, /重新保存自定义连接/);
-  assert.equal(f.retry.textContent, '重试连接');
 });
 
-test('a slow-starting shell that announces itself twice keeps the confirmed workspace', async () => {
+test('a reload whose single announcement arrives before its load starts a new document', async () => {
   const f = await fixture();
-  f.loaded();
-  // The released client queues the shell while its store opens: it applies the
-  // shell and acknowledges it, then announces itself a second time. Both
-  // announcements belong to the same document.
+  // The connected document has announced itself once and loaded once.
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   await f.ackConnection();
-  const shell = await f.ackShell();
-  assert.equal(f.document.body.dataset.integrated, 'true');
-  assert.equal(f.frame.hidden, false);
-  const configs = f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-config').length;
-
-  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
-  await flush();
-  assert.equal(f.document.body.dataset.integrated, 'true');
-  assert.equal(f.frame.hidden, false);
-  assert.equal(f.document.body.dataset.state, 'ready');
-  assert.equal(f.last('sub2api:image-studio-shell-config').revision, shell.revision, 'the shell is not replaced');
-  assert.equal(f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-config').length, configs,
-    'the repeated announcement asks for no configuration');
-});
-
-test('a load between a slow start\'s announcements does not replace its document', async () => {
-  const f = await fixture();
-  // The order a delayed store produces: the first announcement, the frame's
-  // own load, the shell being applied, and a second announcement.
-  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   f.loaded();
   await f.ackConnection();
   const shell = await f.ackShell();
   assert.equal(f.document.body.dataset.integrated, 'true');
 
+  // The child reloads: its single announcement arrives before its load. An
+  // announcement after a document that counted a ready and a load belongs to
+  // the replacement, even though its own load has not arrived yet.
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
   await flush();
-  assert.equal(f.document.body.dataset.integrated, 'true');
-  assert.equal(f.frame.hidden, false);
-  assert.equal(f.document.body.dataset.state, 'ready');
-  assert.equal(f.last('sub2api:image-studio-shell-config').revision, shell.revision, 'the shell is not replaced');
-});
-
-test('a reload whose announcements arrive before its load is still a new document', async () => {
-  const f = await fixture();
-  const shell = await f.integrate();
-  // The first document's load never arrived before the child reloaded.
-
-  // The child reloads; both of the new document's announcements come first.
-  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
-  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
-  await flush();
-  const restarted = f.last('sub2api:image-studio-shell-config');
-  assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
   assert.equal(f.document.body.dataset.integrated, 'false');
   assert.equal(f.frame.hidden, true);
-  assert.equal(f.retry.hidden, false);
 
-  // The load that follows belongs to that document, not to another one.
-  f.loaded();
+  // Confirming the configuration delivered again restores the workspace.
+  await f.ackConnection();
+  const restarted = await f.ackShell();
+  assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
+  assert.equal(f.document.body.dataset.integrated, 'true');
+});
+
+test('a repeated announcement starts a new document', async () => {
+  const f = await fixture();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackConnection();
+  const shell = await f.ackShell();
+  assert.equal(f.document.body.dataset.integrated, 'true');
+  const configs = () => f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-config').length;
+  const delivered = configs();
+
+  // The client's store opens and announces itself again. That cannot be the
+  // same document: the page starts a new one and delivers its configuration.
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await flush();
   assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(configs(), delivered + 1, 'the confirmed configuration is delivered again');
+  await f.ackConnection();
+  const restarted = await f.ackShell();
+  assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
+  assert.equal(f.document.body.dataset.integrated, 'true');
+});
+
+test('a 409 answer is not sent into a document that replaced the requester', async () => {
+  const answer = Promise.withResolvers();
+  const f = await fixture({ custom: 'configured', connection: (options, config) =>
+    options.body.group_id === CUSTOM_ID ? answer.promise : { ok: true, status: 200, data: config(options.body.group_id) } });
+  // A connected document counted its announcement once.
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackConnection();
+  const shell = await f.ackShell();
+  assert.equal(f.document.body.dataset.integrated, 'true');
+  f.send(select(CUSTOM_ID, shell.revision, 'old-409-request-0001'));
+  await flush();
+
+  // The child reloads. Its document is open but neither an announcement nor a
+  // load has arrived yet, so the page cannot attribute anything to it.
+  answer.resolve({ ok: false, status: 409, data: { error: 'custom_connection_needs_update' } });
+  await flush();
+  // The resave entry is the page's own state. It is never expressed by posting
+  // the old request's answer into whatever document the frame holds now.
+  assert.equal(f.studioMessages.some((item) => item.type === 'sub2api:image-studio-select-group-result' &&
+    item.requestId === 'old-409-request-0001'), false);
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  assert.match(f.message.textContent, /重新保存自定义连接/);
+});
+
+test('a second announcement is a new document whose confirmation restores the workspace', async () => {
+  const f = await fixture();
+  f.loaded();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackConnection();
+  const shell = await f.ackShell();
+  assert.equal(f.document.body.dataset.integrated, 'true');
+  assert.equal(f.frame.hidden, false);
+  const configs = () => f.studioMessages.filter((item) => item.type === 'sub2api:image-studio-config').length;
+  const delivered = configs();
+
+  // The released client queues the shell while its store opens and announces
+  // itself again. That is a new document; it costs one short disconnect and a
+  // fresh confirmation, never the old document's state.
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await flush();
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(configs(), delivered + 1, 'the confirmed configuration is delivered again');
+  await f.ackConnection();
+  const restarted = await f.ackShell();
+  assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
+  assert.equal(f.document.body.dataset.integrated, 'true');
+  assert.equal(f.frame.hidden, false);
+  assert.equal(f.document.body.dataset.state, 'ready');
+});
+
+test('a load after an announcement starts a new document', async () => {
+  const f = await fixture();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackConnection();
+  const shell = await f.ackShell();
+  assert.equal(f.document.body.dataset.integrated, 'true');
+
+  // The order a delayed store produces: announcement, then the frame's own
+  // load. The load cannot belong to a document that already counted an event.
+  f.loaded();
+  await flush();
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  await f.ackConnection();
+  const restarted = await f.ackShell();
+  assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
+  assert.equal(f.document.body.dataset.integrated, 'true');
+});
+
+test('a reload whose announcements arrive before its load starts a new document', async () => {
+  const f = await fixture();
+  const shell = await f.integrate();
+  // The child reloads; its first announcement arrives before any load.
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await flush();
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.frame.hidden, true);
+  // Its own second announcement is another document again.
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await flush();
+  assert.equal(f.document.body.dataset.integrated, 'false');
+  // Confirming the latest configuration publishes a fresh shell for this
+  // document; only then is the workspace reported ready again.
+  await f.ackConnection();
+  const restarted = await f.ackShell();
+  assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
+  assert.equal(f.document.body.dataset.integrated, 'true');
   assert.equal(f.retry.hidden, false);
   assert.equal(f.select.disabled, false);
 });
@@ -882,13 +934,14 @@ test('a Studio shell restart after a failed switch asks the new document for its
 
   f.loaded();
   f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
-  const restarted = f.last('sub2api:image-studio-shell-config');
+  // The new document is delivered the configuration the old one confirmed.
+  await f.ackConnection();
+  const restarted = await f.ackShell();
   assert.ok(restarted.revision > shell.revision, 'the new document is asked for its shell');
-  await f.ackShell();
   assert.equal(f.retry.hidden, false);
   assert.equal(f.select.disabled, false);
   // The switch and the confirmation it never got ended with the old document.
-  assert.equal(f.document.body.dataset.integrated, 'false');
+  assert.equal(f.document.body.dataset.integrated, 'true');
 });
 
 test('a Studio settings save from before the shell restarted cannot close the dialog', async () => {
