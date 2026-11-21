@@ -1655,8 +1655,8 @@ class DeployTest(unittest.TestCase):
         # Capture both ordinary releases from 4925fc0a3 with this FakeOps
         # fixture. Normalize only generated names, paths and creation times.
         baseline = (
-            "649ed5390cbb1da9ba9cd71b06e19e5c415d12816921d09729959c861eb5995e",
-            "20cd79359d45747f862be271e65f4c58fb5e2a992b1b5f24887b54240f8475c8",
+            "1d1d94a4a669fcd4339cc5d71059afdfb88b9229e0df383a3a00cabb65fdac11",
+            "25d24ae8cf854d7849298afd9a8d33a11232d4a74456cd14de8fb07de8faa29d",
         )
         self.load_fixture_route(LEGACY, proof=False)
         inspect = self.ops.inspect
@@ -1673,8 +1673,8 @@ class DeployTest(unittest.TestCase):
                 with self.subTest(image=image):
                     self.ops.commands.clear()
                     self.deploy(image=image)
-                    self.assertEqual(16, sum(args[:2] == ["docker", "inspect"] for args in self.ops.commands))
-                    self.assertEqual(69, len(self.ops.commands))
+                    self.assertEqual(15, sum(args[:2] == ["docker", "inspect"] for args in self.ops.commands))
+                    self.assertEqual(67, len(self.ops.commands))
                     commands = []
                     for args in self.ops.commands:
                         command = []

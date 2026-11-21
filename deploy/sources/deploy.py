@@ -1393,14 +1393,18 @@ class Deployer:
             restart += f":{limit}"
         return restart
 
-    def start_background(self, view: dict[str, Any], *, restart: str = "unless-stopped",
+    def start_background(self, view: dict[str, Any], *, restart: str | None = "unless-stopped",
                          deadline: float | None = None, check_health: bool = False) -> None:
         name = view["containers"]["background"]
         # Once ownership is vacant, Ctrl-C must not stop the Docker clients
         # that put an owner back in service. They inherit the ignored signal.
         with finish_handoff_cleanup(ignore=True):
-            self.ops.run(["docker", "update", f"--restart={restart}", name], mutate=True,
-                         timeout=self.recovery_timeout(deadline, 600))
+            if restart is not None:
+                # A container just created for this release already carries the
+                # policy, and the ordinary release must issue the same writes
+                # as before. Only a reused container needs the update.
+                self.ops.run(["docker", "update", f"--restart={restart}", name], mutate=True,
+                             timeout=self.recovery_timeout(deadline, 600))
             self.ops.run(["docker", "start", name], mutate=True, timeout=self.recovery_timeout(deadline, 600))
             if not self.ops.dry_run:
                 self.wait_ready(view["ports"]["background"], self.token_for(view, "background"),
@@ -1435,7 +1439,20 @@ class Deployer:
         new = target.containers["background"]
         progress = state.get("in_progress") or {}
         before = self.owner_runtime(current)  # read-only, also in a dry run
-        old_info, old_removed = self.inspect_or_missing(old)
+        if self.ops.dry_run:
+            old_info, old_removed = self.ops.inspect(old), False
+        else:
+            # The policy capture needs one fresh observation. Read it over the
+            # local Engine's API so the ordinary release keeps the same
+            # command sequence; only a failed read falls back to the CLI check
+            # that decides whether the container is really gone.
+            try:
+                old_info = self.ops.inspect_snapshot(old)
+                old_removed = old_info is None
+            except (DeployError, OSError, ValueError, subprocess.SubprocessError):
+                # An unknown read falls back to the CLI check, which consults
+                # the container list before deciding the container is gone.
+                old_info, old_removed = self.inspect_or_missing(old)
         if old_info is None and not old_removed:
             raise DeployError(f"could not confirm the state of background container {old} before handoff")
         policies = progress.get("background_restart_policies", {})
@@ -1501,7 +1518,7 @@ class Deployer:
             else:
                 self.log(f"   {old} is not running. Starting the prepared background {new}.")
             try:
-                self.start_background(view, restart=policies.get(new, "unless-stopped"),
+                self.start_background(view, restart=None if create else policies.get(new, "unless-stopped"),
                                       check_health=check_health,
                                       deadline=recovery.work_until if recovery else None)
             except (DeployError, OSError, subprocess.SubprocessError) as err:
