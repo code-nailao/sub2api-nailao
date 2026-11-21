@@ -659,18 +659,145 @@ class DeployTest(unittest.TestCase):
         self.assertTrue(deployer.background_answering(LEGACY))
         self.assertFalse(deployer.background_answering(target))
 
-    def test_guard_rollback_points_admin_at_the_only_restorable_owner_when_none_answers(self):
+    def test_guard_rollback_keeps_the_current_admin_pointer_when_no_background_answers(self):
         ctx, upstream, candidate_admin, previous_admin, target = self.failed_handback_admin_owner(
             previous_stays_up=False)
         message = str(ctx.exception)
-        self.assertIn(f"127.0.0.1:{previous_admin};", upstream,
-                      "admin points at the only container a person can restore")
-        self.assertNotIn(f"127.0.0.1:{candidate_admin};", upstream)
+        self.assertIn(f"127.0.0.1:{candidate_admin};", upstream, "the admin upstream is left where it is")
+        self.assertNotIn(f"127.0.0.1:{previous_admin};", upstream)
+        self.assertIn("No background answers admin now", message)
         self.assertIn("admin entry is unavailable", message)
         self.assertIn("needs a person", message)
         deployer = deploy.Deployer(self.cfg, self.ops)
         self.assertFalse(deployer.background_answering(LEGACY))
         self.assertFalse(deployer.background_answering(target))
+
+    def test_guard_rollback_keeps_admin_on_the_candidate_after_a_restart_timeout(self):
+        self.ops.memory_after_switch = 20 * GIB
+        self.cfg.background_exit_timeout = 2
+        self.cfg.background_ready_timeout = 6
+        target = self.cfg.slot_view("a")
+        candidate_background = target["containers"]["background"]
+        candidate_admin = target["ports"]["background"]
+        previous_background = LEGACY["containers"]["background"]
+        previous_admin = LEGACY["ports"]["background"]
+        self.ops.drain_seconds[candidate_background] = 8
+        started_previous = False
+
+        run, http_json = self.ops.run, self.ops.http_json
+
+        def start(args, **kw):
+            nonlocal started_previous
+            result = run(args, **kw)
+            if args == ["docker", "start", previous_background]:
+                started_previous = True
+            if args == ["docker", "start", candidate_background] and started_previous:
+                # The restart times out even though the candidate came up.
+                raise subprocess.TimeoutExpired(args, 600)
+            return result
+
+        def probe(url, **kw):
+            if started_previous and url.endswith(f":{LEGACY['ports']['background']}/internal/sources/runtime"):
+                status, body = http_json(url, **kw)
+                if status == 200 and isinstance(body, dict):
+                    return status, {**body, "owns_background": False}
+                return status, body
+            return http_json(url, **kw)
+
+        with mock.patch.object(self.ops, "run", start), mock.patch.object(self.ops, "http_json", probe):
+            with self.assertRaises(deploy.FallbackFailed) as ctx:
+                self.deploy()
+            deployer = deploy.Deployer(self.cfg, self.ops)
+            self.assertTrue(deployer.background_answering(target), "the re-probe confirms the restarted candidate")
+            self.assertFalse(deployer.background_answering(LEGACY))
+
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{candidate_admin};", upstream)
+        self.assertNotIn(f"127.0.0.1:{previous_admin};", upstream,
+                         "admin must not move to a background that lost the lock")
+        self.assertIn(f"admin still uses slot {target['slot']}", str(ctx.exception))
+        self.assertEqual("guard", self.state()["in_progress"]["step"])
+
+    def test_guard_rollback_keeps_admin_off_a_missing_previous_background(self):
+        self.ops.memory_after_switch = 20 * GIB
+        self.cfg.background_exit_timeout = 2
+        self.cfg.background_ready_timeout = 6
+        target = self.cfg.slot_view("a")
+        candidate_background = target["containers"]["background"]
+        candidate_admin = target["ports"]["background"]
+        previous_background = LEGACY["containers"]["background"]
+        previous_admin = LEGACY["ports"]["background"]
+        self.ops.drain_seconds[candidate_background] = 8
+        run = self.ops.run
+        handback_failed = False
+        candidate_restarts = 0
+
+        def start(args, **kw):
+            nonlocal handback_failed, candidate_restarts
+            if args == ["docker", "start", previous_background]:
+                handback_failed = True
+                del self.ops.containers[previous_background]
+                raise deploy.DeployError("fixture: previous background is missing")
+            if args == ["docker", "start", candidate_background] and handback_failed:
+                candidate_restarts += 1
+                if candidate_restarts == 1:
+                    raise subprocess.TimeoutExpired(args, 600)  # the first restart fails
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", start):
+            with self.assertRaises(deploy.FallbackFailed) as ctx:
+                self.deploy()
+
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{candidate_admin};", upstream)
+        self.assertNotIn(f"127.0.0.1:{previous_admin};", upstream,
+                         "admin must not point at a background that no longer exists")
+        self.assertIn("container is missing", str(ctx.exception))
+        progress = self.state()["in_progress"]
+        self.assertEqual("guard", progress["step"])
+        self.assertIn("failed", progress)
+        # The candidate stays the only restorable owner: starting it answers admin.
+        self.ops.run(["docker", "update", "--restart=unless-stopped", candidate_background], mutate=True)
+        self.ops.run(["docker", "start", candidate_background], mutate=True)
+        self.assertTrue(deploy.Deployer(self.cfg, self.ops).background_answering(target))
+
+    def test_guard_rollback_records_failure_when_a_probe_times_out(self):
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+        candidate_background = target["containers"]["background"]
+        candidate_admin = target["ports"]["background"]
+        previous_background = LEGACY["containers"]["background"]
+        previous_admin = LEGACY["ports"]["background"]
+        run, inspect = self.ops.run, self.ops.inspect
+        probe_timed_out = False
+
+        def start(args, **kw):
+            nonlocal probe_timed_out
+            if args == ["docker", "start", previous_background]:
+                probe_timed_out = True
+                raise deploy.DeployError("fixture: previous background cannot start")
+            if args == ["docker", "start", candidate_background] and probe_timed_out:
+                raise deploy.DeployError("fixture: candidate background cannot restart")
+            return run(args, **kw)
+
+        def check(name, **kw):
+            if probe_timed_out and name == previous_background:
+                raise subprocess.TimeoutExpired(["docker", "inspect", name], 30)
+            return inspect(name, **kw)
+
+        with mock.patch.object(self.ops, "run", start), mock.patch.object(self.ops, "inspect", check):
+            with self.assertRaises(Exception) as ctx:
+                self.deploy()
+
+        progress = self.state()["in_progress"]
+        self.assertEqual("guard", progress["step"])
+        self.assertIn("failed", progress, "a probe timeout must still record the failure")
+        self.assertIn("failed_at", progress)
+        self.assertIn("inspect failed", progress["failed"])
+        self.assertIsInstance(ctx.exception, deploy.FallbackFailed)
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{candidate_admin};", upstream)
+        self.assertNotIn(f"127.0.0.1:{previous_admin};", upstream)
 
     def test_guard_counts_connect_failures_only_for_new_ports(self):
         line = 'connect() failed (111) while connecting to upstream, upstream: "http://127.0.0.1:{}/v1"'
