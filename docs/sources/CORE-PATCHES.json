@@ -1135,19 +1135,21 @@
     },
     {
       "path": "backend/internal/processrole/handoff.go",
-      "sha256": "7926d6fea53b07b96bac7be59a642b66b5df0c24c16d559621c9cac6db429651",
+      "sha256": "a0c6dbbef6324314cfb747a05a37cff430d1439b522df98d2dd04eadc2a2a880",
       "features": [
-        "background_handoff_read_only"
+        "background_handoff_read_only",
+        "scheduled_backup_handoff"
       ],
-      "reason": "Read-only drain of the background owner: after Drain it answers admin GET and HEAD only, except reviewed reads that reach an upstream provider or the stopped media engine store; everything else is refused with 503, the native error envelope and Retry-After before any handler runs. Counts the admin requests it would refuse while draining (writes, MCP and the refused reads, but not upgrades) that were admitted before Drain and waits for them, cancels the contexts of upgraded admin connections, and reports cleanup steps still stopping."
+      "reason": "Read-only drain of the background owner: after Drain it answers admin GET and HEAD only, except reviewed reads that reach an upstream provider or the stopped media engine store; everything else is refused with 503, the native error envelope and Retry-After before any handler runs. Counts the admin requests it would refuse while draining (writes, MCP and the refused reads, but not upgrades) that were admitted before Drain and waits for them, cancels the contexts of upgraded admin connections, and reports cleanup steps still stopping. Tracks the active scheduled backup deadline and stops admitting new scheduled backup creation when the process starts draining."
     },
     {
       "path": "backend/internal/processrole/handoff_test.go",
-      "sha256": "5ade9c966e1f15f885ccbfe206c42364d1af394533b7c5e84111604198986a6f",
+      "sha256": "ee5214719e5fb91b814ea5fa6de1d69dd44de26dd5f117575fa30b6520e0015f",
       "features": [
-        "background_handoff_read_only"
+        "background_handoff_read_only",
+        "scheduled_backup_handoff"
       ],
-      "reason": "Covers the read-only drain policy, the unchanged serving and standalone behaviour, waiting for writes and refused reads admitted before Drain while an open upgrade is not waited for, cancelling only upgraded admin requests and the stopping report."
+      "reason": "Covers the read-only drain policy, the unchanged serving and standalone behaviour, waiting for writes and refused reads admitted before Drain while an open upgrade is not waited for, cancelling only upgraded admin requests and the stopping report. Checks that the runtime keeps reporting an active scheduled backup while draining and clears the status once creation has finished."
     },
     {
       "path": "backend/internal/processrole/mcp_test.go",
@@ -1159,22 +1161,24 @@
     },
     {
       "path": "backend/internal/processrole/role.go",
-      "sha256": "077d589b61fcf0cc969ed5fb94edca72cc6cb7aa62f8394fd74959283c6176d1",
+      "sha256": "26d60e6fd5f17a9273f7a8f5e0d2b23cad92d786317bac8ea07e38dd67c4698b",
       "features": [
         "native_process_lifecycle",
-        "background_handoff_read_only"
+        "background_handoff_read_only",
+        "scheduled_backup_handoff"
       ],
-      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. The runtime holds the handoff state: in-flight admin writes, cancel functions of upgraded admin connections and cleanup steps still stopping."
+      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. The runtime holds the handoff state: in-flight admin writes, cancel functions of upgraded admin connections and cleanup steps still stopping. Keeps the active scheduled backup deadline in the runtime handoff state."
     },
     {
       "path": "backend/internal/processrole/runtime.go",
-      "sha256": "87ec32a5d9be8978711b2791615d911755aad8aa8540018c952f931b5f241d8d",
+      "sha256": "ddbadf5a65da67bee7a292cbc164e678b2d82ef8b08f99f9556e3e5d28060c1c",
       "features": [
         "native_process_lifecycle",
         "account_wallet_refresh",
-        "background_handoff_read_only"
+        "background_handoff_read_only",
+        "scheduled_backup_handoff"
       ],
-      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Background admin requests pass the handoff admission check before the handler, and the runtime status reports admin_during_drain, active_admin_writes and stopping for the background role."
+      "reason": "Splits the server into serving and background roles, with a file lock that keeps one background process, read-only serving initialisation, internal runtime and drain endpoints, a -migrate-only entry point and graceful shutdown of OAuth refreshes, probes and scheduled tests; upstream gets small hooks in main, wiring and the affected services. Queries upstream wallet balances with bounded timeouts, stores identity-bound balance snapshots and refreshes successful wallets on a schedule under a fenced lease held by the background process, which needs new repository, service, handler and wiring hooks. It also adds a narrow configuration endpoint for a separate Sub2API balance query address. Background admin requests pass the handoff admission check before the handler, and the runtime status reports admin_during_drain, active_admin_writes and stopping for the background role. Reports the remaining scheduled backup time on the authenticated runtime endpoint for release preflight and handoff waits."
     },
     {
       "path": "backend/internal/processrole/runtime_test.go",
@@ -2292,19 +2296,30 @@
       "path": "backend/internal/service/backup_service.go",
       "features": [
         "backup_execution_deadline",
-        "backup_bounded_disk"
+        "backup_bounded_disk",
+        "scheduled_backup_handoff",
+        "backup_connection_credentials"
       ],
-      "sha256": "2367281971898300800b311b88e4bf934c67bc4a29e9e2f7f64266a82cb839a0",
-      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space."
+      "sha256": "c7e8430f1983a7f5eb14b4e758621e648f7df04080f583f9c09c457dd00d1c3b",
+      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Lets admitted scheduled backup creation keep its own deadline during shutdown, while retention cleanup remains cancellable under the original shutdown grace period. Reuses a saved S3 secret for connection tests when the endpoint and access key match. An explicit endpoint can be tried with a different signing region. An implicit endpoint still requires a matching region. A bucket change is allowed when both configurations use path-style addressing. The addressing mode can change. An optional trailing slash matches at the root or in path-style addressing. A non-empty virtual-hosted path must match verbatim."
     },
     {
       "path": "backend/internal/service/backup_service_test.go",
       "features": [
         "backup_execution_deadline",
-        "backup_bounded_disk"
+        "backup_bounded_disk",
+        "backup_connection_credentials"
       ],
-      "sha256": "db062a6b4fc725c0bf4fb4142c00a71e514178de040497fd8d9e74dcbb9390fd",
-      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Tests for this behaviour."
+      "sha256": "a0ceadac4c1534aff3a95b93f233dc3492303df9967e3ac6a59e005bb6ec317b",
+      "reason": "Gives manual and scheduled backups a two-hour total deadline with a matching but separate lease, and keeps the restore and record-write deadlines independent, so long backups are neither cut short nor left stale. Builds the full backup gzip once and uploads each part as an offset range of that file instead of writing separate temporary part files, so a backup needs only one copy of disk space. Tests for this behaviour. Covers saved-secret reuse for either addressing mode at the saved S3 target and for bucket changes in path style. Rejects endpoint, access key and virtual-hosted bucket changes, as well as region changes when the endpoint is implicit. Verifies that a signing region change for an explicit endpoint leaves the signed request destination unchanged. Uses the S3 SDK with an in-memory transport to verify the signed request paths in both addressing modes, including refusal to reuse secrets if a slash changes the virtual-hosted path."
+    },
+    {
+      "path": "backend/internal/service/backup_shutdown_test.go",
+      "features": [
+        "scheduled_backup_handoff"
+      ],
+      "sha256": "d608234e6b4993395acc030c2212b24b9600f07778c3082c198b5d577c0fd84f",
+      "reason": "Uses virtual time to exercise shutdown with an active scheduled backup that finishes before or after the normal wait, and with interrupted retention after a completed backup."
     },
     {
       "path": "backend/internal/service/batch_image_worker_runtime.go",

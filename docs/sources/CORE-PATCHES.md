@@ -142,10 +142,12 @@ GPT-6.2 价卡的 Ultrafast 倍率留空时，按本仓库既有售价固定为 
 
 ### 日志保留与备份
 
-标签：`external_log_cleanup_owner`、`admin_history_retention`、`backup_execution_deadline`、`backup_bounded_disk`。
+标签：`external_log_cleanup_owner`、`admin_history_retention`、`backup_execution_deadline`、`backup_bounded_disk`、`scheduled_backup_handoff`、`backup_connection_credentials`。
 
 - 外部日志保留归属开关，默认关闭；开启后拒绝原生用量清理。管理员历史统计在明细删除后保留紧凑汇总。
 - 备份总时限两小时，租约与截止时间分离。完整 gzip 只生成一次，分片按偏移从该文件上传，不再另存分片临时文件。
+- 已开始的定时备份创建沿用原执行期限，旧后台在创建结束前保留依赖。内部运行状态让发布工具避开备份并校准交接等待。
+- S3 连通性测试在 Endpoint 和 Access Key ID 与已保存设置匹配时可复用密钥。显式配置 Endpoint 时可以改变签名 Region，省略 Endpoint 时要求 Region 匹配。已保存设置和试连都使用路径式寻址时可以换桶，其他情况要求桶名一致。根地址或路径式寻址的 Endpoint 允许增减一个等价的尾斜杠。虚拟主机式寻址使用带路径的 Endpoint 时，路径必须一致。
 
 ### 依赖安全与兼容
 

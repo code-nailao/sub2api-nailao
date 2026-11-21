@@ -10,12 +10,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -1117,6 +1121,206 @@ func TestBackupService_TestS3Connection(t *testing.T) {
 		SecretAccessKey: "sk",
 	})
 	require.NoError(t, err)
+}
+
+func TestBackupService_TestS3ConnectionReusesSecretOnlyForSavedTarget(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestBackupService(newMockSettingRepo(), &mockDumper{}, newMockObjectStore())
+	saved := BackupS3Config{Endpoint: "https://s3-fixture.invalid/objects", Region: "auto", Bucket: "fixture-bucket",
+		AccessKeyID: "fixture-key", SecretAccessKey: "fixture-secret", ForcePathStyle: true}
+	_, err := svc.UpdateS3Config(ctx, saved)
+	require.NoError(t, err)
+
+	for _, tt := range []struct {
+		name       string
+		change     func(*BackupS3Config)
+		wantSecret string
+	}{
+		{name: "same target", wantSecret: saved.SecretAccessKey},
+		{name: "same default region", change: func(c *BackupS3Config) { c.Region = "" }, wantSecret: saved.SecretAccessKey},
+		{name: "different endpoint", change: func(c *BackupS3Config) { c.Endpoint = "NEW_ENDPOINT" }},
+		{name: "extra path separators", change: func(c *BackupS3Config) { c.Endpoint += "//" }},
+		{name: "different base path", change: func(c *BackupS3Config) { c.Endpoint += "/other" }},
+		{name: "removed endpoint", change: func(c *BackupS3Config) { c.Endpoint = "" }},
+		{name: "different signing region with custom endpoint", wantSecret: saved.SecretAccessKey, change: func(c *BackupS3Config) {
+			c.Region = "other"
+		}},
+		{name: "different bucket in path style", wantSecret: saved.SecretAccessKey, change: func(c *BackupS3Config) {
+			c.Bucket = "other"
+		}},
+		{name: "different bucket in virtual host", change: func(c *BackupS3Config) {
+			c.Bucket = "other"
+			c.ForcePathStyle = false
+		}},
+		{name: "same target with different addressing mode", wantSecret: saved.SecretAccessKey, change: func(c *BackupS3Config) {
+			c.ForcePathStyle = false
+		}},
+		{name: "different access key", change: func(c *BackupS3Config) { c.AccessKeyID = "other" }},
+		{name: "new target with explicit secret", wantSecret: "replacement", change: func(c *BackupS3Config) {
+			c.Endpoint = "NEW_ENDPOINT"
+			c.SecretAccessKey = "replacement"
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := saved
+			cfg.SecretAccessKey = ""
+			if tt.change != nil {
+				tt.change(&cfg)
+			}
+			var usedSecret string
+			called := false
+			svc.storeFactory = func(_ context.Context, testCfg *BackupS3Config) (BackupObjectStore, error) {
+				called = true
+				require.Equal(t, cfg.ForcePathStyle, testCfg.ForcePathStyle)
+				require.Equal(t, cfg.Bucket, testCfg.Bucket)
+				usedSecret = testCfg.SecretAccessKey
+				return newMockObjectStore(), nil
+			}
+			err := svc.TestS3Connection(ctx, cfg)
+			if tt.wantSecret == "" {
+				require.ErrorContains(t, err, "incomplete S3 config")
+				require.False(t, called)
+				return
+			}
+			require.NoError(t, err)
+			require.True(t, called)
+			require.Equal(t, tt.wantSecret, usedSecret)
+		})
+	}
+}
+
+// The SDK signs and builds the request before the test transport sees it.
+type backupProbeHTTPClient func(*http.Request) (*http.Response, error)
+
+func (c backupProbeHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	return c(req)
+}
+
+type backupProbeStore struct {
+	*mockObjectStore
+	client *s3.Client
+	bucket string
+}
+
+func (s *backupProbeStore) HeadBucket(ctx context.Context) error {
+	_, err := s.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: &s.bucket})
+	return err
+}
+
+func newBackupProbeStore(cfg *BackupS3Config, transport backupProbeHTTPClient) *backupProbeStore {
+	client := s3.NewFromConfig(aws.Config{
+		Region:      cfg.Region,
+		Credentials: credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, ""),
+		HTTPClient:  transport,
+	}, func(o *s3.Options) {
+		if cfg.Endpoint != "" {
+			o.BaseEndpoint = &cfg.Endpoint
+		}
+		o.UsePathStyle = cfg.ForcePathStyle
+	})
+	return &backupProbeStore{mockObjectStore: newMockObjectStore(), client: client, bucket: cfg.Bucket}
+}
+
+func TestBackupService_TestS3ConnectionReusesSecretForSigningRegionChange(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		endpoint       string
+		forcePathStyle bool
+	}{
+		{name: "custom endpoint in path style", endpoint: "https://s3-fixture.invalid/objects", forcePathStyle: true},
+		{name: "custom endpoint in virtual host", endpoint: "https://s3-fixture.invalid/objects"},
+		{name: "region resolved endpoint", forcePathStyle: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			svc := newTestBackupService(newMockSettingRepo(), &mockDumper{}, newMockObjectStore())
+			saved := BackupS3Config{Endpoint: tt.endpoint, Region: "us-east-1", Bucket: "fixture-bucket",
+				AccessKeyID: "fixture-key", SecretAccessKey: "fixture-secret", ForcePathStyle: tt.forcePathStyle}
+			_, err := svc.UpdateS3Config(ctx, saved)
+			require.NoError(t, err)
+
+			var destinations, authorization []string
+			svc.storeFactory = func(_ context.Context, cfg *BackupS3Config) (BackupObjectStore, error) {
+				require.Equal(t, saved.SecretAccessKey, cfg.SecretAccessKey)
+				return newBackupProbeStore(cfg, func(req *http.Request) (*http.Response, error) {
+					destinations = append(destinations, req.URL.String())
+					authorization = append(authorization, req.Header.Get("Authorization"))
+					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody}, nil
+				}), nil
+			}
+
+			trial := saved
+			trial.SecretAccessKey = ""
+			require.NoError(t, svc.TestS3Connection(ctx, trial))
+			trial.Region = "us-west-2"
+			err = svc.TestS3Connection(ctx, trial)
+			if tt.endpoint == "" {
+				require.ErrorContains(t, err, "incomplete S3 config")
+				require.Len(t, destinations, 1)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, destinations, 2)
+			require.Equal(t, destinations[0], destinations[1])
+			require.Contains(t, authorization[0], "/us-east-1/s3/aws4_request")
+			require.Contains(t, authorization[1], "/us-west-2/s3/aws4_request")
+		})
+	}
+}
+
+func TestBackupService_TestS3ConnectionReusesSecretForTrailingSlash(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		basePath       string
+		forcePathStyle bool
+		wantHost       string
+		wantPath       string
+		canReuse       bool
+	}{
+		{name: "path style with base path", basePath: "/objects", forcePathStyle: true,
+			wantHost: "s3-fixture.invalid", wantPath: "/objects/fixture-bucket", canReuse: true},
+		{name: "virtual host at root", wantHost: "fixture-bucket.s3-fixture.invalid", wantPath: "/", canReuse: true},
+		{name: "virtual host with base path", basePath: "/objects",
+			wantHost: "fixture-bucket.s3-fixture.invalid", wantPath: "/objects"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			svc := newTestBackupService(newMockSettingRepo(), &mockDumper{}, newMockObjectStore())
+			saved := BackupS3Config{Endpoint: "https://s3-fixture.invalid" + tt.basePath, Region: "auto", Bucket: "fixture-bucket",
+				AccessKeyID: "fixture-key", SecretAccessKey: "fixture-secret", ForcePathStyle: tt.forcePathStyle}
+			_, err := svc.UpdateS3Config(ctx, saved)
+			require.NoError(t, err)
+
+			var signedTargets []string
+			svc.storeFactory = func(_ context.Context, cfg *BackupS3Config) (BackupObjectStore, error) {
+				require.Equal(t, saved.SecretAccessKey, cfg.SecretAccessKey)
+				return newBackupProbeStore(cfg, func(req *http.Request) (*http.Response, error) {
+					require.Equal(t, http.MethodHead, req.Method)
+					require.NotEmpty(t, req.Header.Get("Authorization"))
+					signedTargets = append(signedTargets, req.URL.Host+req.URL.RequestURI())
+					status := http.StatusOK
+					if req.URL.Host != tt.wantHost || req.URL.RequestURI() != tt.wantPath {
+						status = http.StatusNotFound
+					}
+					return &http.Response{StatusCode: status, Header: make(http.Header), Body: http.NoBody}, nil
+				}), nil
+			}
+
+			cfg := saved
+			cfg.SecretAccessKey = ""
+			require.NoError(t, svc.TestS3Connection(ctx, cfg))
+			cfg.Endpoint += "/"
+			err = svc.TestS3Connection(ctx, cfg)
+			want := tt.wantHost + tt.wantPath
+			if tt.canReuse {
+				require.NoError(t, err)
+				require.Equal(t, []string{want, want}, signedTargets)
+			} else {
+				require.Equal(t, []string{want}, signedTargets, "do not sign a request to a different path")
+				require.ErrorContains(t, err, "incomplete S3 config")
+			}
+		})
+	}
 }
 
 func TestBackupService_TestS3Connection_Incomplete(t *testing.T) {
