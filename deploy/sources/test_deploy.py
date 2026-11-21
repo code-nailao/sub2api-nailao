@@ -434,6 +434,98 @@ class DeployTest(unittest.TestCase):
         self.assertEqual("legacy", self.state()["current"]["slot"])
         self.assertIsNone(self.state()["in_progress"])
 
+    def test_guard_rollback_keeps_admin_on_the_answering_owner_until_the_previous_background_is_ready(self):
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+        new_admin = target["ports"]["background"]
+        old_background = LEGACY["containers"]["background"]
+        old_admin = LEGACY["ports"]["background"]
+        writes: list[tuple[float, str]] = []
+        started = None
+        healthy = False
+
+        run, http_json, write = self.ops.run, self.ops.http_json, self.ops.write_file_atomic
+
+        def start(args, **kw):
+            nonlocal started
+            result = run(args, **kw)
+            if args == ["docker", "start", old_background]:
+                started = self.ops.clock
+            return result
+
+        def probe(url, **kw):
+            # The previous background passes /health only once it has restarted
+            # and owns the lock; until then admin must not move to its port.
+            nonlocal healthy
+            if started is not None and url.endswith(f":{old_admin}/health"):
+                if self.ops.clock - started < 3:
+                    return 0, None
+                healthy = True
+            return http_json(url, **kw)
+
+        def record(path, text, **kw):
+            if path == self.cfg.upstream_file:
+                writes.append((self.ops.clock, text))
+            return write(path, text, **kw)
+
+        with mock.patch.object(self.ops, "run", start), mock.patch.object(self.ops, "http_json", probe), \
+                mock.patch.object(self.ops, "write_file_atomic", record):
+            with self.assertRaisesRegex(deploy.DeployError, "guard failed"):
+                self.deploy()
+
+        serving = LEGACY["ports"]["serving"]
+        rollback_writes = [(at, text) for at, text in writes if f"127.0.0.1:{serving} max_fails" in text]
+        self.assertEqual(2, len(rollback_writes), "serving returns to the previous slot, then admin follows")
+        first_at, first = rollback_writes[0]
+        self.assertIn(f"127.0.0.1:{new_admin};", first, "admin stays on the owner that still answers")
+        self.assertIsNotNone(started)
+        self.assertLess(first_at, started, "serving moved before the previous background was started")
+        second_at, second = rollback_writes[1]
+        self.assertIn(f"127.0.0.1:{old_admin};", second)
+        self.assertTrue(healthy)
+        self.assertGreaterEqual(second_at - started, 3, "admin moved before the previous background was healthy")
+        self.assertTrue(deploy.Deployer(self.cfg, self.ops).background_answering(LEGACY))
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual("failed", self.history()[-1]["result"])
+
+    def test_guard_rollback_records_incomplete_recovery_when_the_previous_background_never_answers(self):
+        self.ops.memory_after_switch = 20 * GIB
+        self.cfg.background_ready_timeout = 6
+        target = self.cfg.slot_view("a")
+        old_admin = LEGACY["ports"]["background"]
+        new_admin = target["ports"]["background"]
+        started = False
+
+        run, http_json = self.ops.run, self.ops.http_json
+
+        def start(args, **kw):
+            nonlocal started
+            result = run(args, **kw)
+            if args == ["docker", "start", LEGACY["containers"]["background"]]:
+                started = True
+            return result
+
+        def probe(url, **kw):
+            if started and url.endswith(f":{old_admin}/health"):
+                return 0, None
+            return http_json(url, **kw)
+
+        with mock.patch.object(self.ops, "run", start), mock.patch.object(self.ops, "http_json", probe):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "handing the background back to slot legacy did not finish"):
+                self.deploy()
+
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['serving']} max_fails", upstream)
+        self.assertIn(f"127.0.0.1:{new_admin};", upstream, "admin stays on the owner that still answers")
+        self.assertNotIn(f"127.0.0.1:{old_admin};", upstream)
+        self.assertTrue(deploy.Deployer(self.cfg, self.ops).background_answering(target))
+        progress = self.state()["in_progress"]
+        self.assertEqual("guard", progress["step"])
+        self.assertIn("handing the background back to slot legacy did not finish", progress["failed"])
+        self.assertTrue(progress.get("failed_at"))
+        self.assertEqual(progress, deploy.status(self.cfg, self.ops)["in_progress"])
+        self.assertEqual("failed", self.history()[-1]["result"])
+
     def test_guard_counts_connect_failures_only_for_new_ports(self):
         line = 'connect() failed (111) while connecting to upstream, upstream: "http://127.0.0.1:{}/v1"'
         text = "\n".join([line.format(9401)] * 3 + [line.format(9426)] * 50)

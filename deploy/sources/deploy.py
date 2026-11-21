@@ -500,6 +500,9 @@ class Deployer:
         status, body = self.ops.http_json(f"http://127.0.0.1:{port}/internal/sources/runtime", token=token, timeout=timeout)
         return body if status == 200 and isinstance(body, dict) else None
 
+    def health(self, port: int) -> bool:
+        return self.ops.http_json(f"http://127.0.0.1:{port}/health")[0] == 200
+
     def recovery_timeout(self, deadline: float | None, maximum: float) -> float:
         if deadline is None:
             return maximum
@@ -509,7 +512,8 @@ class Deployer:
         return min(maximum, remaining)
 
     def wait_ready(self, port: int, token: str, role: str, timeout: int,
-                   container: str | None = None, poll: float = 2, *, deadline: float | None = None) -> dict[str, Any]:
+                   container: str | None = None, poll: float = 2, *, deadline: float | None = None,
+                   check_health: bool = False) -> dict[str, Any]:
         """Wait for a role to report ready. During recovery, share its deadline."""
         ready_until = self.ops.monotonic() + timeout
         if deadline is not None:
@@ -530,7 +534,10 @@ class Deployer:
                 last = self.runtime(port, token)
             if last and last.get("ready") and last.get("role") == role:
                 if role != "background" or last.get("owns_background"):
-                    return last
+                    # Routing that a person depends on must not move before
+                    # the new owner answers its health probe too.
+                    if not check_health or self.health(port):
+                        return last
             delay = poll if deadline is None else min(poll, max(0, ready_until - self.ops.monotonic()))
             self.ops.sleep(delay)
         limit = f"within {timeout}s" if deadline is None else "before the recovery deadline"
@@ -753,9 +760,12 @@ class Deployer:
             raise DeployError("nginx -t rejected the upstream file; previous file restored, routing unchanged")
         self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
 
-    def switch_to(self, view: dict[str, Any]) -> None:
+    def switch_to(self, view: dict[str, Any], *, admin: dict[str, Any] | None = None) -> None:
+        """Point both upstreams at view, or keep admin on another slot's
+        background while serving already moves."""
         ports = view["ports"]
-        self.install_upstreams(render_upstreams(ports["serving"], ports["standby"], ports["background"]))
+        admin_port = (view if admin is None else admin)["ports"]["background"]
+        self.install_upstreams(render_upstreams(ports["serving"], ports["standby"], admin_port))
 
     # steps ------------------------------------------------------------------
     def preflight(self, state: dict[str, Any], target: Target, reuse: bool,
@@ -811,6 +821,15 @@ class Deployer:
             lambda timeout: self.runtime(view["ports"]["background"], self.token_for(view, "background"), timeout=timeout),
             deadline,
         )
+
+    def background_answering(self, view: dict[str, Any], *, allow_draining: bool = False) -> bool:
+        """Whether the slot's background owns the lock and answers admin requests.
+        A read-only owner that is still draining can answer reads until it exits."""
+        runtime = self.owner_runtime(view) or {}
+        responding = runtime.get("ready") or (allow_draining and runtime.get("draining")
+                                              and runtime.get("admin_during_drain") == "read-only")
+        return bool(runtime.get("role") == "background" and runtime.get("owns_background") and responding
+                    and self.health(view["ports"]["background"]))
 
     def runtime_request_before(self, request: Callable[[float], dict[str, Any] | None],
                                deadline: float | None) -> dict[str, Any] | None:
@@ -873,7 +892,7 @@ class Deployer:
         return restart
 
     def start_background(self, view: dict[str, Any], *, restart: str = "unless-stopped",
-                         deadline: float | None = None) -> None:
+                         deadline: float | None = None, check_health: bool = False) -> None:
         name = view["containers"]["background"]
         # Once ownership is vacant, Ctrl-C must not stop the Docker clients
         # that put an owner back in service. They inherit the ignored signal.
@@ -884,7 +903,7 @@ class Deployer:
             if not self.ops.dry_run:
                 self.wait_ready(view["ports"]["background"], self.token_for(view, "background"),
                                 "background", self.cfg.background_ready_timeout, container=name,
-                                poll=HANDOFF_POLL_SECONDS, deadline=deadline)
+                                poll=HANDOFF_POLL_SECONDS, deadline=deadline, check_health=check_health)
 
     def restore_background(self, current: dict[str, Any], failed: DeployError, *, restart: str,
                            recovery: BackgroundRecovery | None = None) -> NoReturn:
@@ -901,13 +920,14 @@ class Deployer:
                                  cleanup_deadline=recovery.deadline if recovery else None) from failed
 
     def handoff_background(self, current: dict[str, Any], target: Target, create: bool,
-                           back: bool = False) -> float | None:
+                           back: bool = False, *, check_health: bool = False) -> float | None:
         """Move background ownership from current to target. The old owner gets
         one SIGTERM and finishes in-flight work; the kernel lock passes when it
         exits. If the new owner does not become ready, the old one restarts.
         An old owner that reports admin_during_drain keeps answering admin
         reads until it closes its listener, just before it exits. back: the
         handoff returns ownership to target after traffic already moved there.
+        check_health also requires /health before the new owner counts as ready.
         Return the active recovery deadline, if any, for subsequent cleanup."""
         old = current["containers"]["background"]
         new = target.containers["background"]
@@ -928,7 +948,8 @@ class Deployer:
             else:
                 self.log(f"   {old} is absent. Starting the prepared background {new}.")
             try:
-                self.start_background(view, deadline=recovery.work_until if recovery else None)
+                self.start_background(view, deadline=recovery.work_until if recovery else None,
+                                      check_health=check_health)
             except (DeployError, OSError, subprocess.SubprocessError) as err:
                 if recovery is not None:
                     raise FallbackFailed(f"could not make {new} ready during background recovery: {err}") from err
@@ -1147,11 +1168,24 @@ class Deployer:
             if reason:
                 self.log(f"   guard failed: {reason}; switching traffic back to slot {previous['slot']}")
                 try:
-                    self.switch_to(previous)
+                    # Serving goes back first. Admin stays on the background
+                    # that still answers (the candidate's while it drains)
+                    # until the previous background is ready to take over.
+                    self.switch_to(previous, admin=target.view())
                 except DeployError as err:
                     raise FallbackFailed(f"guard failed ({reason}) and switching back failed ({err})") from err
-                self.log("   handing the background back to the previous release")
-                recovery_deadline = self.hand_back(target, previous)
+                self.log(f"   handing the background back to the previous release; admin stays on slot "
+                         f"{target.slot} until slot {previous['slot']}'s background answers")
+                try:
+                    recovery_deadline = self.hand_back(target, previous, check_health=True)
+                except (DeployError, OSError, subprocess.SubprocessError) as err:
+                    raise self.rollback_admin_owner(target, previous, reason, err) from err
+                try:
+                    self.switch_to(previous)
+                except DeployError as err:
+                    raise FallbackFailed(f"guard failed ({reason}); the previous release owns the background again "
+                                         f"but admin routing was not moved to slot {previous['slot']} ({err}); "
+                                         "verify live routing before clearing in_progress") from err
                 restored = f"guard failed ({reason}); the previous release serves traffic and owns the background again"
                 protect = finish_handoff_cleanup(ignore=True) if recovery_deadline is not None else contextlib.nullcontext()
                 with protect:
@@ -1165,15 +1199,33 @@ class Deployer:
                 return
             self.ops.sleep(self.cfg.guard_interval)
 
-    def hand_back(self, target: Target, previous: dict[str, Any]) -> float | None:
+    def hand_back(self, target: Target, previous: dict[str, Any], *, check_health: bool = False) -> float | None:
         """Return background ownership to the release that still serves traffic."""
         try:
             return self.handoff_background(target.view(), Target.from_view(previous, self.cfg.runtime_token_file),
-                                           create=False, back=True)
+                                           create=False, back=True, check_health=check_health)
         except FallbackFailed:
             raise
         except DeployError as err:
             raise FallbackFailed(f"handing the background back failed: {err}") from err
+
+    def rollback_admin_owner(self, target: Target, previous: dict[str, Any], reason: str,
+                             err: BaseException) -> FallbackFailed:
+        """Admin routing stays on the owner that still answers, and an
+        incomplete recovery is recorded instead of ending silently."""
+        try:
+            answering = self.background_answering(target.view(), allow_draining=True)
+        except (DeployError, OSError, subprocess.SubprocessError):
+            answering = False
+        if answering:
+            where = (f"serving serves from slot {previous['slot']} and admin still uses slot {target.slot}, "
+                     "whose background answers")
+        else:
+            where = (f"serving serves from slot {previous['slot']} but no background answers admin now; "
+                     "restore one and point admin routing at it")
+        return FallbackFailed(
+            f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not finish "
+            f"({err}). {where}. Verify the background, its lock and live routing before clearing in_progress")
 
     def container_memory(self, info: dict[str, Any]) -> int | None:
         cid = info.get("Id")
