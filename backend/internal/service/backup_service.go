@@ -473,12 +473,14 @@ func sameBackupS3Endpoint(a, b string, forcePathStyle bool) bool {
 }
 
 func (s *BackupService) TestS3Connection(ctx context.Context, cfg BackupS3Config) error {
-	// Changing the bucket in path style keeps the request on the same host.
-	// Virtual-host addressing puts the bucket in the host name.
+	// A custom endpoint fixes the address even when the signing region changes.
+	// Without one, the region selects the endpoint. Virtual-host addressing
+	// also puts the bucket in the host name.
 	if cfg.SecretAccessKey == "" {
 		old, _ := s.loadS3Config(ctx)
 		if old != nil && sameBackupS3Endpoint(old.Endpoint, cfg.Endpoint, cfg.ForcePathStyle) &&
-			cmp.Or(old.Region, "auto") == cmp.Or(cfg.Region, "auto") && old.AccessKeyID == cfg.AccessKeyID &&
+			old.AccessKeyID == cfg.AccessKeyID &&
+			(cfg.Endpoint != "" || cmp.Or(old.Region, "auto") == cmp.Or(cfg.Region, "auto")) &&
 			(old.Bucket == cfg.Bucket || (old.ForcePathStyle && cfg.ForcePathStyle)) {
 			cfg.SecretAccessKey = old.SecretAccessKey
 		}

@@ -536,7 +536,7 @@ class Deployer:
         limit = f"within {timeout}s" if deadline is None else "before the recovery deadline"
         raise DeployError(f"port {port} not ready as {role} {limit} (last runtime: {json.dumps(last)[:300]})")
 
-    def background_container(self, name: str, *, deadline: float | None = None) -> tuple[dict[str, Any] | None, bool]:
+    def inspect_or_missing(self, name: str, *, deadline: float | None = None) -> tuple[dict[str, Any] | None, bool]:
         """Return Docker's inspection and whether Docker confirmed removal."""
         timeout = DOCKER_STATUS_TIMEOUT_SECONDS
         if deadline is not None:
@@ -583,7 +583,7 @@ class Deployer:
 
         while True:
             probe_deadline = probe_until()
-            info, removed = self.background_container(name, deadline=probe_deadline)
+            info, removed = self.inspect_or_missing(name, deadline=probe_deadline)
             seen_at = self.ops.monotonic()
             if seen_at < probe_deadline:
                 cutoff = forward_deadline()
@@ -912,7 +912,7 @@ class Deployer:
         old = current["containers"]["background"]
         new = target.containers["background"]
         before = self.owner_runtime(current)  # read-only, also in a dry run
-        old_info, old_removed = self.background_container(old)
+        old_info, old_removed = self.inspect_or_missing(old)
         if old_info is None and not old_removed:
             raise DeployError(f"could not confirm the state of background container {old} before handoff")
         if create:
@@ -933,7 +933,7 @@ class Deployer:
                 if recovery is not None:
                     raise FallbackFailed(f"could not make {new} ready during background recovery: {err}") from err
                 self.log(f"   new background failed: {err}. Restoring {old} once {new} exits.")
-                new_info, new_removed = self.background_container(new)
+                new_info, new_removed = self.inspect_or_missing(new)
                 if new_info is not None:
                     try:
                         recovery = self.drain_background(view, new_info, self.owner_runtime(view), successor=old,
@@ -1090,7 +1090,7 @@ class Deployer:
                 self.restore_background(current, failure or DeployError("handoff interrupted"), restart=restart,
                                         recovery=recovery)
             except FallbackFailed:
-                _, removed = self.background_container(old, deadline=recovery.deadline if recovery else None)
+                _, removed = self.inspect_or_missing(old, deadline=recovery.deadline if recovery else None)
                 if not removed:
                     raise
                 if recovery is not None:
@@ -1156,7 +1156,7 @@ class Deployer:
                 protect = finish_handoff_cleanup(ignore=True) if recovery_deadline is not None else contextlib.nullcontext()
                 with protect:
                     try:
-                        self.retire_serving(target.view(), deadline=recovery_deadline)
+                        self.retire_serving(target.view(), deadline=recovery_deadline, require_known_state=True)
                     except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
                         raise ServingCleanupFailed(f"{restored}. Incomplete serving cleanup: {err}. "
                                                    "Check the target slot before clearing in_progress.") from err
@@ -1194,7 +1194,8 @@ class Deployer:
                     count += 1
         return count
 
-    def retire_serving(self, view: dict[str, Any], *, deadline: float | None = None) -> None:
+    def retire_serving(self, view: dict[str, Any], *, deadline: float | None = None,
+                       require_known_state: bool = False) -> None:
         for role in SERVING_ROLES:
             name = view["containers"].get(role)
             if not name:
@@ -1202,8 +1203,16 @@ class Deployer:
             token = None
             with contextlib.suppress(OSError):
                 token = self.token_for(view, role)
-            info = self.ops.inspect(name, timeout=self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS))
-            if not info or not info.get("State", {}).get("Running"):
+            if require_known_state:
+                info, removed = self.inspect_or_missing(name, deadline=deadline)
+                if removed:
+                    continue
+            else:
+                info = self.ops.inspect(name, timeout=self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS))
+            running = ((info or {}).get("State") or {}).get("Running")
+            if require_known_state and not isinstance(running, bool):
+                raise DeployError(f"could not confirm the state of serving container {name}")
+            if not running:
                 continue
             self.ops.run(["docker", "update", "--restart=no", name], mutate=True,
                          timeout=self.recovery_timeout(deadline, 600))

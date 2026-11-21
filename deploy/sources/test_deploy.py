@@ -1612,6 +1612,65 @@ class DeployTest(unittest.TestCase):
     def test_guard_failure_bounds_serving_cleanup_after_background_handback(self):
         self.run_handback_with_slow_serving_cleanup(guard_failure=True)
 
+    def run_guard_with_failed_serving_inspect(self, *, removed):
+        current = self.state()["current"]
+        previous_bg = current["containers"]["background"]
+        candidate_bg = self.cfg.container("a", "background")
+        candidate_serving = self.cfg.container("a", "serving")
+        candidate_standby = self.cfg.container("a", "standby")
+        self.cfg.background_exit_timeout = 2
+        self.ops.drain_seconds[candidate_bg] = 8
+        self.ops.memory_after_switch = 20 * GIB
+        original_run = self.ops.run
+        original_inspect = self.ops.inspect
+        term_at = None
+        lists = []
+
+        def inspect(name, **kwargs):
+            if term_at is not None and name == candidate_serving:
+                return deploy.Ops.inspect(self.ops, name, **kwargs)
+            return original_inspect(name, **kwargs)
+
+        def run(args, **kwargs):
+            nonlocal term_at
+            if args == ["docker", "kill", "--signal=TERM", candidate_bg]:
+                term_at = self.ops.clock
+                if removed:
+                    self.ops.containers.pop(candidate_serving)
+            if args == ["docker", "inspect", candidate_serving]:
+                return subprocess.CompletedProcess(args, 1, "", "inspect failed")
+            if term_at is not None and args[:3] == ["docker", "container", "ls"]:
+                lists.append((self.ops.clock - term_at, kwargs["timeout"]))
+            return original_run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "run", run), mock.patch.object(self.ops, "inspect", inspect), \
+                deploy.release_lock(self.cfg.lock_file):
+            with self.assertRaisesRegex(deploy.DeployError, "guard failed.*previous release serves traffic"):
+                self.deploy()
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertEqual(current, self.state()["current"])
+            progress = self.state()["in_progress"]
+            if removed:
+                self.assertIsNone(progress)
+                self.assertFalse(self.ops.containers[candidate_standby]["State"]["Running"])
+            else:
+                self.assertIsNotNone(progress, "an unreadable serving state must leave a failure record")
+                self.assertIn("Incomplete serving cleanup", progress["failed"])
+                self.assertIn(candidate_serving, progress["failed"])
+                self.assertTrue(self.ops.containers[candidate_serving]["State"]["Running"])
+                self.assertTrue(self.ops.containers[candidate_standby]["State"]["Running"])
+        self.assertTrue(self.ops.containers[previous_bg]["State"]["Running"])
+        self.assertFalse(self.ops.containers[candidate_bg]["State"]["Running"])
+        self.assertEqual(1, len(lists))
+        started, timeout = lists[0]
+        self.assertLess(started + timeout, 33, "the container list must share the handback deadline")
+
+    def test_guard_records_failure_when_serving_inspect_cannot_confirm_state(self):
+        self.run_guard_with_failed_serving_inspect(removed=False)
+
+    def test_guard_skips_serving_only_when_docker_confirms_removal(self):
+        self.run_guard_with_failed_serving_inspect(removed=True)
+
     def test_a_reply_cut_off_mid_way_never_ends_the_handoff(self):
         # The old owner exits while answering a runtime read: the progress note
         # and the pre-signal read must not raise out of the handoff.
