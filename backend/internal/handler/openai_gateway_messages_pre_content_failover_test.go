@@ -80,10 +80,11 @@ type unexpectedEOFReader struct{}
 func (unexpectedEOFReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 
 type preContentFailoverScenario struct {
-	accounts    []service.Account
-	respond     func(call int) (*http.Response, error)
-	passthrough *service.ErrorPassthroughService
-	requestBody string
+	accounts           []service.Account
+	respond            func(call int) (*http.Response, error)
+	passthrough        *service.ErrorPassthroughService
+	requestBody        string
+	waitQueueHeartbeat bool
 }
 
 func preContentAccounts(count int) []service.Account {
@@ -128,15 +129,26 @@ func serveMessagesScenario(t *testing.T, sc preContentFailoverScenario) (*httpte
 		service.NewBillingService(cfg, nil), nil, billingCache, upstream,
 		&service.DeferredService{}, nil, nil, nil, nil, nil, nil, nil,
 	)
+	rec := httptest.NewRecorder()
 	cache := &concurrencyCacheMock{
-		acquireUserSlotFn:    func(context.Context, int64, int, string) (bool, error) { return true, nil },
+		acquireUserSlotFn: func(context.Context, int64, int, string) (bool, error) {
+			return !sc.waitQueueHeartbeat || rec.Flushed, nil
+		},
 		acquireAccountSlotFn: func(context.Context, int64, int, string) (bool, error) { return true, nil },
 	}
-	h := NewOpenAIGatewayHandler(gateway, service.NewConcurrencyService(cache), billingCache, &service.APIKeyService{}, nil, sc.passthrough, nil, nil, cfg)
+	slots := service.NewConcurrencyService(cache)
+	h := NewOpenAIGatewayHandler(gateway, slots, billingCache, &service.APIKeyService{}, nil, sc.passthrough, nil, nil, cfg)
+	if sc.waitQueueHeartbeat {
+		h.concurrencyHelper = NewConcurrencyHelper(slots, SSEPingFormatComment, time.Millisecond)
+	}
+	platform := service.PlatformOpenAI
+	if len(sc.accounts) > 0 {
+		platform = sc.accounts[0].Platform
+	}
 	apiKey := &service.APIKey{
 		ID: 9102, GroupID: &groupID,
 		User:  &service.User{ID: 9103, Status: service.StatusActive},
-		Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI, Status: service.StatusActive, AllowMessagesDispatch: true},
+		Group: &service.Group{ID: groupID, Platform: platform, Status: service.StatusActive, AllowMessagesDispatch: true},
 	}
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -147,7 +159,6 @@ func serveMessagesScenario(t *testing.T, sc preContentFailoverScenario) (*httpte
 	})
 	router.POST("/v1/messages", h.Messages)
 
-	rec := httptest.NewRecorder()
 	requestBody := sc.requestBody
 	if requestBody == "" {
 		requestBody = `{"model":"gpt-5.4","max_tokens":32,"messages":[{"role":"user","content":"hello"}],"stream":true}`
@@ -156,6 +167,47 @@ func serveMessagesScenario(t *testing.T, sc preContentFailoverScenario) (*httpte
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(rec, req)
 	return rec, upstream
+}
+
+func TestOpenAIMessagesPaidTimeoutRetryHeaderOnWire(t *testing.T) {
+	const body = `{"model":"k3","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"fixture"}],"tools":{"name":"local_lookup","input_schema":{"type":"object"}},"tool_choice":{"type":"tool","name":"local_lookup"}}`
+	for _, queued := range []bool{false, true} {
+		name := "before-heartbeat"
+		if queued {
+			name = "after-queue-heartbeat"
+		}
+		t.Run(name, func(t *testing.T) {
+			accounts := preContentAccounts(2)
+			for i := range accounts {
+				accounts[i].Platform = service.PlatformKimi
+				accounts[i].Credentials = map[string]any{
+					"api_key": "fixture-key", "api_protocol": service.APIProtocolAnthropic,
+					"api_base_urls": map[string]any{service.APIProtocolAnthropic: "https://upstream.example"},
+				}
+			}
+			rec, upstream := serveMessagesScenario(t, preContentFailoverScenario{
+				accounts: accounts, requestBody: body, waitQueueHeartbeat: queued,
+				respond: func(int) (*http.Response, error) {
+					return &http.Response{StatusCode: http.StatusRequestTimeout, Header: make(http.Header),
+						Body: io.NopCloser(strings.NewReader(`{"error":{"message":"fixture timeout"}}`))}, nil
+				},
+			})
+			require.Equal(t, 1, upstream.calls(), rec.Body.String())
+			require.Contains(t, rec.Body.String(), "result is unknown")
+			response := rec.Result()
+			defer func() { _ = response.Body.Close() }()
+			if queued {
+				require.Equal(t, http.StatusOK, response.StatusCode)
+				require.Equal(t, "text/event-stream", response.Header.Get("Content-Type"))
+				require.True(t, strings.HasPrefix(rec.Body.String(), string(SSEPingFormatComment)))
+				requireEndsWithSSEError(t, rec.Body.String())
+			} else {
+				require.Equal(t, http.StatusRequestTimeout, response.StatusCode)
+				require.Equal(t, "api_error", gjson.Get(rec.Body.String(), "error.type").String())
+			}
+			require.Equal(t, "false", response.Header.Get("X-Should-Retry"))
+		})
+	}
 }
 
 // requireEndsWithSSEError checks that a response already committed as SSE ends

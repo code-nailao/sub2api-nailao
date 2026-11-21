@@ -498,6 +498,7 @@ func TestDeepSeekToolsFailOverOnlyOnDefinitiveRejection(t *testing.T) {
 func TestDeepSeekToolsNeverReplayAnUnknownOutcome(t *testing.T) {
 	for name, respond := range map[string]func() (*http.Response, error){
 		"transport_failure": func() (*http.Response, error) { return nil, errors.New("connection reset after send") },
+		"request_timeout":   func() (*http.Response, error) { return deepSeekJSONResponse(http.StatusRequestTimeout, `{}`), nil },
 		"gateway_timeout":   func() (*http.Response, error) { return deepSeekJSONResponse(http.StatusGatewayTimeout, `{}`), nil },
 		"bad_gateway":       func() (*http.Response, error) { return deepSeekJSONResponse(http.StatusBadGateway, `{}`), nil },
 	} {

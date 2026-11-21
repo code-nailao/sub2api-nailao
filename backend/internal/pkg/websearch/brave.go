@@ -2,9 +2,7 @@ package websearch
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -58,24 +56,9 @@ func (b *BraveProvider) Search(ctx context.Context, req SearchRequest) (*SearchR
 	httpReq.Header.Set("X-Subscription-Token", b.apiKey)
 	httpReq.Header.Set("Accept", "application/json")
 
-	resp, err := b.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("brave: request failed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
-	if err != nil {
-		return nil, fmt.Errorf("brave: read body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("brave: status %d: %s", resp.StatusCode, truncateBody(body))
-	}
-
 	var raw braveResponse
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("brave: decode response: %w", err)
+	if err := searchJSON(b.httpClient, httpReq, braveProviderName, &raw); err != nil {
+		return nil, err
 	}
 
 	results := make([]SearchResult, 0, len(raw.Web.Results))

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,11 +24,15 @@ import (
 
 type chatToolFilterUpstream struct {
 	service.HTTPUpstream
-	calls int
+	calls    int
+	onSubmit func(*http.Request)
 }
 
-func (u *chatToolFilterUpstream) Do(*http.Request, string, int64, int) (*http.Response, error) {
+func (u *chatToolFilterUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
 	u.calls++
+	if u.onSubmit != nil {
+		u.onSubmit(req)
+	}
 	return nil, io.ErrUnexpectedEOF
 }
 
@@ -103,6 +108,77 @@ func TestDeepSeekChatFilterWritesSSEErrorAfterQueueHeartbeat(t *testing.T) {
 	}
 	require.Len(t, errorFrames, 1)
 	require.Zero(t, upstream.calls)
+}
+
+type chatForwardCheckCount struct {
+	context.Context
+	watching atomic.Bool
+	checks   atomic.Int64
+}
+
+func (c *chatForwardCheckCount) Err() error {
+	if c.watching.Load() {
+		c.checks.Add(1)
+	}
+	return c.Context.Err()
+}
+
+func TestDeepSeekChatReusesIngressScan(t *testing.T) {
+	// The forwarding scanner checks cancellation every few KiB. Once the body
+	// has passed ingress, unrelated metadata must not add that work again.
+	forwardChecks := func(padding int) int64 {
+		t.Helper()
+		probe := &chatForwardCheckCount{Context: t.Context()}
+		h, key, upstream := newDeepSeekChatFilterHandler(t, func() bool { return true }, nil, func() { probe.watching.Store(true) })
+		const tools = `[{"type":"function","function":{"name":"local_lookup","parameters":{"type":"object"}}}]`
+		upstream.onSubmit = func(req *http.Request) {
+			probe.watching.Store(false)
+			sent, err := io.ReadAll(req.Body)
+			require.NoError(t, err)
+			require.JSONEq(t, tools, gjson.GetBytes(sent, "tools").Raw)
+		}
+		body := `{"model":"deepseek-flash","messages":[{"role":"user","content":"fixture"}],"metadata":{"padding":"` +
+			strings.Repeat("x", padding) + `"},"tools":` + tools + `}`
+		rec := serveIndexedDeepSeekChat(probe, h, key, body)
+		require.Equal(t, 1, upstream.calls, rec.Body.String())
+		return probe.checks.Load()
+	}
+
+	small, large := forwardChecks(16), forwardChecks(1<<20)
+	t.Logf("context checks before upstream submission: small=%d, large=%d", small, large)
+	require.LessOrEqual(t, large, small+8, "forwarding must not scan unrelated padding after ingress")
+}
+
+func serveIndexedDeepSeekChat(ctx context.Context, h *OpenAIGatewayHandler, key *service.APIKey, body string) *httptest.ResponseRecorder {
+	router := gin.New()
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		c.Set(string(middleware2.ContextKeyAPIKey), key)
+		c.Set(string(middleware2.ContextKeyUser), middleware2.AuthSubject{UserID: key.UserID, Concurrency: 1})
+		c.Next()
+	}, middleware2.RejectConflictingRequestFields(), h.ChatCompletions)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestDeepSeekChatFilterWithIndexedFields(t *testing.T) {
+	h, key, upstream := newDeepSeekChatFilterHandler(t, func() bool { return true }, nil, nil)
+	upstream.onSubmit = func(req *http.Request) {
+		sent, err := io.ReadAll(req.Body)
+		require.NoError(t, err)
+		require.True(t, gjson.ValidBytes(sent), "%s", sent)
+		require.False(t, gjson.GetBytes(sent, "tools").Exists(), "%s", sent)
+		require.False(t, gjson.GetBytes(sent, "tool_choice").Exists(), "%s", sent)
+		require.Equal(t, "fixture", gjson.GetBytes(sent, "messages.0.content").String())
+		require.Equal(t, "system", gjson.GetBytes(sent, "messages.1.role").String())
+		require.NotEmpty(t, gjson.GetBytes(sent, "messages.1.content").String())
+		require.Equal(t, "keep", gjson.GetBytes(sent, "metadata.other").String())
+	}
+	const body = `{"\u0074ools":[{"type":"web_search"}], "tool_choice":"required", "model":"deepseek-flash", "messages":[{"role":"user","content":"fixture"}], "metadata":{"other":"keep"}}`
+	rec := serveIndexedDeepSeekChat(t.Context(), h, key, body)
+	require.Equal(t, 1, upstream.calls, rec.Body.String())
 }
 
 type chatToolFilterSchedulerSettings struct{ service.SettingRepository }

@@ -142,6 +142,10 @@ func (s *OpenAIGatewayService) forwardAnthropicViaRawChatCompletions(
 	defer func() { _ = resp.Body.Close() }()
 
 	// 4. Handle error responses
+	if err := stopHostedToolTimeout(c, resp.StatusCode, chatBody, APIProtocolAnthropic); err != nil {
+		return nil, err
+	}
+
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
 		if foErr := s.failoverOpenAIUpstreamHTTPError(ctx, c, account, resp, respBody, upstreamMsg, upstreamModel); foErr != nil {

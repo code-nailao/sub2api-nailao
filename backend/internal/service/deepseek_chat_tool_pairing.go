@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"net/http"
 )
 
 type deepSeekToolHistoryMessage struct {
@@ -34,6 +35,21 @@ func normalizeDeepSeekChatToolPairing(ctx context.Context, body []byte) ([]byte,
 	if err != nil {
 		return nil, err
 	}
+	return repairDeepSeekChatToolPairing(ctx, body, top)
+}
+
+// normalizeDeepSeekChatToolPairingForRequest prefers the fields the HTTP
+// ingress already located, so an unchanged preread body is not walked again
+// on its way out. A rewritten body has no index and is scanned here.
+func normalizeDeepSeekChatToolPairingForRequest(ctx context.Context, req *http.Request, body []byte) ([]byte, error) {
+	top, err := deepSeekChatEnvelopeForRequest(ctx, req, body)
+	if err != nil {
+		return nil, err
+	}
+	return repairDeepSeekChatToolPairing(ctx, body, top)
+}
+
+func repairDeepSeekChatToolPairing(ctx context.Context, body []byte, top deepSeekChatEnvelope) ([]byte, error) {
 	if top.messages == nil || !top.messages.nonemptyArray {
 		return body, nil
 	}

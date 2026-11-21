@@ -133,7 +133,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	}
 	upstreamBody = updatedBody
 	if inboundProtocol == APIProtocolChatCompletions && targetsDeepSeekChatModel(account, upstreamBody) {
-		pairedBody, err := normalizeDeepSeekChatToolPairing(ctx, upstreamBody)
+		pairedBody, err := normalizeDeepSeekChatToolPairingForRequest(ctx, c.Request, upstreamBody)
 		if err != nil {
 			return nil, rejectDeepSeekChatFilter(c, err)
 		}
@@ -238,6 +238,10 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	defer func() { _ = resp.Body.Close() }()
 
 	// 7. Handle error response with failover
+	if err := stopHostedToolTimeout(c, resp.StatusCode, upstreamBody, APIProtocolChatCompletions); err != nil {
+		return nil, err
+	}
+
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
 		if rejection := DetectUpstreamRejectionHTTP(account, resp.StatusCode, respBody); rejection != nil {

@@ -2,7 +2,10 @@ package antigravity
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requestmodel"
 )
 
 // Claude 请求/响应类型定义
@@ -43,6 +46,16 @@ type ThinkingConfig struct {
 // ClaudeMetadata 请求元数据
 type ClaudeMetadata struct {
 	UserID string `json:"user_id,omitempty"`
+}
+
+// UnmarshalJSON checks aliases of the user_id field at the point where they
+// would bind to the same struct field.
+func (m *ClaudeMetadata) UnmarshalJSON(data []byte) error {
+	if field, conflict := requestmodel.ConflictingClaudeMetadataField(data); conflict {
+		return fmt.Errorf("metadata declares field %.64q more than once", field)
+	}
+	type metadataFields ClaudeMetadata
+	return json.Unmarshal(data, (*metadataFields)(m))
 }
 
 // ClaudeTool Claude 工具定义

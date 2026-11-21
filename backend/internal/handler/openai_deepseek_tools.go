@@ -34,49 +34,79 @@ func (h *OpenAIGatewayHandler) writeDeepSeekContinuationError(c *gin.Context, re
 	c.JSON(http.StatusUnprocessableEntity, gin.H{"error": gin.H{"type": "tool_continuation_failed", "message": "The continuation failed after confirmed usage. Do not automatically replay the request.", "request_id": result.RequestID}})
 }
 
-// DeepSeekTool serves the five standalone tools (search, fetch, ocr, asr, tts)
-// as thin relays. It shares provider execution and billing with hosted tools,
-// does not accept a model and never enters token or model fallback pricing.
+const deepSeekToolUploadAdmitted = "deepseek_tool_upload_admitted"
+
+// AdmitDeepSeekToolBody keeps the standalone tool's access check and size cap
+// ahead of the gateway middleware that prereads request bodies.
+func (h *OpenAIGatewayHandler) AdmitDeepSeekToolBody(c *gin.Context) {
+	operation, ok := strings.CutPrefix(c.FullPath(), "/v1/tools/")
+	if !ok || !service.IsDeepSeekToolOperation(operation) {
+		return
+	}
+	key, _ := middleware2.GetAPIKeyFromContext(c)
+	// Composite routes resolve a model group after ingress validation. Check
+	// access in the handler if that routing changes the key's group.
+	if key == nil || key.Group == nil || key.Group.Platform != service.PlatformComposite {
+		if !h.checkDeepSeekToolAccess(c, key, operation) {
+			c.Abort()
+			return
+		}
+		c.Set(deepSeekToolUploadAdmitted, true)
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, service.DeepSeekToolMaxBody(operation))
+}
+
+func writeDeepSeekToolError(c *gin.Context, status int, message string) {
+	c.JSON(status, gin.H{"error": gin.H{"type": "deepseek_tool_error", "message": message}})
+}
+
+func (h *OpenAIGatewayHandler) checkDeepSeekToolAccess(c *gin.Context, key *service.APIKey, operation string) bool {
+	if key == nil {
+		writeDeepSeekToolError(c, http.StatusUnauthorized, "API key required")
+		return false
+	}
+	if key.Group == nil || key.Group.Platform != service.PlatformDeepseek || !key.Group.DeepSeekTools.Enabled {
+		writeDeepSeekToolError(c, http.StatusForbidden, "DeepSeek tools are disabled for this group")
+		return false
+	}
+	if !service.IsDeepSeekToolOperation(operation) {
+		writeDeepSeekToolError(c, http.StatusNotFound, "unsupported DeepSeek tool")
+		return false
+	}
+	if service.DeepSeekToolGroupPrice(key.Group, operation) == nil {
+		writeDeepSeekToolError(c, http.StatusForbidden, "DeepSeek "+operation+" is not offered for this group")
+		return false
+	}
+	if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), key.User, key, key.Group, nil, service.PlatformDeepseek); err != nil {
+		status, _, message, _ := billingErrorDetails(err)
+		writeDeepSeekToolError(c, status, message)
+		return false
+	}
+	return true
+}
+
+// DeepSeekTool serves the standalone tools as thin relays. It shares provider
+// execution and billing with hosted tools, with no token or model fallback pricing.
 func (h *OpenAIGatewayHandler) DeepSeekTool(c *gin.Context) {
 	started := time.Now()
 	operation := strings.TrimPrefix(c.Request.URL.Path, "/v1/tools/")
-	fail := func(status int, message string) {
-		c.JSON(status, gin.H{"error": gin.H{"type": "deepseek_tool_error", "message": message}})
-	}
-	key, ok := middleware2.GetAPIKeyFromContext(c)
-	if !ok || key == nil {
-		fail(http.StatusUnauthorized, "API key required")
-		return
-	}
-	if key.Group == nil || key.Group.Platform != service.PlatformDeepseek || !key.Group.DeepSeekTools.Enabled {
-		fail(http.StatusForbidden, "DeepSeek tools are disabled for this group")
-		return
-	}
-	if !service.IsDeepSeekToolOperation(operation) {
-		fail(http.StatusNotFound, "unsupported DeepSeek tool")
-		return
-	}
-	// A tool without a group price is not offered: refuse before reading the body.
-	if service.DeepSeekToolGroupPrice(key.Group, operation) == nil {
-		fail(http.StatusForbidden, "DeepSeek "+operation+" is not offered for this group")
+	key, _ := middleware2.GetAPIKeyFromContext(c)
+	if _, admitted := c.Get(deepSeekToolUploadAdmitted); !admitted && !h.checkDeepSeekToolAccess(c, key, operation) {
 		return
 	}
 	reqLog := requestLogger(c, "handler.deepseek.tools")
-	// Refuse a user who cannot pay before buffering up to 101 MiB of upload.
-	if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), key.User, key, key.Group, nil, service.PlatformDeepseek); err != nil {
-		status, _, message, _ := billingErrorDetails(err)
-		fail(status, message)
-		return
+	// Keep the preread buffer intact. The route capped the raw body before
+	// reading it, and PrepareDeepSeekToolRequest also bounds the decoded bytes.
+	if _, preread := c.Request.Body.(*pkghttputil.PrereadBody); !preread {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, service.DeepSeekToolMaxBody(operation))
 	}
-	limit := service.DeepSeekToolMaxBody(operation)
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 	body, err := pkghttputil.ReadRequestBodyWithPrealloc(c.Request)
 	if err != nil {
 		if handleRequestBodyReadError(c, reqLog, err) {
 			return
 		}
 		status, message := requestBodyReadFailure(reqLog, c.Request, err)
-		fail(status, message)
+		writeDeepSeekToolError(c, status, message)
 		return
 	}
 	req, err := service.PrepareDeepSeekToolRequest(operation, c.GetHeader("Content-Type"), body)
@@ -86,12 +116,12 @@ func (h *OpenAIGatewayHandler) DeepSeekTool(c *gin.Context) {
 		if errors.As(err, &input) {
 			status = input.Status
 		}
-		fail(status, err.Error())
+		writeDeepSeekToolError(c, status, err.Error())
 		return
 	}
 	subject, ok := middleware2.GetAuthSubjectFromContext(c)
 	if !ok {
-		fail(http.StatusUnauthorized, "user required")
+		writeDeepSeekToolError(c, http.StatusUnauthorized, "user required")
 		return
 	}
 	// Text the supplier acts on is audited like a chat message; files are not.
@@ -102,7 +132,7 @@ func (h *OpenAIGatewayHandler) DeepSeekTool(c *gin.Context) {
 			if status == 0 {
 				status = http.StatusForbidden
 			}
-			fail(status, decision.ClientMessage)
+			writeDeepSeekToolError(c, status, decision.ClientMessage)
 			return
 		}
 	}
@@ -116,7 +146,7 @@ func (h *OpenAIGatewayHandler) DeepSeekTool(c *gin.Context) {
 	meta := service.OpenAIRecordUsageInput{InboundEndpoint: c.Request.URL.Path, UserAgent: c.GetHeader("User-Agent"), IPAddress: ip.GetClientIP(c), APIKeyService: h.apiKeyService, PricingAt: started}
 	if err = h.gatewayService.ServeDeepSeekTool(c.Request.Context(), c.Writer, key, req, meta); err != nil {
 		status, _, message, _ := billingErrorDetails(err)
-		fail(status, message)
+		writeDeepSeekToolError(c, status, message)
 	}
 }
 

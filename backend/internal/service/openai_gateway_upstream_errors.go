@@ -12,12 +12,256 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
+
+// submissionMayRunHostedTools examines the request sent to the provider and
+// ignores historical search results. Unknown tools are treated conservatively.
+func submissionMayRunHostedTools(body []byte) bool {
+	if gjson.GetBytes(body, "web_search_options").IsObject() {
+		return true // Native Chat Completions can enable web search separately.
+	}
+	choice := gjson.GetBytes(body, "tool_choice")
+	if choice.String() == "none" || choice.Get("type").String() == "none" {
+		return false
+	}
+	toolSets := []gjson.Result{gjson.GetBytes(body, "tools")}
+	for _, item := range gjson.GetBytes(body, "input").Array() {
+		if item.Get("type").String() == openAIAdditionalToolsItemType {
+			toolSets = append(toolSets, item.Get("tools"))
+		}
+	}
+	if choiceAllowsOnlyDeclaredClientFunctions(choice, toolSets) {
+		return false
+	}
+	for _, tools := range toolSets {
+		if responsesToolsMayRunOnProvider(tools) {
+			return true
+		}
+	}
+	return false
+}
+
+// An explicit function or a restricted list can exclude hosted tools. Every
+// reference must resolve to a declared client-side function in the same scope.
+func choiceAllowsOnlyDeclaredClientFunctions(choice gjson.Result, toolSets []gjson.Result) bool {
+	if choice.Get("type").String() != "allowed_tools" {
+		return isDeclaredClientFunctionChoice(choice, toolSets)
+	}
+	mode := choice.Get("mode").String()
+	allowed := choice.Get("tools")
+	if (mode != "required" && mode != "auto") || !allowed.IsArray() {
+		return false
+	}
+	choices := allowed.Array()
+	if len(choices) == 0 {
+		return false
+	}
+	for _, selected := range choices {
+		if !isDeclaredClientFunctionChoice(selected, toolSets) {
+			return false
+		}
+	}
+	return true
+}
+
+func isDeclaredClientFunctionChoice(choice gjson.Result, toolSets []gjson.Result) bool {
+	if choice.Get("type").String() != "function" {
+		return false
+	}
+	name := choice.Get("name")
+	if !name.Exists() {
+		name = choice.Get("function.name")
+	}
+	namespace := choice.Get("namespace")
+	if name.Type != gjson.String || name.Str == "" || (namespace.Exists() && (namespace.Type != gjson.String || namespace.Str == "")) {
+		return false
+	}
+	for _, tools := range toolSets {
+		if !tools.IsArray() {
+			continue
+		}
+		if !namespace.Exists() {
+			if containsClientFunction(tools, name.Str) {
+				return true
+			}
+			continue
+		}
+		for _, declaration := range tools.Array() {
+			if declaration.Get("type").String() == "namespace" && declaration.Get("name").String() == namespace.Str &&
+				containsClientFunction(declaration.Get("tools"), name.Str) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsClientFunction(tools gjson.Result, name string) bool {
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		if tool.Get("type").String() == "function" && (tool.Get("name").String() == name || tool.Get("function.name").String() == name) {
+			return true
+		}
+	}
+	return false
+}
+
+// Native Anthropic tool choices name a tool, including server tools. Only a
+// unique client tool declaration proves that hosted tools cannot run.
+func selectsDeclaredAnthropicClientTool(name, tools gjson.Result) bool {
+	if name.Type != gjson.String || name.Str == "" || !tools.IsArray() {
+		return false
+	}
+	found := false
+	for _, declaration := range tools.Array() {
+		declaredName := declaration.Get("name")
+		if declaredName.Type != gjson.String || declaredName.Str != name.Str {
+			continue
+		}
+		kind := declaration.Get("type")
+		isClient := !kind.Exists() || kind.Str == "custom"
+		if found || !isClient || !declaration.Get("input_schema").IsObject() {
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
+func responsesToolsMayRunOnProvider(tools gjson.Result) bool {
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		switch strings.TrimSpace(tool.Get("type").String()) {
+		case "", "function", "custom", "local_shell", "computer", "computer_use_preview", "apply_patch":
+			// These tools return a call for the client to execute.
+		case "namespace":
+			if responsesToolsMayRunOnProvider(tool.Get("tools")) {
+				return true
+			}
+		case "web_search", "web_search_preview", "web_search_preview_2025_03_11", "web_search_2025_08_26", "x_search", "web_fetch", "google_search":
+			return true // Hosted public or social web retrieval.
+		case "file_search", "collections_search", "attachment_search":
+			return true // Hosted private data retrieval.
+		case "mcp":
+			return true // The provider may query a connector.
+		case "tool_search":
+			if tool.Get("execution").String() != "client" {
+				return true
+			}
+		default:
+			return true // Other hosted tools and provider extensions may already have run.
+		}
+	}
+	return false
+}
+
+const paidSubmissionTimeoutMessage = "The upstream timed out and the result is unknown. The request was not retried."
+
+// The upstream may have accepted a paid submission before returning HTTP 408.
+func markPaidSubmissionTimeout(c *gin.Context) error {
+	setOpsUpstreamError(c, http.StatusRequestTimeout, paidSubmissionTimeoutMessage, "")
+	c.Header("x-should-retry", "false")
+	MarkResponseCommitted(c)
+	return fmt.Errorf("upstream submission outcome unknown: HTTP %d", http.StatusRequestTimeout)
+}
+
+func stopPaidSubmissionAfterTimeout(c *gin.Context) (*OpenAIForwardResult, error) {
+	err := markPaidSubmissionTimeout(c)
+	c.JSON(http.StatusRequestTimeout, gin.H{"error": gin.H{
+		"type": "upstream_error", "code": "request_timeout", "message": paidSubmissionTimeoutMessage,
+	}})
+	return nil, err
+}
+
+func stopPaidResponsesSubmissionAfterTimeout(c *gin.Context, model string) (*OpenAIForwardResult, error) {
+	StopOpenAICompactSSEKeepaliveCommitted(c)
+	if !c.Writer.Written() || !strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
+		return stopPaidSubmissionAfterTimeout(c)
+	}
+
+	outcomeErr := markPaidSubmissionTimeout(c)
+	MarkOpsStreamFailure(c, "upstream_error", "request_timeout", paidSubmissionTimeoutMessage, http.StatusRequestTimeout)
+	frame, err := apicompat.ResponsesEventToSSE(apicompat.ResponsesStreamEvent{
+		Type: "response.failed",
+		Response: &apicompat.ResponsesResponse{
+			ID:        "resp_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+			Object:    "response",
+			CreatedAt: time.Now().Unix(),
+			Model:     model,
+			Status:    "failed",
+			Output:    []apicompat.ResponsesOutput{},
+			Error:     &apicompat.ResponsesError{Code: "request_timeout", Message: paidSubmissionTimeoutMessage},
+		},
+	})
+	if err == nil {
+		_, err = io.WriteString(c.Writer, frame)
+	}
+	if err != nil {
+		_ = c.Error(err)
+	} else {
+		c.Writer.Flush()
+	}
+	return nil, outcomeErr
+}
+
+// Apply the outbound Messages tool choice even when the client expects an
+// OpenAI error response.
+func stopNativeAnthropicHostedToolTimeout(c *gin.Context, status int, outbound []byte, inboundProtocol string) error {
+	if status != http.StatusRequestTimeout {
+		return nil
+	}
+	choice := gjson.GetBytes(outbound, "tool_choice")
+	if choice.Get("type").String() != "tool" {
+		return stopHostedToolTimeout(c, status, outbound, inboundProtocol)
+	}
+	if selectsDeclaredAnthropicClientTool(choice.Get("name"), gjson.GetBytes(outbound, "tools")) {
+		return nil
+	}
+	// A named selection that cannot be resolved is inconclusive even when all
+	// listed tools are client tools.
+	return writeHostedToolTimeout(c, outbound, inboundProtocol)
+}
+
+// Call before error recovery can send the request again, using the request
+// after protocol conversion and the error format of the original client.
+func stopHostedToolTimeout(c *gin.Context, status int, outbound []byte, inboundProtocol string) error {
+	if status != http.StatusRequestTimeout || !submissionMayRunHostedTools(outbound) {
+		return nil
+	}
+	return writeHostedToolTimeout(c, outbound, inboundProtocol)
+}
+
+func writeHostedToolTimeout(c *gin.Context, outbound []byte, inboundProtocol string) error {
+	if inboundProtocol == APIProtocolAnthropic {
+		err := markPaidSubmissionTimeout(c)
+		writeAnthropicError(c, http.StatusRequestTimeout, "api_error", paidSubmissionTimeoutMessage)
+		return err
+	}
+	if inboundProtocol == APIProtocolChatCompletions && c.Writer.Written() && strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
+		err := markPaidSubmissionTimeout(c)
+		if _, writeErr := fmt.Fprint(c.Writer, buildChatStreamErrorSSE("request_timeout", paidSubmissionTimeoutMessage)); writeErr == nil {
+			c.Writer.Flush()
+		}
+		return err
+	}
+	if inboundProtocol == APIProtocolResponses {
+		_, err := stopPaidResponsesSubmissionAfterTimeout(c, gjson.GetBytes(outbound, "model").String())
+		return err
+	}
+	_, err := stopPaidSubmissionAfterTimeout(c)
+	return err
+}
 
 func logOpenAIInstructionsRequiredDebug(
 	ctx context.Context,
@@ -302,7 +546,7 @@ func isOpenAIContextWindowError(upstreamMsg string, upstreamBody []byte) bool {
 
 func (s *OpenAIGatewayService) shouldFailoverUpstreamError(statusCode int) bool {
 	switch statusCode {
-	case 401, 402, 403, 405, 429, 529:
+	case 401, 402, 403, 405, http.StatusRequestTimeout, 429, 529:
 		return true
 	default:
 		return statusCode >= 500

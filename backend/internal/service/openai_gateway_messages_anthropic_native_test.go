@@ -83,6 +83,115 @@ data: {"type":"message_stop"}
 	}
 }
 
+func TestNativeAnthropic408UsesTheEffectiveToolSelection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const responseShape = `{"model":"minimax-m3","input":"fixture","tools":[%s{"type":"function","name":"local_lookup","parameters":{"type":"object"}}],"tool_choice":{"type":"function","name":%q}}`
+	const messagesShape = `{"model":"minimax-m3","max_tokens":32,"messages":[{"role":"user","content":"fixture"}],"tools":[%s{"type":"custom","name":"local_lookup","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":%q}}`
+	const responsesSearch = `{"type":"web_search"}`
+	const messagesSearch = `{"type":"web_search_20250305","name":"web_search"}`
+	for _, ingress := range []struct {
+		path, template, search string
+	}{
+		{"/v1/responses", responseShape, responsesSearch},
+		{"/v1/chat/completions", responseShape, responsesSearch},
+		{"/v1/messages", messagesShape, messagesSearch},
+	} {
+		for _, scenario := range []struct {
+			name, selected string
+			withSearch     bool
+			failover       bool
+		}{
+			{"client-selected-with-search", "local_lookup", true, true},
+			{"search-selected", "web_search", true, false},
+			{"undeclared-with-search", "missing", true, false},
+			{"undeclared-client-only", "missing", false, false},
+			{"client-selected-client-only", "local_lookup", false, true},
+		} {
+			t.Run(strings.TrimPrefix(ingress.path, "/v1/")+"/"+scenario.name, func(t *testing.T) {
+				search := ""
+				if scenario.withSearch {
+					search = ingress.search + ","
+				}
+				body := []byte(fmt.Sprintf(ingress.template, search, scenario.selected))
+				c := adaptiveProtocolTestContext(ingress.path, body)
+				upstream := &httpUpstreamRecorder{resp: &http.Response{
+					StatusCode: http.StatusRequestTimeout,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"fixture timeout"}}`)),
+				}}
+				svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+				account := &Account{ID: 2, Platform: PlatformOpenCodeGo, Type: AccountTypeAPIKey, Credentials: map[string]any{
+					"api_key": "fixture-key", "account_mode": AccountModeGo,
+					"api_base_urls": map[string]any{APIProtocolAnthropic: "https://anthropic.example"},
+				}}
+				var result *OpenAIForwardResult
+				var err error
+				switch ingress.path {
+				case "/v1/chat/completions":
+					result, err = svc.ForwardAsChatCompletions(c.Request.Context(), c, account, body, "", "")
+				case "/v1/messages":
+					result, err = svc.ForwardAsAnthropic(c.Request.Context(), c, account, body, "", "")
+				default:
+					result, err = svc.Forward(c.Request.Context(), c, account, body)
+				}
+
+				require.Len(t, upstream.requests, 1)
+				require.Equal(t, "/v1/messages", upstream.lastReq.URL.Path)
+				require.Equal(t, "tool", gjson.GetBytes(upstream.lastBody, "tool_choice.type").String())
+				require.Equal(t, scenario.selected, gjson.GetBytes(upstream.lastBody, "tool_choice.name").String())
+				tools := gjson.GetBytes(upstream.lastBody, "tools").Array()
+				if scenario.withSearch {
+					require.Len(t, tools, 2)
+					require.Equal(t, "web_search_20250305", tools[0].Get("type").String())
+				} else {
+					require.Len(t, tools, 1)
+				}
+				require.Equal(t, "local_lookup", tools[len(tools)-1].Get("name").String())
+				require.Nil(t, result)
+				var failover *UpstreamFailoverError
+				if scenario.failover {
+					require.ErrorAs(t, err, &failover, "only a client tool could run on this request")
+					require.Equal(t, http.StatusRequestTimeout, failover.StatusCode)
+					require.False(t, IsResponseCommitted(c))
+				} else {
+					require.NotErrorAs(t, err, &failover)
+					require.ErrorContains(t, err, "outcome unknown")
+					require.True(t, IsResponseCommitted(c))
+					require.Equal(t, http.StatusRequestTimeout, c.Writer.Status())
+					require.Equal(t, "false", c.Writer.Header().Get("X-Should-Retry"))
+				}
+			})
+		}
+	}
+}
+
+func TestNativeAnthropic408StopsForNonArrayToolDeclarations(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"k3","max_tokens":32,"messages":[{"role":"user","content":"fixture"}],` +
+		`"tools":{"name":"local_lookup","input_schema":{"type":"object"}},"tool_choice":{"type":"tool","name":"local_lookup"}}`)
+	c := adaptiveProtocolTestContext("/v1/messages", body)
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusRequestTimeout,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"fixture timeout"}}`)),
+	}}
+	svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+
+	result, err := svc.ForwardAsAnthropic(c.Request.Context(), c, nativeAnthropicTestAccount(), body, "", "")
+
+	require.Len(t, upstream.requests, 1)
+	require.Equal(t, "/anthropic/v1/messages", upstream.lastReq.URL.Path)
+	require.True(t, gjson.GetBytes(upstream.lastBody, "tools").IsObject())
+	require.Equal(t, "local_lookup", gjson.GetBytes(upstream.lastBody, "tool_choice.name").String())
+	require.Nil(t, result)
+	var failover *UpstreamFailoverError
+	require.NotErrorAs(t, err, &failover)
+	require.ErrorContains(t, err, "outcome unknown")
+	require.True(t, IsResponseCommitted(c))
+	require.Equal(t, http.StatusRequestTimeout, c.Writer.Status())
+	require.Equal(t, "false", c.Writer.Header().Get("X-Should-Retry"))
+}
+
 func TestNativeAnthropicPassthroughRecordsOutputConfigEffort(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	body := []byte(`{"model":"k3","max_tokens":32,"stream":false,` +
