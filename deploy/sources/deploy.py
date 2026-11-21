@@ -1181,6 +1181,14 @@ class Deployer:
                 except (DeployError, OSError, subprocess.SubprocessError) as err:
                     raise self.rollback_admin_owner(target, previous, reason, err) from err
                 try:
+                    # The owner can exit or lose the lock between its readiness
+                    # probe and the reload. Admin must not move to it then.
+                    if not self.background_answering(previous):
+                        raise DeployError(f"{previous['containers']['background']} does not hold the background "
+                                          "lock for the admin route")
+                except (DeployError, OSError, subprocess.SubprocessError) as err:
+                    raise self.rollback_admin_owner(target, previous, reason, err) from err
+                try:
                     self.switch_to(previous)
                 except DeployError as err:
                     raise FallbackFailed(f"guard failed ({reason}); the previous release owns the background again "
@@ -1209,20 +1217,43 @@ class Deployer:
         except DeployError as err:
             raise FallbackFailed(f"handing the background back failed: {err}") from err
 
+    def revive_background(self, view: dict[str, Any]) -> bool:
+        """Restart a background that merely exited and wait for the lock and
+        health, so the admin upstream keeps an owner that answers."""
+        name = view["containers"]["background"]
+        try:
+            info = self.ops.inspect(name) or {}
+            state = info.get("State") or {}
+            if state.get("Running") or state.get("Restarting"):
+                return False
+            self.log(f"   {name} is stopped; restarting it so admin keeps an owner")
+            self.start_background(view, check_health=True)
+            return self.background_answering(view)
+        except (DeployError, OSError, subprocess.SubprocessError) as err:
+            self.log(f"   {name} did not come back: {err}")
+            return False
+
     def rollback_admin_owner(self, target: Target, previous: dict[str, Any], reason: str,
                              err: BaseException) -> FallbackFailed:
-        """Admin routing stays on the owner that still answers, and an
-        incomplete recovery is recorded instead of ending silently."""
+        """Keep admin on an owner that answers: restart the released
+        background when it merely exited, and record an incomplete recovery."""
+        view = target.view()
         try:
-            answering = self.background_answering(target.view(), allow_draining=True)
+            answering = self.background_answering(view, allow_draining=True)
         except (DeployError, OSError, subprocess.SubprocessError):
             answering = False
+        revived = False
+        if not answering:
+            revived = self.revive_background(view)
+            answering = revived
         if answering:
+            state = "was restarted and answers" if revived else "answers"
             where = (f"serving serves from slot {previous['slot']} and admin still uses slot {target.slot}, "
-                     "whose background answers")
+                     f"whose background {state}")
         else:
-            where = (f"serving serves from slot {previous['slot']} but no background answers admin now; "
-                     "restore one and point admin routing at it")
+            where = (f"serving serves from slot {previous['slot']} and the admin upstream still points at "
+                     f"slot {target.slot}, whose background does not answer; restore a background and point "
+                     "admin routing at it")
         return FallbackFailed(
             f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not finish "
             f"({err}). {where}. Verify the background, its lock and live routing before clearing in_progress")

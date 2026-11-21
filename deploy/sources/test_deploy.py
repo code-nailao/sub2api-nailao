@@ -526,6 +526,90 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(progress, deploy.status(self.cfg, self.ops)["in_progress"])
         self.assertEqual("failed", self.history()[-1]["result"])
 
+    def test_guard_rollback_does_not_move_admin_to_a_background_without_the_lock(self):
+        self.ops.memory_after_switch = 20 * GIB
+        self.cfg.background_ready_timeout = 6
+        target = self.cfg.slot_view("a")
+        old_admin = LEGACY["ports"]["background"]
+        new_admin = target["ports"]["background"]
+        old_background = LEGACY["containers"]["background"]
+        started = False
+        lost_lock = False
+
+        run, http_json = self.ops.run, self.ops.http_json
+
+        def start(args, **kw):
+            nonlocal started
+            result = run(args, **kw)
+            if args == ["docker", "start", old_background]:
+                started = True
+            return result
+
+        def probe(url, **kw):
+            # The background passes its readiness probe and answers /health,
+            # then loses the kernel lock before admin routing moves.
+            nonlocal lost_lock
+            if started and url.endswith(f":{old_admin}/health") and not lost_lock:
+                lost_lock = True
+                return 200, "ok"
+            if lost_lock and url.endswith(f":{old_admin}/internal/sources/runtime"):
+                status, body = http_json(url, **kw)
+                if status == 200 and isinstance(body, dict):
+                    return status, {**body, "owns_background": False}
+                return status, body
+            return http_json(url, **kw)
+
+        with mock.patch.object(self.ops, "run", start), mock.patch.object(self.ops, "http_json", probe):
+            with self.assertRaises(deploy.FallbackFailed) as ctx:
+                self.deploy()
+
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertTrue(lost_lock)
+        self.assertIn(f"127.0.0.1:{new_admin};", upstream)
+        self.assertNotIn(f"127.0.0.1:{old_admin};", upstream,
+                         "a background that does not hold the lock must not receive admin")
+        self.assertIn(f"admin still uses slot {target['slot']}", str(ctx.exception))
+        self.assertEqual("guard", self.state()["in_progress"]["step"])
+        self.assertTrue(deploy.Deployer(self.cfg, self.ops).background_answering(target),
+                        "admin keeps an owner that answers")
+
+    def test_guard_rollback_restarts_the_answering_background_when_the_previous_one_exits(self):
+        self.ops.memory_after_switch = 20 * GIB
+        self.cfg.background_exit_timeout = 2
+        target = self.cfg.slot_view("a")
+        candidate_background = target["containers"]["background"]
+        candidate_admin = target["ports"]["background"]
+        previous_background = LEGACY["containers"]["background"]
+        self.ops.drain_seconds[candidate_background] = 8
+
+        run = self.ops.run
+
+        def start(args, **kw):
+            result = run(args, **kw)
+            if args == ["docker", "start", previous_background]:
+                # The previous background starts and exits at once.
+                self.ops.containers[previous_background]["State"].update(
+                    Running=False, Status="exited", ExitCode=1)
+            return result
+
+        with mock.patch.object(self.ops, "run", start):
+            with self.assertRaises(deploy.FallbackFailed) as ctx:
+                self.deploy()
+
+        message = str(ctx.exception)
+        self.assertIn(f"admin still uses slot {target['slot']}", message, "admin keeps an owner that answers")
+        self.assertNotIn("no background answers admin now", message)
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['serving']} max_fails", upstream)
+        self.assertIn(f"127.0.0.1:{candidate_admin};", upstream)
+        self.assertNotIn(f"127.0.0.1:{LEGACY['ports']['background']};", upstream)
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        self.assertTrue(deployer.background_answering(target), "the drained background was restarted as owner")
+        self.assertEqual(2, self.ops.commands.count(["docker", "start", candidate_background]))
+        progress = self.state()["in_progress"]
+        self.assertEqual("guard", progress["step"])
+        self.assertIn("restarted", progress["failed"])
+
     def test_guard_counts_connect_failures_only_for_new_ports(self):
         line = 'connect() failed (111) while connecting to upstream, upstream: "http://127.0.0.1:{}/v1"'
         text = "\n".join([line.format(9401)] * 3 + [line.format(9426)] * 50)
