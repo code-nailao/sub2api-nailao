@@ -347,3 +347,75 @@ test('an account without registered groups is offered its own key, and a lock wi
   assert.match(off.message.textContent, /请联系管理员/);
   assert.equal(off.ownKeyButton.hidden, true);
 });
+
+const staleConnection = { ok: false, status: 409,
+  data: { error: 'custom_connection_needs_update', message: '这把密钥所在的分组已经变化，请重新打开“自定义连接”保存一次。' } };
+
+test('a stale own-key connection asks to resave and opens its dialog', async () => {
+  const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID), connection: () => staleConnection });
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.message.textContent, staleConnection.data.message);
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  f.retry.onclick();
+  assert.equal(f.settings.at(-1).kind, 'custom');
+  assert.equal(f.calls.filter((call) => call.path.endsWith('/connection')).length, 1);
+});
+
+test('a stale connection hint stays after the shell acknowledgement', async () => {
+  const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID), connection: () => staleConnection });
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackShell();
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.message.textContent, staleConnection.data.message);
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  assert.equal(f.frame.hidden, true);
+});
+
+test('an unrelated 409 keeps the released wording', async () => {
+  const f = await fixture({ connection: () => ({ ok: false, status: 409, data: { error: 'settings_changed' } }) });
+  assert.equal(f.message.textContent, '暂时无法连接此分组，请重试。已有作品和输入内容已保留。');
+  assert.equal(f.retry.textContent, '重试连接');
+  assert.equal(f.settings.length, 0);
+});
+
+test('a normal failure after a stale connection keeps the resave entry', async () => {
+  let stale = true;
+  const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID),
+    connection: () => stale ? staleConnection : { ok: false, status: 503 } });
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  stale = false;
+  f.select.value = '26';
+  f.select.onchange();
+  await flush();
+  assert.equal(f.message.textContent, '暂时无法连接此分组，请重试。已有作品和输入内容已保留。');
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  f.retry.onclick();
+  assert.equal(f.settings.at(-1).kind, 'custom');
+});
+
+test('a new acknowledged configuration clears the resave entry', async () => {
+  let stale = true;
+  const f = await fixture({ custom: 'configured', remembered: String(CUSTOM_ID),
+    connection: (options, config) => stale ? staleConnection : { ok: true, status: 200, data: config(options.body.group_id) } });
+  assert.equal(f.retry.textContent, '打开自定义连接');
+  stale = false;
+  f.select.value = '26';
+  f.select.onchange();
+  await flush();
+  await f.ackConnection();
+  f.send({ type: 'sub2api:image-studio-shell-ready', version: 1 });
+  await f.ackShell();
+  assert.equal(f.document.body.dataset.state, 'ready');
+  assert.equal(f.retry.textContent, '重试连接');
+});
+
+test('non-stale connection failures keep the released wording', async () => {
+  const f = await fixture({ connection: () => ({ ok: false, status: 503 }) });
+  assert.equal(f.document.body.dataset.state, 'recovery');
+  assert.equal(f.message.textContent, '暂时无法连接此分组，请重试。已有作品和输入内容已保留。');
+  assert.equal(f.retry.textContent, '重试连接');
+  f.retry.onclick();
+  await flush();
+  assert.equal(f.settings.length, 0);
+  assert.equal(f.calls.filter((call) => call.path.endsWith('/connection')).length, 2);
+});

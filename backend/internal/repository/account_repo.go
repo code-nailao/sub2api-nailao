@@ -286,6 +286,9 @@ func (r *accountRepository) GetByID(ctx context.Context, id int64) (*service.Acc
 	if scoped := r.accountTransactionScope(ctx); scoped != r {
 		return scoped.GetByID(ctx, id)
 	}
+	if scoped := r.scopedOpenAIRefreshReader(ctx, id); scoped != r {
+		return scoped.GetByID(ctx, id)
+	}
 	m, err := r.client.Account.Query().Where(dbaccount.IDEQ(id)).Only(ctx)
 	if err != nil {
 		return nil, translatePersistenceError(err, service.ErrAccountNotFound, nil)
@@ -1694,6 +1697,29 @@ func (r *accountRepository) UpdateGrokOAuthCredentialsIfUnchanged(
 	expectedProxyID *int64,
 	credentials map[string]any,
 ) (bool, error) {
+	return r.updateOAuthCredentialsIfUnchanged(ctx, id, service.PlatformGrok, expectedCredentials, expectedProxyID, credentials)
+}
+
+// UpdateOpenAIOAuthCredentialsIfUnchanged preserves a completed token rotation
+// without overwriting concurrent reauthorization or writing to a credential shadow.
+func (r *accountRepository) UpdateOpenAIOAuthCredentialsIfUnchanged(
+	ctx context.Context,
+	id int64,
+	expectedCredentials map[string]any,
+	expectedProxyID *int64,
+	credentials map[string]any,
+) (bool, error) {
+	return r.updateOAuthCredentialsIfUnchanged(ctx, id, service.PlatformOpenAI, expectedCredentials, expectedProxyID, credentials)
+}
+
+func (r *accountRepository) updateOAuthCredentialsIfUnchanged(
+	ctx context.Context,
+	id int64,
+	platform string,
+	expectedCredentials map[string]any,
+	expectedProxyID *int64,
+	credentials map[string]any,
+) (bool, error) {
 	if r == nil || r.sql == nil {
 		return false, errors.New("account repository SQL executor is not configured")
 	}
@@ -1705,7 +1731,18 @@ func (r *accountRepository) UpdateGrokOAuthCredentialsIfUnchanged(
 	if err != nil {
 		return false, err
 	}
-	result, err := r.sql.ExecContext(ctx, `
+	executor := r.sql
+	if tx := dbent.TxFromContext(ctx); tx != nil {
+		executor = tx.Client()
+	} else if session, _ := ctx.Value(scopedOpenAIRefreshSessionKey{}).(*scopedOpenAIRefreshSession); session != nil {
+		if session.accountID != id || platform != service.PlatformOpenAI {
+			return false, errors.New("credential write does not match the scoped OAuth refresh")
+		}
+		// The atomic update and outbox insert below are one autocommit
+		// transaction, under the persistence deadline rather than the lock wait.
+		executor = session.conn
+	}
+	result, err := executor.ExecContext(ctx, `
 		WITH updated AS (
 		UPDATE accounts AS a
 		SET credentials = $1::jsonb,
@@ -1716,6 +1753,7 @@ func (r *accountRepository) UpdateGrokOAuthCredentialsIfUnchanged(
 			AND a.type = $4
 			AND a.credentials = $5::jsonb
 			AND a.proxy_id IS NOT DISTINCT FROM $6
+			AND ($3 <> 'openai' OR a.parent_account_id IS NULL)
 		RETURNING a.id
 		)
 		INSERT INTO scheduler_outbox (event_type, account_id, group_id, payload)
@@ -1723,7 +1761,7 @@ func (r *accountRepository) UpdateGrokOAuthCredentialsIfUnchanged(
 	`,
 		string(credentialsJSON),
 		id,
-		service.PlatformGrok,
+		platform,
 		service.AccountTypeOAuth,
 		string(expectedJSON),
 		expectedProxyID,
@@ -1739,7 +1777,9 @@ func (r *accountRepository) UpdateGrokOAuthCredentialsIfUnchanged(
 	if rowsAffected == 0 {
 		return false, nil
 	}
-	r.syncSchedulerAccountSnapshotDetached(ctx, id)
+	service.AfterAccountCommit(ctx, func(committed context.Context) {
+		r.syncSchedulerAccountSnapshotDetached(committed, id)
+	})
 	return true, nil
 }
 
@@ -4257,6 +4297,9 @@ func (r *accountRepository) RevertProxyFallback(ctx context.Context, accountID i
 // 软删除行由 SoftDeleteMixin 拦截器自动排除，无需手写 deleted_at IS NULL。
 func (r *accountRepository) ListShadowsByParent(ctx context.Context, parentID int64) ([]*service.Account, error) {
 	if scoped := r.accountTransactionScope(ctx); scoped != r {
+		return scoped.ListShadowsByParent(ctx, parentID)
+	}
+	if scoped := r.scopedOpenAIRefreshReader(ctx, parentID); scoped != r {
 		return scoped.ListShadowsByParent(ctx, parentID)
 	}
 	rows, err := r.client.Account.Query().

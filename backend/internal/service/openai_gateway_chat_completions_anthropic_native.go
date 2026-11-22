@@ -46,7 +46,7 @@ func (s *OpenAIGatewayService) forwardChatCompletionsViaNativeAnthropic(
 
 	// 1. Parse Chat Completions request
 	var ccReq apicompat.ChatCompletionsRequest
-	if err := json.Unmarshal(body, &ccReq); err != nil {
+	if err := parseChatRequestForBridge(body, account.Platform, &ccReq); err != nil {
 		writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
 		return nil, fmt.Errorf("parse chat completions request: %w", err)
 	}
@@ -127,6 +127,10 @@ func (s *OpenAIGatewayService) forwardChatCompletionsViaNativeAnthropic(
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true)
 	}
 	defer func() { _ = resp.Body.Close() }()
+
+	if err := stopNativeAnthropicHostedToolTimeout(c, resp.StatusCode, forwardedBody, APIProtocolChatCompletions); err != nil {
+		return nil, err
+	}
 
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)

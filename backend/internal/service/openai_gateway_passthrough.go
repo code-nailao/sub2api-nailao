@@ -387,11 +387,18 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			// a failover so the handler switches to a healthy account.
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true)
 		}
+		if resp.StatusCode == http.StatusRequestTimeout && !imageIntent && submissionMayRunHostedTools(body) {
+			_ = resp.Body.Close()
+			return stopPaidResponsesSubmissionAfterTimeout(c, reqModel)
+		}
 		if resp.StatusCode >= 400 {
 			// Peek only to identify an invalid task. Restore the body so the existing
 			// passthrough error handling sees the same response after recovery fails.
 			probeBody := s.readUpstreamErrorBody(resp)
 			_ = resp.Body.Close()
+			if imageIntent && resp.StatusCode == http.StatusRequestTimeout {
+				return stopOpenAIImageSubmissionAfterTimeout(c, resp, s.redactAgentIdentitySensitiveBody(ctx, account, probeBody))
+			}
 			resp.Body = io.NopCloser(bytes.NewReader(probeBody))
 			if rejection := DetectUpstreamRejectionHTTP(account, resp.StatusCode, probeBody); rejection != nil {
 				result := upstreamRejectionForwardResult(resp, reqModel, actualModel, actualModel, reqStream, startTime, rejection)

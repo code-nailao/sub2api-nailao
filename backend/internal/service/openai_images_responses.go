@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -300,6 +301,11 @@ func buildOpenAIImagesStreamCompletedPayload(
 		payload, _ = sjson.SetBytes(payload, "model", img.Model)
 	}
 	if len(usageRaw) > 0 && gjson.ValidBytes(usageRaw) {
+		// Upstream JSON may be pretty-printed; a newline would split the SSE data line.
+		var compact bytes.Buffer
+		if json.Compact(&compact, usageRaw) == nil {
+			usageRaw = compact.Bytes()
+		}
 		payload, _ = sjson.SetRawBytes(payload, "usage", usageRaw)
 	}
 	return payload
@@ -896,6 +902,15 @@ func openAIImagesUpstreamErrorFromHTTP(statusCode int, header http.Header, body 
 		Param:             param,
 		UpstreamRequestID: requestID,
 	}
+}
+
+// A 408 may arrive after a paid generation was accepted.
+func stopOpenAIImageSubmissionAfterTimeout(c *gin.Context, resp *http.Response, body []byte) (*OpenAIForwardResult, error) {
+	upstreamErr := openAIImagesUpstreamErrorFromHTTP(resp.StatusCode, resp.Header, body)
+	setOpsUpstreamError(c, resp.StatusCode, upstreamErr.Message, "")
+	c.Header("x-should-retry", "false")
+	writeOpenAIImagesUpstreamErrorResponse(c, upstreamErr)
+	return nil, upstreamErr
 }
 
 // handleOpenAIImagesErrorResponse is the non-failover error handler for the
@@ -1922,6 +1937,9 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 		respBody := s.readUpstreamErrorBody(resp)
 		_ = resp.Body.Close()
 		respBody = s.redactAgentIdentitySensitiveBody(upstreamCtx, account, respBody)
+		if resp.StatusCode == http.StatusRequestTimeout {
+			return stopOpenAIImageSubmissionAfterTimeout(c, resp, respBody)
+		}
 		if direct && !requiresCodexDirectImages(upstreamModel) && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed) {
 			return s.forwardOpenAIImagesOAuth(withOpenAIImagesForceResponses(ctx), c, account, parsed, channelMappedModel)
 		}

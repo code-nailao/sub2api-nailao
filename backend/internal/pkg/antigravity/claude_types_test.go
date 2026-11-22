@@ -5,6 +5,26 @@ import (
 	"testing"
 )
 
+func TestClaudeRequestRejectsAmbiguousMetadataUserID(t *testing.T) {
+	for _, metadata := range []string{
+		`{"user_id":"first","USER_ID":"second"}`,
+		`{"USER_ID":"first","\u0075ser_id":"second"}`,
+	} {
+		var request ClaudeRequest
+		if err := json.Unmarshal([]byte(`{"metadata":`+metadata+`}`), &request); err == nil {
+			t.Errorf("accepted two names for the same user_id field: %s", metadata)
+		}
+	}
+
+	var request ClaudeRequest
+	if err := json.Unmarshal([]byte(`{"metadata":{"USER_ID":"fixture","trace":"a","TRACE":"b"}}`), &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Metadata == nil || request.Metadata.UserID != "fixture" {
+		t.Fatalf("expected the single user ID to bind, got %+v", request.Metadata)
+	}
+}
+
 func TestDefaultModels_ContainsNewAndLegacyImageModels(t *testing.T) {
 	t.Parallel()
 

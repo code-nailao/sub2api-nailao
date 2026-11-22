@@ -21,7 +21,7 @@ import (
 
 // ProviderConfig holds the configuration for a single search provider.
 type ProviderConfig struct {
-	Type         string `json:"type"`                    // ProviderTypeBrave | ProviderTypeTavily
+	Type         string `json:"type"`                    // ProviderTypeBrave | ProviderTypeTavily | ProviderTypeExa
 	APIKey       string `json:"api_key"`                 // secret
 	QuotaLimit   int64  `json:"quota_limit"`             // 0 = unlimited
 	SubscribedAt *int64 `json:"subscribed_at,omitempty"` // subscription start (unix seconds); quota resets monthly from this date
@@ -108,6 +108,9 @@ func (m *Manager) SearchWithBestProvider(ctx context.Context, req SearchRequest)
 		if err != nil {
 			if incremented {
 				m.rollbackQuota(ctx, cfg)
+			}
+			if errors.Is(err, ErrSearchOutcomeUnknown) {
+				return nil, "", err
 			}
 			if isProxyError(err) {
 				m.markProxyUnavailable(ctx, cfg, req.ProxyURL)
@@ -349,8 +352,9 @@ func (m *Manager) rollbackQuota(ctx context.Context, cfg ProviderConfig) {
 
 // --- Search execution ---
 
-// TestSearch executes a search using the first available provider without reserving quota.
-// Intended for admin test functionality only.
+// TestSearch executes an admin search without reserving quota. As in normal
+// searches, an unknown outcome stops provider selection. A confirmed pre-send
+// failure or an HTTP 401 authentication rejection can fall back.
 func (m *Manager) TestSearch(ctx context.Context, req SearchRequest) (*SearchResponse, string, error) {
 	if strings.TrimSpace(req.Query) == "" {
 		return nil, "", fmt.Errorf("websearch: empty search query")
@@ -361,6 +365,9 @@ func (m *Manager) TestSearch(ctx context.Context, req SearchRequest) (*SearchRes
 		}
 		resp, err := m.executeSearch(ctx, cfg, req)
 		if err != nil {
+			if errors.Is(err, ErrSearchOutcomeUnknown) {
+				return nil, "", err
+			}
 			continue
 		}
 		return resp, cfg.Type, nil
@@ -407,6 +414,9 @@ func (m *Manager) getOrCreateHTTPClient(proxyURL string) (*http.Client, error) {
 // Returns error if proxyURL is invalid — never falls back to direct connection.
 func newHTTPClient(proxyURL string) (*http.Client, error) {
 	transport := &http.Transport{
+		// net/http may automatically replay a GET on a reused connection
+		// after the provider has already received it. Searches are paid.
+		DisableKeepAlives:     true,
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 		DialContext:           (&net.Dialer{Timeout: proxyDialTimeout}).DialContext,
 		TLSHandshakeTimeout:   proxyTLSTimeout,
@@ -464,6 +474,8 @@ func (m *Manager) buildProvider(cfg ProviderConfig, client *http.Client) Provide
 		return NewBraveProvider(cfg.APIKey, client)
 	case tavilyProviderName:
 		return NewTavilyProvider(cfg.APIKey, client)
+	case exaProviderName:
+		return NewExaProvider(cfg.APIKey, client)
 	default:
 		slog.Warn("websearch: unknown provider type, falling back to brave",
 			"type", cfg.Type)

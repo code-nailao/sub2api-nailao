@@ -18,6 +18,33 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// forwardWithDeepSeekTools treats a first-turn timeout as a terminal result
+// instead of sending the same paid tool request through account selection again.
+func (s *OpenAIGatewayService) forwardWithDeepSeekTools(ctx context.Context, c *gin.Context, account *Account, body []byte, protocol, defaultModel string) (*OpenAIForwardResult, []byte, bool, error) {
+	if account == nil || account.Platform != PlatformDeepseek || c == nil || c.GetBool(deepSeekInternalTurn) {
+		return nil, body, false, nil
+	}
+	previous, _ := c.Get(OpsUpstreamErrorsKey)
+	priorEvents, _ := previous.([]*OpsUpstreamErrorEvent)
+	result, next, handled, err := s.tryForwardDeepSeekTools(ctx, c, account, body, protocol, defaultModel)
+	if !handled || err == nil || (result != nil && (len(result.DeepSeekModelTurns) > 0 || result.DeepSeekTools == nil || result.DeepSeekTools.Cost() > 0)) {
+		return result, next, handled, err
+	}
+	var failover *UpstreamFailoverError
+	timedOut := errors.As(err, &failover) && failover.StatusCode == http.StatusRequestTimeout
+	if eventsValue, ok := c.Get(OpsUpstreamErrorsKey); ok && !timedOut {
+		if events, valid := eventsValue.([]*OpsUpstreamErrorEvent); valid && len(events) > len(priorEvents) {
+			latest := events[len(events)-1]
+			timedOut = latest != nil && latest.UpstreamStatusCode == http.StatusRequestTimeout
+		}
+	}
+	if timedOut {
+		c.Header("x-should-retry", "false")
+		return nil, next, true, fmt.Errorf("DeepSeek tool turn timed out: %v", err)
+	}
+	return result, next, handled, err
+}
+
 // Forward forwards request to OpenAI API
 func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (out *OpenAIForwardResult, forwardErr error) {
 	defer func() { StampFixedUpstreamRequestTier(ctx, out) }()
@@ -27,7 +54,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		return nil, fixedErr
 	}
 	body = fixedBody
-	if result, next, handled, err := s.tryForwardDeepSeekTools(ctx, c, account, body, "responses", ""); handled {
+	if result, next, handled, err := s.forwardWithDeepSeekTools(ctx, c, account, body, "responses", ""); handled {
 		return result, err
 	} else {
 		body = next
@@ -1107,9 +1134,16 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 
 		// Handle error response
+		if resp.StatusCode == http.StatusRequestTimeout && !imageIntent && submissionMayRunHostedTools(body) {
+			_ = resp.Body.Close()
+			return stopPaidResponsesSubmissionAfterTimeout(c, originalModel)
+		}
 		if resp.StatusCode >= 400 {
 			respBody := s.readUpstreamErrorBody(resp)
 			_ = resp.Body.Close()
+			if imageIntent && resp.StatusCode == http.StatusRequestTimeout {
+				return stopOpenAIImageSubmissionAfterTimeout(c, resp, s.redactAgentIdentitySensitiveBody(ctx, account, respBody))
+			}
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
 
 			upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
