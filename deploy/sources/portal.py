@@ -35,7 +35,7 @@ import stat
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, NoReturn
 
 import deploy
 from deploy import DeployError, FallbackFailed, append_history, load_state, now, port_problems, release_lock, save_state
@@ -172,8 +172,8 @@ class PortalOps(deploy.Ops):
         DeployError so the handover falls back instead of ending in a traceback."""
         try:
             return super().run(args, mutate=mutate, timeout=timeout, check=check)
-        except subprocess.TimeoutExpired:
-            raise DeployError(f"command timed out after {int(timeout)}s: {shlex.join(args[:4])} ...") from None
+        except subprocess.TimeoutExpired as err:
+            raise deploy.CommandTimedOut(err) from None
         except OSError as err:
             raise DeployError(f"command could not run: {shlex.join(args[:4])} ...: {err.strerror or err}") from None
 
@@ -355,8 +355,8 @@ class PortalDeployer(deploy.Deployer):
         except OSError:
             return None
 
-    def install(self, port: int) -> None:
-        self.install_upstreams(render_upstream(self.cfg.upstream_name, port))
+    def install(self, port: int, *, recover_reload: Callable[[str | None, BaseException], NoReturn] | None = None) -> None:
+        self.install_upstreams(render_upstream(self.cfg.upstream_name, port), recover_reload=recover_reload)
 
     # steps ------------------------------------------------------------------------
     def preflight(self, current: dict[str, Any], previous: dict[str, Any] | None,  # type: ignore[override]
@@ -444,6 +444,10 @@ class PortalDeployer(deploy.Deployer):
         """Steps 5-7: stop old, start new, switch, guard. Any failure (an
         interrupt included) after the old Portal was touched falls back to it."""
         self.signalled_old = False
+
+        def recover_reload(_previous: str | None, err: BaseException) -> NoReturn:
+            self.fall_back(old, new, f"reload failed ({err})", self.signalled_old, force_reload=True)
+
         try:
             self._mark(state, new, "handoff")
             with self.step("handoff"):
@@ -453,7 +457,7 @@ class PortalDeployer(deploy.Deployer):
                     self.wait_healthy(new["container"], new["port"], self.cfg.ready_timeout)
             self._mark(state, new, "switch")
             with self.step("switch"):
-                self.install(new["port"])
+                self.install(new["port"], recover_reload=recover_reload)
                 self.ops.run(["docker", "update", "--restart=unless-stopped", new["container"]], mutate=True)
                 self.wait_public_healthy(new)
             if self.ops.dry_run:
@@ -463,7 +467,11 @@ class PortalDeployer(deploy.Deployer):
             self._mark(state, new, "guard")
             with self.step("guard"):
                 self.guard_portal(new)
-        except (OldStillRunning, FallbackFailed):
+        except deploy.RoutingFileNotRestored as err:
+            if self.ops.dry_run:
+                raise
+            self.fall_back(old, new, str(err), self.signalled_old, force_reload=True)
+        except (OldStillRunning, FallbackFailed, deploy.RoutingRestored):
             raise
         except DeployError as err:
             if self.ops.dry_run:
@@ -476,7 +484,8 @@ class PortalDeployer(deploy.Deployer):
             # previous Portal is restored, and the run still ends in an error.
             self.fall_back(old, new, "interrupted", self.signalled_old)
 
-    def fall_back(self, old: dict[str, Any], new: dict[str, Any], cause: str, signalled: bool = True) -> None:
+    def fall_back(self, old: dict[str, Any], new: dict[str, Any], cause: str, signalled: bool = True,
+                  *, force_reload: bool = False) -> NoReturn:
         """(a) stop the new Portal, which holds the state lock; (b) start the
         old one (waiting first for it to exit if it was signalled and is still
         draining); (c) point Nginx back at it if the upstream file was changed
@@ -503,13 +512,13 @@ class PortalDeployer(deploy.Deployer):
             self.ops.run(["docker", "update", f"--restart={policy}", old["container"]], mutate=True)
             self.ops.run(["docker", "start", old["container"]], mutate=True)
             self.wait_healthy(old["container"], old["port"], self.cfg.ready_timeout)
-            if self.upstream_text() != render_upstream(self.cfg.upstream_name, old["port"]):
+            if force_reload or self.upstream_text() != render_upstream(self.cfg.upstream_name, old["port"]):
                 self.install(old["port"])
         except DeployError as err:
             raise FallbackFailed(f"{cause}; restoring the previous Portal {old['container']} failed too ({err})") \
                 from err
-        raise DeployError(f"{cause}; the previous Portal {old['container']} is serving again; the new container "
-                          f"{new['container']} was stopped and kept for inspection")
+        raise deploy.RoutingRestored(f"{cause}; the previous Portal {old['container']} is serving again; "
+                                    f"the new container {new['container']} was stopped and kept for inspection")
 
     def guard_portal(self, new: dict[str, Any]) -> None:
         name, port = new["container"], new["port"]

@@ -4,7 +4,7 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `deploy.py` | 唯一的发布入口：`main <image>`、`rollback`、`status`、`watch`、`adopt` |
+| `deploy.py` | 唯一的发布入口：`main <image>`、`resume`、`abort`、`rollback`、`status`、`watch`、`adopt` |
 | `portal.py` | Portal 的发布逻辑，由 `deploy.py` 的 `portal <image>`、`portal-rollback`、`portal-status`、`portal-adopt` 调用（见下文“Portal”） |
 | `migration_lint.py` | CI 检查：新迁移只能扩展结构，破坏性变更必须放进带 `contract` 的迁移 |
 | `sources-main-watch.service` | 常驻监测（只写 journal，第一版不推送） |
@@ -32,18 +32,20 @@ ssh <host> 'sudo -n journalctl -fu sources-deploy'
 | 启动检查 | `-check-startup`：用生产配置构造全部依赖 | 退出，没有创建任何容器 |
 | 静态资源 | `-export-web-assets`：把新版本资源追加到固定目录（不删除、不覆盖） | 退出 |
 | 启动新 serving | 目标槽位的主、备两个容器，等待就绪 | 删除新容器，退出 |
-| 后台交接 | 旧后台收到一次 SIGTERM。支持只读排空的旧后台继续提供普通管理读接口，旧版本可能中断管理读。工具定期复查定时备份状态，查询失败时退避重试。Docker 确认旧后台退出或容器已移除后，新后台才启动并持锁就绪 | 发送 SIGTERM 返回失败后，Docker 和运行态查询共用 30 秒确认窗口。确认发出停止信号后，若常规等待和适用的备份等待均已到期，则用同一个 30 秒窗口确认退出并尝试恢复。到期仍无法恢复时，工具保留失败原因并释放发布锁 |
-| 切流 | 重写 `00-sources-main-upstreams.conf`，`nginx -t`，reload 一次 | `nginx -t` 失败：恢复原文件，把后台交还旧版本 |
-| 守护 | 5 分钟：新主实例就绪、无重启和 OOM、内存不超过上限 70% 且 30 秒内涨幅不超过 4GiB、公网健康、Nginx 连不上新端口的次数 | 流量切回旧槽位，后台交还旧版本，新 serving 停止并保留供排查 |
+| 后台交接 | 旧后台收到一次 SIGTERM，处理完在途任务后退出（不发 SIGKILL），排空期间管理接口只读；新后台拿锁、就绪。日志写明管理接口在排空期间是只读还是不可用，以及旧后台还在停止哪些服务。工具定期复查定时备份状态，查询失败时退避重试。Docker 确认旧后台退出或容器已移除后，新后台才启动并持锁就绪 | 未就绪：重新启动旧后台，删除新 serving，退出。发送 SIGTERM 返回失败后，Docker 和运行态查询共用 30 秒确认窗口。常规等待和适用的备份等待到期后，用同一个恢复窗口确认退出并尝试恢复；到期仍无法恢复时保留 `in_progress` 和失败原因，释放发布锁 |
+| 切流 | 重写 `00-sources-main-upstreams.conf`，`nginx -t`，reload 一次 | `nginx -t` 拒绝文件时恢复原文件并交还后台。reload 非零且探针确认旧路由仍生效时也按此恢复。路由无法确认则保留两组 serving 和故障记录 |
+| 守护 | 5 分钟：新主实例就绪、无重启和 OOM、内存不超过上限 70% 且 30 秒内涨幅不超过 4GiB、公网健康、Nginx 连不上新端口的次数 | 流量切回旧槽位，后台交还旧版本，新 serving 停止并保留供排查；恢复窗口内完成交还，serving 清理沿用该截止时间 |
 | 退役 | 旧 serving 重启策略改为 `no`，排空，发 SIGTERM，不等待 | — |
 
-每次正式运行在 `history.jsonl` 追加一行，记录结果和各步骤耗时；失败的演练不写记录。`--dry-run` 是全局参数，写在子命令之前（`deploy.py --dry-run main <镜像>`），只打印会执行的变更命令；只读的步骤（列出迁移、启动检查）照常执行。有待执行迁移时演练不执行迁移，因此跳过启动检查并在输出中说明；两个环境的配置在正式运行中迁移之后、创建任何容器之前才校验。公网健康预检在演练中同样执行。
+Main 的 `history.jsonl` 记录发布结果和各步骤耗时。追加失败时只告警一次，已保存的状态和命令的退出结果仍有效。`--dry-run` 是全局参数，写在子命令之前（`deploy.py --dry-run main <镜像>`）。演练仍按需拉取镜像，实际运行用于列出迁移或检查启动的一次性容器，不写历史。有待执行迁移时跳过启动检查，正式发布会在迁移完成后检查两个环境。公网健康预检在演练中同样执行。
 
 公网健康请求带固定的 `User-Agent`，因为公网入口前的部分边缘防护会拒绝 urllib 的默认标识。预检时公网健康不是 200 就停止，现场不变，错误里写明看到的状态码（0 表示没有响应）。只有在当前版本已经让公网健康失败、要向前发布修复时，才加 `--allow-public-health-failure`（`deploy.py main --allow-public-health-failure <镜像>`）：预检只打印警告，守护照常要求切流后返回 200。`rollback` 不做这项预检。
 
 两个槽位 A、B 轮流使用，容器名固定为 `sources-main-{a,b}-{serving,standby,background}`。发到某个槽位时，那里原有的容器（上上个版本）会被删除，所以始终只保留一个可回滚的上一版本。
 
 ## 回滚和查看状态
+
+需要先验证新版本时，使用 `deploy.py main <IMAGE_DIGEST> --hold-before-switch`。工具在新 serving 就绪后成功退出，旧版本继续服务；`deploy.py resume` 复核暂停状态和候选主备的健康接口后继续交接切流。只读复检失败时状态文件保持原样。`deploy.py abort` 优雅停止并移除本次暂停实例。三个入口均支持前置全局参数 `--dry-run`。暂停期间拒绝其它 Main 发布与回滚；不要手工清除暂停来绕过。状态、直连验证范围和失败恢复见 [DEPLOY.md 的“暂停发布”](../../docs/sources/DEPLOY.md#暂停发布)。
 
 ```bash
 ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py rollback'
@@ -53,11 +55,11 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py rollback'
 ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 ```
 
-回滚会复用上一槽位已停止的容器。启动前检查当前后台是否在创建定时备份。备份进行中默认中止，可用 `deploy.py rollback --allow-running-backup` 继续。
+回滚会复用上一槽位已停止的容器。启动前检查当前后台是否在创建定时备份；备份进行中默认中止，可用 `deploy.py rollback --allow-running-backup` 继续。暂停期间回滚先提示 `resume` 或 `abort`。`resume` 同样在发信号前做备份预检，可用 `--allow-running-backup` 显式放行。回滚先确认上一槽位的后台容器仍在，隔离并启动主备，随后交接后台、切流、守护和退役。现役备用实例停止时，旧主实例和持锁后台健康即可继续。目标主备必须就绪才切流。准备失败保留当前路由并告警。`resume` 和手动 `rollback` 在确认切流并通过守护后逐台排空、重连目标主备，使目标覆盖所有所需网络。保留旧别名到目标就绪并复验通过。交接时两槽位可短暂共用别名，旧主备排空后才移除旧端点的共享别名。准备暂停的目标槽位也会删除槽位里原来的容器。即使之后成功 `abort`，先前的回滚目标也可能已经不存在。
 
-如果某次运行没有走完（`status` 里 `in_progress` 不为空），下一次 `main` 会拒绝执行。先用 `status` 和 `docker ps` 看清现场，处理完后再把 `state.json` 的 `in_progress` 清空。`FAILED AND NOT RESTORED` 时原因写在 `in_progress.failed`；`status` 里的 `restart_policy` 可用来确认容器的重启策略。
+查看 `status` 的 `in_progress.phase` 区分暂停、正在发布和故障。若为 `held`，用 `resume` 或 `abort`。若为 `aborting`，重试 `abort`。若失败步骤为 `prepare held slot`，可用 `resume` 重试准备，或用 `abort` 放弃。首次保存暂停记录失败时，`save held release` 可用 `resume` 或 `abort`。其它 `failed` 可运行 `abort`。工具核对实际路由、恢复原槽位，再按容器 ID 清理本次候选主备及本次继续发布创建的后台。如果发布尚未尝试切流且已有路由匹配，放弃操作沿用原 upstream。回切被拒绝且探针确认回切前的路由仍生效时，恢复该路由的后台并保留可重试的 `aborting` 记录。候选后台的 ID 在接入其余网络前保存，接网失败也可放弃。Docker 创建候选后中断时，可通过创建标签找到尚未记录 ID 的候选。容器身份无法确认时保留故障记录。确认或清理未完成时可重试 `abort`。失败位置和原因分别记录在 `failed_step` 与 `reason`（同时写入兼容旧脚本的 `failed`）。容器的 `restart_policy` 为 `no` 时，退出后不会自动重启。通过日志和运行时状态确认它是否已收到 SIGTERM。
 
-常规排空、备份延长和恢复等待期间，Docker 的 `inspect` 和容器列表查询共用当前期限。超过 `background_exit_timeout` 和适用的备份等待期后，状态查询、退出确认、恢复后台和清理新 serving 共用一个 30 秒恢复窗口。备份状态读不到时在窗口内重试。切流前若确认旧后台退出，就按原重启策略恢复当前槽位。若 Docker 确认旧容器已被移除，则继续交接给已准备好的目标后台。恢复就绪检查为写失败记录预留最后 5 秒。切流失败或守护失败后若进入恢复窗口，交还后台后的 serving 清理仍沿用原截止时间。清理未完成时会留下失败记录并释放发布锁。详见 [发布与部署](../../docs/sources/DEPLOY.md)。
+常规排空、备份延长和恢复等待期间，Docker 的 `inspect` 和容器列表查询共用当前期限。超过 `background_exit_timeout` 和适用的备份等待期后，状态查询、退出确认、恢复后台和清理新 serving 共用一个 30 秒恢复窗口。备份状态读不到时在窗口内重试。切流前若确认旧后台退出，就按原重启策略恢复当前槽位。若 Docker 确认旧容器已被移除，则继续交接给已准备好的目标后台。恢复就绪检查为写失败记录预留最后 5 秒。切流失败或守护失败后若进入恢复窗口，交还后台后的 serving 清理仍沿用原截止时间。清理未完成时会留下失败记录并释放发布锁。守护失败先回切用户路由，管理入口继续指向候选后台。旧备用不可用时，由健康的旧主实例接流，保留恢复记录供 `abort` 恢复主备并清理。守护回退和手动回滚都要求目标后台返回 `/health` 200 并确认持锁后才切换管理 upstream。若原管理后台仍能应答，工具只回退用户流量，记录 `ROLLBACK INCOMPLETE`。工具确认实际用户路由已切换、目标槽位能接住共享别名流量后，才排空原主备并撤下它们的共享别名。探测未确认或目标缺少共享别名时，保留两组 serving 并告警。两边后台都无法确认可用时不再为备用掉线重载，保留最后加载的用户路由和管理指向，提示人工恢复一个持锁且健康的后台。守护回退未完成时，`status` 保留 `failed_step=guard` 和原因。重新入路由或退役复检时发现角色掉线，还会记录槽位、角色和发现时间，供人工确认后重试 `abort`。详见 [DEPLOY.md](../../docs/sources/DEPLOY.md#无法自动恢复的情况)。
 
 ## 首次接入
 
@@ -71,7 +73,7 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
      --public-health-url https://example.com/health
    ```
 
-   它从正在运行的容器生成 `/opt/sources-deploy/main.json`、两个只有 root 可读的 env 文件和固定输入目录，并把这些容器记为当前版本（槽位 `legacy`）。不碰运行中的容器，不打印任何变量值。`--public-health-url` 必填，是守护阶段检查的公网健康地址，写入 `main.json` 的 `public_health_url`；以后要改，直接编辑该文件。可先加全局参数 `--dry-run`（`deploy.py --dry-run adopt ...`）查看会执行的命令。
+   它从正在运行的容器生成 `/opt/sources-deploy/main.json`、两个只有 root 可读的 env 文件和固定输入目录，并把这些容器记为当前版本（槽位 `legacy`）。不碰运行中的容器，不打印任何变量值。`adopt` 使用 Main 发布锁，遇到暂停或其它未结束的发布时拒绝写入。`--public-health-url` 必填，是守护阶段检查的公网健康地址，写入 `main.json` 的 `public_health_url`；以后要改，直接编辑该文件。可先加全局参数 `--dry-run`（`deploy.py --dry-run adopt ...`）查看会执行的命令。
 3. **Nginx 改用固定名称**：所有反向代理改为 `proxy_pass http://sources_main_serving`，管理后台改为 `http://sources_main_admin`。这两个 upstream 定义在 `/etc/nginx/conf.d/00-sources-main-upstreams.conf`（由 `deploy.py` 在每次切流时重写，不要手工编辑；第一次可按当前容器端口手写一份同名 upstream）。静态资源指向固定目录 `/opt/sources-web/main/assets`。改完先 `nginx -t` 再 reload；预检会拒绝仍引用按版本命名 upstream 的配置。
 4. **常驻监测**：安装并启用 `sources-main-watch.service`，停用此前按版本命名的监测服务。
 5. **第一次正式发版**：`deploy.py main <image>`，它会把 `legacy` 槽位换到 A 槽位。旧容器在确认没有依赖后手动删除。
@@ -80,11 +82,15 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 
 - 手机推送第一版不做，监测结果只写 journal。
 
+Main 发布在宿主机的 Unix socket 上读取切流核验和恢复重启策略所需的 Docker 元数据，普通发布保留原来的 Docker 与 Nginx 命令顺序。工具按 Docker 客户端的当前配置选择 socket。其它 Docker 连接方式沿用 `docker inspect` 查询。
+
 ## 内部调用方使用稳定别名
 
-`deploy.py` 创建的每个 serving 容器（主和备）都在它所在的每个网络上带一个固定别名 `sources-main-serving`（`main.json` 的 `serving_alias`），后台容器没有。旧版本容器退役停止后，会自动从这个名字的解析结果里消失，所以同一 Docker 网络内的调用方（例如 Portal）应使用 `http://sources-main-serving:8080`，不要写死某个容器的 IP 或名称，否则那个容器就无法退役。
+同一 Docker 网络内的调用方通过 `main.json` 中的 `serving_alias` 访问主备 serving。普通发布在创建和接网时配置别名，新旧槽位从新主备启动到旧主备排空退出可以同时提供别名。暂停实例在继续之前保持隔离。继续发布和回滚会保留原提供方，直到目标覆盖所需网络并就绪。两槽位可在别名交接期间同时应答。下线前确认新代 Nginx 生效，并等待旧 worker 完成连接，再让旧主备完成在途请求、退出并撤下别名。给接流的主备补别名时逐台临时移出 Nginx，排空后重连，确认恢复应答后才切换另一台。守护回退在管理路由确认后，按退役方登记的网络给接收方补共享别名。接收方缺少所需网络或别名覆盖无法确认时，保留原提供方并告警。`watch` 根据发布记录和退役实例身份区分普通发布的预期重叠与别名冲突。被标记退役的实例重新启动后，即使发布仍在运行也会检查冲突。发布结束后，旧槽位未登记为退役的实例提供共享别名也会告警。继续时先在停止的候选上验证接网。旧版仍提供共享别名时，候选保持隔离到切流。后续发布别名失败会尝试恢复原路由、后台和暂停候选。
 
-注意：Docker 只能在创建容器时附加网络别名。`adopt` 记录的旧容器没有这个别名，只有经 `deploy.py` 发布后的容器才有；调用方应在第一次正式发版之后再切换到别名，并在确认旧地址不再有连接后再退役旧容器。
+`watch` 和 `status` 检查共享别名时，会继续核查已登记的接管槽位，即使发布已覆盖 `previous`。缺少旧槽位的登记时报告 `shared_alias_unverified`，请人工核查。Docker 查询失败按槽位和角色报 `docker_inspect_failed`，仍报告已确认的 `shared_alias_conflict` 并继续检查其余实例。
+
+`adopt` 记录的旧容器可能已有其它网络别名。首次正式发布后，确认新版本已提供配置中的共享别名，再将内部调用方切过去。
 
 ## Portal
 
