@@ -1856,6 +1856,25 @@ class Deployer:
                     and self.health(view["ports"]["background"],
                                     timeout=self.recovery_timeout(deadline, RUNTIME_STATUS_TIMEOUT_SECONDS)))
 
+    def serving_role_answering(self, view: dict[str, Any], role: str,
+                               deadline: float | None = None) -> bool:
+        """A serving role counts as usable only while it is running and
+        answering. Probed at the moment a route is written: a role that was
+        healthy when the rollback began may have exited since, and a dead
+        upstream left in the live route is exactly how user traffic stays on a
+        failed slot."""
+        try:
+            info = self.serving_info(view, role, None, deadline=deadline) or {}
+        except Exception:  # noqa: BLE001 - an unreadable state is not "answering"
+            return False
+        if not (info.get("State") or {}).get("Running"):
+            return False
+        try:
+            return self.health(view["ports"][role],
+                               timeout=self.recovery_timeout(deadline, RUNTIME_STATUS_TIMEOUT_SECONDS))
+        except Exception:  # noqa: BLE001
+            return False
+
     def check_rollback_route(self, route: MainRoute, *, allow_draining: bool = False,
                              require_standby: bool = True, observed: dict[str, dict[str, Any]] | None = None,
                              allow_missing_background: bool = False,
@@ -3228,9 +3247,27 @@ class Deployer:
             self.ops.run(["docker", "update", "--restart=unless-stopped", cid], mutate=True,
                          timeout=self.recovery_timeout(deadline, 600))
         if active.excluded_serving is not None:
-            complete = MainRoute(receiving, route.admin)
-            self.apply_route(state, active, complete, retiring, allow_draining=allow_draining, deadline=deadline)
-            active = complete
+            # 被排除的角色只有在真的应答时才放回路由。之前是无条件放回，
+            # 于是「一开始就掉线的备用」会被重新写进 Nginx，留下一个死上游——
+            # 这正是守护回退反复被审出来的那个洞。
+            role = active.excluded_serving
+            if self.serving_role_answering(receiving, role, deadline=deadline):
+                complete = MainRoute(receiving, route.admin)
+                self.apply_route(state, active, complete, retiring, allow_draining=allow_draining,
+                                 deadline=deadline)
+                active = complete
+            else:
+                self.log(f"   {role} still does not answer; keeping it out of the live route")
+                progress = state.get("in_progress")
+                if progress is not None:
+                    progress["excluded_serving"] = {
+                        "role": role,
+                        "slot": receiving["slot"],
+                        "reason": "did not answer when the guard rollback finished; "
+                                  "restore it and verify live routing before clearing in_progress",
+                    }
+                    with contextlib.suppress(Exception, KeyboardInterrupt):
+                        self._save_progress(state, progress)
         return active
 
     def configure_rollback_aliases(self, target: Target, identities: dict[str, str],

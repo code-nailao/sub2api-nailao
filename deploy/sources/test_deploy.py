@@ -2599,6 +2599,18 @@ class DeployTest(unittest.TestCase):
     def test_guard_rollback_corrects_a_loaded_admin_route_after_standby_exit(self):
         self.assert_guard_rollback_survives_late_standby_loss("admin reload")
 
+    def test_a_serving_role_only_counts_while_it_answers(self):
+        """把被排除的角色放回路由之前必须再探一次。
+
+        守护回退开始时旧备用是健康的，收尾时它可能已经退出；无条件把名字写回
+        Nginx 就会留下一个死上游，用户流量继续留在故障槽位——这正是守护回退
+        反复被审出来的那个洞。
+        """
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        self.assertTrue(deployer.serving_role_answering(LEGACY, "standby"))
+        self.ops.containers[LEGACY["containers"]["standby"]]["State"]["Running"] = False
+        self.assertFalse(deployer.serving_role_answering(LEGACY, "standby"))
+
     def test_guard_rollback_refuses_a_primary_that_stops_answering_during_switch(self):
         self.ops.memory_after_switch = 20 * GIB
         target = self.cfg.slot_view("a")
