@@ -1164,7 +1164,7 @@ class DeployTest(unittest.TestCase):
 
     def property_port_index(self):
         views = self.property_views()
-        return {(view["ports"][role]): (view["slot"], role)
+        return {view["ports"][role]: (view["slot"], role)
                 for view in views.values() for role in deploy.ROLES}
 
     def property_probe_counts(self, flow):
