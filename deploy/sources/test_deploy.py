@@ -1151,6 +1151,42 @@ class DeployTest(unittest.TestCase):
         self.assertTrue(any(i["slot"] == "legacy" and i["role"] == "serving"
                             for i in progress["route_issues"]), progress["route_issues"])
 
+    def test_second_rollback_judges_the_state_it_finds(self):
+        """A#2 and B#9: two rollbacks in a row each report the roles they found.
+
+        Each run writes the rollback route and then stops the previous primary
+        and background just before the final re-probe after retirement. Both
+        runs end unfinished, and the second one records the same roles again: a
+        role that is down in this run is this run's finding, not a repeat of
+        the last run's."""
+        self.deploy()
+        retire_serving = deploy.Deployer.retire_serving
+
+        def retire_then_stop(self, *args, **kw):
+            result = retire_serving(self, *args, **kw)
+            # The rollback route is loaded; the roles it names exit just before
+            # the final re-probe that follows retirement.
+            for name in ("old-serving", "old-bg"):
+                self.ops.containers[name]["State"].update(Running=False, Status="exited")
+            return result
+
+        for attempt in (1, 2):
+            with self.subTest(attempt=attempt):
+                before = len(self.history())
+                with mock.patch.object(deploy.Deployer, "retire_serving", retire_then_stop):
+                    with self.assertRaisesRegex(deploy.FallbackFailed, "before clearing in_progress"):
+                        deploy.Deployer(self.cfg, self.ops).rollback()
+                progress = self.state()["in_progress"]
+                self.assertIsNotNone(progress, f"rollback {attempt} cleared the recovery record")
+                self.assertEqual("failed", progress["phase"])
+                for role in ("serving", "background"):
+                    self.assertTrue(any(i["slot"] == "legacy" and i["role"] == role
+                                        for i in progress["route_issues"]),
+                                    f"rollback {attempt} did not record slot legacy {role}: "
+                                    f"{progress['route_issues']}")
+                self.assertEqual("failed", self.history()[before]["result"],
+                                 f"rollback {attempt} was written into the history as a success")
+
     def test_normal_release_probes_both_upstreams_before_clearing_progress(self):
         self.deploy()
         target = self.state()["current"]

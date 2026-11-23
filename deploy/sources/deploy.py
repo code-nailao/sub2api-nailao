@@ -554,6 +554,12 @@ def route_issue(kind: str, probe: RoleProbe) -> dict[str, Any]:
     return {**probe.record(), "kind": kind, "found_at": now()}
 
 
+def issue_key(issue: dict[str, Any]) -> tuple[str, str, str]:
+    """One role failing one way. The same key in a later round is a new
+    observation of the same role, not a copy of the earlier one."""
+    return (issue["slot"], issue["role"], issue["kind"])
+
+
 def describe_route_issues(issues: list[dict[str, Any]]) -> str:
     return "; ".join(
         f"slot {i['slot']} {i['role']} ({i['name']}, port {i['port']}) {i['detail']} "
@@ -571,9 +577,10 @@ class Deployer:
         # Backgrounds already started in this guard rollback. A failed start is
         # not retried in the same round; it is reported instead.
         self._rollback_starts: set[str] | None = None
-        # Route findings recorded in this run. A finding that a previous run
-        # wrote into the state file belongs to that run, not to this one.
-        self._findings: list[dict[str, Any]] = []
+        # Route findings recorded in this run, one per (slot, role, kind). A
+        # finding that a previous run wrote into the state file belongs to
+        # that run, so the same role failing again is recorded here anew.
+        self._findings: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     # helpers ---------------------------------------------------------------
     def log(self, msg: str) -> None:
@@ -988,17 +995,29 @@ class Deployer:
         return progress, state
 
     def _record_route_issues(self, issues: list[dict[str, Any]], note: str) -> None:
+        """Record what the probes of this round actually found.
+
+        The unresolved list is recomputed from this round's findings: a role
+        that fails again after an earlier round, or after a run that ended
+        without resolving it, is down now and is recorded again with the time
+        it was found. Only a role this run has already reported is collapsed,
+        so one run names a failing role once."""
         if not issues or self.ops.dry_run:
             return
         try:
             progress, state = self._route_progress()
-            kept = list(progress.get("route_issues") or [])
-            seen = {(i["slot"], i["role"], i["kind"]) for i in kept}
-            fresh = [i for i in issues if (i["slot"], i["role"], i["kind"]) not in seen]
+            kept = {issue_key(i): i for i in progress.get("route_issues") or []}
+            fresh: list[dict[str, Any]] = []
+            for issue in issues:
+                key = issue_key(issue)
+                if key in self._findings:
+                    continue
+                self._findings[key] = issue
+                kept[key] = issue
+                fresh.append(issue)
             if not fresh:
                 return
-            progress["route_issues"] = kept + fresh
-            self._findings.extend(fresh)
+            progress["route_issues"] = list(kept.values())
             save_state(self.cfg, state)
             self.log(f"   route issue ({note}): {describe_route_issues(fresh)}")
         except Exception as err:  # noqa: BLE001 - never mask the routing failure
@@ -1285,12 +1304,22 @@ class Deployer:
         return True
 
     def recorded_route_issues(self) -> list[dict[str, Any]]:
-        """Every route finding this run has recorded. Unlike
-        `unresolved_route_issues`, a finding stays here after a corrective
-        rewrite removed the port: nobody has verified the route since it
-        dropped, so a person still has to look. Findings a previous run left in
-        the state file are not this run's business."""
-        return list(self._findings)
+        """Every route finding this run has recorded, one per failing role.
+        Unlike `unresolved_route_issues`, a finding stays here after a
+        corrective rewrite removed the port: nobody has verified the route
+        since it dropped, so a person still has to look. Findings a previous
+        run left in the state file are not this run's business - but a role
+        that fails again in this run is recorded here again."""
+        return list(self._findings.values())
+
+    def pending_route_issues(self) -> list[dict[str, Any]]:
+        """What still has to keep in_progress: everything this run found, plus
+        what an earlier run left while the loaded route still names that
+        port."""
+        pending = dict(self._findings)
+        for issue in self.unresolved_route_issues():
+            pending.setdefault(issue_key(issue), issue)
+        return list(pending.values())
 
     def unresolved_route_issues(self) -> list[dict[str, Any]]:
         """Findings that still matter: a recorded role failure whose port the
@@ -2478,7 +2507,7 @@ class Deployer:
                 if isinstance(err, FallbackFailed):
                     self._record_unrestored(state, err)
                 elif isinstance(err, BackgroundRestored):
-                    if self.unresolved_route_issues():
+                    if self.pending_route_issues():
                         self._record_unrestored(state, FallbackFailed(str(err)))
                     else:
                         fresh = load_state(self.cfg)
@@ -2581,9 +2610,11 @@ class Deployer:
             if key in recorded:
                 progress[key] = recorded[key]
         if recorded.get("route_issues"):
-            merged = list(progress.get("route_issues") or [])
-            merged += [issue for issue in recorded["route_issues"] if issue not in merged]
-            progress["route_issues"] = merged
+            # One entry per failing role, the most recent observation winning:
+            # a person reads this list, not a history of every probe.
+            merged = {issue_key(i): i for i in progress.get("route_issues") or []}
+            merged.update({issue_key(i): i for i in recorded["route_issues"]})
+            progress["route_issues"] = list(merged.values())
         progress["phase"] = "failed"
         progress["failed"] = str(err)
         progress["failed_at"] = now()
@@ -2624,12 +2655,12 @@ class Deployer:
                     self._record_unrestored(state, failure)
                     self.log(f"FAILED: {failure}")
                     return
-        issues = self.unresolved_route_issues()
+        issues = self.pending_route_issues()
         if issues:
-            # A probe wrote down a role that the loaded route still names and
-            # that stopped answering. Clearing now would hide that from the
-            # next person and from 'status'; a transient step failure alone
-            # would not survive, because the step that recorded it also ended it.
+            # A probe wrote down a role that failed while the route was being
+            # written or after it. Clearing now would hide that from the next
+            # person and from 'status'; a transient step failure alone would not
+            # survive, because the step that recorded it also ended it.
             failure = FallbackFailed(
                 f"{err}. An earlier route probe still records an unresolved finding "
                 f"({describe_route_issues(issues)}); "
