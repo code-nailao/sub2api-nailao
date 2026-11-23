@@ -100,6 +100,11 @@ class BackgroundExitTimeout(DeployError):
         self.deadline = deadline
 
 
+class RouteRefused(DeployError):
+    """A route was not written because the probe taken immediately before the
+    write no longer held. Nothing was changed: the loaded route stays."""
+
+
 @dataclass(frozen=True)
 class BackgroundExit:
     code: int | None  # None only when Docker confirmed container removal
@@ -388,19 +393,34 @@ class Ops:
 # Nginx
 
 
-def render_upstreams(serving_port: int, standby_port: int, background_port: int) -> str:
+def render_upstreams(serving_port: int, standby_port: int | None, background_port: int) -> str:
+    backup = ("" if standby_port is None
+              else f"    server 127.0.0.1:{standby_port} backup max_fails=1 fail_timeout=5s;\n")
     return f"""# Managed by deploy/sources/deploy.py; rewritten on every switch. Do not edit.
 upstream sources_main_serving {{
     zone sources_main_serving 64k;
     server 127.0.0.1:{serving_port} max_fails=1 fail_timeout=5s;
-    server 127.0.0.1:{standby_port} backup max_fails=1 fail_timeout=5s;
-}}
+{backup}}}
 
 upstream sources_main_admin {{
     zone sources_main_admin 64k;
     server 127.0.0.1:{background_port};
 }}
 """
+
+
+def replace_admin_port(text: str, port: int) -> str:
+    """Change only the admin upstream; the loaded serving block stays as it is."""
+    return re.sub(r"(upstream sources_main_admin \{.*?server 127\.0\.0\.1:)\d+",
+                  lambda match: match.group(1) + str(port), text, count=1, flags=re.S)
+
+
+def loaded_upstream_ports(text: str) -> tuple[list[int], int | None]:
+    """Serving ports and admin port exactly as the loaded file names them."""
+    serving = re.search(r"upstream sources_main_serving \{.*?\n\}", text, re.S)
+    admin = re.search(r"upstream sources_main_admin \{.*?server 127\.0\.0\.1:(\d+)", text, re.S)
+    ports = [int(p) for p in re.findall(r"server 127\.0\.0\.1:(\d+)", serving.group(0))] if serving else []
+    return ports, (int(admin.group(1)) if admin else None)
 
 
 LEGACY_UPSTREAM = re.compile(r"sources_main_\d{3}_serving")
@@ -473,11 +493,74 @@ class Target:
                    ports=dict(view["ports"]), token_files=tokens)
 
 
+@dataclass(frozen=True)
+class RoleProbe:
+    """One role's usability at one instant.
+
+    Availability is not a property of a container; it is the result of a probe
+    that a route write must take again immediately before writing. `outcome`
+    keeps "did not answer in time", "did not answer" and "could not be checked"
+    apart so reports never hide one behind another."""
+
+    slot: str
+    role: str
+    name: str
+    port: int
+    usable: bool
+    outcome: str
+    detail: str
+    at: str
+
+    def record(self) -> dict[str, Any]:
+        return {"slot": self.slot, "role": self.role, "name": self.name, "port": self.port,
+                "usable": self.usable, "outcome": self.outcome, "detail": self.detail, "at": self.at}
+
+    def evidence(self) -> str:
+        return f"slot {self.slot} {self.role} ({self.name}, port {self.port}): {self.detail}"
+
+
+@dataclass
+class RouteOutcome:
+    written: bool
+    text: str
+    serving_slot: str
+    admin_slot: str | None
+    admin_port: int | None
+    admin_source: str
+    probes: dict[str, RoleProbe]
+    issues: list[dict[str, Any]]
+
+
+def _docker_outcome(note: str) -> str:
+    """Classify Docker's own view without letting it decide ownership."""
+    if "unreadable" in note:
+        return "state unknown"
+    if "stopped" in note:
+        return "stopped"
+    return "missing"
+
+
+def route_issue(kind: str, probe: RoleProbe) -> dict[str, Any]:
+    return {**probe.record(), "kind": kind, "found_at": now()}
+
+
+def describe_route_issues(issues: list[dict[str, Any]]) -> str:
+    return "; ".join(
+        f"slot {i['slot']} {i['role']} ({i['name']}, port {i['port']}) {i['detail']} "
+        f"was written into the route, then found {i['outcome']} at {i['found_at']}"
+        if i["kind"] == "written_role_exited" else
+        f"slot {i['slot']} {i['role']} ({i['name']}, port {i['port']}) {i['detail']} at {i['found_at']}"
+        for i in issues)
+
+
 class Deployer:
     def __init__(self, cfg: Config, ops: Ops):
         self.cfg = cfg
         self.ops = ops
         self.timings: list[dict[str, Any]] = []
+        # Backgrounds already started in this guard rollback. A failed start is
+        # not retried in the same round; it is reported instead.
+        self._rollback_starts: set[str] | None = None
 
     # helpers ---------------------------------------------------------------
     def log(self, msg: str) -> None:
@@ -502,6 +585,99 @@ class Deployer:
 
     def health(self, port: int) -> bool:
         return self.ops.http_json(f"http://127.0.0.1:{port}/health")[0] == 200
+
+    # availability probes ------------------------------------------------------
+    def probe_role(self, view: dict[str, Any], role: str, *,
+                   deadline: float | None = None) -> RoleProbe:
+        """Probe one role now. Never cached, never inferred from an earlier
+        answer: a route write must call this immediately before it writes."""
+        name = view["containers"][role]
+        port = view["ports"][role]
+        docker_note = None
+        try:
+            info = self.ops.inspect(name)
+        except Exception as err:  # noqa: BLE001 - unreadable state is its own outcome
+            info = None
+            docker_note = f"docker state unreadable ({err})"
+        if info is None and docker_note is None:
+            docker_note = "container is missing"
+        elif info is not None and not (info.get("State") or {}).get("Running"):
+            docker_note = "container is stopped"
+        if role == "background":
+            return self._probe_background(view, deadline, docker_note)
+        return self._probe_serving(view, role, deadline, docker_note)
+
+    def _probe_serving(self, view: dict[str, Any], role: str, deadline: float | None,
+                       docker_note: str | None) -> RoleProbe:
+        name, port = view["containers"][role], view["ports"][role]
+
+        def result(usable: bool, outcome: str, detail: str) -> RoleProbe:
+            return RoleProbe(view["slot"], role, name, port, usable, outcome, detail, now())
+
+        try:
+            token = self.token_for(view, role)
+        except OSError as err:
+            return result(False, "unreadable", f"runtime token unreadable ({err})")
+        started = self.ops.monotonic()
+        runtime = (self.runtime_request_before(
+            lambda timeout: self.runtime(port, token, timeout=timeout), deadline)
+            if deadline is not None else self.runtime(port, token))
+        elapsed = self.ops.monotonic() - started
+        if not runtime:
+            if docker_note:
+                return result(False, _docker_outcome(docker_note), docker_note)
+            if elapsed >= RUNTIME_STATUS_TIMEOUT_SECONDS:
+                return result(False, "timeout",
+                              f"no runtime answer within the {RUNTIME_STATUS_TIMEOUT_SECONDS:.0f}s probe timeout")
+            return result(False, "no answer", "runtime request was refused or reset")
+        if runtime.get("role") not in ("serving", "standby"):
+            return result(False, "wrong role", f"runtime reports role {runtime.get('role')!r}")
+        if not runtime.get("ready"):
+            return result(False, "not ready", "runtime reports ready=false")
+        try:
+            healthy = self.health(port)
+        except Exception as err:  # noqa: BLE001
+            return result(False, "no answer", f"/health probe failed ({err})")
+        if not healthy:
+            return result(False, "unhealthy", "/health did not return 200")
+        return result(True, "answers", "runtime ready and /health returned 200")
+
+    def _probe_background(self, view: dict[str, Any], deadline: float | None,
+                          docker_note: str | None) -> RoleProbe:
+        name, port = view["containers"]["background"], view["ports"]["background"]
+
+        def result(usable: bool, outcome: str, detail: str) -> RoleProbe:
+            return RoleProbe(view["slot"], "background", name, port, usable, outcome, detail, now())
+
+        started = self.ops.monotonic()
+        try:
+            runtime = self.owner_runtime(view, deadline=deadline)
+        except Exception as err:  # noqa: BLE001
+            return result(False, "unreadable", f"runtime probe failed ({err})")
+        elapsed = self.ops.monotonic() - started
+        if runtime is None:
+            if docker_note:
+                return result(False, _docker_outcome(docker_note), docker_note)
+            if elapsed >= RUNTIME_STATUS_TIMEOUT_SECONDS:
+                return result(False, "timeout",
+                              f"no runtime answer within the {RUNTIME_STATUS_TIMEOUT_SECONDS:.0f}s probe timeout")
+            return result(False, "no answer", "runtime request was refused or reset")
+        if runtime.get("role") != "background":
+            return result(False, "wrong role", f"runtime reports role {runtime.get('role')!r}")
+        if not runtime.get("owns_background"):
+            return result(False, "not the owner", "runtime does not hold the background lock")
+        if not (runtime.get("ready")
+                or (runtime.get("draining") and runtime.get("admin_during_drain") == "read-only")):
+            return result(False, "not ready", "runtime is not ready for admin reads")
+        try:
+            healthy = self.health(port)
+        except Exception as err:  # noqa: BLE001
+            return result(False, "no answer", f"/health probe failed ({err})")
+        if not healthy:
+            return result(False, "unhealthy", "/health did not return 200")
+        if runtime.get("draining"):
+            return result(True, "answers", "holds the background lock and answers admin reads while draining")
+        return result(True, "answers", "holds the background lock and answers /health 200")
 
     def recovery_timeout(self, deadline: float | None, maximum: float) -> float:
         if deadline is None:
@@ -760,12 +936,208 @@ class Deployer:
             raise DeployError("nginx -t rejected the upstream file; previous file restored, routing unchanged")
         self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
 
-    def switch_to(self, view: dict[str, Any], *, admin: dict[str, Any] | None = None) -> None:
+    def current_upstreams(self) -> str | None:
+        try:
+            return self.ops.read_text(self.cfg.upstream_file)
+        except OSError:
+            return None
+
+    def loaded_route_ports(self) -> tuple[list[int], int | None]:
+        return loaded_upstream_ports(self.current_upstreams() or "")
+
+    @staticmethod
+    def admin_port_slot(port: int | None, views: tuple[dict[str, Any], ...]) -> str | None:
+        for view in views:
+            if port is not None and view["ports"]["background"] == port:
+                return view["slot"]
+        return None
+
+    def _route_progress(self) -> dict[str, Any]:
+        state = load_state(self.cfg)
+        progress = state.get("in_progress")
+        if not progress:
+            progress = state["in_progress"] = {"since": now(), "phase": "deploying"}
+        progress.setdefault("phase", "deploying")
+        return progress, state
+
+    def _record_route_issues(self, issues: list[dict[str, Any]], note: str) -> None:
+        if not issues or self.ops.dry_run:
+            return
+        try:
+            progress, state = self._route_progress()
+            kept = list(progress.get("route_issues") or [])
+            seen = {(i["slot"], i["role"], i["kind"]) for i in kept}
+            fresh = [i for i in issues if (i["slot"], i["role"], i["kind"]) not in seen]
+            if not fresh:
+                return
+            progress["route_issues"] = kept + fresh
+            save_state(self.cfg, state)
+            self.log(f"   route issue ({note}): {describe_route_issues(fresh)}")
+        except Exception as err:  # noqa: BLE001 - never mask the routing failure
+            self.log(f"   WARNING: could not record a route issue: {err}")
+
+    def record_route(self, primary: RoleProbe, backup: RoleProbe, admin: RoleProbe,
+                     admin_slot: str | None, admin_port: int, admin_source: str,
+                     note: str) -> None:
+        """Keep the probe that justified every target currently written."""
+        if self.ops.dry_run:
+            return
+        try:
+            progress, state = self._route_progress()
+            progress["serving_route"] = {
+                "at": now(), "note": note, "slot": primary.slot,
+                "primary": primary.record(), "backup": backup.record(),
+                "written": [p.port for p in (primary, backup) if p.usable],
+                "excluded": [] if backup.usable else [backup.record()],
+            }
+            progress["admin_route"] = {
+                "at": now(), "note": note, "slot": admin_slot, "port": admin_port,
+                "source": admin_source, "probe": admin.record(),
+            }
+            save_state(self.cfg, state)
+        except Exception as err:  # noqa: BLE001
+            self.log(f"   WARNING: could not record the route decision: {err}")
+
+    def publish_routes(self, serving: dict[str, Any], *, admin: dict[str, Any] | None = None,
+                       admin_required: bool = True, deadline: float | None = None,
+                       note: str = "") -> RouteOutcome:
+        """The only place either upstream is written.
+
+        Every role named in the new route is probed here, immediately before
+        the write; the primary serving role must answer or nothing is written.
+        The standby is written only while it answers. Admin moves only to a
+        background that was just probed as the lock holder; when it is not
+        required (a guard rollback keeps admin where it is) the loaded pointer
+        is left alone rather than pointed at an unverified target."""
+        serving_slot = serving["slot"]
+        admin_view = serving if admin is None else admin
+        if self.ops.dry_run:
+            text = render_upstreams(serving["ports"]["serving"], serving["ports"]["standby"],
+                                    admin_view["ports"]["background"])
+            self.ops.write_file_atomic(self.cfg.upstream_file, text)
+            self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False)
+            self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True)
+            synthetic = RoleProbe(serving_slot, "serving", serving["containers"]["serving"],
+                                  serving["ports"]["serving"], True, "dry-run", "not probed in dry-run", now())
+            return RouteOutcome(True, text, serving_slot, admin_view["slot"],
+                                admin_view["ports"]["background"], "dry-run",
+                                {"serving": synthetic}, [])
+        primary = self.probe_role(serving, "serving", deadline=deadline)
+        if not primary.usable:
+            raise RouteRefused(
+                f"not writing the service route: {primary.evidence()}; the loaded route is unchanged")
+        backup = self.probe_role(serving, "standby", deadline=deadline)
+        issues: list[dict[str, Any]] = []
+        if not backup.usable:
+            self.log(f"   slot {serving_slot} standby stays out of the route: {backup.evidence()}")
+        admin_probe = self.probe_role(admin_view, "background", deadline=deadline)
+        admin_port = admin_view["ports"]["background"]
+        admin_slot: str | None = admin_view["slot"]
+        admin_source = "probed"
+        if not admin_probe.usable:
+            if admin_required:
+                raise RouteRefused(
+                    f"not writing the admin route: {admin_probe.evidence()}; the loaded route is unchanged")
+            loaded_admin = self.loaded_route_ports()[1]
+            if loaded_admin is None:
+                raise RouteRefused(
+                    f"no background answers admin and the loaded route names no admin port: "
+                    f"{admin_probe.evidence()}")
+            admin_port = loaded_admin
+            admin_slot = self.admin_port_slot(loaded_admin, (serving, admin_view))
+            admin_source = "kept; the target did not answer"
+            self.log(f"   admin stays on port {loaded_admin}: {admin_probe.evidence()}")
+        text = render_upstreams(primary.port, backup.port if backup.usable else None, admin_port)
+        written = text != self.current_upstreams()
+        if written:
+            self.install_upstreams(text)
+            backup_note = "" if backup.usable else f"; no backup ({backup.outcome})"
+            self.log(f"   route written: serving slot {serving_slot} port {primary.port}{backup_note}; "
+                     f"admin slot {admin_slot or 'unknown'} port {admin_port} ({admin_source}); "
+                     f"{primary.evidence()}")
+        else:
+            self.log(f"   route already points at serving slot {serving_slot} port {primary.port} "
+                     f"and admin port {admin_port}; no reload")
+        # A write is only valid at the instant of its probe: look again, now.
+        issues += self.verify_loaded_route((serving, admin_view),
+                                           note=f"{note or 'route write'}: after writing")
+        self.record_route(primary, backup, admin_probe, admin_slot, admin_port, admin_source, note)
+        return RouteOutcome(written, text, serving_slot, admin_slot, admin_port, admin_source,
+                            {"serving": primary, "standby": backup, "background": admin_probe}, issues)
+
+    def publish_admin_route(self, view: dict[str, Any], *, deadline: float | None = None,
+                            note: str = "") -> RoleProbe:
+        """Move only the admin upstream, leaving the loaded serving block alone.
+        The target is probed before the write and again after it."""
+        probe = self.probe_role(view, "background", deadline=deadline)
+        if not probe.usable:
+            raise RouteRefused(f"not moving the admin route: {probe.evidence()}")
+        text = self.current_upstreams()
+        if text is None:
+            return self.publish_routes(view, admin=None, deadline=deadline,
+                                       note=note).probes["background"]
+        updated = replace_admin_port(text, probe.port)
+        if updated != text:
+            self.install_upstreams(updated)
+            self.log(f"   admin route written: slot {view['slot']} port {probe.port} ({probe.evidence()})")
+        post = self.probe_role(view, "background", deadline=deadline)
+        if not post.usable:
+            issue = route_issue("written_role_exited", post)
+            self._record_route_issues([issue], note or "admin route")
+            raise RouteRefused(
+                f"admin route was written to slot {view['slot']} port {probe.port}, "
+                f"but it stopped answering ({post.detail})")
+        if not self.ops.dry_run:
+            try:
+                progress, state = self._route_progress()
+                progress["admin_route"] = {"at": now(), "note": note, "slot": view["slot"],
+                                           "port": probe.port, "source": "probed", "probe": probe.record()}
+                save_state(self.cfg, state)
+            except Exception as err:  # noqa: BLE001
+                self.log(f"   WARNING: could not record the admin route: {err}")
+        return post
+
+    def verify_loaded_route(self, views: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+                            *, note: str = "") -> list[dict[str, Any]]:
+        """Probe every role the loaded file names. A role that was written and
+        no longer answers is reported with slot, role and time; it is not
+        silently left for the next release to discover."""
+        if self.ops.dry_run:
+            return []
+        serving_ports, admin_port = self.loaded_route_ports()
+        issues: list[dict[str, Any]] = []
+        for view in views:
+            for role in SERVING_ROLES:
+                if view["ports"][role] in serving_ports:
+                    probe = self.probe_role(view, role)
+                    if not probe.usable:
+                        issues.append(route_issue("written_role_exited", probe))
+            if admin_port is not None and view["ports"]["background"] == admin_port:
+                probe = self.probe_role(view, "background")
+                if not probe.usable:
+                    issues.append(route_issue("written_role_exited", probe))
+        if issues:
+            self._record_route_issues(issues, note or "verification")
+        return issues
+
+    def unresolved_route_issues(self) -> list[dict[str, Any]]:
+        """Findings that still matter: a recorded role failure whose port the
+        loaded route still names. A role that was retired out of the route is
+        no longer unresolved."""
+        progress = load_state(self.cfg).get("in_progress") or {}
+        recorded = progress.get("route_issues") or []
+        if not recorded:
+            return []
+        serving_ports, admin_port = self.loaded_route_ports()
+        return [i for i in recorded
+                if (i["role"] in SERVING_ROLES and i["port"] in serving_ports)
+                or (i["role"] == "background" and i["port"] == admin_port)]
+
+    def switch_to(self, view: dict[str, Any], *, admin: dict[str, Any] | None = None,
+                  admin_required: bool = True, note: str = "") -> RouteOutcome:
         """Point both upstreams at view, or keep admin on another slot's
         background while serving already moves."""
-        ports = view["ports"]
-        admin_port = (view if admin is None else admin)["ports"]["background"]
-        self.install_upstreams(render_upstreams(ports["serving"], ports["standby"], admin_port))
+        return self.publish_routes(view, admin=admin, admin_required=admin_required, note=note)
 
     # steps ------------------------------------------------------------------
     def preflight(self, state: dict[str, Any], target: Target, reuse: bool,
@@ -894,6 +1266,8 @@ class Deployer:
     def start_background(self, view: dict[str, Any], *, restart: str = "unless-stopped",
                          deadline: float | None = None, check_health: bool = False) -> None:
         name = view["containers"]["background"]
+        if self._rollback_starts is not None:
+            self._rollback_starts.add(name)
         # Once ownership is vacant, Ctrl-C must not stop the Docker clients
         # that put an owner back in service. They inherit the ignored signal.
         with finish_handoff_cleanup(ignore=True):
@@ -1174,13 +1548,23 @@ class Deployer:
 
     def fail_back_to_previous(self, target: Target, previous: dict[str, Any], reason: str) -> DeployError:
         """Switch serving back, hand the background over and retire the target.
-        Returns the error the caller reports; a settled admin entry raises."""
+        Returns the error the caller reports; an unsettled route raises."""
         self.log(f"   guard failed: {reason}; switching traffic back to slot {previous['slot']}")
+        self._rollback_starts = set()
         try:
-            # Serving goes back first. Admin stays on the background
-            # that still answers (the candidate's while it drains)
-            # until the previous background is ready to take over.
-            self.switch_to(previous, admin=target.view())
+            # Serving goes back first. Admin stays on the background that
+            # still answers (the candidate's while it drains) until the
+            # previous background is ready to take over. The primary and the
+            # standby are probed here, immediately before the write.
+            self.switch_to(previous, admin=target.view(), admin_required=False,
+                           note=f"guard rollback serving after: {reason}")
+        except RouteRefused as err:
+            failure = FallbackFailed(
+                f"guard failed ({reason}); the rollback service route was not written ({err}). "
+                f"Traffic stays on slot {target.slot}; verify slot {previous['slot']}'s serving containers "
+                "and restore the route before clearing in_progress")
+            self.record_guard_failure(target, failure)
+            raise failure from err
         except BaseException as err:
             failure = FallbackFailed(
                 f"guard failed ({reason}) and switching serving back failed ({err}); admin still "
@@ -1191,12 +1575,11 @@ class Deployer:
                  f"{target.slot} until slot {previous['slot']}'s background answers")
         try:
             recovery_deadline = self.hand_back(target, previous, check_health=True)
-            # The owner can exit or lose the lock between readiness and
-            # the reload. Only a confirmed probe may receive admin.
-            ready, why = self.admin_owner_status(previous)
-            if not ready:
-                raise DeployError(f"the previous background is not the admin owner ({why})")
-            self.switch_to(previous)
+            # The owner can exit or lose the lock between readiness and the
+            # reload. Only a probe taken now may receive admin; the write is
+            # followed by another probe, and a failed one stops here.
+            self.publish_admin_route(previous, deadline=recovery_deadline,
+                                     note=f"guard rollback admin after: {reason}")
         except BaseException as err:
             # An interrupt belongs here too: whatever ended the step,
             # the failure is recorded and admin keeps an owner.
@@ -1209,6 +1592,20 @@ class Deployer:
             except (DeployError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as err:
                 raise ServingCleanupFailed(f"{restored}. Incomplete serving cleanup: {err}. "
                                            "Check the target slot before clearing in_progress.") from err
+        # Retiring the candidate is the last write-shaped step. Probe the route
+        # that is loaded now: a role that exited between probes is reported in
+        # the same round instead of surfacing at the next release. A finding
+        # stays unresolved even if the role came back, because nobody has
+        # verified the route since.
+        self.verify_loaded_route((previous, target.view()),
+                                 note="guard rollback: after retiring the candidate serving")
+        issues = self.unresolved_route_issues()
+        if issues:
+            failure = FallbackFailed(
+                f"{restored}, but {describe_route_issues(issues)}. Restore or remove the affected role "
+                "and verify live routing before clearing in_progress")
+            self.record_guard_failure(target, failure)
+            raise failure
         return DeployError(f"{restored}; the new serving containers were stopped and kept for inspection")
 
     def hand_back(self, target: Target, previous: dict[str, Any], *, check_health: bool = False) -> float | None:
@@ -1281,6 +1678,11 @@ class Deployer:
         try:
             if self.background_running(view):
                 return False
+            if self._rollback_starts is not None and name in self._rollback_starts:
+                # One attempt per background per rollback round: a second start
+                # of the same container is not a new fact, it is a repeat.
+                self.log(f"   {name} was already started once in this rollback; reporting instead of retrying")
+                return False
             self.log(f"   {name} is stopped; restarting it so admin keeps an owner")
             self.start_background(view, check_health=True)
             return self.background_answering(view)
@@ -1327,53 +1729,74 @@ class Deployer:
 
     def settle_admin_owner(self, target: Target, previous: dict[str, Any], reason: str,
                            err: BaseException) -> FallbackFailed:
-        """Point admin at a probed owner, or leave the current pointer alone
-        when nothing answers and say which background a person must restore."""
+        """Point admin at an owner probed now, or leave the loaded pointer
+        alone when nothing answers and say which background a person must
+        restore. Never moves admin to a target that was not just probed."""
         views = {"previous": previous, "candidate": target.view()}
-        owner, detail = self.answering_admin_owner(views)
+        probes = {side: self.probe_role(view, "background") for side, view in views.items()}
         restarted = False
-        if owner is None:
-            self.log(f"   no background answers admin; restarting slot {views['candidate']['slot']}'s background")
-            try:
-                self.revive_background(views["candidate"])
-            except (Exception, KeyboardInterrupt) as revive_err:  # noqa: BLE001 - probe again anyway
-                detail["candidate"] += f"; restart failed ({revive_err})"
-            owner, detail = self.answering_admin_owner(views)  # never assume the restart made it the owner
-            restarted = owner is not None
-        admin_port = self.current_admin_port()
-        pointed = next((side for side, view in views.items()
-                        if admin_port is not None and str(view["ports"]["background"]) == admin_port), None)
-        if owner is None:
-            summary = "; ".join(detail.values())
-            where = (f"admin still points at slot {views[pointed]['slot']}" if pointed
-                     else f"admin points at {admin_port or 'an unknown port'}")
+        owner_side = next((side for side, probe in probes.items() if probe.usable), None)
+        if owner_side is None:
+            self.log(f"   no background answers admin; trying to restore slot "
+                     f"{views['candidate']['slot']}'s background once")
+            if self.revive_background(views["candidate"]):
+                restarted = True
+            # Never assume the restart made it the owner: probe again.
+            probes = {side: self.probe_role(view, "background") for side, view in views.items()}
+            owner_side = next((side for side, probe in probes.items() if probe.usable), None)
+        loaded_admin = self.loaded_route_ports()[1]
+        pointed = self.admin_port_slot(loaded_admin, tuple(views.values()))
+        if owner_side is None:
+            summary = "; ".join(probe.evidence() for probe in probes.values())
+            where = (f"admin still points at slot {pointed}" if pointed
+                     else f"admin points at port {loaded_admin}" if loaded_admin is not None
+                     else "admin points at an unknown port")
+            self._record_admin_none(probes, loaded_admin, previous["slot"], reason, err)
             return FallbackFailed(
                 f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not finish "
                 f"({err}). No background answers admin now ({summary}); {where}, so the admin entry is "
-                f"unavailable and needs a person to restore a background (slot {previous['slot']} for the "
-                "rollback) and point admin routing at it")
-        if not pointed or pointed != ("previous" if owner is views["previous"] else "candidate"):
+                f"unavailable and needs a person to restore one background (slot {previous['slot']} for the "
+                "rollback) and point admin routing at it; verify the route and background ownership "
+                "before clearing in_progress")
+        owner = views[owner_side]
+        admin_port = owner["ports"]["background"]
+        if loaded_admin != admin_port:
             try:
-                if owner is views["previous"]:
-                    self.switch_to(views["previous"])
-                else:
-                    # Serving already serves from the previous slot; only admin moves.
-                    self.switch_to(views["previous"], admin=owner)
+                self.publish_admin_route(owner, note=f"guard rollback: settle admin on slot {owner['slot']}")
             except (Exception, KeyboardInterrupt) as route_err:  # noqa: BLE001
                 return FallbackFailed(
                     f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not "
-                    f"finish ({err}). {owner['slot']}'s background answers, but moving admin routing there "
-                    f"failed ({route_err}); the admin entry is unavailable and needs a person to check where "
-                    "it points")
+                    f"finish ({err}). Slot {owner['slot']}'s background answered when probed, but moving admin "
+                    f"routing there did not hold ({route_err}); the admin entry is unavailable and needs a "
+                    "person to check where it points and restore one background; verify the route and "
+                    "background ownership before clearing in_progress")
             moved = f"admin was moved to slot {owner['slot']}, whose background "
-        elif owner is views["previous"]:
+        elif owner_side == "previous":
             moved = f"serving and admin serve from slot {previous['slot']}, whose background "
         else:
             moved = f"serving serves from slot {previous['slot']} but admin still uses slot {owner['slot']}, whose background "
-        state = "was restarted and answers" if restarted and owner is not views["previous"] else "answers"
+        state = "was restarted and answers" if restarted and owner_side != "previous" else "answers"
         return FallbackFailed(
             f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not finish "
-            f"({err}). {moved}{state}. Verify the background, its lock and live routing before clearing in_progress")
+            f"({err}). {moved}{state}. verify the background, its lock and live routing "
+            "before clearing in_progress")
+
+    def _record_admin_none(self, probes: dict[str, RoleProbe], loaded_port: int | None,
+                           restore_slot: str, reason: str, err: BaseException) -> None:
+        """Persist "no background answers" with the slot a person must restore."""
+        if self.ops.dry_run:
+            return
+        try:
+            progress, state = self._route_progress()
+            progress["admin_route"] = {
+                "at": now(), "note": f"guard rollback after: {reason}", "slot": None,
+                "port": loaded_port, "source": "no background answers",
+                "probes": {side: probe.record() for side, probe in probes.items()},
+                "restore": restore_slot, "failed": str(err),
+            }
+            save_state(self.cfg, state)
+        except Exception as record_err:  # noqa: BLE001 - never mask the failure
+            self.log(f"   WARNING: could not record the missing admin owner: {record_err}")
 
     def container_memory(self, info: dict[str, Any]) -> int | None:
         cid = info.get("Id")
@@ -1541,8 +1964,12 @@ class Deployer:
                 if isinstance(err, FallbackFailed):
                     self._record_unrestored(state, err)
                 elif isinstance(err, BackgroundRestored):
-                    state["in_progress"] = None
-                    save_state(self.cfg, state)
+                    if self.unresolved_route_issues():
+                        self._record_unrestored(state, FallbackFailed(str(err)))
+                    else:
+                        fresh = load_state(self.cfg)
+                        fresh["in_progress"] = None
+                        save_state(self.cfg, fresh)
                 append_history(self.cfg, record)
             raise
 
@@ -1569,8 +1996,26 @@ class Deployer:
                 self.guard(target, current)
         with self.step("retire previous serving"):
             self.retire_serving(current)
+        if not self.ops.dry_run:
+            # The last step that can invalidate the loaded route is retirement.
+            # Probe it before promising the release: a role written into the
+            # route and since gone keeps in_progress with the finding, even if
+            # it has come back, because nobody has verified the route since.
+            self.verify_loaded_route((view, current),
+                                     note="release: after retiring the previous serving")
+            issues = self.unresolved_route_issues()
+            if issues:
+                failure = FallbackFailed(
+                    f"release finished, but {describe_route_issues(issues)}. Restore or remove the "
+                    "affected role and verify live routing before clearing in_progress")
+                self._record_unrestored(state, failure)
+                raise failure
         view["deployed_at"] = now()
-        state.update(previous=current, current=view, in_progress=None)
+        slots = state.get("slots") or {}
+        slots[target.slot] = view
+        if current:
+            slots[current["slot"]] = current
+        state.update(previous=current, current=view, in_progress=None, slots=slots)
         if not self.ops.dry_run:
             save_state(self.cfg, state)
         record.update(result="ok", steps=self.timings, finished_at=now())
@@ -1579,16 +2024,41 @@ class Deployer:
         self.log(f"done: slot {target.slot} serving {target.image}")
 
     def _mark(self, state: dict[str, Any], target: Target, step: str) -> None:
-        state["in_progress"] = {"target": target.view(), "step": step, "since": now()}
+        # A step change must not erase route evidence an earlier probe wrote.
+        recorded = state.get("in_progress") or {}
+        if not self.ops.dry_run:
+            recorded = load_state(self.cfg).get("in_progress") or recorded
+        progress = {"target": target.view(), "step": step, "since": now(), "phase": "deploying"}
+        for key in ("serving_route", "admin_route", "route_issues"):
+            if key in recorded:
+                progress[key] = recorded[key]
+        state["in_progress"] = progress
         if not self.ops.dry_run:
             save_state(self.cfg, state)
 
     def _record_unrestored(self, state: dict[str, Any], err: FallbackFailed) -> None:
         """Keep in_progress, with why, so the next run refuses and 'status'
-        shows what a person has to do."""
-        if state.get("in_progress"):
-            state["in_progress"].update(failed=str(err), failed_at=now())
-            save_state(self.cfg, state)
+        shows what a person has to do. Route evidence recorded by an earlier
+        probe is merged in, never overwritten by a later step."""
+        if self.ops.dry_run:
+            return
+        fresh = load_state(self.cfg)
+        progress = state.get("in_progress") or fresh.get("in_progress")
+        if not progress:
+            return
+        recorded = fresh.get("in_progress") or {}
+        for key in ("serving_route", "admin_route"):
+            if key in recorded:
+                progress[key] = recorded[key]
+        if recorded.get("route_issues"):
+            merged = list(progress.get("route_issues") or [])
+            merged += [issue for issue in recorded["route_issues"] if issue not in merged]
+            progress["route_issues"] = merged
+        progress["phase"] = "failed"
+        progress["failed"] = str(err)
+        progress["failed_at"] = now()
+        fresh["in_progress"] = progress
+        save_state(self.cfg, fresh)
 
     def _abort(self, state: dict[str, Any], target: Target, err: DeployError) -> None:
         """Record failed recovery or clean up after the previous release is ready."""
@@ -1624,8 +2094,22 @@ class Deployer:
                     self._record_unrestored(state, failure)
                     self.log(f"FAILED: {failure}")
                     return
-        state["in_progress"] = None
-        save_state(self.cfg, state)
+        issues = self.unresolved_route_issues()
+        if issues:
+            # A probe wrote down a role that the loaded route still names and
+            # that stopped answering. Clearing now would hide that from the
+            # next person and from 'status'; a transient step failure alone
+            # would not survive, because the step that recorded it also ended it.
+            failure = FallbackFailed(
+                f"{err}. An earlier route probe still records an unresolved finding "
+                f"({describe_route_issues(issues)}); "
+                "verify live routing and the background lock before clearing in_progress")
+            self._record_unrestored(state, failure)
+            self.log(f"FAILED AND NOT RESTORED: {failure}")
+            return
+        fresh = load_state(self.cfg)
+        fresh["in_progress"] = None
+        save_state(self.cfg, fresh)
         self.log(f"FAILED: {err}")
 
 
@@ -1635,7 +2119,14 @@ class Deployer:
 
 def status(cfg: Config, ops: Ops) -> dict[str, Any]:
     state = load_state(cfg)
-    report: dict[str, Any] = {"in_progress": state.get("in_progress")}
+    deployer = Deployer(cfg, ops)
+    serving_ports, admin_port = deployer.loaded_route_ports()
+    report: dict[str, Any] = {
+        "in_progress": state.get("in_progress"),
+        # What Nginx was last told, read from the file rather than assumed.
+        "loaded_route": {"serving_ports": serving_ports, "admin_port": admin_port},
+        "slots": sorted((state.get("slots") or {}).keys()),
+    }
     for key in ("current", "previous"):
         view = state.get(key)
         if not view:
@@ -1659,44 +2150,76 @@ def status(cfg: Config, ops: Ops) -> dict[str, Any]:
 
 
 def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]]) -> list[dict[str, Any]]:
-    """One resident sample of the current release; returns alerts."""
+    """One resident sample of every slot the state still knows about.
+
+    Coverage does not depend on which slot a release retired: both slots are
+    kept in `slots`, and a slot that cannot be inspected is named in an alert
+    instead of being skipped."""
     state = load_state(cfg)
-    current = state.get("current")
-    if not current:
+    views: dict[str, dict[str, Any]] = {}
+    for key in ("current", "previous"):
+        view = state.get(key)
+        if view:
+            views[view["slot"]] = view
+    for slot, view in (state.get("slots") or {}).items():
+        views.setdefault(slot, view)
+    target = (state.get("in_progress") or {}).get("target")
+    if target:
+        views.setdefault(target["slot"], target)
+    if not views:
         return []
     deployer = Deployer(cfg, ops)
     alerts = []
     t = ops.monotonic()
-    for role, name in current["containers"].items():
-        token = None
-        with contextlib.suppress(OSError):
-            token = deployer.token_for(current, role)
-        info = ops.inspect(name) or {}
-        s = info.get("State", {})
-        port = current["ports"][role]
-        status_code, _ = ops.http_json(f"http://127.0.0.1:{port}/health")
-        runtime = deployer.runtime(port, token) if token else None
-        memory = deployer.container_memory(info)
-        sample = {"role": role, "name": name, "running": s.get("Running"), "health": status_code,
-                  "restarts": info.get("RestartCount"), "oom": s.get("OOMKilled"),
-                  "memory_gib": round(memory / GIB, 2) if memory else None,
-                  "active_http": (runtime or {}).get("active_http")}
-        reasons = []
-        if not s.get("Running") or status_code != 200:
-            reasons.append("unhealthy")
-        if s.get("OOMKilled"):
-            reasons.append("oom")
-        if runtime and (runtime.get("active_http") or 0) >= cfg.watch_active_http:
-            reasons.append("active_http")
-        if memory:
-            series = [(ts, m) for ts, m in history.get(name, []) if t - ts <= 30] + [(t, memory)]
-            history[name] = series
-            if memory >= cfg.watch_memory_gib * GIB:
-                reasons.append("memory")
-            if memory - min(m for _, m in series) >= cfg.guard_memory_jump_gib * GIB:
-                reasons.append("memory_jump")
-        if reasons:
-            alerts.append({**sample, "alert": reasons, "at": now()})
+    for slot, view in sorted(views.items()):
+        for role, name in view["containers"].items():
+            try:
+                info = ops.inspect(name) or {}
+            except Exception as err:  # noqa: BLE001 - an unchecked slot is reported, not skipped
+                alerts.append({"slot": slot, "role": role, "name": name, "alert": ["docker_inspect_failed"],
+                               "detail": f"could not inspect {name} ({err}); this slot was not checked",
+                               "at": now()})
+                continue
+            token = None
+            with contextlib.suppress(OSError):
+                token = deployer.token_for(view, role)
+            s = info.get("State", {})
+            port = view["ports"][role]
+            try:
+                status_code, _ = ops.http_json(f"http://127.0.0.1:{port}/health")
+            except Exception:  # noqa: BLE001 - no answer is unhealthy, not a crash
+                status_code = 0
+            try:
+                runtime = deployer.runtime(port, token) if token else None
+            except Exception:  # noqa: BLE001
+                runtime = None
+            memory = deployer.container_memory(info)
+            sample = {"slot": slot, "role": role, "name": name, "running": s.get("Running"),
+                      "health": status_code, "restarts": info.get("RestartCount"), "oom": s.get("OOMKilled"),
+                      "memory_gib": round(memory / GIB, 2) if memory else None,
+                      "active_http": (runtime or {}).get("active_http")}
+            reasons = []
+            if not s.get("Running") or status_code != 200:
+                reasons.append("unhealthy")
+            if s.get("OOMKilled"):
+                reasons.append("oom")
+            if runtime and (runtime.get("active_http") or 0) >= cfg.watch_active_http:
+                reasons.append("active_http")
+            if memory:
+                series = [(ts, m) for ts, m in history.get(name, []) if t - ts <= 30] + [(t, memory)]
+                history[name] = series
+                if memory >= cfg.watch_memory_gib * GIB:
+                    reasons.append("memory")
+                if memory - min(m for _, m in series) >= cfg.guard_memory_jump_gib * GIB:
+                    reasons.append("memory_jump")
+            if reasons:
+                alerts.append({**sample, "alert": reasons, "at": now()})
+    progress = state.get("in_progress") or {}
+    if progress.get("route_issues") or progress.get("failed"):
+        alerts.append({"alert": ["in_progress"], "step": progress.get("step"),
+                       "phase": progress.get("phase"), "failed": progress.get("failed"),
+                       "route_issues": progress.get("route_issues"), "since": progress.get("since"),
+                       "at": now()})
     return alerts
 
 
@@ -1796,7 +2319,8 @@ def adopt(cfg_path: str, ops: Ops, serving: str, standby: str, background: str, 
                                       for role in names}}
     if not ops.dry_run:
         Config.load(cfg_path)
-        save_state(Config.load(cfg_path), {"current": legacy, "previous": None, "in_progress": None})
+        save_state(Config.load(cfg_path), {"current": legacy, "previous": None, "in_progress": None,
+                                           "slots": {"legacy": legacy}})
     for line in plan:
         ops.log("adopt: " + line)
     ops.log(f"adopt: wrote {cfg_path} and recorded the running containers as the current (legacy) release")
