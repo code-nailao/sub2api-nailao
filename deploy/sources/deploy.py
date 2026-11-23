@@ -182,8 +182,21 @@ class RoutingRestored(DeployError):
     """A failed reload was recovered along with the previous background."""
 
 
-class RollbackBackgroundUnavailable(DeployError):
+class RouteRoleUnavailable(DeployError):
+    """A route health check could not confirm a particular role."""
+
+    def __init__(self, slot: str, role: str, detail: str = "is not answering health checks") -> None:
+        reason = f"rollback {role} on slot {slot} {detail}"
+        action = "Verify live routing with 'status' and restore the instance before retrying 'abort'"
+        self.observation = {"slot": slot, "role": role, "detected_at": now(), "reason": reason, "action": action}
+        super().__init__(f"{reason}. {action}")
+
+
+class RollbackBackgroundUnavailable(RouteRoleUnavailable):
     """The selected background stopped answering before reload."""
+
+    def __init__(self, slot: str) -> None:
+        super().__init__(slot, "background", "is not answering health checks as owner")
 
 
 class GuardStandbyUnavailable(DeployError):
@@ -907,6 +920,7 @@ def alias_slot_views(cfg: Config, state: dict[str, Any], progress: dict[str, Any
         hold = progress.get("hold") or {}
         add(hold.get("current"))
         add(hold.get("target"))
+    add(state.get("adopted_serving"))
     for slot in cfg.slots:
         add(cfg.slot_view(slot))
     return views
@@ -1836,10 +1850,8 @@ class Deployer:
                                roles: tuple[str, ...] = SERVING_ROLES,
                                deadline: float | None = None) -> None:
         for role in roles:
-            info = self.serving_info(view, role, observed, deadline=deadline)
-            timeout = self.recovery_timeout(deadline, RUNTIME_STATUS_TIMEOUT_SECONDS)
-            if not info.get("State", {}).get("Running") or not self.health(view["ports"][role], timeout=timeout):
-                raise DeployError(f"rollback {role} on slot {view['slot']} is not answering health checks")
+            if not self.serving_role_answering(view, role, deadline=deadline, observed=observed):
+                raise RouteRoleUnavailable(view["slot"], role)
 
     def background_running(self, view: dict[str, Any]) -> bool:
         """Whether the slot's background container exists and is not stopped."""
@@ -1856,24 +1868,15 @@ class Deployer:
                     and self.health(view["ports"]["background"],
                                     timeout=self.recovery_timeout(deadline, RUNTIME_STATUS_TIMEOUT_SECONDS)))
 
-    def serving_role_answering(self, view: dict[str, Any], role: str,
-                               deadline: float | None = None) -> bool:
-        """A serving role counts as usable only while it is running and
-        answering. Probed at the moment a route is written: a role that was
-        healthy when the rollback began may have exited since, and a dead
-        upstream left in the live route is exactly how user traffic stays on a
-        failed slot."""
+    def serving_role_answering(self, view: dict[str, Any], role: str, deadline: float | None = None, *,
+                               observed: dict[str, dict[str, Any]] | None = None) -> bool:
+        """Check the container and its health, preserving failed probe details."""
         try:
-            info = self.serving_info(view, role, None, deadline=deadline) or {}
-        except Exception:  # noqa: BLE001 - an unreadable state is not "answering"
-            return False
-        if not (info.get("State") or {}).get("Running"):
-            return False
-        try:
-            return self.health(view["ports"][role],
-                               timeout=self.recovery_timeout(deadline, RUNTIME_STATUS_TIMEOUT_SECONDS))
-        except Exception:  # noqa: BLE001
-            return False
+            info = self.serving_info(view, role, observed, deadline=deadline)
+            timeout = self.recovery_timeout(deadline, RUNTIME_STATUS_TIMEOUT_SECONDS)
+            return bool(info.get("State", {}).get("Running") and self.health(view["ports"][role], timeout=timeout))
+        except (DeployError, OSError, subprocess.SubprocessError) as err:
+            raise RouteRoleUnavailable(view["slot"], role, f"health could not be checked ({err})") from err
 
     def check_rollback_route(self, route: MainRoute, *, allow_draining: bool = False,
                              require_standby: bool = True, observed: dict[str, dict[str, Any]] | None = None,
@@ -1911,8 +1914,7 @@ class Deployer:
                 # background; the new release creates one. This is not a second
                 # source of truth for the shared alias, so it never blocks.
                 return
-            raise RollbackBackgroundUnavailable(
-                f"rollback background on slot {route.admin['slot']} is not answering health checks as owner")
+            raise RollbackBackgroundUnavailable(route.admin["slot"])
 
     def route_probe_path(self) -> str:
         socket_name = hashlib.sha256(os.fsencode(self.cfg.upstream_file)).hexdigest()[:12] + ".sock"
@@ -2057,6 +2059,12 @@ class Deployer:
                     allow_unready_background: bool = False,
                     guard_serving_only: bool = False, recheck_guard_standby: bool = False,
                     deadline: float | None = None) -> None:
+        same_serving = active.serving["slot"] == pending.serving["slot"]
+        returning = active.excluded_serving
+        if not (same_serving and returning in pending.serving_roles() and not self.ops.dry_run):
+            returning = None
+        if returning is not None:
+            self.check_rollback_serving(pending.serving, roles=(returning,), deadline=deadline)
         if recheck_guard_standby:
             # Verify the required primary and admin independently. A standby
             # loss must not obscure whether the new generation is loaded.
@@ -2066,7 +2074,6 @@ class Deployer:
             self._save_progress(state, {**progress, "verified_route": asdict(active), "pending_route": asdict(pending)})
         attempted = False
         reload_error = None
-        same_serving = active.serving["slot"] == pending.serving["slot"]
 
         def start_reload() -> None:
             nonlocal attempted
@@ -2075,8 +2082,10 @@ class Deployer:
                 reload_started()
 
         def check_before_reload() -> None:
-            if recheck_guard_standby and not self.guard_standby_answering(pending.serving, deadline=deadline):
-                raise GuardStandbyUnavailable("rollback standby is not answering before reload")
+            if recheck_guard_standby:
+                standby_problem = self.observe_serving_role(state, pending.serving, "standby", deadline=deadline)
+                if standby_problem is not None:
+                    raise GuardStandbyUnavailable(str(standby_problem)) from standby_problem
             self.verify_topology(state, active, peer if same_serving else pending.serving, disk=pending, ready=pending,
                                  check_health=False, allow_draining=allow_draining, bootstrap=not active.revision,
                                  require_standby=require_standby,
@@ -2111,6 +2120,15 @@ class Deployer:
                     self.restore_rejected_reload(state, active, pending, peer if same_serving else pending.serving,
                                                  rejected, deadline=deadline)
                 reason = str(err) or type(err).__name__
+                if returning is not None:
+                    if isinstance(err, RouteRoleUnavailable):
+                        self.remember_route_issue(state.get("in_progress"), err)
+                    else:
+                        # A failed generation probe can hide a role that died
+                        # immediately after rejoining. Report what we can observe.
+                        problem = self.observe_serving_role(state, pending.serving, returning, deadline=deadline)
+                        if problem is not None:
+                            reason = f"{reason}. {problem}"
                 if reload_error is not None:
                     reason = f"{reload_error}. {reason}"
                 raise RoutingUnconfirmed(f"serving route unconfirmed ({reason}). Both serving pairs were kept") from err
@@ -2140,19 +2158,21 @@ class Deployer:
         if reload_error is not None and isinstance(reload_error.__cause__, KeyboardInterrupt):
             raise KeyboardInterrupt
 
-    def guard_standby_answering(self, view: dict[str, Any], *, deadline: float | None = None) -> bool:
+    def observe_serving_role(self, state: dict[str, Any], view: dict[str, Any], role: str, *,
+                             deadline: float | None = None) -> RouteRoleUnavailable | None:
         try:
-            self.check_rollback_serving(view, roles=("standby",), deadline=deadline)
-        except (DeployError, OSError, subprocess.SubprocessError):
-            return False
-        return True
+            self.check_rollback_serving(view, roles=(role,), deadline=deadline)
+        except RouteRoleUnavailable as err:
+            self.remember_route_issue(state.get("in_progress"), err)
+            return err
+        return None
 
     def apply_guard_route(self, state: dict[str, Any], active: MainRoute, pending: MainRoute, peer: dict[str, Any], *,
                           serving_only: bool = False, reload_started: Callable[[], None] | None = None) -> MainRoute:
         """Load a guard rollback route, shedding its standby at most once."""
         pair_loaded = False
         if pending.excluded_serving is None:
-            if self.guard_standby_answering(pending.serving):
+            if self.observe_serving_role(state, pending.serving, "standby") is None:
                 try:
                     self.apply_route(state, active, pending, peer, guard_serving_only=serving_only,
                                      recheck_guard_standby=True, reload_started=reload_started)
@@ -2160,7 +2180,7 @@ class Deployer:
                     # No reload was attempted and the loaded file was restored.
                     pass
                 else:
-                    if self.guard_standby_answering(pending.serving):
+                    if self.observe_serving_role(state, pending.serving, "standby") is None:
                         return pending
                     active = pending
                     pair_loaded = True
@@ -2169,7 +2189,10 @@ class Deployer:
         # At most one correction. Reuse the confirmed loaded generation and
         # keep the admin checks in force for every change of its owner.
         try:
-            self.apply_route(state, active, pending, peer, guard_serving_only=serving_only,
+            # The first serving switch keeps the admin pointer. Once serving
+            # is restored, do not reload it again without an answering owner.
+            self.apply_route(state, active, pending, peer, guard_serving_only=serving_only and not pair_loaded,
+                             allow_draining=serving_only and pair_loaded,
                              reload_started=reload_started)
         except (Exception, KeyboardInterrupt) as err:
             if pair_loaded:
@@ -2224,6 +2247,14 @@ class Deployer:
             return
         origin = progress["origin"]
         original = route.serving["slot"] == origin["current"]["slot"]
+        if "adopted_serving" not in state:
+            for view in (origin["current"], origin["previous"]):
+                if view and view["slot"] == "legacy":
+                    # The adopted names cannot be derived from the fixed slots.
+                    # Keep them even after current/previous have both moved on.
+                    state["adopted_serving"] = {"slot": view["slot"], "containers": {
+                        role: view["containers"][role] for role in SERVING_ROLES}}
+                    break
         # The live route has already changed. Keep the proof in memory even
         # when this write fails so the caller can restore the original route.
         state["in_progress"] = {**progress, "verified_route": asdict(route), "pending_route": None}
@@ -2314,8 +2345,9 @@ class Deployer:
             serving_route = self.apply_guard_route(state, active, MainRoute(previous, active.admin), retiring,
                                                    serving_only=True)
         except (Exception, KeyboardInterrupt) as err:
+            hint = self.guard_admin_outage_hint(previous, active.admin)
             raise FallbackFailed(f"guard failed ({reason}) and switching back failed "
-                                 f"({err or type(err).__name__})") from err
+                                 f"({err or type(err).__name__}).{hint}") from err
 
         deadline = None
 
@@ -2328,7 +2360,8 @@ class Deployer:
             route = self.handoff_and_switch(state, serving_route, receiver, handoff, guard_peer=retiring)
         except RoutingUnconfirmed as err:
             # The loaded generation must be confirmed before further changes.
-            raise RoutingUnconfirmed(f"guard failed ({reason}); admin route unconfirmed ({err})") from err
+            hint = self.guard_admin_outage_hint(previous, active.admin)
+            raise RoutingUnconfirmed(f"guard failed ({reason}); admin route unconfirmed ({err}).{hint}") from err
         except (Exception, KeyboardInterrupt) as err:
             if isinstance(err, BackgroundRestored) and serving_route.excluded_serving is None:
                 # The serving-only route is already loaded. If its pair
@@ -2405,6 +2438,15 @@ class Deployer:
             if owner:
                 return view, detail
         return None, detail
+
+    def guard_admin_outage_hint(self, previous: dict[str, Any], candidate: dict[str, Any]) -> str:
+        # A route may already be loaded. Diagnose it without starting a
+        # background or reloading again to try to repair an uncertain route.
+        owner, detail = self.answering_admin_owner({"previous": previous, "candidate": candidate})
+        if owner is not None:
+            return ""
+        return (f" No background answers admin now ({'; '.join(detail.values())}). The admin entry is unavailable; "
+                "restore one background manually, confirm its lock and health, and verify live routing with 'status'.")
 
     def revive_background(self, view: dict[str, Any]) -> bool:
         """Restart a background that merely exited and wait for the lock and
@@ -3184,6 +3226,10 @@ class Deployer:
                 if not expected_aliases.issubset(self.alias_networks(receiving, deadline=deadline)):
                     raise DeployError("the shared alias is not active on all expected networks")
             except (Exception, KeyboardInterrupt) as err:
+                # A live route issue needs operator verification. Do not
+                # treat it as a recoverable alias configuration error.
+                if isinstance(err, RouteRoleUnavailable) or (state.get("in_progress") or {}).get("route_issues"):
+                    raise
                 raise AliasPublicationFailed(str(err) or type(err).__name__) from err
         if old_aliases:
             # Confirm coverage before anything is stopped: a gap discovered
@@ -3247,27 +3293,9 @@ class Deployer:
             self.ops.run(["docker", "update", "--restart=unless-stopped", cid], mutate=True,
                          timeout=self.recovery_timeout(deadline, 600))
         if active.excluded_serving is not None:
-            # 被排除的角色只有在真的应答时才放回路由。之前是无条件放回，
-            # 于是「一开始就掉线的备用」会被重新写进 Nginx，留下一个死上游——
-            # 这正是守护回退反复被审出来的那个洞。
-            role = active.excluded_serving
-            if self.serving_role_answering(receiving, role, deadline=deadline):
-                complete = MainRoute(receiving, route.admin)
-                self.apply_route(state, active, complete, retiring, allow_draining=allow_draining,
-                                 deadline=deadline)
-                active = complete
-            else:
-                self.log(f"   {role} still does not answer; keeping it out of the live route")
-                progress = state.get("in_progress")
-                if progress is not None:
-                    progress["excluded_serving"] = {
-                        "role": role,
-                        "slot": receiving["slot"],
-                        "reason": "did not answer when the guard rollback finished; "
-                                  "restore it and verify live routing before clearing in_progress",
-                    }
-                    with contextlib.suppress(Exception, KeyboardInterrupt):
-                        self._save_progress(state, progress)
+            complete = MainRoute(receiving, route.admin)
+            self.apply_route(state, active, complete, retiring, allow_draining=allow_draining, deadline=deadline)
+            active = complete
         return active
 
     def configure_rollback_aliases(self, target: Target, identities: dict[str, str],
@@ -4130,10 +4158,12 @@ class Deployer:
                     or verified["serving"]["slot"] != target.slot or verified["admin"]["slot"] != target.slot):
                 raise
             reason = str(err) or type(err).__name__
-            try:
-                self.restore_after_guard(state, MainRoute(**verified), current, reason)
-            except ServingCleanupFailed:
-                raise
+            self.restore_after_guard(state, MainRoute(**verified), current, reason)
+            progress = state["in_progress"]
+            confirmed = progress.get("verified_route") or {}
+            if progress.get("route_issues") or progress.get("excluded_serving") or confirmed.get("excluded_serving"):
+                raise ServingCleanupFailed(f"guard failed ({reason}); route recovery is incomplete. "
+                                           "Verify live routing with 'status' before retrying 'abort'") from err
             if held is None:
                 self._save_progress(state, None)
             raise DeployError(f"guard failed ({reason}); the previous release serves traffic and owns the "
@@ -4201,7 +4231,7 @@ class Deployer:
                     "step": step, "since": now(), "origin": original}
         for key in ("verified_route", "pending_route", "owned", "candidate_ids", "original_endpoints",
                     "background_restart_policies", "held_background_id", "held_background_creation_id",
-                    "original_serving_ids", "nginx_previous_workers", "alias_handoff", "alias_overlap"):
+                    "original_serving_ids", "nginx_previous_workers", "alias_handoff", "alias_overlap", "route_issues"):
             if key in prior:
                 progress[key] = prior[key]
         if publish_aliases_at_create or prior.get("publish_aliases_at_create"):
@@ -4239,6 +4269,14 @@ class Deployer:
             save_state(self.cfg, {**state, "in_progress": progress})
         state["in_progress"] = progress
 
+    @staticmethod
+    def remember_route_issue(progress: dict[str, Any] | None, err: RouteRoleUnavailable) -> None:
+        if progress is not None:
+            observation = err.observation
+            issues = progress.get("route_issues") or []
+            if not any((item["slot"], item["role"]) == (observation["slot"], observation["role"]) for item in issues):
+                progress["route_issues"] = [*issues, observation]
+
     def _record_unrestored(self, state: dict[str, Any], err: DeployError) -> None:
         """Keep in_progress, with why, so the next run refuses and 'status'
         shows what a person has to do."""
@@ -4248,6 +4286,11 @@ class Deployer:
             failed.update(phase="failed", failed_step=progress.get("step", "unknown"),
                           reason=str(err) or type(err).__name__,
                           failed=str(err) or type(err).__name__, failed_at=now())
+            cause: BaseException | None = err
+            while cause is not None:
+                if isinstance(cause, RouteRoleUnavailable):
+                    self.remember_route_issue(failed, cause)
+                cause = cause.__cause__
             self._save_progress(state, failed)
 
     def _report_unrestored(self, state: dict[str, Any], err: DeployError) -> None:
@@ -4404,27 +4447,20 @@ def status(cfg: Config, ops: Ops) -> dict[str, Any]:
                                          "restart_policy": ((info.get("HostConfig") or {})
                                                             .get("RestartPolicy") or {}).get("Name")}
         report[key] = entry
+    active_release = (report["in_progress"] or {}).get("process_running") is True
+    alias_alerts = shared_alias_alerts(deployer, state, active_release=active_release)
+    if alias_alerts:
+        report["alias_alerts"] = alias_alerts
     return report
 
 
-def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]]) -> list[dict[str, Any]]:
-    """One resident sample of the current release; returns alerts."""
-    state = load_main_state(cfg)
-    alerts = []
+def shared_alias_alerts(deployer: Deployer, state: dict[str, Any], *, active_release: bool) -> list[dict[str, Any]]:
+    """Sample every known slot and preserve observations if another query fails."""
+    current = state.get("current")
+    if not deployer.cfg.serving_alias or not current:
+        return []
     progress = state.get("in_progress") or {}
     phase = progress.get("phase")
-    active_release = phase in ("deploying", "aborting") and release_running(ops, progress) is True
-    if phase == "failed":
-        alerts.append({"alert": ["release_incomplete"], "at": now(), "in_progress": progress})
-    elif phase in ("deploying", "aborting") and not active_release:
-        # Avoid an alert if the sampled process just completed and saved a new phase.
-        if load_main_state(cfg).get("in_progress") == progress:
-            alert = "release_incomplete" if phase == "deploying" else "abort_incomplete"
-            alerts.append({"alert": [alert], "at": now(), "in_progress": progress})
-    current = state.get("current")
-    if not current:
-        return alerts
-    deployer = Deployer(cfg, ops)
     peer = progress.get("target")
     if not peer or peer["slot"] == current["slot"]:
         peer = state.get("previous")
@@ -4448,8 +4484,14 @@ def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]
             if retired.get("slot") == peer["slot"]:
                 allowed.add(peer["slot"])
                 retiring_slot, retiring = peer["slot"], retired.get("containers")
+    views = alias_slot_views(deployer.cfg, state, progress)
+    alerts = []
+    if "legacy" not in views:
+        alerts.append({"alert": ["shared_alias_unverified"], "at": now(), "slots": ["legacy"],
+                       "reason": "Adopted serving names are no longer in the release record",
+                       "action": "Check former serving instances for the shared alias"})
     conflict = set()
-    for slot, view in alias_slot_views(cfg, state, progress).items():
+    for slot, view in views.items():
         if slot == retiring_slot:
             # During a release, roles not yet marked for TERM are covered
             # by the planned overlap. After it finishes, only the recorded
@@ -4461,14 +4503,43 @@ def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]
         else:
             continue
         for role in roles:
+            name = view["containers"].get(role)
+            if not name:
+                alerts.append({"alert": ["shared_alias_unverified"], "at": now(), "slots": [slot], "role": role,
+                               "reason": "The serving role has no recorded container", "action": "Verify its shared alias manually"})
+                continue
             try:
                 if deployer.alias_networks(view, retiring=exempt, roles=(role,)):
                     conflict.add(slot)
-            except (DeployError, OSError, subprocess.SubprocessError):
+            except (DeployError, OSError, subprocess.SubprocessError) as err:
                 alerts.append({"alert": ["docker_inspect_failed"], "at": now(), "slot": slot,
-                               "role": role, "name": view["containers"][role]})
+                               "role": role, "name": name, "reason": f"Shared alias check failed ({err})",
+                               "action": "Check Docker and confirm whether this instance advertises the shared alias"})
     if conflict:
-        alerts.append({"alert": ["shared_alias_conflict"], "at": now(), "slots": sorted(conflict)})
+        alerts.append({"alert": ["shared_alias_conflict"], "at": now(), "slots": sorted(conflict),
+                       "action": "Verify the provider on each network before draining any extra instance"})
+    return alerts
+
+
+def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]]) -> list[dict[str, Any]]:
+    """One resident sample of the current release; returns alerts."""
+    state = load_main_state(cfg)
+    alerts = []
+    progress = state.get("in_progress") or {}
+    phase = progress.get("phase")
+    active_release = phase in ("deploying", "aborting") and release_running(ops, progress) is True
+    if phase == "failed":
+        alerts.append({"alert": ["release_incomplete"], "at": now(), "in_progress": progress})
+    elif phase in ("deploying", "aborting") and not active_release:
+        # Avoid an alert if the sampled process just completed and saved a new phase.
+        if load_main_state(cfg).get("in_progress") == progress:
+            alert = "release_incomplete" if phase == "deploying" else "abort_incomplete"
+            alerts.append({"alert": [alert], "at": now(), "in_progress": progress})
+    current = state.get("current")
+    if not current:
+        return alerts
+    deployer = Deployer(cfg, ops)
+    alerts.extend(shared_alias_alerts(deployer, state, active_release=active_release))
     t = ops.monotonic()
     for role, name in current["containers"].items():
         token = None
@@ -4476,7 +4547,8 @@ def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]
             token = deployer.token_for(current, role)
         info, container_status = observed_container(ops, name)
         if container_status == "unknown":
-            alerts.append({"alert": ["docker_inspect_failed"], "at": now(), "role": role, "name": name})
+            alerts.append({"alert": ["docker_inspect_failed"], "at": now(), "slot": current["slot"],
+                           "role": role, "name": name})
             continue
         s = info.get("State", {})
         port = current["ports"][role]

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from email.message import Message
 from pathlib import Path
 from unittest import mock
@@ -2032,6 +2033,42 @@ class DeployTest(unittest.TestCase):
                             and alert.get("slot") == previous["slot"] and alert.get("role") == "standby"
                             for alert in alerts))
 
+    def test_watch_keeps_checking_the_adopted_slot_after_previous_changes(self):
+        standby = LEGACY["containers"]["standby"]
+        for endpoint in self.ops.containers[standby]["NetworkSettings"]["Networks"].values():
+            endpoint["Aliases"] = [self.cfg.serving_alias]
+        self.ops.run(["docker", "kill", "--signal=TERM", standby], mutate=True)
+        self.deploy()
+        self.assertNotIn("standby", self.state()["retiring_serving"]["containers"])
+        self.ops.run(["docker", "start", standby], mutate=True)
+
+        def assert_conflict():
+            alerts = deploy.watch_once(self.cfg, self.ops, {})
+            self.assertEqual([[LEGACY["slot"]]], [item["slots"] for item in alerts
+                                                  if item["alert"] == ["shared_alias_conflict"]])
+
+        assert_conflict()
+        self.deploy(image="fixture:second")
+        self.assertNotEqual(LEGACY["slot"], self.state()["previous"]["slot"])
+        self.assertNotEqual(LEGACY["slot"], self.state()["retiring_serving"]["slot"])
+        assert_conflict()
+        self.assertTrue(any(item["alert"] == ["shared_alias_conflict"] and LEGACY["slot"] in item["slots"]
+                            for item in deploy.status(self.cfg, self.ops)["alias_alerts"]))
+
+    def test_alias_monitor_names_the_gap_when_existing_state_lost_the_adopted_slot(self):
+        self.deploy()
+        self.deploy(image="fixture:second")
+        state = self.state()
+        state.pop("adopted_serving", None)
+        deploy.save_state(self.cfg, state)
+        state_path = Path(self.cfg.state_file)
+        before = state_path.read_bytes()
+        for alerts in (deploy.watch_once(self.cfg, self.ops, {}), deploy.status(self.cfg, self.ops).get("alias_alerts", [])):
+            unverified = [item for item in alerts if item["alert"] == ["shared_alias_unverified"]]
+            self.assertEqual([[LEGACY["slot"]]], [item["slots"] for item in unverified])
+            self.assertIn("Check former serving instances", unverified[0]["action"])
+        self.assertEqual(before, state_path.read_bytes())
+
     def test_watch_reports_a_third_slot_sharing_the_alias_inside_a_recorded_window(self):
         self.deploy()
         state = self.state()
@@ -2598,6 +2635,84 @@ class DeployTest(unittest.TestCase):
 
     def test_guard_rollback_corrects_a_loaded_admin_route_after_standby_exit(self):
         self.assert_guard_rollback_survives_late_standby_loss("admin reload")
+
+    def assert_guard_reports_standby_loss_during_alias_handoff(self, when):
+        self.ops.memory_after_switch = 20 * GIB
+        # Only the standby needs reconnecting; the primary already covers the alias.
+        primary = self.ops.containers[LEGACY["containers"]["serving"]]
+        for endpoint in primary["NetworkSettings"]["Networks"].values():
+            endpoint["Aliases"] = [self.cfg.serving_alias]
+        standby = self.ops.containers[LEGACY["containers"]["standby"]]
+        target = self.cfg.slot_view("a")
+        run, sleep, write = self.ops.run, self.ops.sleep, self.ops.write_file_atomic
+        restarted = rejoined = exited = False
+        writes_after_exit, reloads_after_exit = [], []
+
+        def stop_standby():
+            nonlocal exited
+            standby["State"].update(Running=False, Status="exited")
+            exited = True
+
+        def watch_reload(args, **kw):
+            nonlocal restarted, rejoined
+            result = run(args, **kw)
+            if args == ["docker", "update", "--restart=unless-stopped", standby["Id"]]:
+                restarted = True
+                if when == "before rejoin":
+                    stop_standby()
+            if args == [self.cfg.nginx_bin, "-s", "reload"]:
+                if exited:
+                    reloads_after_exit.append(args)
+                if restarted and self.upstreams_only(self.ops.loaded_upstreams) == self.upstreams_for(LEGACY):
+                    rejoined = True
+                    if when == "after rejoin":
+                        stop_standby()
+            return result
+
+        def before_retirement(seconds):
+            if when == "before retirement" and rejoined and seconds == deploy.ALIAS_DNS_GRACE_SECONDS:
+                stop_standby()
+            sleep(seconds)
+
+        def track_write(path, text, **kw):
+            if exited and path == self.cfg.upstream_file:
+                writes_after_exit.append(text)
+            return write(path, text, **kw)
+
+        with mock.patch.object(self.ops, "run", watch_reload), mock.patch.object(self.ops, "sleep", before_retirement), \
+                mock.patch.object(self.ops, "write_file_atomic", track_write):
+            with self.assertRaisesRegex(deploy.DeployError, "guard failed") as failure:
+                self.deploy()
+
+        self.assertTrue(exited)
+        self.assertEqual([], reloads_after_exit, "an unresolved role does not trigger another reload")
+        self.assertEqual(200, self.ops.probe_nginx_serving("", 1)[0])
+        progress = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertIsNotNone(progress)
+        self.assertEqual("failed", progress["phase"])
+        self.assertEqual("guard", progress["failed_step"])
+        issue = next((item for item in progress.get("route_issues", []) if item["role"] == "standby"), None)
+        self.assertIsNotNone(issue, "record the observed loss of the standby")
+        self.assertEqual(LEGACY["slot"], issue["slot"])
+        self.assertIsNotNone(datetime.fromisoformat(issue["detected_at"]).tzinfo)
+        self.assertIn("Verify live routing", str(failure.exception))
+        self.assertTrue(any(item["alert"] == ["release_incomplete"] and issue in item["in_progress"]["route_issues"]
+                            for item in deploy.watch_once(self.cfg, self.ops, {})))
+        self.assertTrue(all(self.ops.inspect(target["containers"][role])["State"]["Running"]
+                            for role in deploy.SERVING_ROLES))
+        if when == "before rejoin":
+            self.assertFalse(rejoined)
+            self.assertEqual([], writes_after_exit, "a non-answering role is not written back")
+            self.assertEqual("standby", progress["verified_route"]["excluded_serving"])
+
+    def test_guard_keeps_recovery_record_if_standby_stops_before_rejoining(self):
+        self.assert_guard_reports_standby_loss_during_alias_handoff("before rejoin")
+
+    def test_guard_reports_standby_lost_just_after_rejoining(self):
+        self.assert_guard_reports_standby_loss_during_alias_handoff("after rejoin")
+
+    def test_guard_reports_standby_lost_before_retirement(self):
+        self.assert_guard_reports_standby_loss_during_alias_handoff("before retirement")
 
     def test_a_serving_role_only_counts_while_it_answers(self):
         """把被排除的角色放回路由之前必须再探一次。
@@ -4582,6 +4697,54 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(progress, deploy.status(self.cfg, self.ops)["in_progress"])
         self.assertEqual("failed", self.history()[-1]["result"])
 
+    def assert_guard_reports_no_background_after_reload(self, stage):
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+        split = self.upstreams_for({"ports": {**LEGACY["ports"], "background": target["ports"]["background"]}})
+        restored = self.upstreams_for(LEGACY)
+        run = self.ops.run
+        reloads = []
+        failed_route = split if stage == "serving" else restored
+
+        def lose_admin(args, **kw):
+            result = run(args, **kw)
+            if args == [self.cfg.nginx_bin, "-s", "reload"]:
+                text = self.upstreams_only(self.ops.loaded_upstreams)
+                reloads.append(text)
+                if text == failed_route:
+                    owner = target if stage == "serving" else LEGACY
+                    self.ops.containers[owner["containers"]["background"]]["State"].update(Running=False, Status="exited")
+                    if stage == "serving":
+                        self.ops.containers[LEGACY["containers"]["standby"]]["State"].update(Running=False, Status="exited")
+            return result
+
+        with mock.patch.object(self.ops, "run", lose_admin):
+            with self.assertRaises(deploy.FallbackFailed) as failure:
+                self.deploy()
+
+        expected = [self.upstreams_for(target), split]
+        if stage == "admin":
+            expected.append(restored)
+        self.assertEqual(expected, reloads)
+        self.assertEqual(failed_route, self.upstreams_only(self.ops.loaded_upstreams))
+        self.assertEqual(self.ops.loaded_upstreams, self.ops.files[self.cfg.upstream_file])
+        self.assertEqual(200, self.ops.probe_nginx_serving("", 1)[0])
+        self.assertIn("No background answers admin now", str(failure.exception))
+        self.assertIn("restore one background", str(failure.exception))
+        progress = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertEqual("guard", progress["failed_step"])
+        self.assertIn("restore one background", progress["reason"])
+        self.assertTrue(any(item["role"] == "background" and item["detected_at"]
+                            for item in progress["route_issues"]))
+        self.assertTrue(any(item["alert"] == ["release_incomplete"] and "restore one background" in item["in_progress"]["reason"]
+                            for item in deploy.watch_once(self.cfg, self.ops, {})))
+
+    def test_guard_reports_operator_recovery_if_the_loaded_admin_owner_exits(self):
+        self.assert_guard_reports_no_background_after_reload("admin")
+
+    def test_guard_does_not_reload_to_remove_standby_without_an_answering_admin(self):
+        self.assert_guard_reports_no_background_after_reload("serving")
+
     def test_guard_rollback_does_not_move_admin_to_a_background_without_the_lock(self):
         self.ops.memory_after_switch = 20 * GIB
         self.cfg.background_ready_timeout = 6
@@ -4724,10 +4887,9 @@ class DeployTest(unittest.TestCase):
         self.assertIn("No background answers admin now", message)
         self.assertIn("admin entry is unavailable", message)
         self.assertIn("needs a person", message)
-        self.assert_loaded_interfaces(LEGACY, target, admin_healthy=False)
-        self.assertEqual(self.ops.loaded_upstreams, upstream)
-        self.assertEqual("guard", self.state()["in_progress"]["failed_step"])
-        self.assertFalse(deploy.Deployer(self.cfg, self.ops).background_answering(LEGACY))
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        self.assertFalse(deployer.background_answering(LEGACY))
+        self.assertFalse(deployer.background_answering(target))
 
     def test_guard_rollback_keeps_admin_on_the_candidate_after_a_restart_timeout(self):
         self.ops.memory_after_switch = 20 * GIB
