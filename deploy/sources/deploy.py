@@ -1104,44 +1104,81 @@ class Deployer:
                             {"serving": primary, "standby": backup, "background": admin_probe}, issues)
 
     def publish_admin_route(self, view: dict[str, Any], *, deadline: float | None = None,
-                            note: str = "") -> RoleProbe:
+                            note: str = "", views: tuple[dict[str, Any], ...] = ()) -> RoleProbe:
         """Move only the admin upstream, leaving the loaded serving block alone.
-        The target is probed before the write and again after it."""
+
+        The target is probed before the write. Whatever happens next, the same
+        settlement as every other write runs before this returns or raises: the
+        serving roles the loaded file names are probed again too, so a role
+        that dropped out in this window is not left for the next release. A
+        failed post-write probe reports where admin points now, or that no
+        background answers."""
+        related = self.distinct_views(view, *views)
         probe = self.probe_role(view, "background", deadline=deadline)
         if not probe.usable:
+            self.settle_loaded_route(related, note=f"{note or 'admin route'}: refused write",
+                                     deadline=deadline)
             raise RouteRefused(f"not moving the admin route: {probe.evidence()}")
         text = self.current_upstreams()
         if text is None:
-            return self.publish_routes(view, admin=None, deadline=deadline,
-                                       note=note).probes["background"]
+            return self.publish_routes(view, admin=None, deadline=deadline, note=note,
+                                       views=related).probes["background"]
         updated = replace_admin_port(text, probe.port)
         if updated == text and loaded_upstream_ports(text)[1] != probe.port:
+            self.settle_loaded_route(related, note=f"{note or 'admin route'}: refused write",
+                                     deadline=deadline)
             raise RouteRefused(
                 f"the loaded upstream file names no admin upstream to move to slot {view['slot']} "
                 f"port {probe.port}; {probe.evidence()}")
         if updated != text:
-            self.install_upstreams(updated)
             self.log(f"   admin route written: slot {view['slot']} port {probe.port} ({probe.evidence()})")
-        post = self.probe_role(view, "background", deadline=deadline)
-        if not post.usable:
-            issue = route_issue("written_role_exited", post)
-            self._record_route_issues([issue], note or "admin route")
+            self.write_route(updated, related, note=note or "admin route", deadline=deadline)
+        else:
+            self.settle_loaded_route(related, note=f"{note or 'admin route'}: after writing",
+                                     deadline=deadline)
+        # The admin entry has to name a background that answers now: the one
+        # just written, or the one the settlement moved admin to.
+        owner, why = self.loaded_admin_owner(related)
+        if owner is None:
+            loaded_admin = self.loaded_route_ports()[1]
+            probes = {other["slot"]: self.probe_role(other, "background", deadline=deadline)
+                      for other in related}
+            self._record_admin_none(probes, loaded_admin, view["slot"], note or "admin route",
+                                    why)
             raise AdminRouteLost(
-                f"admin route was written to slot {view['slot']} port {probe.port}, "
-                f"but it stopped answering ({post.detail})")
+                f"admin was written to slot {view['slot']} port {probe.port}, but no background answers "
+                f"admin now ({why}); the loaded pointer is unchanged and no further reload was made")
+        if owner.slot != view["slot"]:
+            raise AdminRouteLost(
+                f"admin was written to slot {view['slot']} port {probe.port}, but that background stopped "
+                f"answering; admin now points at slot {owner.slot} port {owner.port}, which answers "
+                f"({owner.detail}); no further reload was made beyond that correction")
         if not self.ops.dry_run:
             try:
                 progress, state = self._route_progress()
-                progress["admin_route"] = {"at": now(), "note": note, "slot": view["slot"],
-                                           "port": probe.port, "source": "probed",
-                                           "probe": probe.record(), "verified": post.record()}
+                progress["admin_route"] = {"at": now(), "note": note, "slot": owner.slot,
+                                           "port": owner.port, "source": "probed",
+                                           "probe": probe.record(), "verified": owner.record()}
                 # Survives the successful release clearing in_progress.
                 state["last_route"] = {"at": now(), "note": note, "admin": progress["admin_route"],
                                        "serving": (state.get("last_route") or {}).get("serving")}
                 save_state(self.cfg, state)
             except Exception as err:  # noqa: BLE001
                 self.log(f"   WARNING: could not record the admin route: {err}")
-        return post
+        return owner
+
+    def loaded_admin_owner(self, views: tuple[dict[str, Any], ...] | list[dict[str, Any]]
+                           ) -> tuple[RoleProbe | None, str]:
+        """Probe the owner of the admin port the loaded file names. Returns the
+        probe when it answers, otherwise why there is no owner."""
+        admin_port = self.loaded_route_ports()[1]
+        if admin_port is None:
+            return None, "the loaded route names no admin port"
+        for view in self.distinct_views(*views):
+            if view["ports"]["background"] == admin_port:
+                probe = self.probe_role(view, "background")
+                return (probe, probe.detail) if probe.usable else (None, probe.evidence())
+        return None, f"the loaded admin port {admin_port} belongs to no slot the tool knows"
 
     def write_route(self, text: str, views: tuple[dict[str, Any], ...] | list[dict[str, Any]],
                     *, note: str, deadline: float | None = None) -> list[dict[str, Any]]:
@@ -1725,17 +1762,17 @@ class Deployer:
             # reload. Only a probe taken now may receive admin; the write is
             # followed by another probe, and a failed one stops here.
             self.publish_admin_route(previous, deadline=recovery_deadline,
-                                     note=f"guard rollback admin after: {reason}")
+                                     note=f"guard rollback admin after: {reason}",
+                                     views=(target.view(),))
         except AdminRouteLost as err:
             # The admin route was written and the target stopped answering.
-            # Stop on the loaded route: no second reload, no trying the other
-            # slot. Say where admin points and what to restore.
+            # The route itself was settled before this raised (serving roles
+            # included), so all that is left is to say where admin points and
+            # what to restore.
             failure = FallbackFailed(
                 f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not "
-                f"finish ({err}). Admin was moved to slot {previous['slot']} and that background stopped "
-                f"answering after the write; no further reload was made. Restore slot {previous['slot']}'s "
-                "background (or point admin routing at an answering one) and verify live routing before "
-                "clearing in_progress")
+                f"finish ({err}). Restore slot {previous['slot']}'s background (or point admin routing at "
+                "an answering one) and verify live routing before clearing in_progress")
             self.record_guard_failure(target, failure)
             raise failure from err
         except BaseException as err:
@@ -1928,7 +1965,8 @@ class Deployer:
         admin_port = owner["ports"]["background"]
         if loaded_admin != admin_port:
             try:
-                self.publish_admin_route(owner, note=f"guard rollback: settle admin on slot {owner['slot']}")
+                self.publish_admin_route(owner, note=f"guard rollback: settle admin on slot {owner['slot']}",
+                                         views=tuple(views.values()))
             except (Exception, KeyboardInterrupt) as route_err:  # noqa: BLE001
                 return FallbackFailed(
                     f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not "
@@ -1949,9 +1987,14 @@ class Deployer:
 
     def _record_admin_none(self, probes: dict[str, RoleProbe], loaded_port: int | None,
                            restore_slot: str, reason: str, err: BaseException) -> None:
-        """Persist "no background answers" with the slot a person must restore."""
+        """Persist "no background answers" with the slot a person must restore.
+        The backgrounds that did not answer are also kept as route findings, so
+        `status` and the watch name them like any other role that dropped out."""
         if self.ops.dry_run:
             return
+        self._record_route_issues([route_issue("written_role_exited", probe)
+                                   for probe in probes.values() if not probe.usable],
+                                  f"{reason}: no background answers")
         try:
             progress, state = self._route_progress()
             progress["admin_route"] = {
