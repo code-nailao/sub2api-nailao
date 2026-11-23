@@ -186,6 +186,10 @@ class RollbackBackgroundUnavailable(DeployError):
     """The selected background stopped answering before reload."""
 
 
+class GuardStandbyUnavailable(DeployError):
+    """The optional standby stopped answering before a guard rollback reload."""
+
+
 class AliasPublicationFailed(DeployError):
     """The destination did not acquire its shared alias on every network."""
 
@@ -1261,7 +1265,7 @@ class Deployer:
                 raise RoutingFileNotRestored("could not restore the previous upstream file after failure before reload") from restore_err
             if previous is None:
                 raise RoutingFileNotRestored(f"{reason}; rejected upstream file removed. The previous upstream file is missing") from err
-            if isinstance(err, (RollbackBackgroundUnavailable, RoutingUnconfirmed)):
+            if isinstance(err, (RollbackBackgroundUnavailable, GuardStandbyUnavailable, RoutingUnconfirmed)):
                 raise
             raise DeployError(f"{reason}; previous file restored, routing unchanged") from err
 
@@ -2032,7 +2036,12 @@ class Deployer:
                     allow_draining: bool = False, require_standby: bool = True,
                     reload_started: Callable[[], None] | None = None,
                     allow_unready_background: bool = False,
-                    guard_serving_only: bool = False, deadline: float | None = None) -> None:
+                    guard_serving_only: bool = False, recheck_guard_standby: bool = False,
+                    deadline: float | None = None) -> None:
+        if recheck_guard_standby:
+            # Verify the required primary and admin independently. A standby
+            # loss must not obscure whether the new generation is loaded.
+            require_standby = False
         progress = state.get("in_progress")
         if progress and progress.get("origin") and not self.ops.dry_run:
             self._save_progress(state, {**progress, "verified_route": asdict(active), "pending_route": asdict(pending)})
@@ -2047,6 +2056,8 @@ class Deployer:
                 reload_started()
 
         def check_before_reload() -> None:
+            if recheck_guard_standby and not self.guard_standby_answering(pending.serving, deadline=deadline):
+                raise GuardStandbyUnavailable("rollback standby is not answering before reload")
             self.verify_topology(state, active, peer if same_serving else pending.serving, disk=pending, ready=pending,
                                  check_health=False, allow_draining=allow_draining, bootstrap=not active.revision,
                                  require_standby=require_standby,
@@ -2109,6 +2120,44 @@ class Deployer:
             raise
         if reload_error is not None and isinstance(reload_error.__cause__, KeyboardInterrupt):
             raise KeyboardInterrupt
+
+    def guard_standby_answering(self, view: dict[str, Any], *, deadline: float | None = None) -> bool:
+        try:
+            self.check_rollback_serving(view, roles=("standby",), deadline=deadline)
+        except (DeployError, OSError, subprocess.SubprocessError):
+            return False
+        return True
+
+    def apply_guard_route(self, state: dict[str, Any], active: MainRoute, pending: MainRoute, peer: dict[str, Any], *,
+                          serving_only: bool = False, reload_started: Callable[[], None] | None = None) -> MainRoute:
+        """Load a guard rollback route, shedding its standby at most once."""
+        pair_loaded = False
+        if pending.excluded_serving is None:
+            if self.guard_standby_answering(pending.serving):
+                try:
+                    self.apply_route(state, active, pending, peer, guard_serving_only=serving_only,
+                                     recheck_guard_standby=True, reload_started=reload_started)
+                except GuardStandbyUnavailable:
+                    # No reload was attempted and the loaded file was restored.
+                    pass
+                else:
+                    if self.guard_standby_answering(pending.serving):
+                        return pending
+                    active = pending
+                    pair_loaded = True
+            pending = MainRoute(pending.serving, pending.admin, excluded_serving="standby")
+
+        # At most one correction. Reuse the confirmed loaded generation and
+        # keep the admin checks in force for every change of its owner.
+        try:
+            self.apply_route(state, active, pending, peer, guard_serving_only=serving_only,
+                             reload_started=reload_started)
+        except (Exception, KeyboardInterrupt) as err:
+            if pair_loaded:
+                raise RoutingUnconfirmed(f"could not remove the unavailable standby from the loaded guard route "
+                                         f"({err or type(err).__name__}). Both serving pairs were kept") from err
+            raise
+        return pending
 
     def restore_rejected_reload(self, state: dict[str, Any], active: MainRoute, pending: MainRoute,
                                 peer: dict[str, Any], rejected: ReloadRejected, *, deadline: float | None = None) -> None:
@@ -2241,13 +2290,10 @@ class Deployer:
         candidate = Target.from_view(active.admin, self.cfg.runtime_token_file)
         receiver = Target.from_view(previous, self.cfg.runtime_token_file)
         try:
-            standby = self.serving_info(previous, "standby", None)
-            standby_healthy = standby.get("State", {}).get("Running") and self.health(previous["ports"]["standby"])
-            excluded = None if standby_healthy else "standby"
-            serving_route = MainRoute(previous, active.admin, excluded_serving=excluded)
             # Move only serving. The admin port already belongs to the loaded
             # route and remains selected throughout the background handoff.
-            self.apply_route(state, active, serving_route, retiring, guard_serving_only=True)
+            serving_route = self.apply_guard_route(state, active, MainRoute(previous, active.admin), retiring,
+                                                   serving_only=True)
         except (Exception, KeyboardInterrupt) as err:
             raise FallbackFailed(f"guard failed ({reason}) and switching back failed "
                                  f"({err or type(err).__name__})") from err
@@ -2395,7 +2441,7 @@ class Deployer:
         if owner["slot"] != loaded.admin["slot"]:
             try:
                 route = MainRoute(previous, owner, excluded_serving=loaded.excluded_serving)
-                self.apply_route(state, loaded, route, retiring)
+                self.apply_guard_route(state, loaded, route, retiring)
             except (Exception, KeyboardInterrupt) as route_err:  # noqa: BLE001
                 return FallbackFailed(
                     f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not "
@@ -2459,7 +2505,9 @@ class Deployer:
             with self.step("switch" if guard_peer is None else "restore admin route"):
                 if guard_peer is None:
                     self._mark(state, target, "switch")
-                self.apply_route(state, loaded, pending, peer, reload_started=mark_reload_attempted)
+                    self.apply_route(state, loaded, pending, peer, reload_started=mark_reload_attempted)
+                else:
+                    pending = self.apply_guard_route(state, loaded, pending, peer, reload_started=mark_reload_attempted)
             return pending
         except (Exception, KeyboardInterrupt) as err:
             if self.ops.dry_run or isinstance(err, RollbackIncomplete):
@@ -4364,17 +4412,24 @@ def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]
                 allowed.add(peer["slot"])
                 retiring_slot, retiring = peer["slot"], retired.get("containers")
     conflict = set()
-    with contextlib.suppress(DeployError, OSError, subprocess.SubprocessError):
-        for slot, view in alias_slot_views(cfg, state, progress).items():
-            if slot == retiring_slot:
-                # During a release, roles not yet marked for TERM are covered
-                # by the planned overlap. After it finishes, only the recorded
-                # draining instances are exempt.
-                roles = tuple(retiring or ()) if progress else SERVING_ROLES
-                if deployer.alias_networks(view, retiring=retiring, roles=roles):
+    for slot, view in alias_slot_views(cfg, state, progress).items():
+        if slot == retiring_slot:
+            # During a release, roles not yet marked for TERM are covered
+            # by the planned overlap. After it finishes, only the recorded
+            # draining instances are exempt.
+            roles = tuple(retiring or ()) if progress else SERVING_ROLES
+            exempt = retiring
+        elif slot not in allowed:
+            roles, exempt = SERVING_ROLES, None
+        else:
+            continue
+        for role in roles:
+            try:
+                if deployer.alias_networks(view, retiring=exempt, roles=(role,)):
                     conflict.add(slot)
-            elif slot not in allowed and deployer.alias_networks(view):
-                conflict.add(slot)
+            except (DeployError, OSError, subprocess.SubprocessError):
+                alerts.append({"alert": ["docker_inspect_failed"], "at": now(), "slot": slot,
+                               "role": role, "name": view["containers"][role]})
     if conflict:
         alerts.append({"alert": ["shared_alias_conflict"], "at": now(), "slots": sorted(conflict)})
     t = ops.monotonic()

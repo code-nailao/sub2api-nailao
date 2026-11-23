@@ -2008,6 +2008,30 @@ class DeployTest(unittest.TestCase):
         self.ops.run(["docker", "start", standby], mutate=True)
         self.assertEqual([[previous["slot"]]], conflicts())
 
+    def test_watch_keeps_a_known_alias_conflict_when_the_other_role_times_out(self):
+        self.deploy()
+        previous = self.state()["current"]
+        standby = previous["containers"]["standby"]
+        self.ops.run(["docker", "kill", "--signal=TERM", standby], mutate=True)
+        self.deploy(image="fixture:second")
+        self.assertEqual({"serving"}, set(self.state()["retiring_serving"]["containers"]))
+        self.ops.sleep(1)
+        self.ops.run(["docker", "start", previous["containers"]["serving"]], mutate=True)
+        inspect = self.ops.inspect
+
+        def timeout_on_standby(name, **kw):
+            if name == standby:
+                raise subprocess.TimeoutExpired(["docker", "inspect", name], kw.get("timeout", 30))
+            return inspect(name, **kw)
+
+        with mock.patch.object(self.ops, "inspect", timeout_on_standby):
+            alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertEqual([[previous["slot"]]], [alert["slots"] for alert in alerts
+                                               if alert["alert"] == ["shared_alias_conflict"]])
+        self.assertTrue(any(alert["alert"] == ["docker_inspect_failed"]
+                            and alert.get("slot") == previous["slot"] and alert.get("role") == "standby"
+                            for alert in alerts))
+
     def test_watch_reports_a_third_slot_sharing_the_alias_inside_a_recorded_window(self):
         self.deploy()
         state = self.state()
@@ -2490,11 +2514,96 @@ class DeployTest(unittest.TestCase):
         self.assert_loaded_interfaces(previous, previous)
         self.assertIsNone(self.state()["in_progress"])
 
-    def test_guard_rollback_refuses_a_serving_port_that_stops_answering_during_switch(self):
+    def assert_guard_rollback_survives_late_standby_loss(self, when):
+        self.deploy()
+        previous = self.state()["current"]
+        self.deploy(image="fixture:second", hold_before_switch=True)
+        target = self.state()["in_progress"]["target"]
+        standby = previous["containers"]["standby"]
+        ports = previous["ports"]
+        split = deploy.render_upstreams(ports["serving"], ports["standby"], target["ports"]["background"])
+        split_primary = deploy.render_upstreams(ports["serving"], None, target["ports"]["background"])
+        restored = deploy.render_upstreams(ports["serving"], None, ports["background"])
+        runner = deploy.Deployer(self.cfg, self.ops)
+        inspect, probe, run = self.ops.inspect, self.ops.http_json, self.ops.run
+        candidate_health, reloads = [], []
+        standby_stopped = False
+
+        def stop_standby():
+            nonlocal standby_stopped
+            standby_stopped = True
+            self.ops.containers[standby]["State"].update(Running=False, Status="exited")
+
+        def stop_candidate(name, **kw):
+            if (not candidate_health and name == target["containers"]["serving"]
+                    and (self.state()["in_progress"] or {}).get("step") == "guard"):
+                for role in deploy.SERVING_ROLES:
+                    self.ops.containers[target["containers"][role]]["State"].update(Running=False, Status="exited")
+                candidate_health.append(self.ops.probe_nginx_serving("", 1)[0])
+            return inspect(name, **kw)
+
+        def probe_health(url, **kw):
+            response = probe(url, **kw)
+            if (when == "first health" and candidate_health and not standby_stopped
+                    and url.endswith(f":{ports['standby']}/health") and response[0] == 200):
+                stop_standby()
+            return response
+
+        def watch_reload(args, **kw):
+            written = self.upstreams_only(self.ops.files[self.cfg.upstream_file])
+            if when == "before reload" and written == split and args == [self.cfg.nginx_bin, "-t"]:
+                stop_standby()
+            result = run(args, **kw)
+            if args == [self.cfg.nginx_bin, "-s", "reload"]:
+                reloads.append(written)
+                if when == "after reload" and written == split:
+                    stop_standby()
+                if when == "admin reload" and written == self.upstreams_for(previous):
+                    stop_standby()
+                self.assertTrue(runner.background_answering(
+                    previous if written in (self.upstreams_for(previous), restored) else target))
+            return result
+
+        with mock.patch.object(self.ops, "inspect", stop_candidate), \
+                mock.patch.object(self.ops, "http_json", probe_health), \
+                mock.patch.object(self.ops, "run", watch_reload):
+            with self.assertRaisesRegex(deploy.DeployError, "guard failed"):
+                runner.resume()
+
+        self.assertTrue(standby_stopped, when)
+        self.assertEqual([502], candidate_health)
+        self.assertEqual(200, self.ops.probe_nginx_serving("", 1)[0])
+        expected = [self.upstreams_for(target), split_primary, restored]
+        if when == "after reload":
+            expected.insert(1, split)
+        elif when == "admin reload":
+            expected[1:2] = [split, self.upstreams_for(previous)]
+        self.assertEqual(expected, reloads)
+        self.assertEqual(restored, self.upstreams_only(self.ops.loaded_upstreams))
+        self.assertEqual(self.ops.loaded_upstreams, self.ops.files[self.cfg.upstream_file])
+        self.assertTrue(runner.background_answering(previous))
+        self.assert_release_failure("failed", "standby")
+        progress = self.state()["in_progress"]
+        self.assertEqual("guard", progress["failed_step"])
+        self.assertEqual("standby", progress["verified_route"]["excluded_serving"])
+
+    def test_guard_rollback_recovers_when_standby_exits_after_first_health(self):
+        self.assert_guard_rollback_survives_late_standby_loss("first health")
+
+    def test_guard_rollback_recovers_when_standby_exits_before_reload(self):
+        self.assert_guard_rollback_survives_late_standby_loss("before reload")
+
+    def test_guard_rollback_corrects_a_loaded_route_after_standby_exit(self):
+        self.assert_guard_rollback_survives_late_standby_loss("after reload")
+
+    def test_guard_rollback_corrects_a_loaded_admin_route_after_standby_exit(self):
+        self.assert_guard_rollback_survives_late_standby_loss("admin reload")
+
+    def test_guard_rollback_refuses_a_primary_that_stops_answering_during_switch(self):
         self.ops.memory_after_switch = 20 * GIB
         target = self.cfg.slot_view("a")
         run, http_json = self.ops.run, self.ops.http_json
-        failed_port = LEGACY["ports"]["standby"]
+        failed_port = LEGACY["ports"]["serving"]
         reloads = []
         offline = False
 
@@ -2512,7 +2621,7 @@ class DeployTest(unittest.TestCase):
             return http_json(url, **kw)
 
         with mock.patch.object(self.ops, "run", observe_switch), mock.patch.object(self.ops, "http_json", probe):
-            with self.assertRaisesRegex(deploy.FallbackFailed, "rollback standby.*not answering"):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "rollback serving.*not answering"):
                 self.deploy()
         self.assertTrue(offline)
         self.assertEqual([self.upstreams_for(target)], reloads)
