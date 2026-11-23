@@ -566,6 +566,9 @@ class Deployer:
         # Backgrounds already started in this guard rollback. A failed start is
         # not retried in the same round; it is reported instead.
         self._rollback_starts: set[str] | None = None
+        # Route findings recorded in this run. A finding that a previous run
+        # wrote into the state file belongs to that run, not to this one.
+        self._findings: list[dict[str, Any]] = []
 
     # helpers ---------------------------------------------------------------
     def log(self, msg: str) -> None:
@@ -990,6 +993,7 @@ class Deployer:
             if not fresh:
                 return
             progress["route_issues"] = kept + fresh
+            self._findings.extend(fresh)
             save_state(self.cfg, state)
             self.log(f"   route issue ({note}): {describe_route_issues(fresh)}")
         except Exception as err:  # noqa: BLE001 - never mask the routing failure
@@ -1279,9 +1283,9 @@ class Deployer:
         """Every route finding this run has recorded. Unlike
         `unresolved_route_issues`, a finding stays here after a corrective
         rewrite removed the port: nobody has verified the route since it
-        dropped, so a person still has to look."""
-        progress = load_state(self.cfg).get("in_progress") or {}
-        return list(progress.get("route_issues") or [])
+        dropped, so a person still has to look. Findings a previous run left in
+        the state file are not this run's business."""
+        return list(self._findings)
 
     def unresolved_route_issues(self) -> list[dict[str, Any]]:
         """Findings that still matter: a recorded role failure whose port the
