@@ -1286,13 +1286,18 @@ class DeployTest(unittest.TestCase):
                              f"{probe.port}, which does not answer, while another role could "
                              f"have replaced it")
             self.assert_reported(view["slot"], r, label)
-        # The role we stopped: if its port made it into a written route and it
-        # does not answer now, the run must leave that where a person can see
-        # it - even if the role is back before the next look.
+        # The role we stopped: if it was written into the route, its slot is
+        # still part of the final route and it is now gone, a person has to be
+        # able to see that from status and from the watch - even if the role is
+        # back before the next look. A slot the route moved away from entirely
+        # (the rollback went to the other slot) is not a dropped role.
         view = views[slot]
-        if run["stopped"] and view["ports"][role] in written:
-            if not deployer.probe_role(view, role).usable:
-                self.assert_reported(slot, role, label)
+        final_ports = set(serving_ports) | ({admin_port} if admin_port is not None else set())
+        slot_ports = {view["ports"][r] for r in deploy.ROLES}
+        if (run["stopped"] and view["ports"][role] in written
+                and final_ports & slot_ports and view["ports"][role] not in final_ports
+                and not deployer.probe_role(view, role).usable):
+            self.assert_reported(slot, role, label)
 
     def property_fresh(self):
         case = DeployTest("test_first_deploy_from_legacy_moves_everything_to_slot_a")
@@ -1531,6 +1536,53 @@ docker kill --signal=TERM old-spare
         self.assertEqual("legacy", self.state()["current"]["slot"])
         self.assertIsNone(self.state()["in_progress"])
 
+    def test_manual_rollback_serves_from_the_primary_when_its_standby_never_becomes_ready(self):
+        """Invariant 3: the standby only decides whether it is written. A
+        container that exists but never becomes ready must not keep a healthy
+        previous primary from serving."""
+        self.deploy()
+        self.ops.unready_ports.add(LEGACY["ports"]["standby"])
+        deploy.Deployer(self.cfg, self.ops).rollback()
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['serving']} max_fails", upstream)
+        self.assertNotIn(f"127.0.0.1:{LEGACY['ports']['standby']}", upstream,
+                         "a standby that never became ready is not written as a backup")
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertIn("did not become ready", "\n".join(self.ops.logs))
+
+    def test_normal_release_does_not_write_a_background_that_stopped_before_the_write(self):
+        """Invariant 1: the admin target has no fallback inside the file, so it
+        is the last probe before the write. A background that exits while the
+        serving roles are probed is not written."""
+        target = self.cfg.slot_view("a")
+        writes: list[str] = []
+        write, http_json = self.ops.write_file_atomic, self.ops.http_json
+        fired = []
+
+        def record(path, text, **kw):
+            if path == self.cfg.upstream_file:
+                writes.append(text)
+            return write(path, text, **kw)
+
+        def stop_during_serving_probe(url, **kw):
+            if (not fired
+                    and url.startswith(f"http://127.0.0.1:{target['ports']['serving']}/internal/sources/runtime")
+                    and (self.state().get("in_progress") or {}).get("step") == "switch"):
+                fired.append(1)
+                self.ops.containers[target["containers"]["background"]]["State"].update(
+                    Running=False, Status="exited")
+            return http_json(url, **kw)
+
+        with mock.patch.object(self.ops, "http_json", stop_during_serving_probe), \
+                mock.patch.object(self.ops, "write_file_atomic", record):
+            with self.assertRaisesRegex(deploy.DeployError, "not writing the admin route"):
+                self.deploy()
+        self.assertTrue(fired)
+        self.assertEqual([], [text for text in writes
+                              if f"127.0.0.1:{target['ports']['background']};" in text],
+                         "a background that stopped before the write was not written")
+
     def test_rollback_checks_written_roles_when_retirement_fails(self):
         """Invariant 2: a retirement error must not skip the check of the roles
         already written; a primary that exited is named."""
@@ -1670,6 +1722,24 @@ docker kill --signal=TERM old-spare
             return real(url, **kw)
 
         with mock.patch.object(self.ops, "http_json", slow_runtime):
+            alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertTrue(any(a.get("alert") == ["runtime_unavailable"] and a.get("slot") == "a"
+                            and a.get("role") == "serving" for a in alerts), alerts)
+
+    def test_watch_alerts_when_the_runtime_token_cannot_be_read(self):
+        """B segment 10: the container is up and /health is 200, but the token
+        that would let the tool read its runtime state cannot be read. That is
+        an alert, not a silent pass."""
+        self.deploy()
+        # The token files still exist for the other roles; only these cannot be read.
+        readable = self.ops.read_text
+
+        def unreadable(path):
+            if path == "/opt/x/runtime.token" or path.startswith("/legacy/"):
+                raise PermissionError(f"fixture: cannot read {path}")
+            return readable(path)
+
+        with mock.patch.object(self.ops, "read_text", unreadable):
             alerts = deploy.watch_once(self.cfg, self.ops, {})
         self.assertTrue(any(a.get("alert") == ["runtime_unavailable"] and a.get("slot") == "a"
                             and a.get("role") == "serving" for a in alerts), alerts)

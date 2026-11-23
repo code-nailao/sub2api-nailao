@@ -2155,26 +2155,42 @@ class Deployer:
         for role in ("serving", "background"):
             if not self.ops.inspect(previous["containers"][role]):
                 raise DeployError(f"previous container {previous['containers'][role]} no longer exists")
-        # The previous standby only decides whether it is written as a backup;
-        # its absence must not keep a healthy previous primary from serving.
-        missing_standby = not self.ops.inspect(previous["containers"]["standby"])
+        # The previous standby only decides whether it is written as a backup.
+        # A container that is missing, will not start or never becomes ready
+        # must not keep a healthy previous primary from serving; the route
+        # write probes it again and leaves it out while it does not answer.
+        standby_skipped = not self.ops.inspect(previous["containers"]["standby"])
         target = Target.from_view(previous, self.cfg.runtime_token_file)
         record: dict[str, Any] = {"started_at": now(), "action": "rollback", "image": target.image, "slot": target.slot}
         try:
             with self.step("start previous serving"):
                 for role in SERVING_ROLES:
-                    if role == "standby" and missing_standby:
+                    if role == "standby" and standby_skipped:
                         self.log(f"   previous standby {target.containers[role]} is missing; "
                                  "the rollback will serve from the primary only")
                         continue
                     self.ops.run(["docker", "update", "--restart=unless-stopped", target.containers[role]], mutate=True)
-                    self.ops.run(["docker", "start", target.containers[role]], mutate=True)
+                    try:
+                        self.ops.run(["docker", "start", target.containers[role]], mutate=True)
+                    except DeployError as err:
+                        if role != "standby":
+                            raise
+                        standby_skipped = True
+                        self.log(f"   previous standby {target.containers[role]} did not start ({err}); "
+                                 "the rollback will serve from the primary only")
                 if not self.ops.dry_run:
                     for role in SERVING_ROLES:
-                        if role == "standby" and missing_standby:
+                        if role == "standby" and standby_skipped:
                             continue
-                        self.wait_ready(target.ports[role], self.token_for(previous, role), "serving",
-                                        self.cfg.ready_timeout)
+                        try:
+                            self.wait_ready(target.ports[role], self.token_for(previous, role), "serving",
+                                            self.cfg.ready_timeout)
+                        except DeployError as err:
+                            if role != "standby":
+                                raise
+                            standby_skipped = True
+                            self.log(f"   previous standby {target.containers[role]} did not become ready "
+                                     f"({err}); the rollback serves from the primary only")
             self._finish_switch(state, current, target, record, create_background=False)
         except DeployError as err:
             record.update(result="failed", error=str(err), steps=self.timings, finished_at=now())
@@ -2438,9 +2454,10 @@ def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]
             reasons = []
             if not s.get("Running") or status_code != 200:
                 reasons.append("unhealthy")
-            if token and runtime is None:
+            if runtime is None and s.get("Running") and status_code == 200:
                 # The container answers Docker and /health but the tool cannot
-                # read its runtime state. That is "not checked", not "fine".
+                # read its runtime state (no token file, or no answer). That is
+                # "not checked", not "fine", so it is an alert either way.
                 reasons.append("runtime_unavailable")
             if s.get("OOMKilled"):
                 reasons.append("oom")
