@@ -44,16 +44,17 @@ issue 记录要做什么、为什么做，PR 记录怎么做的、验证了什�
 | 情况 | 写法 |
 | --- | --- |
 | 这个 PR 做完了 issue | `Closes #12`，缺陷也可以写 `Fixes #12` |
-| 一个 PR 关闭多个 issue | 每个编号前都写关键字：`Closes #12, closes #15`。写成 `Closes #12, #15` 只会关闭第一个 |
+| 一个 PR 关闭多个 issue | 不支持。一个 PR 只解决一个关注点：拆成多个 PR，每个正文只写一个 `Closes #N` |
 | 一个 issue 分几个 PR 完成 | 前面的 PR 写 `Refs #12`，最后一个写 `Closes #12`；各步骤在 issue 里用任务清单列出 |
 | 相关但不解决 | `Refs #12`。issue 页面上会出现对这个 PR 的引用，issue 不会被关闭 |
 | 回滚 | GitHub 的 Revert 按钮生成的 `Reverts owner/repo#12` 原样即可通过，它指向被回滚的 PR |
 | 没有 issue | 单独一行 `No issue: 原因`，前面可以有 `Issue:` |
 
-- 关键字写在 PR 正文里。检查只读正文，不读标题和提交信息。
+- 关键字写在 PR 正文里。检查只读正文，不读标题和提交信息；HTML 注释、围栏代码块和行内代码里的内容也不算，引用块里这样举例同样不算：GitHub 在代码里不做自动链接，举例时不会误关 issue。
 - `No issue:` 要写在一行的开头，句子中间提到它不算；原因直接写文字，不要放在尖括号里（GitHub 不显示尖括号里的内容，检查也不认）。
 - 可以写 `No issue` 的只有四类：错别字、纯文档小改、依赖或 CI 的机械维护、发版准备 PR。原因用一句话说明属于哪一类，例如 `No issue: 修正开发指南里的命令拼写`。拿不准时就开 issue。
-- CI 的 `issue-link` 作业运行 `scripts/sources_extensions/check_pr_issue.py`：正文里既没有关键字加编号，也没有 `No issue:` 加原因时，`ci` 不通过。它只检查写了没有；编号是否对应真实的 issue、原因是否属于上面四类，由评审判断。
+- 一个关键字后面列多个编号（例如 `Closes #12, #15`）只关闭第一个，检查也不会报错，容易让人以为关了两个。要同时提两个 issue，写 `Refs #12` 和 `Refs #15`；要关闭两个，拆成两个 PR。
+- CI 的 `issue-link` 作业运行 `scripts/sources_extensions/check_pr_issue.py`：`Closes`、`Fixes`、`Resolves` 指向的 issue 去重后必须恰好一个。issue 按仓库加编号区分，`#12` 指本仓库，`other-owner/other-repo#12` 是另一个 issue；同一 issue 写几次都只算一次。多于一个时失败，并提示保留哪个、把哪些拆成单独的 PR。没有关闭型关键字时，要按上表写 `Refs #N` 或 `No issue:` 加原因。它只检查形式；编号是否对应真实的 issue、原因是否属于上面四类，由评审判断。
 - 修改正文不会自动重新运行检查。改完后等这次运行结束，重新运行失败的作业（检查页上的按钮，或 `gh run rerun <运行编号> --failed`），它读取的是当前的正文。重新运行需要仓库的写权限；没有权限时推送新的提交，同样会重新检查。
 
 ### 标签

@@ -3,19 +3,26 @@
 
 The description is read from the PR_BODY environment variable. It passes with
 
-1. a closing keyword and an issue reference, as GitHub reads them (`Closes #12`,
-   `Fixes: owner/repo#12`, `Resolves <issue URL>`), `Refs #12` for a mention
-   that closes nothing, or the `Reverts owner/repo#12` that GitHub's Revert
-   button writes; or
+1. exactly one issue closed by a closing keyword, as GitHub reads them
+   (`Closes #12`, `Fixes: owner/repo#12`, `Resolves <issue URL>`). The same
+   issue named more than once counts once, and an issue is a repository and a
+   number: `#12` and `owner/repo#12` are the same only when the owner and
+   repository match. A reference without them is this repository's, named by
+   the `REPO` environment variable the workflow passes. Two different issues
+   fail, since a pull request has one concern and is split rather than closing
+   both. A `Refs #12` that closes nothing, or the `Reverts owner/repo#12` that
+   GitHub's Revert button writes, passes when no closing keyword is present; or
 2. a line that starts with `No issue:` and goes on to give the reason. An
    `Issue:` label, a list marker or emphasis may come before it; the phrase in
    the middle of a sentence does not count.
 
-HTML comments are ignored, so the hints in the pull request template do not
-count as an answer. Code spans and fences are not parsed. Only the form is
-checked: whether the number is a real issue, and whether the reason is an
-accepted one, is for the reviewer. The rule is in the "Issue 与 PR" section of
-docs/sources/WORKSPACE.md.
+HTML comments, fenced code blocks and code spans are ignored: GitHub shows none
+of them as links, so the hints in the pull request template and the examples in
+a description do not answer for it. A fence or a span inside a block quote is
+read the same way, since quoting an example does not make it an answer. Only
+the form is checked: whether the number is a real issue, and whether the reason
+is an accepted one, is for the reviewer. The rule is in the "Issue 与 PR"
+section of docs/sources/WORKSPACE.md.
 
 Nothing here uses the network, and nothing from the description is printed
 except the matched reference.
@@ -29,10 +36,25 @@ import sys
 # needs its end marker in the same paragraph, or it is ordinary text.
 COMMENT = re.compile(r'^ {0,3}<!--.*?(?:-->|\Z)|<!--(?:(?!\n[ \t]*\r?\n).)*?-->', re.S | re.M)
 KEYWORD = r'(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?|reverts?)'
+# GitHub closes an issue for the first three; the other two only reference.
+CLOSING_KEYWORDS = frozenset(('close', 'closes', 'closed', 'fix', 'fixes', 'fixed',
+                              'resolve', 'resolves', 'resolved'))
 NAME = r'[A-Za-z0-9_.-]+'
 NUMBER = r'[1-9][0-9]*'
 REFERENCE = rf'(?:(?:{NAME}/{NAME})?#{NUMBER}|https://github\.com/{NAME}/{NAME}/issues/{NUMBER})'
-LINKED = re.compile(rf'(?<![\w-]){KEYWORD}:?[ \t]+{REFERENCE}(?!\w)', re.I)
+LINKED = re.compile(rf'(?<![\w-])({KEYWORD}):?[ \t]+({REFERENCE})(?!\w)', re.I)
+# The reference is read back as a repository and a number. The number stays a
+# string: it is canonical without leading zeros, and a number long enough to
+# overflow int() is still just a number no issue has. These read the same
+# references LINKED matches, which ignores case, so they ignore it too.
+SHORT_REFERENCE = re.compile(rf'^(?:(?P<slug>{NAME}/{NAME}))?#(?P<number>{NUMBER})$', re.I)
+URL_REFERENCE = re.compile(
+    rf'^https://github\.com/(?P<slug>{NAME}/{NAME})/issues/(?P<number>{NUMBER})$', re.I)
+FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})')
+# A block quote marker: up to three spaces, `>`, and at most one space or tab.
+# These repeat for nesting.
+QUOTE = re.compile(r' {0,3}>[ \t]?')
+BACKTICKS = re.compile(r'`+')
 # A full-width colon is accepted after either label. No two neighbouring
 # repeats can match the same character, which keeps a long run of `*` linear.
 NO_ISSUE = re.compile(
@@ -40,18 +62,158 @@ NO_ISSUE = re.compile(
     re.I | re.M)
 PLACEHOLDER = re.compile(r'<[^<>]*>')
 
-HINT = ('the pull request description names no issue. Add `Closes #N` '
-        '(`Refs #N` to mention one without closing it), or a line that starts '
-        'with `No issue:` followed by the reason in plain words, then re-run '
-        'this job.')
+HINT = ('the pull request description names no issue. Add `Closes #N` for the '
+        'one issue this pull request settles (`Refs #N` to mention one without '
+        'closing it), or a line that starts with `No issue:` followed by the '
+        'reason in plain words, then re-run this job.')
+
+
+def blank_spans(text):
+    """Replaces code spans, inside a line or across lines, with a space.
+
+    A span opens with a run of backticks and closes with an equally long run, as
+    Markdown reads it. An unclosed run is literal, and pairs that nest blank
+    their whole outer span.
+    """
+    opened = {}
+    spans = []
+    for match in BACKTICKS.finditer(text):
+        length = match.end() - match.start()
+        start = opened.pop(length, None)
+        if start is None:
+            opened[length] = match.start()
+        else:
+            spans.append((start, match.end()))
+    if not spans:
+        return text
+    out = []
+    position = 0
+    for start, end in sorted(spans):
+        if start < position:
+            position = max(position, end)
+            continue
+        out.append(text[position:start])
+        out.append(' ')
+        position = end
+    out.append(text[position:])
+    return ''.join(out)
+
+
+def unquote(line):
+    """Returns a line's block quote depth and its content without the markers.
+
+    GitHub reads a quoted line as Markdown in its own right, so a fence or a
+    span inside a quote is one. A quote ends at the first line without a
+    marker, and that ends a fence opened inside it, as GitHub ends it.
+    """
+    depth = 0
+    position = 0
+    while True:
+        marker = QUOTE.match(line, position)
+        if not marker:
+            return depth, line[position:]
+        depth += 1
+        position = marker.end()
+
+
+def quoted_prefix(line, depth):
+    """Returns the line with exactly `depth` block quote markers removed."""
+    position = 0
+    for _ in range(depth):
+        marker = QUOTE.match(line, position)
+        if not marker:
+            break
+        position = marker.end()
+    return line[position:]
+
+
+def strip_code(text):
+    """Drops fenced blocks and code spans, which GitHub never links from.
+
+    The quote depth and the open fence are read together. Outside a fence a
+    line's markers say what depth the description is at, and a fence opens at
+    the depth it is found on. Inside one a `>` is code rather than a marker:
+    only the markers that place the line at the fence's own depth are removed,
+    so a line that looks like a closing fence once the rest is stripped cannot
+    close it. A line above the fence's depth ends the quote holding the fence,
+    and GitHub ends the fence with it. Every other line of an open fence is
+    code, and an unclosed fence runs to the end of the description.
+    """
+    kept = []
+    fence = None  # (character, length, quote depth) of the open fence
+    for line in text.splitlines():
+        depth, content = unquote(line)
+        if fence is not None:
+            if depth < fence[2]:
+                fence = None  # the quote holding this fence ended, so the fence did
+            else:
+                inner = quoted_prefix(line, fence[2])
+                closing = FENCE.match(inner)
+                if (closing and closing.group(1)[0] == fence[0]
+                        and len(closing.group(1)) >= fence[1]
+                        and not inner[closing.end():].strip()):
+                    fence = None
+                continue
+        opening = FENCE.match(content)
+        if opening:
+            fence = (opening.group(1)[0], len(opening.group(1)), depth)
+            continue
+        kept.append(content)
+    return blank_spans('\n'.join(kept))
+
+
+def issue_in(reference):
+    """Returns ((repository, number), display) for a matched reference.
+
+    Raises ValueError for anything the two forms do not read, rather than
+    guessing: the keyword scan and this one share a grammar, so a reference
+    that reaches here unread is a mismatch to report, not to drop.
+    """
+    match = SHORT_REFERENCE.match(reference) or URL_REFERENCE.match(reference)
+    if match is None:
+        raise ValueError(reference)
+    number = match.group('number')
+    slug = match.group('slug')
+    repository = (slug or os.environ.get('REPO', '')).lower()
+    # The message repeats the reference as it was written.
+    return (repository, number), (f'{slug}#{number}' if slug else f'#{number}')
 
 
 def verdict(body):
     """Returns (passed, detail) for a pull request description."""
-    text = COMMENT.sub('', body or '')
-    linked = LINKED.search(text)
-    if linked:
-        return True, 'linked with "' + linked.group(0) + '"'
+    text = strip_code(COMMENT.sub('', body or ''))
+    closing = {}  # (repository, number) -> the first reference that closes it
+    mention = None
+    for match in LINKED.finditer(text):
+        try:
+            issue, display = issue_in(match.group(2))
+        except ValueError:
+            # Never guess at one, and never pass by dropping it: say what to fix.
+            return False, (f'the pull request description names "{match.group(2)}", '
+                           f'which this check cannot read as an issue. Write it as '
+                           f'`Closes #N`, `Closes owner/repo#N` or an issue URL, then '
+                           f're-run this job.')
+        if match.group(1).lower() in CLOSING_KEYWORDS:
+            closing.setdefault(issue, (match.group(0), display))
+        elif mention is None:
+            mention = match.group(0)
+    if len(closing) == 1:
+        return True, 'linked with "' + next(iter(closing.values()))[0] + '"'
+    if len(closing) > 1:
+        items = list(closing.values())
+        keep, keep_display = items[0]
+        others = [display for _, display in items[1:]]
+        listed = ', '.join([keep_display] + others)
+        if len(others) == 1:
+            move = f'open a separate pull request for {others[0]}'
+        else:
+            move = ('open separate pull requests for '
+                    + ', '.join(others[:-1]) + f' and {others[-1]}')
+        return False, (f'the pull request description closes {len(items)} issues '
+                       f'({listed}). One pull request closes one issue: keep only '
+                       f'"{keep}" here, {move}, and re-run this job.')
+    if mention:
+        return True, 'linked with "' + mention + '"'
     for reason in NO_ISSUE.findall(text):
         # GitHub hides text in angle brackets, so a reason has to stand outside
         # them; a placeholder left as it was, such as `<reason>`, is not one.
@@ -66,7 +228,7 @@ def main():
         print('PR_ISSUE_PASS: ' + detail)
         return 0
     if os.environ.get('GITHUB_ACTIONS') == 'true':
-        print('::error title=Pull request names no issue::' + detail)
+        print('::error title=Pull request must name exactly one issue::' + detail)
     print('PR_ISSUE_FAIL: ' + detail)
     return 1
 

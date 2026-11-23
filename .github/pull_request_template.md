@@ -3,7 +3,7 @@
 金额或数量、上游供应商或渠道名称、用户数据、密钥。运维、事故和资金细节不写在这里。
 -->
 
-Issue: <!-- 必填，CI 会检查：Closes #N（只关联不关闭写 Refs #N），或 No issue: 原因 -->
+Issue: <!-- 必填，CI 会检查：只写一个 Closes #N 或 Fixes #N（只关联不关闭写 Refs #N），或 No issue: 原因 -->
 
 ## 改了什么
 

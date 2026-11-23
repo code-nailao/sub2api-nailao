@@ -72,7 +72,7 @@ jobs:
         run: python3 scripts/sources_extensions/check_public_tree.py
 
   issue-link:
-    # Every pull request names the issue it closes, or says why it has none.
+    # Every pull request closes exactly one issue, or says why it has none.
     # It does not wait for `changes`: the rule holds whatever the files are. A
     # push to main and a manual run have no description, so they skip it.
     if: github.event_name == 'pull_request'
@@ -84,7 +84,7 @@ jobs:
       pull-requests: read
     steps:
       - uses: actions/checkout@v6
-      - name: The description links an issue or says why there is none
+      - name: The description closes one issue or says why there is none
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
