@@ -934,6 +934,10 @@ class Deployer:
         raise DeployError(f"no '{prefix}' line in command output")
 
     def install_upstreams(self, text: str) -> None:
+        """Write the file and reload Nginx. Call it through `write_route`, or
+        from the corrective rewrite of `settle_loaded_route`: a write that is
+        not followed by a settlement is exactly the failure this file exists
+        to prevent."""
         previous = self.ops.read_text(self.cfg.upstream_file) if Path(self.cfg.upstream_file).exists() else None
         self.ops.write_file_atomic(self.cfg.upstream_file, text)
         test = self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False)
@@ -1048,11 +1052,12 @@ class Deployer:
             return RouteOutcome(True, text, serving_slot, admin_view["slot"],
                                 admin_view["ports"]["background"], "dry-run",
                                 {"serving": synthetic}, [])
-        # The admin target is probed last, immediately before the write: an
-        # admin upstream cannot be left without a server, so a background that
-        # dies there has no fallback inside the file. The serving primary and
-        # the standby are probed just before that and corrected from the file
-        # when they drop out in the remaining window.
+        # The background is probed first, so a serving role that exits while it
+        # is being probed is still seen by a later probe. It is then probed
+        # again last, immediately before the write: an admin upstream cannot be
+        # left without a server, so a background that dies there has no
+        # fallback inside the file, while a serving role that drops out in the
+        # remaining window is corrected from the file.
         admin_probe = self.probe_role(admin_view, "background", deadline=deadline)
         primary = self.probe_role(serving, "serving", deadline=deadline)
         backup = self.probe_role(serving, "standby", deadline=deadline)
@@ -1207,7 +1212,9 @@ class Deployer:
             return []
         views = self.distinct_views(*views)
         findings: list[dict[str, Any]] = []
-        for attempt in range(2):
+        rounds = 0
+        while True:
+            rounds += 1
             serving_ports, admin_port = self.loaded_route_ports()
             round_findings: list[dict[str, Any]] = []
             for view in views:
@@ -1224,10 +1231,9 @@ class Deployer:
                 return findings
             findings.extend(round_findings)
             self._record_route_issues(round_findings, note or "verification")
-            if attempt or not self.correct_loaded_route(
+            if rounds >= 2 or not self.correct_loaded_route(
                     views, round_findings, note=note or "verification", deadline=deadline):
                 return findings
-        return findings
 
     def correct_loaded_route(self, views: tuple[dict[str, Any], ...] | list[dict[str, Any]],
                              findings: list[dict[str, Any]], *, note: str,
@@ -1257,8 +1263,6 @@ class Deployer:
                     self.log(f"   correcting the admin route to slot {view['slot']} port {candidate} "
                              f"({probe.evidence()})")
                     break
-            if new_admin is None:
-                return False
         if new_admin is None:
             return False
         corrected = render_upstreams(surviving[0], surviving[1] if len(surviving) > 1 else None,
