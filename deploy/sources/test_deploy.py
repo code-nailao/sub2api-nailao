@@ -1648,6 +1648,42 @@ docker kill --signal=TERM old-spare
                               if f"127.0.0.1:{target['ports']['background']};" in text],
                          "a background that stopped before the write was not written")
 
+    def test_normal_release_does_not_write_a_primary_that_stopped_during_the_second_admin_probe(self):
+        """A#1 and list #1: the primary is the last role probed before the
+        write.
+
+        The candidate primary answers its first probe and exits during the
+        second background probe. The first reload must not name it; the write
+        is refused instead."""
+        target = self.cfg.slot_view("a")
+        writes: list[str] = []
+        write, http_json = self.ops.write_file_atomic, self.ops.http_json
+        background_probes: list[int] = []
+
+        def record(path, text, **kw):
+            if path == self.cfg.upstream_file:
+                writes.append(text)
+            return write(path, text, **kw)
+
+        def stop_primary_during_second_background_probe(url, **kw):
+            if (url.startswith(f"http://127.0.0.1:{target['ports']['background']}/internal/sources/runtime")
+                    and (self.state().get("in_progress") or {}).get("step") == "switch"):
+                background_probes.append(1)
+                if len(background_probes) == 2:
+                    self.ops.containers[target["containers"]["serving"]]["State"].update(
+                        Running=False, Status="exited")
+            return http_json(url, **kw)
+
+        with mock.patch.object(self.ops, "http_json", stop_primary_during_second_background_probe), \
+                mock.patch.object(self.ops, "write_file_atomic", record):
+            with self.assertRaisesRegex(deploy.DeployError, "not writing the service route"):
+                self.deploy()
+        self.assertGreaterEqual(len(background_probes), 2,
+                                "the switch did not probe the background again after the primary")
+        self.assertEqual([], [text for text in writes
+                              if f"127.0.0.1:{target['ports']['serving']}" in text],
+                         "a primary that stopped before the write was written into the route")
+
     def test_rollback_checks_written_roles_when_retirement_fails(self):
         """Invariant 2: a retirement error must not skip the check of the roles
         already written; a primary that exited is named."""

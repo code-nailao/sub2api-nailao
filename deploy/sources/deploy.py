@@ -1081,15 +1081,20 @@ class Deployer:
                                 admin_view["ports"]["background"], "dry-run",
                                 {"serving": synthetic}, [])
         # The background is probed first, so a serving role that exits while it
-        # is being probed is still seen by a later probe. It is then probed
-        # again last, immediately before the write: an admin upstream cannot be
-        # left without a server, so a background that dies there has no
-        # fallback inside the file, while a serving role that drops out in the
-        # remaining window is corrected from the file.
+        # is being probed is still seen by a later probe, and again after the
+        # serving roles: an admin upstream cannot be left without a server, so
+        # a background that died during the serving probes has no fallback
+        # inside the file. The primary is probed last, immediately before the
+        # write: it is the role the service route is worthless without, so a
+        # primary that dies while the background or the standby is probed must
+        # not be written. A role that drops out after that last probe is
+        # corrected from the loaded file by `write_route`, and the finding
+        # keeps in_progress.
         admin_probe = self.probe_role(admin_view, "background", deadline=deadline)
         primary = self.probe_role(serving, "serving", deadline=deadline)
         backup = self.probe_role(serving, "standby", deadline=deadline)
         admin_probe = self.probe_role(admin_view, "background", deadline=deadline)
+        primary = self.probe_role(serving, "serving", deadline=deadline)
         if not primary.usable:
             self.settle_loaded_route(related, note=f"{note or 'route write'}: refused write",
                                      deadline=deadline)
