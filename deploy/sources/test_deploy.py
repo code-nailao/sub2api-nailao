@@ -2609,6 +2609,42 @@ class HoldTest(unittest.TestCase):
             self.assertEqual(1, result)
             self.assertIn("unfinished release requires manual recovery", error)
 
+    def test_status_distinguishes_healthy_and_unhealthy_held_candidates(self):
+        held = self.hold()
+        healthy = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertIsNone(healthy["warning"])
+        for role in deploy.SERVING_ROLES:
+            candidate = healthy["live_containers"][role]
+            self.assertTrue(candidate["ready"])
+            self.assertEqual(200, candidate["health"])
+
+        port = held["target"]["ports"]["standby"]
+        http = self.ops.http_json
+
+        def unhealthy(url, **kwargs):
+            if url.endswith(f":{port}/health"):
+                return 503, None
+            return http(url, **kwargs)
+
+        with mock.patch.object(self.ops, "http_json", side_effect=unhealthy):
+            paused = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertEqual("held", paused["phase"])
+        self.assertTrue(paused["live_containers"]["serving"]["ready"])
+        standby = paused["live_containers"]["standby"]
+        self.assertEqual("running", standby["status"])
+        self.assertFalse(standby["ready"])
+        self.assertEqual(503, standby["health"])
+        self.assertIn("standby", paused["warning"])
+        self.assertIn("'abort'", paused["warning"])
+        self.assertEqual(held, self.state()["in_progress"])
+
+        # A successful /health alone does not prove the expected serving role.
+        candidate = self.ops.by_port(port)
+        with mock.patch.dict(candidate, {"role": "background"}):
+            standby = deploy.status(self.cfg, self.ops)["in_progress"]["live_containers"]["standby"]
+        self.assertEqual(200, standby["health"])
+        self.assertFalse(standby["ready"])
+
     def test_reports_release_interrupted_after_resume_releases_its_lock(self):
         held = self.hold()
         serving_id = held["containers"]["serving"]

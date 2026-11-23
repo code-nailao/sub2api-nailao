@@ -119,6 +119,8 @@ python3 deploy/sources/deploy.py --config <MAIN_CONFIG> abort
 
 `status` 在 `in_progress.phase=held` 时显示目标槽位、镜像、容器身份、暂停时间和已暂停时长。暂停时长达到 `hold_warning_seconds` 时会提示处理，默认一天。状态保存在本机状态文件，重启后仍可识别。发布只能由 `resume` 继续。
 
+`live_containers` 对每个候选角色显示 `/health` 的返回状态码 `health` 和就绪判定 `ready`。`health` 为 `0` 表示未收到可用响应，为 `null` 表示未探测。容器和镜像身份匹配、`/health` 返回 `200`，且运行时确认是就绪的 serving，`ready` 才为 `true`。暂停中的任一候选未就绪时，`status` 会列出角色，提示先排查或执行 `abort`。
+
 如果发布锁已释放而状态仍停在某个发布步骤，`status` 显示 `phase=interrupted`，`watch` 发出 `release_incomplete` 并带上最后一步。先核对实际路由和容器，再按[人工恢复步骤](#无法自动恢复的情况)处理。`phase=aborting` 表示放弃清理仍待完成。清理中断或已记录失败时，`watch` 发出 `abort_incomplete`，可检查剩余容器后重试 `abort`。
 
 三个入口都接受放在子命令之前的全局 `--dry-run`。`main` 沿用普通发布演练的读操作，包括必要时拉取镜像以及运行一次性检查容器。`resume` 和 `abort` 读取并核对当前状态，输出后续变更命令。演练保留状态、历史、正式容器和路由。

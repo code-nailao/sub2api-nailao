@@ -1573,6 +1573,19 @@ class Deployer:
         if actual["upstream_fingerprint"] != expected["upstream_fingerprint"]:
             raise DeployError("upstream file changed since preparation began")
 
+    def held_serving_readiness(self, view: dict[str, Any], role: str) -> tuple[int, bool]:
+        port = view["ports"][role]
+        code, _ = self.ops.http_json(f"http://127.0.0.1:{port}/health")
+        if code != 200:
+            return code, False
+        try:
+            runtime = self.runtime(port, self.token_for(view, role)) or {}
+        except OSError:
+            return code, False
+        ready = (runtime.get("role") == "serving" and bool(runtime.get("ready"))
+                 and not runtime.get("owns_background") and not runtime.get("draining"))
+        return code, ready
+
     def check_held_serving(self, target: Target, role: str, *, shared: bool = False,
                            expected_id: str | None = None) -> str:
         info = self.ops.inspect(target.containers[role]) or {}
@@ -1581,7 +1594,7 @@ class Deployer:
             raise DeployError(f"held {role} is missing or its container identity or image changed")
         state = info.get("State", {})
         if not state.get("Running") or state.get("Restarting") or state.get("OOMKilled"):
-            raise DeployError(f"held {role} is unhealthy (stopped, restarting or OOM killed)")
+            raise DeployError(f"held {role} is not ready (stopped, restarting or OOM killed)")
         networks = info.get("NetworkSettings", {}).get("Networks", {})
         alias = self.cfg.serving_alias
         needs_alias = shared and bool(alias)
@@ -1590,10 +1603,8 @@ class Deployer:
             for ep in networks.values()
         ):
             raise DeployError(f"held {role} has unexpected networks or shared aliases")
-        port = target.ports[role]
-        runtime = self.runtime(port, self.token_for(target.view(), role)) or {}
-        if (runtime.get("role") != "serving" or not runtime.get("ready") or runtime.get("owns_background")
-                or runtime.get("draining") or not self.health(port)):
+        _, ready = self.held_serving_readiness(target.view(), role)
+        if not ready:
             raise DeployError(f"held {role} is unhealthy or is not ready as ordinary serving")
         return cid
 
@@ -1630,7 +1641,8 @@ class Deployer:
         held = state.get("in_progress") or {}
         phase = held.get("phase")
         if phase == "aborting" and not aborting:
-            raise DeployError("paused release cleanup is incomplete. Retry 'abort'")
+            raise DeployError("paused release cleanup is incomplete. Retry 'abort'. "
+                              "If the retry fails, inspect the remaining containers with 'status'")
         if phase not in ("held", "aborting"):
             if held:
                 raise DeployError("unfinished release requires manual recovery. Inspect 'status'")
@@ -1764,7 +1776,7 @@ class Deployer:
                     save_state(self.cfg, {**state, "in_progress": progress})
                 except OSError:
                     self.log("   WARNING: could not save the cleanup error. The abort record was retained.")
-            remaining = held_containers(self.cfg, self.ops, held)
+            remaining = held_containers(self.cfg, self.ops, held, probe_health=False)
             detail = ", ".join(f"{role}={entry['status']}" for role, entry in remaining.items())
             raise DeployError(f"abort incomplete (phase={phase}, {detail}). Inspect 'status' and retry 'abort': {err}") from err
         if not self.ops.dry_run:
@@ -1919,18 +1931,24 @@ RELEASE_INTERRUPTED = "The release lock is free but a release step remains. Chec
 ABORT_INTERRUPTED = "The release lock is free but paused release cleanup remains. Check the containers and retry 'abort'."
 
 
-def held_containers(cfg: Config, ops: Ops, held: dict[str, Any]) -> dict[str, Any]:
+def held_containers(cfg: Config, ops: Ops, held: dict[str, Any], *, probe_health: bool = True) -> dict[str, Any]:
     deployer = Deployer(cfg, ops)
     containers = {}
+    view = held["target"]
     for role in SERVING_ROLES:
-        name = held["target"]["containers"][role]
+        name = view["containers"][role]
         info, missing = deployer.inspect_or_missing(name)
-        entry = {"name": name}
+        entry: dict[str, Any] = {"name": name, "health": None, "ready": False}
         if info:
             matches = info.get("Id") == held["containers"][role]
-            live_status = info.get("State", {}).get("Status", "unknown")
+            state = info.get("State", {})
+            live_status = state.get("Status", "unknown")
+            image_matches = info.get("Image") == held["image_id"]
             entry.update(status=live_status if matches else "replaced", identity_matches=matches,
-                         image_matches=info.get("Image") == held["image_id"])
+                         image_matches=image_matches)
+            if (probe_health and matches and image_matches and state.get("Running")
+                    and not state.get("Restarting") and not state.get("OOMKilled")):
+                entry["health"], entry["ready"] = deployer.held_serving_readiness(view, role)
         else:
             entry["status"] = "missing" if missing else "unknown"
         containers[role] = entry
@@ -1944,14 +1962,22 @@ def status(cfg: Config, ops: Ops) -> dict[str, Any]:
     if progress and progress.get("phase") in ("held", "aborting"):
         held_at = dt.datetime.fromisoformat(progress["held_at"])
         age = max(0, int((dt.datetime.now(dt.timezone.utc) - held_at).total_seconds()))
-        warning = None
+        live = held_containers(cfg, ops, progress)
+        warnings = []
         if progress["phase"] == "aborting":
-            warning = (ABORT_INTERRUPTED if lock_free and not progress.get("reason") else
-                       "paused release cleanup is incomplete. Inspect the containers and retry 'abort'")
-        elif age >= cfg.hold_warning_seconds:
-            warning = "release has been paused for a long time. Verify it, then resume or abort"
-        report["in_progress"] = {**progress, "age_seconds": age, "warning": warning,
-                                 "live_containers": held_containers(cfg, ops, progress)}
+            warnings.append(ABORT_INTERRUPTED if lock_free and not progress.get("reason") else
+                            "paused release cleanup is incomplete. Inspect the containers and retry 'abort'")
+        else:
+            not_ready = [role for role, entry in live.items() if not entry["ready"]]
+            if not_ready:
+                warnings.append(f"Held candidates are not ready ({', '.join(not_ready)}). "
+                                "Investigate or run 'abort' before resuming.")
+            if age >= cfg.hold_warning_seconds:
+                warnings.append("release has been paused for a long time. Verify it, then resume or abort")
+        identities = {role: {"id": cid, "image_id": progress["image_id"]}
+                      for role, cid in progress["containers"].items()}
+        report["in_progress"] = {**progress, "age_seconds": age, "warning": " ".join(warnings) or None,
+                                 "containers": identities, "live_containers": live}
     elif progress and lock_free and not progress.get("failed"):
         report["in_progress"] = {**progress, "phase": "interrupted", "warning": RELEASE_INTERRUPTED}
     for key in ("current", "previous"):
