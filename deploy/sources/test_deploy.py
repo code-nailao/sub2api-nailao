@@ -1,7 +1,10 @@
+import copy
+import hashlib
 import http.client
 import io
 import json
 import os
+import re
 import signal
 import socketserver
 import threading
@@ -341,6 +344,32 @@ class DeployTest(unittest.TestCase):
         steps = [s["step"] for s in self.history()[-1]["steps"]]
         self.assertEqual(["pull image", "preflight", "migrate", "startup check", "export assets", "start serving",
                           "background handoff", "switch", "guard", "retire previous serving"], steps)
+
+    def test_main_without_hold_preserves_the_baseline_command_sequence(self):
+        # Captured on the pre-hold baseline with this fixture, first from
+        # legacy and then between fixed slots. Include Docker inspect calls.
+        baseline = (
+            "58117aa3fa340e1d466a7f8479ae5f5edd1234874a318c1ecab335f7e7d37b81",
+            "6744365c378d13dc26b97acb463ca1026fc453433b078e5f2a9cf9239cedecf3",
+        )
+        inspect = self.ops.inspect
+
+        def record_inspect(name, *, timeout=30):
+            self.ops.commands.append(["docker", "inspect", name])
+            return inspect(name, timeout=timeout)
+
+        with mock.patch.object(self.ops, "inspect", record_inspect), \
+                mock.patch.object(deploy, "now", return_value="2020-01-01T00:00:00+00:00"):
+            for image, expected in zip(("new@sha256:2", "other@sha256:3"), baseline):
+                with self.subTest(image=image):
+                    self.ops.commands.clear()
+                    self.deploy(image=image)
+                    commands = [
+                        [re.sub(r"oneoff-\d+-\d+", "oneoff", arg.replace(self._tmp.name, "<TMP>")) for arg in args]
+                        for args in self.ops.commands
+                    ]
+                    self.assertEqual(69, len(commands))
+                    self.assertEqual(expected, hashlib.sha256(json.dumps(commands).encode()).hexdigest(), commands)
 
     def test_containers_run_the_binary_directly_like_production(self):
         self.deploy()
@@ -3228,6 +3257,405 @@ docker kill --signal=TERM old-spare
         state = deploy.load_state(cfg)
         self.assertEqual("legacy", state["current"]["slot"])
         self.assertEqual("/rel/bg/runtime.token", state["current"]["runtime_token_files"]["background"])
+
+
+class HoldOps(FakeOps):
+    """Model the image and network identities used by pause and resume."""
+
+    image = "candidate:tag"
+    image_id = "sha256:" + "a" * 64
+
+    def __init__(self, tmp):
+        super().__init__(tmp)
+        self.local_images.add(self.image)
+        self.tag_image_id = self.image_id
+        self.mutations = []
+        self.next_id = 0
+
+    def add(self, name, port, **kwargs):
+        super().add(name, port, **kwargs)
+        self.next_id += 1
+        self.containers[name]["Id"] = f"fixture-{self.next_id}-id"
+        self.containers[name]["Image"] = self.containers[name]["Config"]["Image"]
+
+    def run(self, args, *, mutate, timeout=600, check=True):
+        if args[:4] == ["docker", "image", "inspect", "--format"]:
+            self.commands.append(list(args))
+            return subprocess.CompletedProcess(args, 0, self.tag_image_id + "\n", "")
+        if mutate and not self.dry_run:
+            self.mutations.append(list(args))
+        name = next((name for name, c in self.containers.items() if c["Id"] == args[-1]), args[-1])
+        result = super().run([*args[:-1], name], mutate=mutate, timeout=timeout, check=check)
+        self.commands[-1] = (["DRY"] if self.dry_run and mutate else []) + list(args)
+        if self.dry_run and mutate:
+            return result
+        if args[:2] == ["docker", "create"]:
+            name = args[args.index("--name") + 1]
+            network = args[args.index("--network") + 1]
+            aliases = [arg for i, arg in enumerate(args) if i and args[i - 1] == "--network-alias"]
+            self.containers[name]["NetworkSettings"]["Networks"] = {network: {"Aliases": aliases}}
+        if args[:2] == ["docker", "network"]:
+            networks = self.containers[name]["NetworkSettings"]["Networks"]
+            if args[2] == "disconnect":
+                del networks[args[-2]]
+            if args[2] == "connect":
+                aliases = [arg for i, arg in enumerate(args) if i and args[i - 1] == "--alias"]
+                networks[args[-2]] = {"Aliases": aliases}
+        return result
+
+    def read_text(self, path):
+        if path.endswith("memory.current"):
+            return str(GIB)
+        return super().read_text(path)
+
+
+class HoldTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.tmp = Path(temporary.name)
+        self.cfg = make_config(self.tmp)
+        self.ops = HoldOps(self.tmp)
+        for role, name in LEGACY["containers"].items():
+            self.ops.add(name, LEGACY["ports"][role])
+            self.ops.containers[name]["role"] = "background" if role == "background" else "serving"
+        self.upstream = deploy.render_upstreams(*(LEGACY["ports"][role] for role in deploy.ROLES))
+        self.ops.files[self.cfg.upstream_file] = self.upstream
+        for path in self.cfg.env_files.values():
+            self.ops.files[path] = "SETTING=placeholder\n"
+        deploy.save_state(self.cfg, {"current": LEGACY, "previous": None, "in_progress": None})
+
+    def cli(self, *args):
+        def make_ops(*, dry_run):
+            self.ops.dry_run = dry_run
+            return self.ops
+
+        with (mock.patch.object(deploy.Config, "load", return_value=self.cfg),
+              mock.patch.object(deploy, "Ops", side_effect=make_ops),
+              mock.patch("sys.stderr", new_callable=io.StringIO) as stderr):
+            result = deploy.main(list(args))
+        return result, stderr.getvalue()
+
+    def state(self):
+        return deploy.load_state(self.cfg)
+
+    def hold(self):
+        self.assertEqual((0, ""), self.cli("main", self.ops.image, "--hold-before-switch"))
+        held = self.state()["in_progress"]
+        self.assertEqual("held", held["phase"])
+        return held
+
+    def test_hold_leaves_the_old_release_serving_and_reports_the_preview(self):
+        held = self.hold()
+        self.assertEqual(LEGACY, self.state()["current"])
+        self.assertEqual(self.upstream, self.ops.files[self.cfg.upstream_file])
+        self.assertFalse(self.ops.switched)
+        self.assertEqual(self.ops.image, held["target"]["image"])
+        self.assertEqual("a", held["target"]["slot"])
+        self.assertEqual(self.ops.image_id, held["image_id"])
+        self.assertLessEqual(deploy.dt.datetime.fromisoformat(held["held_at"]),
+                             deploy.dt.datetime.now(deploy.dt.timezone.utc))
+        self.assertTrue(self.ops.migrated, "additive migrations have already run")
+        for name in LEGACY["containers"].values():
+            self.assertTrue(self.ops.containers[name]["State"]["Running"])
+            self.assertFalse(any(cmd[-1] in (name, self.ops.containers[name]["Id"]) for cmd in self.ops.mutations))
+        target = held["target"]
+        self.assertNotIn(target["containers"]["background"], self.ops.containers)
+        self.assertEqual(set(deploy.SERVING_ROLES), set(held["containers"]))
+        for role in deploy.SERVING_ROLES:
+            candidate = self.ops.containers[target["containers"][role]]
+            self.assertEqual(candidate["Id"], held["containers"][role])
+            self.assertTrue(candidate["State"]["Running"])
+            self.assertEqual("serving", candidate["role"])
+            for network in self.cfg.networks:
+                self.assertNotIn(self.cfg.serving_alias, candidate["NetworkSettings"]["Networks"][network]["Aliases"])
+            self.assertIn(f"{role}: http://127.0.0.1:{target['ports'][role]}/", "\n".join(self.ops.logs))
+
+    def test_resume_uses_tested_image_and_finishes_the_normal_release(self):
+        held = self.hold()
+        self.ops.tag_image_id = "sha256:" + "b" * 64
+        self.ops.mutations.clear()
+        oneoffs = list(self.ops.oneoffs)
+        self.assertEqual((0, ""), self.cli("resume"))
+        current = self.state()["current"]
+        self.assertEqual(held["target"]["slot"], current["slot"])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual(LEGACY, self.state()["previous"])
+        self.assertEqual(oneoffs, self.ops.oneoffs, "resume must not rerun migrations or recreate serving")
+        for role in deploy.SERVING_ROLES:
+            candidate = self.ops.containers[current["containers"][role]]
+            self.assertEqual(held["containers"][role], candidate["Id"])
+            for network in self.cfg.networks:
+                self.assertIn(self.cfg.serving_alias, candidate["NetworkSettings"]["Networks"][network]["Aliases"])
+        background = self.ops.containers[current["containers"]["background"]]
+        self.assertEqual(held["image_id"], background["Image"])
+        self.assertTrue(background["State"]["Running"])
+        old = LEGACY["containers"]["background"]
+        self.assertFalse(self.ops.containers[old]["State"]["Running"])
+        term = self.ops.mutations.index(["docker", "kill", "--signal=TERM", old])
+        start = self.ops.mutations.index(["docker", "start", current["containers"]["background"]])
+        reload = self.ops.mutations.index([self.cfg.nginx_bin, "-s", "reload"])
+        self.assertLess(term, start)
+        self.assertLess(start, reload)
+        self.assertEqual(deploy.render_upstreams(*(current["ports"][role] for role in deploy.ROLES)),
+                         self.ops.files[self.cfg.upstream_file])
+        history = [json.loads(line) for line in Path(self.cfg.history_file).read_text().splitlines()]
+        self.assertEqual(["held", "ok"], [line["result"] for line in history])
+        self.assertEqual(["background handoff", "switch", "guard", "retire previous serving"],
+                         [entry["step"] for entry in history[-1]["steps"][-4:]])
+
+    def test_resume_rejects_unhealthy_standby_before_changing_anything(self):
+        held = self.hold()
+        port = held["target"]["ports"]["standby"]
+        state_file = Path(self.cfg.state_file)
+        saved = state_file.read_bytes()
+        http = self.ops.http_json
+
+        def unhealthy(url, **kwargs):
+            if url.endswith(f":{port}/health"):
+                return 503, None
+            return http(url, **kwargs)
+
+        self.ops.mutations.clear()
+        with mock.patch.object(self.ops, "http_json", side_effect=unhealthy):
+            result, error = self.cli("resume")
+        self.assertEqual(1, result)
+        self.assertIn("Pause retained", error)
+        self.assertIn("held standby is unhealthy", error)
+        self.assertEqual([], self.ops.mutations)
+        self.assertEqual(saved, state_file.read_bytes())
+        self.assertEqual(self.upstream, self.ops.files[self.cfg.upstream_file])
+
+    def test_resume_rejects_a_replacement_a_different_image_or_changed_environment(self):
+        held = self.hold()
+        name = held["target"]["containers"]["serving"]
+        environment = self.cfg.env_files["background"]
+        for fixture, change, reason in (
+            (self.ops.containers[name], {"Id": "replacement-id"}, "container identity or image changed"),
+            (self.ops.containers[name], {"Image": "another-image"}, "container identity or image changed"),
+            (self.ops.files, {environment: "SETTING=changed\n"}, "input files changed"),
+            (self.ops.files, {self.cfg.upstream_file: "updated-upstream\n"}, "upstream file changed"),
+        ):
+            with self.subTest(reason=reason), mock.patch.dict(fixture, change):
+                self.ops.mutations.clear()
+                result, error = self.cli("resume")
+                self.assertEqual(1, result)
+                self.assertIn(reason, error)
+                self.assertEqual([], self.ops.mutations)
+                self.assertEqual(held, self.state()["in_progress"])
+
+    def test_hold_requires_both_candidates_to_answer_health_before_exiting_successfully(self):
+        standby_port = self.cfg.slots["a"]["standby"]
+        http = self.ops.http_json
+
+        def unhealthy(url, **kwargs):
+            if url.endswith(f":{standby_port}/health"):
+                return 503, None
+            return http(url, **kwargs)
+
+        with mock.patch.object(self.ops, "http_json", side_effect=unhealthy):
+            result, error = self.cli("main", self.ops.image, "--hold-before-switch")
+        self.assertEqual(1, result)
+        self.assertIn("not ready as serving", error)
+        self.assertEqual(LEGACY, self.state()["current"])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertFalse(self.ops.switched)
+        self.assertTrue(self.ops.containers[LEGACY["containers"]["background"]]["State"]["Running"])
+
+    def test_abort_reports_and_retries_partial_cleanup_by_container_id(self):
+        held = self.hold()
+        standby = held["target"]["containers"]["standby"]
+        run = self.ops.run
+
+        def fail_removal(args, **kwargs):
+            if args == ["docker", "rm", held["containers"]["standby"]]:
+                raise deploy.DeployError("fixture removal failed")
+            return run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "run", side_effect=fail_removal):
+            result, error = self.cli("abort")
+        self.assertEqual(1, result)
+        self.assertIn("phase=aborting, serving=missing, standby=exited", error)
+        self.assertEqual("aborting", self.state()["in_progress"]["phase"])
+        self.assertIn("fixture removal failed", self.state()["in_progress"]["reason"])
+        self.assertEqual("exited", deploy.status(self.cfg, self.ops)["in_progress"]["live_containers"]["standby"]["status"])
+        self.assertIn(["abort_incomplete"], [a["alert"] for a in deploy.watch_once(self.cfg, self.ops, {})])
+        self.assertIn("Retry 'abort'", self.cli("resume")[1])
+        self.assertEqual((0, ""), self.cli("abort"))
+        self.assertFalse(any(name in self.ops.containers for name in held["target"]["containers"].values()))
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual(LEGACY, self.state()["current"])
+        self.assertEqual(self.upstream, self.ops.files[self.cfg.upstream_file])
+        self.assertTrue(self.ops.migrated)
+        self.assertIn(["docker", "rm", held["containers"]["standby"]], self.ops.mutations)
+        self.assertNotIn(standby, self.ops.containers)
+
+    def test_abort_leaves_a_replacement_container_alone(self):
+        held = self.hold()
+        name = held["target"]["containers"]["serving"]
+        self.ops.add(name, held["target"]["ports"]["serving"])
+        self.ops.mutations.clear()
+        result, error = self.cli("abort")
+        self.assertEqual(1, result)
+        self.assertIn("identity of held serving", error)
+        self.assertEqual([], self.ops.mutations)
+        self.assertTrue(self.ops.containers[name]["State"]["Running"])
+        self.assertEqual("aborting", self.state()["in_progress"]["phase"])
+
+    def test_status_and_watch_distinguish_a_pause_after_restart_from_a_failed_release(self):
+        held = self.hold()
+        self.cfg.hold_warning_seconds = 1
+        held["held_at"] = "2020-01-01T00:00:00+00:00"
+        deploy.save_state(self.cfg, {**self.state(), "in_progress": held})
+        # Read the same persisted state using a fresh process/ops fixture.
+        restarted = HoldOps(self.tmp)
+        restarted.containers = copy.deepcopy(self.ops.containers)
+        paused = deploy.status(self.cfg, restarted)["in_progress"]
+        self.assertEqual("held", paused["phase"])
+        self.assertGreaterEqual(paused["age_seconds"], self.cfg.hold_warning_seconds)
+        self.assertIn("resume or abort", paused["warning"])
+        self.assertEqual([], deploy.watch_once(self.cfg, restarted, {}))
+        self.assertEqual([], restarted.mutations)
+        failed = {"step": "switch", "failed": "fixture failure", "target": held["target"]}
+        deploy.save_state(self.cfg, {**self.state(), "in_progress": failed})
+        self.assertEqual(failed, deploy.status(self.cfg, restarted)["in_progress"])
+        self.assertIn(["release_incomplete"], [a["alert"] for a in deploy.watch_once(self.cfg, restarted, {})])
+        for command in ("resume", "abort"):
+            result, error = self.cli(command)
+            self.assertEqual(1, result)
+            self.assertIn("unfinished release requires manual recovery", error)
+
+    def test_status_distinguishes_healthy_and_unhealthy_held_candidates(self):
+        held = self.hold()
+        healthy = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertIsNone(healthy["warning"])
+        for role in deploy.SERVING_ROLES:
+            candidate = healthy["live_containers"][role]
+            self.assertTrue(candidate["ready"])
+            self.assertEqual(200, candidate["health"])
+
+        port = held["target"]["ports"]["standby"]
+        http = self.ops.http_json
+
+        def unhealthy(url, **kwargs):
+            if url.endswith(f":{port}/health"):
+                return 503, None
+            return http(url, **kwargs)
+
+        with mock.patch.object(self.ops, "http_json", side_effect=unhealthy):
+            paused = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertEqual("held", paused["phase"])
+        self.assertTrue(paused["live_containers"]["serving"]["ready"])
+        standby = paused["live_containers"]["standby"]
+        self.assertEqual("running", standby["status"])
+        self.assertFalse(standby["ready"])
+        self.assertEqual(503, standby["health"])
+        self.assertIn("standby", paused["warning"])
+        self.assertIn("'abort'", paused["warning"])
+        self.assertEqual(held, self.state()["in_progress"])
+
+        # A successful /health alone does not prove the expected serving role.
+        candidate = self.ops.by_port(port)
+        with mock.patch.dict(candidate, {"role": "background"}):
+            standby = deploy.status(self.cfg, self.ops)["in_progress"]["live_containers"]["standby"]
+        self.assertEqual(200, standby["health"])
+        self.assertFalse(standby["ready"])
+
+    def test_reports_release_interrupted_after_resume_releases_its_lock(self):
+        held = self.hold()
+        serving_id = held["containers"]["serving"]
+        self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
+        run = self.ops.run
+
+        def exit_during_activation(args, **kwargs):
+            if args == ["docker", "update", "--restart=no", serving_id]:
+                progress = deploy.status(self.cfg, self.ops)["in_progress"]
+                self.assertEqual("activate held serving", progress["step"])
+                self.assertNotEqual("interrupted", progress.get("phase"))
+                self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
+                # Exit before the deployment can write a failure record.
+                raise SystemExit(97)
+            return run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "run", side_effect=exit_during_activation):
+            with self.assertRaisesRegex(SystemExit, "97"):
+                self.cli("resume")
+
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertNotIn("failed", self.state()["in_progress"])
+        state_file = Path(self.cfg.state_file)
+        saved = state_file.read_bytes()
+        progress = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertEqual("interrupted", progress.get("phase"))
+        self.assertEqual("activate held serving", progress["step"])
+        self.assertIn("release lock is free", progress["warning"])
+        alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertEqual(["release_incomplete"], alerts[0]["alert"])
+        self.assertEqual("activate held serving", alerts[0]["step"])
+        self.assertIn("release lock is free", alerts[0]["reason"])
+        self.assertEqual(saved, state_file.read_bytes())
+
+    def test_reports_interrupted_abort_and_allows_retry(self):
+        held = self.hold()
+        serving_id = held["containers"]["serving"]
+        run = self.ops.run
+
+        def exit_during_cleanup(args, **kwargs):
+            if args == ["docker", "update", "--restart=no", serving_id]:
+                self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
+                raise SystemExit(97)
+            return run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "run", side_effect=exit_during_cleanup):
+            with self.assertRaisesRegex(SystemExit, "97"):
+                self.cli("abort")
+
+        self.assertNotIn("reason", self.state()["in_progress"])
+        progress = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertEqual("aborting", progress["phase"])
+        self.assertIn("release lock is free", progress["warning"])
+        self.assertEqual(["abort_incomplete"], deploy.watch_once(self.cfg, self.ops, {})[0]["alert"])
+        self.assertEqual((0, ""), self.cli("abort"))
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_main_and_rollback_cannot_replace_a_held_release(self):
+        self.hold()
+        self.ops.commands.clear()
+        for args in (("main", self.ops.image), ("rollback",)):
+            with self.subTest(args=args):
+                result, error = self.cli(*args)
+                self.assertEqual(1, result)
+                self.assertIn("Run 'resume' or 'abort' first", error)
+        self.assertEqual([], self.ops.commands)
+        self.assertEqual("held", self.state()["in_progress"]["phase"])
+
+    def test_dry_runs_leave_the_release_containers_and_state_intact(self):
+        history = Path(self.cfg.history_file)
+        before = self.state()
+        self.assertEqual((0, ""), self.cli("--dry-run", "main", self.ops.image, "--hold-before-switch"))
+        self.assertEqual(before, self.state())
+        self.assertEqual([], self.ops.mutations)
+        self.assertFalse(history.exists())
+        self.assertIn("DRY-RUN would pause", "\n".join(self.ops.logs))
+        self.hold()
+        snapshot = self.state(), history.read_bytes(), copy.deepcopy(self.ops.containers)
+        self.ops.mutations.clear()
+        for command in ("resume", "abort"):
+            with self.subTest(command=command):
+                self.ops.commands.clear()
+                self.assertEqual((0, ""), self.cli("--dry-run", command))
+                self.assertTrue(any(cmd[0] == "DRY" for cmd in self.ops.commands))
+                self.assertEqual(snapshot, (self.state(), history.read_bytes(), self.ops.containers))
+                self.assertEqual([], self.ops.mutations)
+                self.assertEqual(self.upstream, self.ops.files[self.cfg.upstream_file])
+
+    def test_hold_rejects_contract_migrations_even_with_the_override(self):
+        self.ops.pending = "fixture_contract.sql"
+        result, error = self.cli("main", self.ops.image, "--hold-before-switch", "--allow-contract")
+        self.assertEqual(1, result)
+        self.assertIn("contract migrations are not allowed", error)
+        self.assertEqual([], self.ops.mutations)
+        self.assertIsNone(self.state()["in_progress"])
 
 
 if __name__ == "__main__":
