@@ -2209,6 +2209,7 @@ class DeployTest(unittest.TestCase):
         target = self.cfg.slot_view("a")
         run = self.ops.run
         starts = []
+        reloads = []
 
         def fail_backgrounds(args, **kw):
             if args[:2] == ["docker", "start"] and args[-1] in (
@@ -2216,18 +2217,26 @@ class DeployTest(unittest.TestCase):
                 starts.append(args[-1])
                 if starts != [target["containers"]["background"]]:
                     raise deploy.DeployError("fixture: background failed to start")
-            return run(args, **kw)
+            result = run(args, **kw)
+            if args == [self.cfg.nginx_bin, "-s", "reload"]:
+                reloads.append(self.upstreams_only(self.ops.loaded_upstreams))
+            return result
 
         with mock.patch.object(self.ops, "run", fail_backgrounds):
             with self.assertRaisesRegex(deploy.FallbackFailed, "verify.*before clearing in_progress"):
                 self.deploy()
+        expected = self.upstreams_for({"ports": {**LEGACY["ports"], "background": target["ports"]["background"]}})
+        self.assertEqual([self.upstreams_for(target), expected], reloads)
+        self.assertEqual(expected, self.upstreams_only(self.ops.loaded_upstreams))
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        self.assertFalse(deployer.background_answering(LEGACY))
+        self.assertFalse(deployer.background_answering(target))
         self.assertEqual([target["containers"]["background"], LEGACY["containers"]["background"],
                           target["containers"]["background"]], starts)
-        self.assertEqual(self.upstreams_for(target), self.upstreams_only(self.ops.loaded_upstreams))
         self.assertEqual(self.ops.loaded_upstreams, self.ops.files[self.cfg.upstream_file])
         self.assertEqual("failed", self.state()["in_progress"]["phase"])
         log = "\n".join(self.ops.logs)
-        self.assertIn("FAILED AND NOT RESTORED", log)
+        self.assertIn("ROLLBACK INCOMPLETE", log)
         self.assertIn("restore one background", log)
 
     def test_guard_rollback_precheck_preserves_running_background(self):

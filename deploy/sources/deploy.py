@@ -913,6 +913,10 @@ class Deployer:
         self.cfg = cfg
         self.ops = ops
         self.timings: list[dict[str, Any]] = []
+        # Backgrounds whose start already failed while they stayed stopped in
+        # this run. Recovery layers consult it so one background gets one
+        # start attempt per run instead of each layer retrying the same one.
+        self.background_start_failures: set[str] = set()
 
     # helpers ---------------------------------------------------------------
     def log(self, msg: str) -> None:
@@ -1411,11 +1415,24 @@ class Deployer:
                 # as before. Only a reused container needs the update.
                 self.ops.run(["docker", "update", f"--restart={restart}", name], mutate=True,
                              timeout=self.recovery_timeout(deadline, 600))
-            self.ops.run(["docker", "start", name], mutate=True, timeout=self.recovery_timeout(deadline, 600))
-            if not self.ops.dry_run:
-                self.wait_ready(view["ports"]["background"], self.token_for(view, "background"),
-                                "background", self.cfg.background_ready_timeout, container=name,
-                                poll=HANDOFF_POLL_SECONDS, check_health=check_health, deadline=deadline)
+            try:
+                self.ops.run(["docker", "start", name], mutate=True,
+                             timeout=self.recovery_timeout(deadline, 600))
+                if not self.ops.dry_run:
+                    self.wait_ready(view["ports"]["background"], self.token_for(view, "background"),
+                                    "background", self.cfg.background_ready_timeout, container=name,
+                                    poll=HANDOFF_POLL_SECONDS, check_health=check_health, deadline=deadline)
+            except (Exception, KeyboardInterrupt):
+                # Nothing has changed for a container that is still stopped, so
+                # an immediate repeat of the same start cannot help. Record it
+                # for the later recovery layers, which then leave this
+                # background alone instead of starting it a second time.
+                if not self.ops.dry_run:
+                    with contextlib.suppress(Exception, KeyboardInterrupt):
+                        if not self.background_running(view):
+                            self.background_start_failures.add(name)
+                raise
+            self.background_start_failures.discard(name)
 
     def restore_background(self, current: dict[str, Any], failed: DeployError, *, restart: str,
                            recovery: BackgroundRecovery | None = None) -> NoReturn:
@@ -2322,6 +2339,9 @@ class Deployer:
         try:
             if self.background_running(view):
                 return False
+            if name in self.background_start_failures:
+                self.log(f"   {name} already failed to start in this run; not repeating it")
+                return False
             self.log(f"   {name} is stopped; restarting it so admin keeps an owner")
             self.start_background(view, check_health=True)
             return self.background_answering(view)
@@ -2349,7 +2369,7 @@ class Deployer:
         owner, detail = self.answering_admin_owner(views)
         restarted = isinstance(err, BackgroundRestored)
         if owner is None:
-            self.log(f"   no background answers admin; restarting slot {views['candidate']['slot']}'s background")
+            self.log(f"   no background answers admin; checking slot {views['candidate']['slot']}'s background")
             try:
                 self.revive_background(views["candidate"])
             except (Exception, KeyboardInterrupt) as revive_err:  # noqa: BLE001 - probe again anyway
