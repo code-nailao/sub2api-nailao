@@ -959,6 +959,14 @@ class Deployer:
                 return view["slot"]
         return None
 
+    @staticmethod
+    def distinct_views(*views: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+        """One view per slot, first occurrence wins."""
+        chosen: dict[str, dict[str, Any]] = {}
+        for view in views:
+            chosen.setdefault(view["slot"], view)
+        return tuple(chosen.values())
+
     def _route_progress(self) -> dict[str, Any]:
         state = load_state(self.cfg)
         progress = state.get("in_progress")
@@ -1012,7 +1020,8 @@ class Deployer:
 
     def publish_routes(self, serving: dict[str, Any], *, admin: dict[str, Any] | None = None,
                        admin_required: bool = True, deadline: float | None = None,
-                       note: str = "") -> RouteOutcome:
+                       note: str = "", views: tuple[dict[str, Any], ...] = ()
+                       ) -> RouteOutcome:
         """The only place either upstream is written.
 
         Every role named in the new route is probed here, immediately before
@@ -1020,9 +1029,14 @@ class Deployer:
         The standby is written only while it answers. Admin moves only to a
         background that was just probed as the lock holder; when it is not
         required (a guard rollback keeps admin where it is) the loaded pointer
-        is left alone rather than pointed at an unverified target."""
+        is left alone rather than pointed at an unverified target.
+
+        Whatever was written is then settled through `write_route`, which is
+        also the only exit of a failed decision: a role that dropped out in the
+        same window is removed from the route and reported there."""
         serving_slot = serving["slot"]
         admin_view = serving if admin is None else admin
+        related = self.distinct_views(serving, admin_view, *views)
         if self.ops.dry_run:
             text = render_upstreams(serving["ports"]["serving"], serving["ports"]["standby"],
                                     admin_view["ports"]["background"])
@@ -1034,17 +1048,20 @@ class Deployer:
             return RouteOutcome(True, text, serving_slot, admin_view["slot"],
                                 admin_view["ports"]["background"], "dry-run",
                                 {"serving": synthetic}, [])
-        # Probe the background first and the serving primary last: the serving
-        # probe is the freshest fact when the file is written, and a role that
-        # exits during an earlier probe is seen by a later one. Any total order
-        # can still be raced; the post-write probes below catch the rest.
+        # The admin target is probed last, immediately before the write: an
+        # admin upstream cannot be left without a server, so a background that
+        # dies there has no fallback inside the file. The serving primary and
+        # the standby are probed just before that and corrected from the file
+        # when they drop out in the remaining window.
         admin_probe = self.probe_role(admin_view, "background", deadline=deadline)
-        backup = self.probe_role(serving, "standby", deadline=deadline)
         primary = self.probe_role(serving, "serving", deadline=deadline)
+        backup = self.probe_role(serving, "standby", deadline=deadline)
+        admin_probe = self.probe_role(admin_view, "background", deadline=deadline)
         if not primary.usable:
+            self.settle_loaded_route(related, note=f"{note or 'route write'}: refused write",
+                                     deadline=deadline)
             raise RouteRefused(
                 f"not writing the service route: {primary.evidence()}; the loaded route is unchanged")
-        issues: list[dict[str, Any]] = []
         if not backup.usable:
             self.log(f"   slot {serving_slot} standby stays out of the route: {backup.evidence()}")
         admin_port = admin_view["ports"]["background"]
@@ -1052,21 +1069,25 @@ class Deployer:
         admin_source = "probed"
         if not admin_probe.usable:
             if admin_required:
+                self.settle_loaded_route(related, note=f"{note or 'route write'}: refused write",
+                                         deadline=deadline)
                 raise RouteRefused(
                     f"not writing the admin route: {admin_probe.evidence()}; the loaded route is unchanged")
             loaded_admin = self.loaded_route_ports()[1]
             if loaded_admin is None:
+                self.settle_loaded_route(related, note=f"{note or 'route write'}: refused write",
+                                         deadline=deadline)
                 raise RouteRefused(
                     f"no background answers admin and the loaded route names no admin port: "
                     f"{admin_probe.evidence()}")
             admin_port = loaded_admin
-            admin_slot = self.admin_port_slot(loaded_admin, (serving, admin_view))
+            admin_slot = self.admin_port_slot(loaded_admin, related)
             admin_source = "kept; the target did not answer"
             self.log(f"   admin stays on port {loaded_admin}: {admin_probe.evidence()}")
         text = render_upstreams(primary.port, backup.port if backup.usable else None, admin_port)
         written = text != self.current_upstreams()
         if written:
-            self.install_upstreams(text)
+            issues = self.write_route(text, related, note=note or "route write", deadline=deadline)
             backup_note = "" if backup.usable else f"; no backup ({backup.outcome})"
             self.log(f"   route written: serving slot {serving_slot} port {primary.port}{backup_note} "
                      f"({primary.evidence()}); admin slot {admin_slot or 'unknown'} port {admin_port} "
@@ -1074,9 +1095,10 @@ class Deployer:
         else:
             self.log(f"   route already points at serving slot {serving_slot} port {primary.port} "
                      f"and admin port {admin_port}; no reload")
-        # A write is only valid at the instant of its probe: look again, now.
-        issues += self.verify_loaded_route((serving, admin_view),
-                                           note=f"{note or 'route write'}: after writing")
+            # Not a write, but the roles named by the loaded file still have to
+            # hold: a file written by an earlier step is checked here too.
+            issues = self.settle_loaded_route(related, note=f"{note or 'route write'}: after writing",
+                                              deadline=deadline)
         self.record_route(primary, backup, admin_probe, admin_slot, admin_port, admin_source, note)
         return RouteOutcome(written, text, serving_slot, admin_slot, admin_port, admin_source,
                             {"serving": primary, "standby": backup, "background": admin_probe}, issues)
@@ -1121,28 +1143,104 @@ class Deployer:
                 self.log(f"   WARNING: could not record the admin route: {err}")
         return post
 
-    def verify_loaded_route(self, views: tuple[dict[str, Any], ...] | list[dict[str, Any]],
-                            *, note: str = "") -> list[dict[str, Any]]:
-        """Probe every role the loaded file names. A role that was written and
-        no longer answers is reported with slot, role and time; it is not
-        silently left for the next release to discover."""
+    def write_route(self, text: str, views: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+                    *, note: str, deadline: float | None = None) -> list[dict[str, Any]]:
+        """The only exit for a route write.
+
+        Nginx is told to load `text`, then every port the loaded file names is
+        probed again immediately. A role that stopped answering is removed in
+        the same round by `settle_loaded_route`, and every finding is kept with
+        its slot, role and time. Nothing that writes a route returns or raises
+        without this having run."""
+        self.install_upstreams(text)
+        return self.settle_loaded_route(views, note=note, deadline=deadline)
+
+    def settle_loaded_route(self, views: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+                            *, note: str = "", deadline: float | None = None) -> list[dict[str, Any]]:
+        """Probe every role the loaded file names and correct what no longer
+        answers, in this same round.
+
+        A dead standby is dropped, a dead primary hands over to its answering
+        standby, and a dead admin moves to another background that answers now.
+        An upstream that would be left without a server is never rewritten;
+        that finding stays and the caller reports it. At most one corrective
+        rewrite is made: a route that is still wrong after it is reported, not
+        rewritten again."""
         if self.ops.dry_run:
             return []
-        serving_ports, admin_port = self.loaded_route_ports()
-        issues: list[dict[str, Any]] = []
-        for view in views:
-            for role in SERVING_ROLES:
-                if view["ports"][role] in serving_ports:
-                    probe = self.probe_role(view, role)
+        views = self.distinct_views(*views)
+        findings: list[dict[str, Any]] = []
+        for attempt in range(2):
+            serving_ports, admin_port = self.loaded_route_ports()
+            round_findings: list[dict[str, Any]] = []
+            for view in views:
+                for role in SERVING_ROLES:
+                    if view["ports"][role] in serving_ports:
+                        probe = self.probe_role(view, role, deadline=deadline)
+                        if not probe.usable:
+                            round_findings.append(route_issue("written_role_exited", probe))
+                if admin_port is not None and view["ports"]["background"] == admin_port:
+                    probe = self.probe_role(view, "background", deadline=deadline)
                     if not probe.usable:
-                        issues.append(route_issue("written_role_exited", probe))
-            if admin_port is not None and view["ports"]["background"] == admin_port:
-                probe = self.probe_role(view, "background")
-                if not probe.usable:
-                    issues.append(route_issue("written_role_exited", probe))
-        if issues:
-            self._record_route_issues(issues, note or "verification")
-        return issues
+                        round_findings.append(route_issue("written_role_exited", probe))
+            if not round_findings:
+                return findings
+            findings.extend(round_findings)
+            self._record_route_issues(round_findings, note or "verification")
+            if attempt or not self.correct_loaded_route(
+                    views, round_findings, note=note or "verification", deadline=deadline):
+                return findings
+        return findings
+
+    def correct_loaded_route(self, views: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+                             findings: list[dict[str, Any]], *, note: str,
+                             deadline: float | None = None) -> bool:
+        """Rewrite the loaded route once without the roles that just failed.
+        Returns whether the file was rewritten."""
+        text = self.current_upstreams()
+        if text is None:
+            return False
+        serving_ports, admin_port = loaded_upstream_ports(text)
+        dead = {i["port"] for i in findings}
+        surviving = [p for p in serving_ports if p not in dead]
+        if not surviving:
+            # An upstream with no server is rejected by `nginx -t`; there is
+            # nothing to write. The finding is what the caller reports.
+            return False
+        new_admin = admin_port
+        if admin_port is not None and admin_port in dead:
+            new_admin = None
+            for view in views:
+                candidate = view["ports"]["background"]
+                if candidate == admin_port:
+                    continue
+                probe = self.probe_role(view, "background", deadline=deadline)
+                if probe.usable:
+                    new_admin = candidate
+                    self.log(f"   correcting the admin route to slot {view['slot']} port {candidate} "
+                             f"({probe.evidence()})")
+                    break
+            if new_admin is None:
+                return False
+        if new_admin is None:
+            return False
+        corrected = render_upstreams(surviving[0], surviving[1] if len(surviving) > 1 else None,
+                                     new_admin)
+        if corrected == text:
+            return False
+        self.install_upstreams(corrected)
+        dropped = sorted(set(serving_ports) - set(surviving))
+        self.log(f"   route corrected ({note}): removed serving ports {dropped or 'none'}, "
+                 f"admin port {admin_port} -> {new_admin}")
+        return True
+
+    def recorded_route_issues(self) -> list[dict[str, Any]]:
+        """Every route finding this run has recorded. Unlike
+        `unresolved_route_issues`, a finding stays here after a corrective
+        rewrite removed the port: nobody has verified the route since it
+        dropped, so a person still has to look."""
+        progress = load_state(self.cfg).get("in_progress") or {}
+        return list(progress.get("route_issues") or [])
 
     def unresolved_route_issues(self) -> list[dict[str, Any]]:
         """Findings that still matter: a recorded role failure whose port the
@@ -1653,7 +1751,7 @@ class Deployer:
                 # Retirement failing must not skip the check of the roles that
                 # were written: the reason to look is exactly that a step
                 # failed while the route was live.
-                found = self.verify_loaded_route(
+                found = self.settle_loaded_route(
                     (previous, target.view()), note="guard rollback: retirement failed")
                 detail = f" {describe_route_issues(found)}." if found else ""
                 raise ServingCleanupFailed(f"{restored}. Incomplete serving cleanup: {err}.{detail} "
@@ -1664,9 +1762,9 @@ class Deployer:
         # the same round instead of surfacing at the next release. A finding
         # stays unresolved even if the role came back, because nobody has
         # verified the route since.
-        self.verify_loaded_route((previous, target.view()),
+        self.settle_loaded_route((previous, target.view()),
                                  note="guard rollback: after retiring the candidate serving")
-        issues = self.unresolved_route_issues()
+        issues = self.recorded_route_issues()
         if issues:
             failure = FallbackFailed(
                 f"{restored}, but {describe_route_issues(issues)}. Restore or remove the affected role "
@@ -2084,9 +2182,9 @@ class Deployer:
             # Probe it before promising the release: a role written into the
             # route and since gone keeps in_progress with the finding, even if
             # it has come back, because nobody has verified the route since.
-            self.verify_loaded_route((view, current),
+            self.settle_loaded_route((view, current),
                                      note="release: after retiring the previous serving")
-            issues = self.unresolved_route_issues()
+            issues = self.recorded_route_issues()
             if issues or retire_error is not None:
                 reason = ("release finished but the previous serving was not fully retired: "
                           f"{retire_error}" if retire_error is not None else "release finished")
