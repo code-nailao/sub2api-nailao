@@ -1714,8 +1714,9 @@ class Deployer:
         except (Exception, KeyboardInterrupt) as cleanup_err:  # noqa: BLE001 - record before leaving
             failure = FallbackFailed(
                 f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not finish "
-                f"({err}); settling the admin entry failed too ({cleanup_err}). The admin entry is unavailable "
-                "and needs a person to check live routing and restore a background")
+                f"({err}); settling the admin entry failed too ({cleanup_err}). No background is confirmed to "
+                f"answer admin; check slot {previous['slot']} and slot {target.slot} and restore one background "
+                "that holds the lock and answers /health, then verify live routing before clearing in_progress")
         self.record_guard_failure(target, failure)
         self._guard_settled = True
         return failure
