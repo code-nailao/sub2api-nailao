@@ -1157,6 +1157,316 @@ class DeployTest(unittest.TestCase):
         self.assertTrue(any(a.get("alert") == ["docker_inspect_failed"] and a.get("slot") == "a"
                             and a.get("role") == "standby" for a in alerts), alerts)
 
+    # -- review round: probe ordering, retirement and admin evidence ----------
+    BASE_SUCCESS_COMMANDS = """\
+docker image inspect new@sha256:2
+docker pull new@sha256:2
+/usr/sbin/nginx -T
+inspector sources-main-a-serving
+inspector sources-main-a-standby
+inspector sources-main-a-background
+docker create --name sources-main-oneoff-<pid>-<t> --user 1001:1001 --entrypoint /app/sub2api --network app-data --label com.sources.deploy.role=oneoff --env-file /opt/x/background.env -e SOURCES_PROCESS_ROLE=background --mount type=bind,source=/state/main,target=/app/data new@sha256:2 -list-pending-migrations
+docker network connect app-upstream sources-main-oneoff-<pid>-<t>
+docker start --attach sources-main-oneoff-<pid>-<t>
+docker rm -f sources-main-oneoff-<pid>-<t>
+docker create --name sources-main-oneoff-<pid>-<t> --user 1001:1001 --entrypoint /app/sub2api --network app-data --label com.sources.deploy.role=oneoff --env-file /opt/x/background.env -e SOURCES_PROCESS_ROLE=background --mount type=bind,source=/state/main,target=/app/data new@sha256:2 -migrate-only 001_add.sql
+docker network connect app-upstream sources-main-oneoff-<pid>-<t>
+docker start --attach sources-main-oneoff-<pid>-<t>
+docker rm -f sources-main-oneoff-<pid>-<t>
+docker create --name sources-main-oneoff-<pid>-<t> --user 1001:1001 --entrypoint /app/sub2api --network app-data --label com.sources.deploy.role=oneoff --env-file /opt/x/serving.env -e SOURCES_PROCESS_ROLE=serving --mount type=bind,source=/state/main,target=/app/data new@sha256:2 -check-startup
+docker network connect app-upstream sources-main-oneoff-<pid>-<t>
+docker start --attach sources-main-oneoff-<pid>-<t>
+docker rm -f sources-main-oneoff-<pid>-<t>
+docker create --name sources-main-oneoff-<pid>-<t> --user 1001:1001 --entrypoint /app/sub2api --network app-data --label com.sources.deploy.role=oneoff --env-file /opt/x/background.env -e SOURCES_PROCESS_ROLE=background --mount type=bind,source=/state/main,target=/app/data new@sha256:2 -check-startup
+docker network connect app-upstream sources-main-oneoff-<pid>-<t>
+docker start --attach sources-main-oneoff-<pid>-<t>
+docker rm -f sources-main-oneoff-<pid>-<t>
+rm -rf <tmp>/work/assets-staging
+install -d -o 1001 -m 0755 <tmp>/work/assets-staging
+docker create --name sources-main-oneoff-<pid>-<t> --user 1001:1001 --entrypoint /app/sub2api --network app-data --label com.sources.deploy.role=oneoff --env-file /opt/x/serving.env -e SOURCES_PROCESS_ROLE=serving --mount type=bind,source=/state/main,target=/app/data --mount type=bind,source=<tmp>/work/assets-staging,target=/export new@sha256:2 -export-web-assets /export
+docker network connect app-upstream sources-main-oneoff-<pid>-<t>
+docker start --attach sources-main-oneoff-<pid>-<t>
+docker rm -f sources-main-oneoff-<pid>-<t>
+cp -Rn <tmp>/work/assets-staging/. /opt/sources-web/main/assets/
+docker rm -f sources-main-a-serving
+docker rm -f sources-main-a-standby
+docker rm -f sources-main-a-background
+rm -rf <tmp>/work/containers/sources-main-a-serving/pricing-cache
+mkdir -p <tmp>/work/containers/sources-main-a-serving
+cp -a /opt/x/inputs/serving/pricing-cache <tmp>/work/containers/sources-main-a-serving/pricing-cache
+docker create --name sources-main-a-serving --hostname sources-main-a-serving --user 1001:1001 --entrypoint /app/sub2api --restart unless-stopped --memory 24g --cpus 12 --pids-limit 4096 --log-opt max-size=10m --log-opt max-file=3 --publish 127.0.0.1:9401:8080 --network app-data --network-alias sources-main-a-serving --network-alias sources-main-serving --label com.sources.deploy.slot=a --label com.sources.deploy.role=serving --label com.sources.deploy.created=<ts> --env-file /opt/x/serving.env -e SOURCES_PROCESS_ROLE=serving --mount type=bind,source=/state/main,target=/app/data --mount type=bind,source=<tmp>/work/containers/sources-main-a-serving/pricing-cache,target=/runtime/pricing-cache new@sha256:2
+docker network connect --alias sources-main-a-serving --alias sources-main-serving app-upstream sources-main-a-serving
+docker start sources-main-a-serving
+rm -rf <tmp>/work/containers/sources-main-a-standby/pricing-cache
+mkdir -p <tmp>/work/containers/sources-main-a-standby
+cp -a /opt/x/inputs/serving/pricing-cache <tmp>/work/containers/sources-main-a-standby/pricing-cache
+docker create --name sources-main-a-standby --hostname sources-main-a-standby --user 1001:1001 --entrypoint /app/sub2api --restart unless-stopped --memory 24g --cpus 12 --pids-limit 4096 --log-opt max-size=10m --log-opt max-file=3 --publish 127.0.0.1:9402:8080 --network app-data --network-alias sources-main-a-standby --network-alias sources-main-serving --label com.sources.deploy.slot=a --label com.sources.deploy.role=standby --label com.sources.deploy.created=<ts> --env-file /opt/x/serving.env -e SOURCES_PROCESS_ROLE=serving --mount type=bind,source=/state/main,target=/app/data --mount type=bind,source=<tmp>/work/containers/sources-main-a-standby/pricing-cache,target=/runtime/pricing-cache new@sha256:2
+docker network connect --alias sources-main-a-standby --alias sources-main-serving app-upstream sources-main-a-standby
+docker start sources-main-a-standby
+inspector old-bg
+docker create --name sources-main-a-background --hostname sources-main-a-background --user 1001:1001 --entrypoint /app/sub2api --restart unless-stopped --memory 24g --cpus 12 --pids-limit 4096 --log-opt max-size=10m --log-opt max-file=3 --publish 127.0.0.1:9403:8080 --network app-data --network-alias sources-main-a-background --label com.sources.deploy.slot=a --label com.sources.deploy.role=background --label com.sources.deploy.created=<ts> --env-file /opt/x/background.env -e SOURCES_PROCESS_ROLE=background --mount type=bind,source=/state/main,target=/app/data new@sha256:2
+docker network connect --alias sources-main-a-background app-upstream sources-main-a-background
+docker update --restart=no old-bg
+docker kill --signal=TERM old-bg
+inspector old-bg
+docker update --restart=unless-stopped sources-main-a-background
+docker start sources-main-a-background
+inspector sources-main-a-background
+/usr/sbin/nginx -t
+/usr/sbin/nginx -s reload
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector old-serving
+docker update --restart=no old-serving
+docker kill --signal=TERM old-serving
+inspector old-spare
+docker update --restart=no old-spare
+docker kill --signal=TERM old-spare
+"""
+
+    def normalised_commands(self):
+        """Every Docker, Nginx and inspect call, in order, with volatile parts
+        replaced. `inspect` is recorded because the real tool runs it as a
+        Docker command; the stock fake answers it without going through run()."""
+        original = self.ops.inspect
+
+        def recording_inspect(name, **kw):
+            self.ops.commands.append(["inspector", name])
+            return original(name, **kw)
+
+        with mock.patch.object(self.ops, "inspect", recording_inspect):
+            self.deploy()
+        lines = []
+        for cmd in self.ops.commands:
+            text = " ".join(cmd)
+            text = __import__("re").sub(r"sources-main-oneoff-\d+-\d+", "sources-main-oneoff-<pid>-<t>", text)
+            text = text.replace(str(self.tmp), "<tmp>")
+            text = __import__("re").sub(r"created=[0-9T:+.\-]+", "created=<ts>", text)
+            lines.append(text)
+        return lines
+
+    def test_success_command_sequence_matches_base(self):
+        """A successful release runs exactly the commands it ran before the
+        guard work: same calls, same order, no probe-specific `docker inspect`."""
+        expected = self.BASE_SUCCESS_COMMANDS.splitlines()
+        actual = self.normalised_commands()
+        self.assertEqual(expected, actual, "the successful release command sequence changed")
+
+    def stop_during_probe(self, stop, *, port, path="/internal/sources/runtime", step=None):
+        """Stop containers while a chosen probe is in flight, then answer it.
+        `step` limits the hook to the rollback (the guard step), so the stop
+        happens during the rollback's own probes, not earlier in the release."""
+        real = self.ops.http_json
+        fired = []
+
+        def probe(url, **kw):
+            if not fired and url.startswith(f"http://127.0.0.1:{port}{path}"):
+                current = (self.state().get("in_progress") or {}).get("step")
+                if step is None or current == step:
+                    fired.append(1)
+                    stop()
+            return real(url, **kw)
+
+        return mock.patch.object(self.ops, "http_json", probe)
+
+    def test_rollback_prewrite_serving_exits_during_admin_probe(self):
+        """Invariant 1: the serving primary is probed after the background, so a
+        primary that exits during the background probe is not written."""
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+
+        def stop_primary():
+            self.ops.containers["old-serving"]["State"].update(Running=False, Status="exited")
+
+        with self.stop_during_probe(stop_primary, port=target["ports"]["background"], step="guard"):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "rollback service route was not written"):
+                self.deploy()
+        self.assertEqual(self.upstreams_for(target), self.ops.loaded_upstreams,
+                         "a dead primary was not written into the service route")
+        self.assertNotIn(f"127.0.0.1:{LEGACY['ports']['serving']}",
+                         self.ops.files[self.cfg.upstream_file])
+        progress = self.state()["in_progress"]
+        self.assertEqual("failed", progress["phase"])
+        self.assertIn("slot legacy's serving containers", progress["failed"])
+
+    def test_rollback_prewrite_standby_exits_during_admin_probe(self):
+        """Invariant 3: a standby that exits during the background probe is
+        simply not written; the primary still takes traffic."""
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+
+        def stop_standby():
+            self.ops.containers["old-spare"]["State"].update(Running=False, Status="exited")
+
+        with self.stop_during_probe(stop_standby, port=target["ports"]["background"], step="guard"):
+            with self.assertRaisesRegex(deploy.DeployError, "guard failed"):
+                self.deploy()
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['serving']} max_fails", upstream)
+        self.assertNotIn(f"127.0.0.1:{LEGACY['ports']['standby']}", upstream)
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_manual_rollback_accepts_healthy_primary_without_standby(self):
+        """Invariant 3: a missing standby does not block returning to a healthy
+        previous primary."""
+        self.deploy()
+        self.ops.containers.pop("old-spare")
+        deploy.Deployer(self.cfg, self.ops).rollback()
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['serving']} max_fails", upstream)
+        self.assertNotIn(f"127.0.0.1:{LEGACY['ports']['standby']}", upstream)
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_rollback_checks_written_roles_when_retirement_fails(self):
+        """Invariant 2: a retirement error must not skip the check of the roles
+        already written; a primary that exited is named."""
+        self.ops.memory_after_switch = 20 * GIB
+        candidate_serving = self.cfg.container("a", "serving")
+        run = self.ops.run
+
+        def fail_retirement(args, **kw):
+            if args == ["docker", "update", "--restart=no", candidate_serving]:
+                self.ops.containers["old-serving"]["State"].update(Running=False, Status="exited")
+                raise deploy.DeployError("fixture: cannot retire the candidate")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", fail_retirement):
+            with self.assertRaisesRegex(deploy.ServingCleanupFailed, "slot legacy serving"):
+                self.deploy()
+        progress = self.state()["in_progress"]
+        self.assertEqual("failed", progress["phase"])
+        self.assertTrue(any(i["slot"] == "legacy" and i["role"] == "serving"
+                            for i in progress["route_issues"]), progress["route_issues"])
+
+    def test_transient_exit_during_failed_retire_surfaces_in_status_and_watch(self):
+        """B segment 8: the exit is recorded even when the role is back before
+        the next watch sample."""
+        self.ops.memory_after_switch = 20 * GIB
+        candidate_serving = self.cfg.container("a", "serving")
+        run = self.ops.run
+        retired_failed = False
+
+        def fail_retirement(args, **kw):
+            nonlocal retired_failed
+            if args == ["docker", "update", "--restart=no", candidate_serving] and not retired_failed:
+                retired_failed = True
+                self.ops.containers["old-serving"]["State"].update(Running=False, Status="exited")
+                raise deploy.DeployError("fixture: cannot retire the candidate")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", fail_retirement):
+            with self.assertRaises(deploy.ServingCleanupFailed):
+                self.deploy()
+        # The role is back by the time anyone looks again.
+        self.ops.containers["old-serving"]["State"].update(Running=True, Status="running")
+
+        progress = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertTrue(any(i["slot"] == "legacy" and i["role"] == "serving" and i.get("found_at")
+                            for i in progress["route_issues"]), progress["route_issues"])
+        alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertTrue(any(a["alert"] == ["in_progress"] and a.get("route_issues") for a in alerts), alerts)
+        self.assertIn("route issue", "\n".join(self.ops.logs))
+
+    def test_successful_publish_preserves_prewrite_admin_probe(self):
+        """Invariant 4: a successful release keeps the probe that justified the
+        admin move, after in_progress is cleared."""
+        self.deploy()
+        self.assertIsNone(self.state()["in_progress"])
+        route = deploy.status(self.cfg, self.ops)["last_route"]
+        admin = route["admin"]
+        self.assertEqual("probed", admin["source"])
+        self.assertEqual("a", admin["slot"])
+        self.assertEqual(9403, admin["port"])
+        self.assertEqual("answers", admin["probe"]["outcome"])
+        self.assertTrue(admin["at"])
+        self.assertEqual([9401, 9402], route["serving"]["written"])
+        log = "\n".join(self.ops.logs)
+        self.assertIn("admin slot a port 9403 (probed; slot a background", log)
+
+    def test_successful_rollback_preserves_prewrite_admin_probe(self):
+        self.deploy()
+        deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertIsNone(self.state()["in_progress"])
+        admin = deploy.status(self.cfg, self.ops)["last_route"]["admin"]
+        self.assertEqual("probed", admin["source"])
+        self.assertEqual("legacy", admin["slot"])
+        self.assertEqual(LEGACY["ports"]["background"], admin["port"])
+        self.assertEqual("answers", admin["probe"]["outcome"])
+
+    def test_guard_reports_no_background_when_service_route_is_refused(self):
+        """Invariant 5: a refused serving write still says that no background
+        answers admin and names the one to restore."""
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+        candidate_background = target["containers"]["background"]
+
+        def stop_everything():
+            self.ops.containers["old-serving"]["State"].update(Running=False, Status="exited")
+            self.ops.containers["old-bg"]["State"].update(Running=False, Status="exited")
+            self.ops.containers[candidate_background]["State"].update(Running=False, Status="exited")
+
+        # The previous primary is the last probe before the rollback write.
+        with self.stop_during_probe(stop_everything, port=LEGACY["ports"]["serving"], step="guard"):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "No background answers admin now") as ctx:
+                self.deploy()
+        self.assertIn("restore one background (slot legacy", str(ctx.exception))
+        progress = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertEqual("no background answers", progress["admin_route"]["source"])
+        self.assertEqual("legacy", progress["admin_route"]["restore"])
+
+    def test_guard_keeps_loaded_admin_after_failed_postwrite_probe(self):
+        """Invariant 5: after the admin write, a failed probe stops on the
+        loaded route. No second reload, no trying the other slot."""
+        self.ops.memory_after_switch = 20 * GIB
+        old_admin = LEGACY["ports"]["background"]
+        candidate_background = self.cfg.container("a", "background")
+        write = self.ops.write_file_atomic
+        admin_writes = []
+
+        def stop_after_admin_write(path, text, **kw):
+            result = write(path, text, **kw)
+            if path == self.cfg.upstream_file and f"127.0.0.1:{old_admin};" in text:
+                admin_writes.append(len(self.ops.commands))
+                self.ops.containers["old-bg"]["State"].update(Running=False, Status="exited")
+            return result
+
+        with mock.patch.object(self.ops, "write_file_atomic", stop_after_admin_write):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "no further reload"):
+                self.deploy()
+        self.assertEqual(1, len(admin_writes), "admin moved exactly once")
+        after = self.ops.commands[admin_writes[0]:]
+        self.assertEqual(1, sum(1 for c in after if c[1:] == ["-s", "reload"]),
+                         "only the admin move's own reload happens after the write")
+        self.assertNotIn(["docker", "start", candidate_background], after,
+                         "the candidate background is not restarted after the failed probe")
+        self.assertIn(f"127.0.0.1:{old_admin};", self.ops.loaded_upstreams)
+        progress = self.state()["in_progress"]
+        self.assertTrue(any(i["slot"] == "legacy" and i["role"] == "background"
+                            for i in progress["route_issues"]), progress["route_issues"])
+
+    def test_watch_alerts_on_runtime_timeout_with_healthy_port(self):
+        """B segment 10: a running container with /health 200 but no runtime
+        answer is reported, not skipped."""
+        self.deploy()
+        real = self.ops.http_json
+
+        def slow_runtime(url, **kw):
+            if url.startswith("http://127.0.0.1:9401/internal/sources/runtime"):
+                return 0, None
+            return real(url, **kw)
+
+        with mock.patch.object(self.ops, "http_json", slow_runtime):
+            alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertTrue(any(a.get("alert") == ["runtime_unavailable"] and a.get("slot") == "a"
+                            and a.get("role") == "serving" for a in alerts), alerts)
+
     def test_guard_counts_connect_failures_only_for_new_ports(self):
         line = 'connect() failed (111) while connecting to upstream, upstream: "http://127.0.0.1:{}/v1"'
         text = "\n".join([line.format(9401)] * 3 + [line.format(9426)] * 50)
