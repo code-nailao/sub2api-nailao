@@ -116,28 +116,49 @@ def unquote(line):
         position = marker.end()
 
 
+def quoted_prefix(line, depth):
+    """Returns the line with exactly `depth` block quote markers removed."""
+    position = 0
+    for _ in range(depth):
+        marker = QUOTE.match(line, position)
+        if not marker:
+            break
+        position = marker.end()
+    return line[position:]
+
+
 def strip_code(text):
-    """Drops fenced blocks and code spans, which GitHub never links from."""
+    """Drops fenced blocks and code spans, which GitHub never links from.
+
+    The quote depth and the open fence are read together. Outside a fence a
+    line's markers say what depth the description is at, and a fence opens at
+    the depth it is found on. Inside one a `>` is code rather than a marker:
+    only the markers that place the line at the fence's own depth are removed,
+    so a line that looks like a closing fence once the rest is stripped cannot
+    close it. A line above the fence's depth ends the quote holding the fence,
+    and GitHub ends the fence with it. Every other line of an open fence is
+    code, and an unclosed fence runs to the end of the description.
+    """
     kept = []
-    fence = None  # (character, length, depth in quotes) of the open fence
+    fence = None  # (character, length, quote depth) of the open fence
     for line in text.splitlines():
         depth, content = unquote(line)
-        if fence is not None and depth < fence[2]:
-            fence = None  # the quote holding this fence ended, so the fence did
-        if fence is None:
-            opening = FENCE.match(content)
-            if opening:
-                fence = (opening.group(1)[0], len(opening.group(1)), depth)
+        if fence is not None:
+            if depth < fence[2]:
+                fence = None  # the quote holding this fence ended, so the fence did
             else:
-                kept.append(content)
-            continue
+                inner = quoted_prefix(line, fence[2])
+                closing = FENCE.match(inner)
+                if (closing and closing.group(1)[0] == fence[0]
+                        and len(closing.group(1)) >= fence[1]
+                        and not inner[closing.end():].strip()):
+                    fence = None
+                continue
         opening = FENCE.match(content)
-        if (opening and opening.group(1)[0] == fence[0]
-                and len(opening.group(1)) >= fence[1]
-                and not content[opening.end():].strip()):
-            fence = None
-        # Every other line of an open fence is code, and an unclosed fence runs
-        # to the end of the description.
+        if opening:
+            fence = (opening.group(1)[0], len(opening.group(1)), depth)
+            continue
+        kept.append(content)
     return blank_spans('\n'.join(kept))
 
 

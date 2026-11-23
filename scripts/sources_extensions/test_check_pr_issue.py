@@ -238,6 +238,24 @@ class CodeTests(unittest.TestCase):
         self.assertFalse(passes('Example:\n\n```\nCloses #12\n'))
         self.assertTrue(passes('Closes #12\n\n```\nunclosed example'))
 
+    def test_a_fence_line_inside_a_fence_does_not_close_it(self):
+        # A `>` at the start of a code line is code, not a quote marker. Read
+        # as one, it strips down to the fence and closes the fence early, which
+        # lets the example below it answer for the description.
+        for body in ('```\n> ```\nCloses #12\n```\n',
+                     '~~~\n> ~~~\nCloses #12\n~~~\n',
+                     '> ```\n> > ```\n> Closes #12\n> ```\n',
+                     '> > ```\n> > > ```\n> > Closes #12\n> > ```\n',
+                     '```\n> ```\nCloses #12\n'):
+            with self.subTest(body=body):
+                self.assertFalse(passes(body))
+
+    def test_a_reference_after_a_fence_is_the_one_reported(self):
+        passed, detail = verdict('```\n> ```\nCloses #12\n```\n\nCloses #15\n')
+        self.assertTrue(passed, detail)
+        self.assertIn('#15', detail)
+        self.assertNotIn('#12', detail)
+
     def test_an_unmatched_backtick_is_literal(self):
         self.assertTrue(passes('A lone ` sign.\n\nCloses #12'))
 
@@ -360,6 +378,63 @@ class CommandTests(unittest.TestCase):
         for body in ('::error::spoofed\n', '::add-mask::spoofed\nNo issue: spoofed reason\n'):
             with self.subTest(body=body):
                 self.assertNotIn('spoofed', self.run_with(body, GITHUB_ACTIONS='true').stdout)
+
+
+class GeneratedFenceTests(unittest.TestCase):
+    """The shapes a fenced block can take, built rather than listed by hand.
+
+    Each body is assembled from a fence character, its length, the quote depth
+    it sits at, whether a `>` line stands inside it, whether it is closed, and
+    where the keyword stands. The expected answer follows from how the body is
+    built, not from reading it back, so the case covers the family instead of
+    the few forms someone thought to write down.
+    """
+
+    def bodies(self):
+        for character in ('`', '~'):
+            for length in (3, 4, 5):
+                fence = character * length
+                for depth in (0, 1, 2):
+                    quote = '> ' * depth
+                    for marker in (False, True):
+                        for closed in (False, True):
+                            for where in ('before', 'inside', 'after', 'both'):
+                                lines = []
+                                if where == 'before':
+                                    lines.append(quote + 'Closes #12')
+                                lines.append(quote + fence)
+                                if marker:
+                                    # `>` then the fence: code inside the fence,
+                                    # though it reads as a quote marker and a
+                                    # closing fence once the marker is removed.
+                                    lines.append(quote + '> ' + fence)
+                                if where in ('inside', 'both'):
+                                    lines.append(quote + 'Closes #15')
+                                if closed:
+                                    lines.append(quote + fence)
+                                if where in ('after', 'both'):
+                                    lines.append(quote + 'Closes #12')
+                                # Only a keyword outside the fence counts, and an
+                                # unclosed fence runs to the end of the body.
+                                expected = where == 'before' or (
+                                    where in ('after', 'both') and closed)
+                                label = (f'{fence} depth={depth} marker={marker} '
+                                         f'closed={closed} {where}')
+                                yield '\n'.join(lines) + '\n', expected, label
+
+    def test_every_shape_reads_the_keyword_where_it_stands(self):
+        seen = 0
+        for body, expected, label in self.bodies():
+            seen += 1
+            with self.subTest(label):
+                passed, detail = verdict(body)
+                self.assertEqual(passed, expected, body)
+                if expected:
+                    # The reference outside the fence answers, and the one in
+                    # the code does not, even when both are spelled the same.
+                    self.assertIn('#12', detail)
+                    self.assertNotIn('#15', detail)
+        self.assertGreaterEqual(seen, 100)
 
 
 if __name__ == '__main__':
