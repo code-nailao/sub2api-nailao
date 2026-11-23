@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 from check_pr_issue import verdict
 
@@ -35,7 +36,7 @@ class LinkedIssueTests(unittest.TestCase):
     def test_reference_forms(self):
         for body in ('Closes: #12', 'Fixes example-owner/example-repo#12',
                      'Resolves https://github.com/example-owner/example-repo/issues/12',
-                     'Issue: Closes #12', '**Issue:** Closes #12', '- Closes #12, closes #15',
+                     'Issue: Closes #12', '**Issue:** Closes #12', '- Closes #12',
                      'First paragraph.\r\n\r\nIssue: Fixes #7\r\n\r\n## Changes\r\n'):
             with self.subTest(body=body):
                 self.assertTrue(passes(body))
@@ -61,6 +62,98 @@ class LinkedIssueTests(unittest.TestCase):
         for body in ('hotfix #12', 'prefix #12', 'bug-fix #12', 'prefs #12', 'unresolved #12'):
             with self.subTest(body=body):
                 self.assertFalse(passes(body))
+
+
+class OneClosingIssueTests(unittest.TestCase):
+    """A pull request closes exactly one issue; a second issue means a split."""
+
+    def test_no_closing_keyword_with_a_reason_passes(self):
+        self.assertTrue(passes('No issue: typo in the developer guide'))
+
+    def test_exactly_one_closing_keyword_passes(self):
+        self.assertTrue(passes('Closes #12'))
+
+    def test_the_same_issue_twice_counts_once(self):
+        for body in ('Closes #12, closes #12', 'Fixes #12\nCloses #12',
+                     'Closes example-owner/example-repo#12 and closes example-owner/example-repo#12',
+                     'Closes https://github.com/example-owner/example-repo/issues/12, '
+                     'closes example-owner/example-repo#12'):
+            with self.subTest(body=body):
+                self.assertTrue(passes(body))
+
+    def test_this_repository_is_named_by_the_environment(self):
+        # The workflow passes REPO, so a bare number is that repository's issue.
+        with mock.patch.dict(os.environ, {'REPO': 'example-owner/example-repo'}):
+            self.assertTrue(passes('Closes #12, closes example-owner/example-repo#12'))
+
+    def test_the_same_number_in_another_repository_is_another_issue(self):
+        with mock.patch.dict(os.environ, {'REPO': 'example-owner/example-repo'}):
+            for body in ('Closes #12, closes other-owner/other-repo#12',
+                         'Closes example-owner/example-repo#12, closes example-owner/other-repo#12',
+                         'Closes https://github.com/other-owner/other-repo/issues/12, closes #12'):
+                with self.subTest(body=body):
+                    passed, detail = verdict(body)
+                    self.assertFalse(passed)
+                    self.assertIn('2 issues', detail)
+
+    def test_a_number_too_long_for_an_integer_is_still_one_issue(self):
+        # Nothing issues it, but the check reads numbers as text and must not
+        # crash on one long enough for int() to refuse.
+        number = '1' * 5000
+        self.assertTrue(passes(f'Closes #{number}'))
+        self.assertFalse(passes(f'Closes #{number}, closes #12'))
+
+    def test_two_different_issues_fail_with_what_to_change(self):
+        passed, detail = verdict('Closes #12, closes #15')
+        self.assertFalse(passed)
+        # The message names every issue and says which one to keep.
+        self.assertIn('#12', detail)
+        self.assertIn('#15', detail)
+        self.assertIn('Closes #12', detail)
+        self.assertIn('separate pull request', detail)
+
+    def test_the_first_closing_reference_is_the_one_to_keep(self):
+        passed, detail = verdict('Fixes #7 and closes #9')
+        self.assertFalse(passed)
+        self.assertIn('Fixes #7', detail)
+        self.assertIn('separate pull request for #9', detail)
+
+    def test_refs_does_not_count_as_closing(self):
+        for body in ('Refs #12\nCloses #15', 'Closes #15\nRefs #12'):
+            with self.subTest(body=body):
+                self.assertTrue(passes(body))
+
+    def test_only_the_reference_after_a_keyword_closes(self):
+        # GitHub closes only #12 here, so the check counts one.
+        self.assertTrue(passes('Closes #12, #15'))
+
+
+class CodeTests(unittest.TestCase):
+    """GitHub shows code without links, so an example in a description is not
+    an answer either."""
+
+    def test_a_keyword_inside_a_span_or_a_fence_does_not_count(self):
+        for body in ('Issue: `Closes #12`',
+                     'Issue: ```Closes #12```',
+                     'Example:\n\n```\nCloses #12\n```\n',
+                     'Example:\r\n\r\n~~~\r\nCloses #12\r\n~~~\r\n',
+                     'Example:\n\n```md\nIssue: Closes #12\n```\n',
+                     'Example:\n\n~~~\n```\nCloses #12\n```\n~~~\n',
+                     'Example:\n\n- `Closes #12`\n',
+                     'Example:\n\n```\nNo issue: typo\n```\n'):
+            with self.subTest(body=body):
+                self.assertFalse(passes(body))
+
+    def test_a_reference_outside_code_still_counts(self):
+        self.assertTrue(passes('`Closes #12` is how it is written.\n\nCloses #15'))
+        self.assertTrue(passes('```\nCloses #12\n```\n\nCloses #15'))
+
+    def test_an_unclosed_fence_runs_to_the_end(self):
+        self.assertFalse(passes('Example:\n\n```\nCloses #12\n'))
+        self.assertTrue(passes('Closes #12\n\n```\nunclosed example'))
+
+    def test_an_unmatched_backtick_is_literal(self):
+        self.assertTrue(passes('A lone ` sign.\n\nCloses #12'))
 
 
 class NoIssueTests(unittest.TestCase):
@@ -157,6 +250,13 @@ class CommandTests(unittest.TestCase):
         result = self.run_with('Closes #12')
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, 'PR_ISSUE_PASS: linked with "Closes #12"\n')
+
+    def test_several_issues_fail_with_instructions(self):
+        result = self.run_with('Closes #12, closes #15')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('#12', result.stdout)
+        self.assertIn('#15', result.stdout)
+        self.assertIn('separate pull request for #15', result.stdout)
 
     def test_fail_without_the_variable(self):
         result = self.run_with(None)
