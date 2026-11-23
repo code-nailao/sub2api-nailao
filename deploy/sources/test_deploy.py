@@ -1039,7 +1039,8 @@ class DeployTest(unittest.TestCase):
         old_background = LEGACY["containers"]["background"]
         old_port = LEGACY["ports"]["background"]
         old_route = self.upstreams_for(LEGACY)
-        live_route = self.upstreams_for(target)
+        split_route = self.upstreams_for({"ports": {**LEGACY["ports"], "background": target["ports"]["background"]}})
+        waiting_route = self.upstreams_for(target) if manual else split_route
         run, http_json, write = self.ops.run, self.ops.http_json, self.ops.write_file_atomic
         started = None
         health_confirmed = False
@@ -1058,8 +1059,8 @@ class DeployTest(unittest.TestCase):
             nonlocal health_confirmed
             if started is not None and f":{old_port}/" in url and url.endswith("/health"):
                 if self.ops.clock - started < 3:
-                    self.assertEqual(live_route, self.upstreams_only(self.ops.loaded_upstreams))
-                    self.assertEqual(live_route, self.upstreams_only(self.ops.files[self.cfg.upstream_file]))
+                    self.assertEqual(waiting_route, self.upstreams_only(self.ops.loaded_upstreams))
+                    self.assertEqual(waiting_route, self.upstreams_only(self.ops.files[self.cfg.upstream_file]))
                     probes_while_starting.append(url)
                     return 0, None
                 health_confirmed = True
@@ -1070,6 +1071,8 @@ class DeployTest(unittest.TestCase):
                 self.assertIsNotNone(started, "upstream was changed before the rollback background was started")
                 self.assertGreaterEqual(self.ops.clock - started, 3)
                 self.assertTrue(health_confirmed, "reload requires a successful health probe")
+                self.assertTrue(deploy.Deployer(self.cfg, self.ops).background_answering(LEGACY),
+                                "the selected admin must hold the lock and answer")
             return write(path, text, **kw)
 
         with mock.patch.object(self.ops, "run", start), mock.patch.object(self.ops, "http_json", probe), \
@@ -1110,9 +1113,10 @@ class DeployTest(unittest.TestCase):
                                         target["ports"]["background"])
         self.assertEqual(route, self.upstreams_only(self.ops.loaded_upstreams))
         self.assertEqual(self.ops.loaded_upstreams, self.ops.files[self.cfg.upstream_file])
-        self.assertTrue(deploy.Deployer(self.cfg, self.ops).owner_runtime(target)["owns_background"])
+        self.assert_loaded_interfaces(LEGACY, target)
         self.assertFalse(self.ops.inspect(target["containers"]["serving"])["State"]["Running"])
         progress = self.state()["in_progress"]
+        self.assertEqual("guard", progress["failed_step"])
         self.assertEqual("failed", progress["phase"])
         self.assertIn("old background failed to start", progress["reason"])
         self.assertEqual(progress, deploy.status(self.cfg, self.ops)["in_progress"])
@@ -1184,7 +1188,8 @@ class DeployTest(unittest.TestCase):
         self.assertGreaterEqual(retirement_samples[0], 6)
         self.assert_loaded_interfaces(LEGACY, target)
         self.assert_no_shared_serving(target)
-        self.assert_release_failure("failed", "rollback background unavailable")
+        self.assert_release_failure("failed", "fixture original background failed")
+        self.assertEqual("guard", self.state()["in_progress"]["failed_step"])
 
     def test_resume_keeps_both_serving_pairs_when_reload_is_ignored(self):
         target = self.hold()["target"]
@@ -1917,13 +1922,13 @@ class DeployTest(unittest.TestCase):
         drain = deploy.Deployer.wait_for_nginx_drain
         injected = {}
 
-        def lose_network(deployer, state, route):
+        def lose_network(deployer, state, route, **kw):
             if not injected:
                 injected["slot"] = route.serving["slot"]
                 for role in deploy.SERVING_ROLES:
                     networks = self.ops.containers[source["containers"][role]]["NetworkSettings"]["Networks"]
                     networks.pop(self.cfg.networks[1], None)
-            return drain(deployer, state, route)
+            return drain(deployer, state, route, **kw)
 
         with mock.patch.object(deploy.Deployer, "wait_for_nginx_drain", lose_network):
             with self.assertRaisesRegex(deploy.FallbackFailed, "shared alias|switching back failed"):
@@ -2197,6 +2202,7 @@ class DeployTest(unittest.TestCase):
             self.assertTrue(all(self.cfg.serving_alias in endpoint["Aliases"] for endpoint in
                                 info["NetworkSettings"]["Networks"].values()))
         self.assert_release_failure("failed", "target does not provide the shared alias")
+        self.assertEqual("guard", self.state()["in_progress"]["failed_step"])
 
     def test_guard_rollback_does_not_reload_when_neither_background_is_available(self):
         self.ops.memory_after_switch = 20 * GIB
@@ -2232,8 +2238,8 @@ class DeployTest(unittest.TestCase):
             self.deploy()
         self.assertNotIn(["docker", "kill", "--signal=TERM", target["containers"]["background"]], self.ops.commands)
         self.assertEqual("failed", self.state()["in_progress"]["phase"])
-        expected = {**LEGACY["ports"], "background": target["ports"]["background"]}
-        self.assertEqual(self.upstreams_for({"ports": expected}), self.upstreams_only(self.ops.loaded_upstreams))
+        self.assert_loaded_interfaces(LEGACY, target)
+        self.assertEqual("guard", self.state()["in_progress"]["failed_step"])
 
     def test_rollback_reloads_held_state_after_lock_acquisition(self):
         self.deploy()
@@ -2356,8 +2362,9 @@ class DeployTest(unittest.TestCase):
                 exited = True
             return result
 
+        message = "Serving uses slot.*admin uses slot" if manual else "admin still uses slot"
         with mock.patch.object(self.ops, "run", stop_destination_after_test):
-            with self.assertRaisesRegex(deploy.RollbackIncomplete, "Serving uses slot.*admin uses slot"):
+            with self.assertRaisesRegex(deploy.RollbackIncomplete, message):
                 if manual:
                     deploy.Deployer(self.cfg, self.ops).rollback()
                 else:
@@ -2424,7 +2431,9 @@ class DeployTest(unittest.TestCase):
         self.assertTrue(offline)
         self.assertEqual([self.upstreams_for(target)], reloads)
         self.assert_live_release(target)
+        self.assertNotIn(["docker", "kill", "--signal=TERM", target["containers"]["background"]], self.ops.commands)
         self.assertEqual("failed", self.state()["in_progress"]["phase"])
+        self.assertEqual("guard", self.state()["in_progress"]["failed_step"])
 
     def test_main_guard_docker_query_failure_restores_live_release(self):
         self.cfg.serving_alias = ""
@@ -2473,7 +2482,7 @@ class DeployTest(unittest.TestCase):
         self.assert_live_release(target)
         self.assertEqual(target["slot"], self.state()["current"]["slot"])
         progress = self.state()["in_progress"]
-        self.assertEqual("switch", progress["failed_step"])
+        self.assertEqual("guard", progress["failed_step"])
         self.assertIn("KeyboardInterrupt", progress["reason"])
 
     def test_resume_busy_or_unreserved_background_port_keeps_pause(self):
@@ -4250,6 +4259,9 @@ class DeployTest(unittest.TestCase):
         self.assertIsNone(self.state()["in_progress"])
 
     def test_guard_rollback_keeps_admin_on_the_answering_owner_until_the_previous_background_is_ready(self):
+        # This covers the two route changes. Alias publication can require its
+        # own reloads to put each receiving serving instance back on its network.
+        self.cfg.serving_alias = ""
         self.ops.memory_after_switch = 20 * GIB
         target = self.cfg.slot_view("a")
         new_admin = target["ports"]["background"]
@@ -4483,9 +4495,10 @@ class DeployTest(unittest.TestCase):
         self.assertIn("No background answers admin now", message)
         self.assertIn("admin entry is unavailable", message)
         self.assertIn("needs a person", message)
-        deployer = deploy.Deployer(self.cfg, self.ops)
-        self.assertFalse(deployer.background_answering(LEGACY))
-        self.assertFalse(deployer.background_answering(target))
+        self.assert_loaded_interfaces(LEGACY, target, admin_healthy=False)
+        self.assertEqual(self.ops.loaded_upstreams, upstream)
+        self.assertEqual("guard", self.state()["in_progress"]["failed_step"])
+        self.assertFalse(deploy.Deployer(self.cfg, self.ops).background_answering(LEGACY))
 
     def test_guard_rollback_keeps_admin_on_the_candidate_after_a_restart_timeout(self):
         self.ops.memory_after_switch = 20 * GIB
@@ -4884,9 +4897,13 @@ class DeployTest(unittest.TestCase):
         target = self.cfg.slot_view("a")
         owner = target["containers"]["background"]
         self.ops.drain_seconds[owner] = float("inf")
+        self.ops.runtime_extra[owner] = {"admin_during_drain": "read-only"}
         with self.assertRaisesRegex(deploy.FallbackFailed, "still draining.*'status'") as ctx:
             self.deploy()
-        self.assertEqual(self.upstreams_for(target), self.upstreams_only(self.ops.loaded_upstreams))
+        expected = {**LEGACY["ports"], "background": target["ports"]["background"]}
+        self.assertEqual(self.upstreams_for({"ports": expected}), self.upstreams_only(self.ops.loaded_upstreams))
+        self.assertTrue(deploy.Deployer(self.cfg, self.ops).background_answering(target, allow_draining=True))
+        self.assertEqual("guard", self.state()["in_progress"]["failed_step"])
         self.assertEqual(self.ops.loaded_upstreams, self.ops.files[self.cfg.upstream_file])
         self.assertTrue(self.ops.inspect(owner)["State"]["Running"])
         self.assertFalse(self.ops.inspect(LEGACY["containers"]["background"])["State"]["Running"])
@@ -5845,16 +5862,41 @@ class DeployTest(unittest.TestCase):
         self.ops.memory_after_switch = 20 * GIB
         self.cfg.background_exit_timeout = 2
         self.ops.drain_seconds[new] = 8
-        with self.assertRaisesRegex(deploy.DeployError, "guard failed.*previous release serves traffic"):
-            self.deploy()
+        target = self.cfg.slot_view("a")
+        run = self.ops.run
+        admin_route = "sources_main_admin"
+        previous_admin = deploy.fixed_upstream_routes(self.upstreams_for(LEGACY))[admin_route]
+        published = set()
+        retired = []
+
+        def observe(args, **kw):
+            if args[:3] == ["docker", "network", "connect"] and self.cfg.serving_alias in args:
+                for role in deploy.SERVING_ROLES:
+                    if args[-1] == self.ops.inspect(LEGACY["containers"][role])["Id"]:
+                        self.assertTrue(deploy.Deployer(self.cfg, self.ops).background_answering(LEGACY))
+                        self.assertEqual(previous_admin, deploy.fixed_upstream_routes(self.ops.loaded_upstreams)[admin_route])
+                        published.add(role)
+            if args[:3] == ["docker", "kill", "--signal=TERM"] and args[-1] in (
+                    target["containers"][role] for role in deploy.SERVING_ROLES):
+                self.assertEqual(set(deploy.SERVING_ROLES), published)
+                self.assert_live_release(LEGACY)
+                self.assertEqual(set(self.cfg.networks), {name for name, _ in
+                                 deploy.Deployer(self.cfg, self.ops).alias_networks(LEGACY)})
+                retired.append(args[-1])
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", observe):
+            with self.assertRaisesRegex(deploy.DeployError, "guard failed.*previous release serves traffic"):
+                self.deploy()
+        self.assertEqual([target["containers"][role] for role in deploy.SERVING_ROLES], retired)
         self.assertEqual(previous, self.state()["current"]["containers"]["background"])
         self.assertTrue(self.ops.containers[previous]["State"]["Running"])
         self.assertFalse(self.ops.containers[new]["State"]["Running"])
-        # The restored slot never advertised the shared alias; the candidate
-        # serving pair stays as its only provider until a person resolves it.
-        progress = self.state()["in_progress"]
-        self.assertIsNotNone(progress)
-        self.assertIn("shared alias", progress["failed"])
+        self.assert_live_release(LEGACY)
+        self.assertIsNone(self.state()["in_progress"])
+        self.assert_no_shared_serving(self.cfg.slot_view("a"))
+        self.assertEqual(set(self.cfg.networks), {name for name, _ in
+                         deploy.Deployer(self.cfg, self.ops).alias_networks(LEGACY)})
 
     def run_handback_with_slow_serving_cleanup(self, *, guard_failure):
         current = self.state()["current"]
@@ -5896,12 +5938,12 @@ class DeployTest(unittest.TestCase):
             self.assertIsNotNone(term_at)
             self.assertLess(self.ops.clock - term_at, 33, "serving cleanup outlasted the handback window")
             if guard_failure:
-                # The restored release never advertised the shared alias, so
-                # retiring the candidate would remove its last provider. Both
-                # serving pairs stay until a person resolves the gap.
-                self.assertEqual("legacy", self.state()["current"]["slot"])
-                self.assertIn("shared alias", self.state()["in_progress"]["failed"])
-                self.assertEqual([], cleanup_attempts)
+                # Alias publication allows retirement to start. A timeout
+                # must still leave both containers and a durable guard fault.
+                self.assert_live_release(current)
+                self.assert_release_failure("failed", "timed out")
+                self.assertEqual("guard", self.state()["in_progress"]["failed_step"])
+                self.assertEqual([candidate_serving], cleanup_attempts)
                 self.assertIn(candidate_serving, self.ops.containers)
                 self.assertTrue(self.ops.containers[candidate_serving]["State"]["Running"])
                 self.assertTrue(self.ops.containers[candidate_standby]["State"]["Running"])
@@ -5958,13 +6000,17 @@ class DeployTest(unittest.TestCase):
         with deploy.release_lock(self.cfg.lock_file):
             self.assertEqual("legacy", self.state()["current"]["slot"])
             progress = self.state()["in_progress"]
-            # The restored slot has no shared alias. Retiring the candidate
-            # would remove its only provider, so both pairs stay.
-            self.assertIsNotNone(progress, "policy refuses to remove the last provider")
-            self.assertIn("shared alias", progress["failed"])
-            self.assertTrue(self.ops.containers[candidate_standby]["State"]["Running"])
-            if not removed:
+            if removed:
+                self.assertIsNone(progress)
+                self.assertFalse(self.ops.containers[candidate_standby]["State"]["Running"])
+                self.assertEqual(set(self.cfg.networks), {name for name, _ in
+                                 deploy.Deployer(self.cfg, self.ops).alias_networks(current)})
+            else:
+                self.assertIsNotNone(progress, "unknown state must keep both serving instances")
+                self.assertIn("shared alias", progress["failed"])
+                self.assertEqual("guard", progress["failed_step"])
                 self.assertTrue(self.ops.containers[candidate_serving]["State"]["Running"])
+                self.assertTrue(self.ops.containers[candidate_standby]["State"]["Running"])
         self.assertTrue(self.ops.containers[previous_bg]["State"]["Running"])
         self.assertFalse(self.ops.containers[candidate_bg]["State"]["Running"])
         self.assertLessEqual(len(lists), 1)

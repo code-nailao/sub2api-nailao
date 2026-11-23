@@ -1215,7 +1215,8 @@ class Deployer:
 
     def install_upstreams(self, text: str, *, before_reload: Callable[[], None] | None = None,
                           reload_started: Callable[[], None] | None = None,
-                          recover_reload: Callable[[str | None, BaseException], NoReturn] | None = None) -> None:
+                          recover_reload: Callable[[str | None, BaseException], NoReturn] | None = None,
+                          deadline: float | None = None) -> None:
         try:
             previous = self.read_upstream()
         except FileNotFoundError:
@@ -1225,15 +1226,17 @@ class Deployer:
         reloading = False
         try:
             self.ops.write_file_atomic(self.cfg.upstream_file, text)
-            test = self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False)
+            test = self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False,
+                                timeout=self.recovery_timeout(deadline, 600))
             if test.returncode != 0:
                 raise DeployError("nginx -t rejected the upstream file")
             if before_reload is not None and not self.ops.dry_run:
                 before_reload()
+            timeout = self.recovery_timeout(deadline, 600)
             reloading = True
             if reload_started is not None:
                 reload_started()
-            reload = self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True, check=False)
+            reload = self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True, check=False, timeout=timeout)
             if reload.returncode != 0:
                 raise ReloadRejected(reload.returncode, previous)
         except (Exception, KeyboardInterrupt) as err:
@@ -1793,20 +1796,26 @@ class Deployer:
                 return
             self.ops.sleep(self.cfg.guard_interval)
 
-    def serving_info(self, view: dict[str, Any], role: str,
-                     observed: dict[str, dict[str, Any]] | None) -> dict[str, Any]:
+    def serving_info(self, view: dict[str, Any], role: str, observed: dict[str, dict[str, Any]] | None, *,
+                     deadline: float | None = None) -> dict[str, Any]:
         name = view["containers"][role]
-        if observed is None:
-            return self.ops.inspect(name) or {}
-        if name not in observed:
-            observed[name] = self.ops.inspect_snapshot(name) or {}
-        return observed[name]
+        if observed is not None and name in observed:
+            return observed[name]
+        if deadline is not None:
+            info = self.ops.inspect(name, timeout=self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS))
+        elif observed is not None:
+            info = self.ops.inspect_snapshot(name)
+        else:
+            info = self.ops.inspect(name)
+        if observed is not None:
+            observed[name] = info or {}
+        return info or {}
 
     def check_rollback_serving(self, view: dict[str, Any], *, observed: dict[str, dict[str, Any]] | None = None,
                                roles: tuple[str, ...] = SERVING_ROLES,
                                deadline: float | None = None) -> None:
         for role in roles:
-            info = self.serving_info(view, role, observed)
+            info = self.serving_info(view, role, observed, deadline=deadline)
             timeout = self.recovery_timeout(deadline, RUNTIME_STATUS_TIMEOUT_SECONDS)
             if not info.get("State", {}).get("Running") or not self.health(view["ports"][role], timeout=timeout):
                 raise DeployError(f"rollback {role} on slot {view['slot']} is not answering health checks")
@@ -1881,12 +1890,13 @@ class Deployer:
 
     def alias_networks(self, view: dict[str, Any], *, retiring: dict[str, Any] | None = None,
                        roles: tuple[str, ...] = SERVING_ROLES,
-                       observed: dict[str, dict[str, Any]] | None = None) -> set[tuple[str, str]]:
+                       observed: dict[str, dict[str, Any]] | None = None,
+                       deadline: float | None = None) -> set[tuple[str, str]]:
         if not view or not self.cfg.serving_alias:
             return set()
         advertised = set()
         for role in roles:
-            info = self.serving_info(view, role, observed)
+            info = self.serving_info(view, role, observed, deadline=deadline)
             state = info.get("State", {})
             if not (state.get("Running") or state.get("Restarting")):
                 continue
@@ -1929,10 +1939,12 @@ class Deployer:
                 raise DeployError("upstream file does not match the expected topology")
             if not bootstrap:
                 addresses = {f"127.0.0.1:{route.serving['ports'][role]}" for role in route.serving_roles()}
-                deadline = self.ops.monotonic() + ROUTE_PROBE_TIMEOUT
+                probe_deadline = self.ops.monotonic() + ROUTE_PROBE_TIMEOUT
+                if deadline is not None:
+                    probe_deadline = min(probe_deadline, deadline)
                 matching_since = None
                 while True:
-                    remaining = deadline - self.ops.monotonic()
+                    remaining = probe_deadline - self.ops.monotonic()
                     status, revision, address = self.ops.probe_nginx_serving(self.route_probe_path(), min(max(remaining, 0.01), 1))
                     backend = (address or "").split(",")[-1].strip()
                     # On recovery, a worker can prove its generation even if
@@ -1957,8 +1969,8 @@ class Deployer:
                     raise DeployError("upstream file changed during route verification")
             if (peer and peer["slot"] != route.serving["slot"]
                     and not planned_alias_overlap(state.get("in_progress") or {}, route.serving, peer)
-                    and self.alias_networks(route.serving, observed=observed)
-                    and self.alias_networks(peer, observed=observed)):
+                    and self.alias_networks(route.serving, observed=observed, deadline=deadline)
+                    and self.alias_networks(peer, observed=observed, deadline=deadline)):
                 raise DeployError("the shared alias is active on both slots")
         except (CommandTimedOut, subprocess.TimeoutExpired):
             # The caller knows whether the check preceded any slot mutations.
@@ -2003,7 +2015,7 @@ class Deployer:
                     allow_draining: bool = False, require_standby: bool = True,
                     reload_started: Callable[[], None] | None = None,
                     allow_unready_background: bool = False,
-                    guard_serving_only: bool = False) -> None:
+                    guard_serving_only: bool = False, deadline: float | None = None) -> None:
         progress = state.get("in_progress")
         if progress and progress.get("origin") and not self.ops.dry_run:
             self._save_progress(state, {**progress, "verified_route": asdict(active), "pending_route": asdict(pending)})
@@ -2022,7 +2034,7 @@ class Deployer:
                                  check_health=False, allow_draining=allow_draining, bootstrap=not active.revision,
                                  require_standby=require_standby,
                                  allow_unready_background=allow_unready_background,
-                                 allow_no_owner=guard_serving_only)
+                                 allow_no_owner=guard_serving_only, deadline=deadline)
             if active.revision and progress and progress.get("origin"):
                 older = list(progress.get("nginx_previous_workers", ()))
                 for worker in self.ops.nginx_workers(self.route_probe_path()):
@@ -2039,17 +2051,18 @@ class Deployer:
                                      wait=True, allow_draining=allow_draining, check_health=rejected is None,
                                      require_standby=require_standby,
                                      allow_unready_background=allow_unready_background,
-                                     allow_no_owner=guard_serving_only)
+                                     allow_no_owner=guard_serving_only, deadline=deadline)
                 new_generation = True
                 if rejected:
                     # A loaded generation may be unhealthy. It still rules
                     # out handing the background back to the old route here.
                     self.check_rollback_route(pending, allow_draining=allow_draining, require_standby=require_standby,
                                               allow_unready_background=allow_unready_background,
-                                              allow_no_owner=guard_serving_only)
+                                              allow_no_owner=guard_serving_only, deadline=deadline)
             except Exception as err:
                 if rejected and not new_generation:
-                    self.restore_rejected_reload(state, active, pending, peer if same_serving else pending.serving, rejected)
+                    self.restore_rejected_reload(state, active, pending, peer if same_serving else pending.serving,
+                                                 rejected, deadline=deadline)
                 reason = str(err) or type(err).__name__
                 if reload_error is not None:
                     reason = f"{reload_error}. {reason}"
@@ -2059,7 +2072,7 @@ class Deployer:
         try:
             try:
                 self.install_upstreams(self.route_text(pending), before_reload=check_before_reload,
-                                       reload_started=start_reload)
+                                       reload_started=start_reload, deadline=deadline)
             except RoutingUnconfirmed as err:
                 if not attempted:
                     raise
@@ -2081,14 +2094,14 @@ class Deployer:
             raise KeyboardInterrupt
 
     def restore_rejected_reload(self, state: dict[str, Any], active: MainRoute, pending: MainRoute,
-                                peer: dict[str, Any], rejected: ReloadRejected) -> None:
+                                peer: dict[str, Any], rejected: ReloadRejected, *, deadline: float | None = None) -> None:
         previous = rejected.previous
         if not active.revision or previous is None or previous != self.route_text(active):
             return
         try:
             # The old background stopped during handoff. Only prove which
             # workers are answering and that the attempted file is unchanged.
-            self.verify_topology(state, active, peer, disk=pending, check_health=False, wait=True)
+            self.verify_topology(state, active, peer, disk=pending, check_health=False, wait=True, deadline=deadline)
         except DeployError:
             return
         try:
@@ -2097,10 +2110,12 @@ class Deployer:
             raise RoutingFileNotRestored(f"{rejected}; old route is still loaded, but its file could not be restored") from err
         raise ReloadNotApplied(f"{rejected}; previous upstream file restored, routing unchanged") from rejected
 
-    def wait_for_nginx_drain(self, state: dict[str, Any], active: MainRoute) -> None:
+    def wait_for_nginx_drain(self, state: dict[str, Any], active: MainRoute, *, deadline: float | None = None) -> None:
         if self.ops.dry_run or not active.revision:
             return
-        deadline = self.ops.monotonic() + self.cfg.ready_timeout
+        wait_deadline = self.ops.monotonic() + self.cfg.ready_timeout
+        if deadline is not None:
+            wait_deadline = min(wait_deadline, deadline)
         progress = state.get("in_progress") or {}
         retiring = [{key: value for key, value in worker.items() if key != "revision"}
                     for worker in progress.get("nginx_previous_workers", ()) if worker["revision"] != active.revision]
@@ -2111,9 +2126,10 @@ class Deployer:
             shutting_down = self.ops.nginx_workers(self.route_probe_path(), shutting_down=True)
             if not any(release_running(self.ops, {"process": worker}) is not False for worker in retiring + shutting_down):
                 break
-            if self.ops.monotonic() >= deadline:
+            remaining = wait_deadline - self.ops.monotonic()
+            if remaining <= 0:
                 raise DrainTimeout("previous Nginx workers still have connections; serving retirement did not start")
-            self.ops.sleep(HANDOFF_POLL_SECONDS)
+            self.ops.sleep(min(remaining, HANDOFF_POLL_SECONDS))
         if "nginx_previous_workers" in progress:
             self._save_progress(state, {key: value for key, value in progress.items() if key != "nginx_previous_workers"})
 
@@ -2132,9 +2148,8 @@ class Deployer:
             save_state(self.cfg, {**state, **update})
         state.update(update)
 
-    def rollback_to(self, state: dict[str, Any], active: MainRoute, target: Target, *, recovery: bool = False,
-                    alias_plan: dict[str, list[str]] | None = None,
-                    recovery_window: list[float | None] | None = None, back: bool = False) -> MainRoute:
+    def rollback_to(self, state: dict[str, Any], active: MainRoute, target: Target, *,
+                    alias_plan: dict[str, list[str]] | None = None) -> MainRoute:
         current = active.admin
         view = target.view()
         if not self.ops.dry_run:
@@ -2145,22 +2160,24 @@ class Deployer:
         def handoff() -> None:
             preparing = True
             try:
-                if not self.ops.dry_run:
-                    info = self.ops.inspect(target.containers["background"])
-                    if not info:
-                        raise DeployError("rollback background container is missing")
-                    if not info.get("State", {}).get("Running") and not self.ops.port_free(target.ports["background"]):
-                        raise DeployError("rollback background port is already in use")
+                self.check_rollback_background_port(target)
                 preparing = False
-                deadline = self.handoff_background(state, current, target, create=False, check_health=True, back=back)
-                if recovery_window is not None:
-                    recovery_window.append(deadline)
+                self.handoff_background(state, current, target, create=False, check_health=True)
             except (Exception, KeyboardInterrupt) as err:
-                if self.ops.dry_run or (preparing and not recovery):
+                if self.ops.dry_run or preparing:
                     raise
                 self.route_rollback_serving_only(state, active, view, err, alias_plan=alias_plan)
 
         return self.handoff_and_switch(state, active, target, handoff, rollback=True, alias_plan=alias_plan)
+
+    def check_rollback_background_port(self, target: Target) -> None:
+        if self.ops.dry_run:
+            return
+        info = self.ops.inspect(target.containers["background"])
+        if not info:
+            raise DeployError("rollback background container is missing")
+        if not info.get("State", {}).get("Running") and not self.ops.port_free(target.ports["background"]):
+            raise DeployError("rollback background port is already in use")
 
     def route_rollback_serving_only(self, state: dict[str, Any], active: MainRoute, view: dict[str, Any],
                                     err: BaseException, *, alias_plan: dict[str, list[str]] | None = None) -> NoReturn:
@@ -2193,58 +2210,63 @@ class Deployer:
                                     f"({route_err or type(route_err).__name__}). Run 'status' and verify the route "
                                     "before clearing in_progress. Use 'abort' to restore the original route") from route_err
         try:
-            self.retire_and_transfer(state, pending, active.serving, alias_plan=alias_plan, allow_draining=True)
+            self.retire_and_transfer(state, pending, retiring=active.serving, receiving=view,
+                                     alias_plan=alias_plan, allow_draining=True)
         except (Exception, KeyboardInterrupt) as retire_err:
             err = DeployError(f"{err}. Serving retirement incomplete ({retire_err or type(retire_err).__name__})")
         raise RollbackIncomplete(f"rollback background unavailable ({err}). Serving uses slot {view['slot']} and admin "
                                  f"uses slot {active.admin['slot']}. Use 'status' or 'abort'") from err
 
-    def switch_route(self, serving: dict[str, Any], admin: dict[str, Any]) -> None:
-        """Point serving and admin upstreams at these slots in one reload.
-
-        The route model already lets serving and admin name different slots,
-        so the guard rollback can move traffic back while admin keeps the
-        background that still answers."""
-        self.install_upstreams(self.route_text(MainRoute(serving, admin)))
-
     def restore_after_guard(self, state: dict[str, Any], active: MainRoute, previous: dict[str, Any], reason: str) -> None:
+        state["in_progress"]["step"] = "guard"
         self.log(f"   guard failed: {reason}; switching traffic back to slot {previous['slot']}")
-        window: list[float | None] = []
+        retiring = active.serving
+        candidate = Target.from_view(active.admin, self.cfg.runtime_token_file)
+        receiver = Target.from_view(previous, self.cfg.runtime_token_file)
+        serving_route = MainRoute(previous, active.admin)
         try:
-            route = self.rollback_to(state, active, Target.from_view(previous, self.cfg.runtime_token_file),
-                                     recovery=True, recovery_window=window, back=True)
-            deadline = window[0] if window else None
-            protect = finish_handoff_cleanup(ignore=True) if deadline is not None else contextlib.nullcontext()
-            with protect:
-                try:
-                    self.retire_and_transfer(state, route, active.serving, deadline=deadline,
-                                             require_known_state=deadline is not None)
-                except ServingCleanupFailed:
-                    raise
-                except (Exception, KeyboardInterrupt) as cleanup_err:
-                    if deadline is not None:
-                        raise ServingCleanupFailed(f"guard failed ({reason}); the previous release serves traffic and "
-                                               f"owns the background again. Incomplete serving cleanup: "
-                                               f"{cleanup_err}. Check the target slot before clearing "
-                                               "in_progress.") from cleanup_err
-                    raise
-        except ServingCleanupFailed:
-            raise
+            # Move only serving. The admin port already belongs to the loaded
+            # route and remains selected throughout the background handoff.
+            self.apply_route(state, active, serving_route, retiring, guard_serving_only=True)
         except (Exception, KeyboardInterrupt) as err:
-            if isinstance(err, DeployError) and "routing unchanged" in str(err):
-                # The rollback could not even write its own route, so nothing
-                # moved: report the switch failure and leave routing as it is.
-                raise FallbackFailed(f"guard failed ({reason}) and switching back failed "
-                                     f"({err or type(err).__name__})") from err
-            # The hand-back can end with the background on neither slot. Settle
-            # the admin entry from probes only, record why the recovery is
-            # incomplete, and carry that in the class callers already handle.
-            failure = self.rollback_admin_owner(state, Target.from_view(active.admin, self.cfg.runtime_token_file),
-                                                previous, reason, err)
-            progress = state.get("in_progress")
-            if progress:
-                progress["step"] = "guard"
+            raise FallbackFailed(f"guard failed ({reason}) and switching back failed "
+                                 f"({err or type(err).__name__})") from err
+
+        deadline = None
+
+        def handoff() -> None:
+            nonlocal deadline
+            self.check_rollback_background_port(receiver)
+            deadline = self.hand_back(state, candidate, previous)
+
+        try:
+            route = self.handoff_and_switch(state, serving_route, receiver, handoff, guard_peer=retiring)
+        except RoutingUnconfirmed as err:
+            # The loaded generation must be confirmed before further changes.
+            raise RoutingUnconfirmed(f"guard failed ({reason}); admin route unconfirmed ({err})") from err
+        except (Exception, KeyboardInterrupt) as err:
+            if isinstance(err, BackgroundRestored):
+                # The serving-only route is already loaded. If its pair
+                # already provides the alias and admin has recovered, finish
+                # the degraded serving retirement behind the same safeguards.
+                try:
+                    self.retire_and_transfer(state, serving_route, retiring=retiring, receiving=previous,
+                                             allow_draining=True, deadline=err.cleanup_deadline)
+                except (Exception, KeyboardInterrupt) as cleanup_err:
+                    err = BackgroundRestored(f"{err}. Serving retirement incomplete "
+                                             f"({cleanup_err or type(cleanup_err).__name__})")
+            failure = self.rollback_admin_owner(state, serving_route, retiring, candidate, reason, err)
             raise RollbackIncomplete(str(failure)) from err
+
+        protect = finish_handoff_cleanup(ignore=True) if deadline is not None else contextlib.nullcontext()
+        with protect:
+            try:
+                self.retire_and_transfer(state, route, retiring=retiring, receiving=previous,
+                                         inherit_aliases=True, deadline=deadline, require_known_state=True)
+            except (Exception, KeyboardInterrupt) as err:
+                raise ServingCleanupFailed(f"guard failed ({reason}); the previous release serves traffic and "
+                                           f"owns the background again. Incomplete serving cleanup: {err or type(err).__name__}. "
+                                           "Check the target slot before clearing in_progress.") from err
 
     def admin_owner_status(self, view: dict[str, Any]) -> tuple[bool, str]:
         """Probe only: is this background the admin owner right now, and if
@@ -2307,49 +2329,25 @@ class Deployer:
             self.log(f"   {name} did not come back: {err}")
             return False
 
-    def record_guard_failure(self, target: Target, failure: FallbackFailed) -> None:
-        """Persist step=guard, the failure and its reason before leaving."""
+    def rollback_admin_owner(self, state: dict[str, Any], loaded: MainRoute, retiring: dict[str, Any],
+                             target: Target, reason: str, err: BaseException) -> FallbackFailed:
+        """Settle admin from probes and preserve the cause if settling it fails."""
         try:
-            state = load_state(self.cfg)
-            progress = state.get("in_progress")
-            if not progress:
-                progress = state["in_progress"] = {"target": target.view(), "since": now()}
-            progress["step"] = "guard"
-            self._record_unrestored(state, failure)
-        except (Exception, KeyboardInterrupt) as record_err:  # noqa: BLE001 - never mask the failure
-            self.log(f"   WARNING: could not record the incomplete recovery: {record_err}")
-
-    def current_admin_port(self) -> str | None:
-        """Where the admin upstream points right now, read from the rendered
-        file rather than assumed from which step ran last."""
-        try:
-            text = self.ops.read_text(self.cfg.upstream_file)
-        except OSError:
-            return None
-        match = re.search(r"upstream sources_main_admin \{.*?server 127\.0\.0\.1:(\d+)", text, re.S)
-        return match.group(1) if match else None
-
-    def rollback_admin_owner(self, state: dict[str, Any], target: Target, previous: dict[str, Any], reason: str,
-                             err: BaseException) -> FallbackFailed:
-        """Settle the admin entry from probes only, and always record why the
-        recovery is incomplete, whatever the cleanup itself raises."""
-        try:
-            failure = self.settle_admin_owner(target, previous, reason, err)
+            failure = self.settle_admin_owner(state, loaded, retiring, target, reason, err)
         except (Exception, KeyboardInterrupt) as cleanup_err:  # noqa: BLE001 - record before leaving
             failure = FallbackFailed(
-                f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not finish "
+                f"guard failed ({reason}); handing the background back to slot {loaded.serving['slot']} did not finish "
                 f"({err}); settling the admin entry failed too ({cleanup_err}). The admin entry is unavailable "
                 "and needs a person to check live routing and restore a background")
-        self.record_guard_failure(target, failure)
         return failure
 
-    def settle_admin_owner(self, target: Target, previous: dict[str, Any], reason: str,
-                           err: BaseException) -> FallbackFailed:
-        """Point admin at a probed owner, or leave the current pointer alone
-        when nothing answers and say which background a person must restore."""
+    def settle_admin_owner(self, state: dict[str, Any], loaded: MainRoute, retiring: dict[str, Any],
+                           target: Target, reason: str, err: BaseException) -> FallbackFailed:
+        """Point admin at a probed owner, or keep the loaded admin route."""
+        previous = loaded.serving
         views = {"previous": previous, "candidate": target.view()}
         owner, detail = self.answering_admin_owner(views)
-        restarted = False
+        restarted = isinstance(err, BackgroundRestored)
         if owner is None:
             self.log(f"   no background answers admin; restarting slot {views['candidate']['slot']}'s background")
             try:
@@ -2358,26 +2356,16 @@ class Deployer:
                 detail["candidate"] += f"; restart failed ({revive_err})"
             owner, detail = self.answering_admin_owner(views)  # never assume the restart made it the owner
             restarted = owner is not None
-        admin_port = self.current_admin_port()
-        pointed = next((side for side, view in views.items()
-                        if admin_port is not None and str(view["ports"]["background"]) == admin_port), None)
         if owner is None:
             summary = "; ".join(detail.values())
-            where = (f"admin still points at slot {views[pointed]['slot']}" if pointed
-                     else f"admin points at {admin_port or 'an unknown port'}")
             return FallbackFailed(
                 f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not finish "
-                f"({err}). No background answers admin now ({summary}); {where}, so the admin entry is "
-                f"unavailable and needs a person to restore a background (slot {previous['slot']} for the "
-                "rollback) and point admin routing at it")
-        expected = "previous" if owner is views["previous"] else "candidate"
-        if not pointed or pointed != expected:
+                f"({err}). No background answers admin now ({summary}); admin still points at slot "
+                f"{loaded.admin['slot']}, so the admin entry is unavailable and needs a person to restore one "
+                f"background (slot {previous['slot']} for the rollback) and verify live routing before clearing in_progress")
+        if owner["slot"] != loaded.admin["slot"]:
             try:
-                if owner is views["previous"]:
-                    self.switch_route(views["previous"], views["previous"])
-                else:
-                    # Serving already serves from the previous slot; only admin moves.
-                    self.switch_route(views["previous"], owner)
+                self.apply_route(state, loaded, MainRoute(previous, owner), retiring)
             except (Exception, KeyboardInterrupt) as route_err:  # noqa: BLE001
                 return FallbackFailed(
                     f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not "
@@ -2399,7 +2387,7 @@ class Deployer:
         try:
             return self.handoff_background(state, target.view(), Target.from_view(previous, self.cfg.runtime_token_file),
                                            create=False, check_health=True, back=True)
-        except FallbackFailed:
+        except (FallbackFailed, BackgroundRestored):
             raise
         except (Exception, KeyboardInterrupt) as err:
             raise FallbackFailed(f"handing the background back failed: {err}") from err
@@ -2418,10 +2406,12 @@ class Deployer:
                                     "use 'docker start' and verify ownership or retry 'abort'") from restore_err
         return deadline
 
-    def handoff_and_switch(self, state: dict[str, Any], active: MainRoute, target: Target, handoff: Callable[[], None], *,
-                           rollback: bool = False, alias_plan: dict[str, list[str]] | None = None) -> MainRoute:
+    def handoff_and_switch(self, state: dict[str, Any], loaded: MainRoute, target: Target, handoff: Callable[[], None], *,
+                           rollback: bool = False, alias_plan: dict[str, list[str]] | None = None,
+                           guard_peer: dict[str, Any] | None = None) -> MainRoute:
         view = target.view()
-        current = active.admin
+        current = loaded.admin
+        peer = view if guard_peer is None else guard_peer
         pending = MainRoute(view, view)
         handoff_started = handoff_complete = reload_attempted = False
 
@@ -2429,15 +2419,16 @@ class Deployer:
             nonlocal reload_attempted
             reload_attempted = True
 
-        self.verify_topology(state, active, view, check_health=False, bootstrap=not active.revision)
+        self.verify_topology(state, loaded, peer, check_health=False, bootstrap=not loaded.revision)
         try:
             with self.step("background handoff"):
                 handoff_started = True
                 handoff()
                 handoff_complete = True
-            with self.step("switch"):
-                self._mark(state, target, "switch")
-                self.apply_route(state, active, pending, view, reload_started=mark_reload_attempted)
+            with self.step("switch" if guard_peer is None else "restore admin route"):
+                if guard_peer is None:
+                    self._mark(state, target, "switch")
+                self.apply_route(state, loaded, pending, peer, reload_started=mark_reload_attempted)
             return pending
         except (Exception, KeyboardInterrupt) as err:
             if self.ops.dry_run or isinstance(err, RollbackIncomplete):
@@ -2475,7 +2466,7 @@ class Deployer:
                 self.log("   switch failed with the original route still loaded; handing the background back")
             deadline = self.restore_loaded_background(state, target, current, reason)
             if rollback and isinstance(err, RollbackBackgroundUnavailable):
-                self.route_rollback_serving_only(state, active, view, err, alias_plan=alias_plan)
+                self.route_rollback_serving_only(state, loaded, view, err, alias_plan=alias_plan)
             if isinstance(err, RoutingFileNotRestored):
                 raise SwitchNotRestored(f"{reason}; the original background owns the lock again. "
                                         "Verify the upstream file before reloading Nginx",
@@ -2568,18 +2559,6 @@ class Deployer:
                 return key
         return None
 
-    def require_not_sole_alias_provider(self, view: dict[str, Any], state: dict[str, Any]) -> None:
-        """Refuse to stop or reconfigure an instance that is a network's only alias provider."""
-        for role in SERVING_ROLES:
-            name = (view.get("containers") or {}).get(role)
-            if not name:
-                continue
-            network = self.sole_alias_network(name, state, extra=(view,))
-            if network is not None:
-                where = f"network {network[0]}" if network[0] != "unknown" else "a network (state unconfirmed)"
-                raise SoleAliasProviderKept(f"{name} is the only serving instance advertising the shared alias on "
-                                        f"{where}; kept running. Stop it only after another slot provides the alias")
-
     @staticmethod
     def connect_errors(log_text: str, ports: set[str]) -> int:
         count = 0
@@ -2590,10 +2569,10 @@ class Deployer:
         return count
 
     def retire_serving(self, view: dict[str, Any], *, state: dict[str, Any] | None = None,
-                       deadline: float | None = None,
-                       require_known_state: bool = False) -> dict[str, dict[str, str]]:
+                       deadline: float | None = None, require_known_state: bool = False,
+                       roles: tuple[str, ...] = SERVING_ROLES) -> dict[str, dict[str, str]]:
         signalled = {}
-        for role in SERVING_ROLES:
+        for role in roles:
             name = view["containers"].get(role)
             if not name:
                 continue
@@ -2646,11 +2625,12 @@ class Deployer:
             token = None
             with contextlib.suppress(OSError):
                 token = self.token_for(target.view(), role)
-            runtime = self.runtime(target.ports[role], token) if token else None
+            runtime = self.runtime_request_before(
+                lambda timeout: self.runtime(target.ports[role], token, timeout=timeout), deadline,
+            ) if token else None
             if (runtime and runtime.get("instance_id") and not runtime.get("draining")
                     and not self.ops.dry_run):
-                self.ops.http_json(f"http://127.0.0.1:{target.ports[role]}/internal/sources/drain", token=token,
-                                   method="POST", body={"instance_id": runtime["instance_id"]})
+                self.drain_serving(target.ports[role], token, runtime["instance_id"], deadline=deadline)
             # The drain endpoint only marks readiness. Serving's SIGTERM handler
             # owns the graceful shutdown, including for containers already draining.
             try:
@@ -3020,25 +3000,41 @@ class Deployer:
         if not self.ops.dry_run:
             save_state(self.cfg, state)
 
-    def retire_and_transfer(self, state: dict[str, Any], route: MainRoute, retiring: dict[str, Any], *,
-                            alias_plan: dict[str, list[str]] | None = None, allow_draining: bool = False,
-                            deadline: float | None = None, require_known_state: bool = False) -> None:
+    def retire_and_transfer(self, state: dict[str, Any], route: MainRoute, *,
+                            retiring: dict[str, Any], receiving: dict[str, Any],
+                            alias_plan: dict[str, list[str]] | None = None, inherit_aliases: bool = False,
+                            allow_draining: bool = False, deadline: float | None = None,
+                            require_known_state: bool = False) -> None:
+        if (route.serving["slot"] != receiving["slot"] or route.serving["containers"] != receiving["containers"]
+                or retiring["slot"] == receiving["slot"]):
+            raise RoutingUnconfirmed("the loaded route does not select the receiving serving pair")
         # Fresh reloads can briefly answer on both worker generations.
         self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True, deadline=deadline)
         if self.ops.dry_run:
             self.retire_serving(retiring)
             return
         old_target = Target.from_view(retiring, self.cfg.runtime_token_file)
-        new_target = Target.from_view(route.serving, self.cfg.runtime_token_file)
+        new_target = Target.from_view(receiving, self.cfg.runtime_token_file)
         old_ids: dict[str, str] = {}
         new_ids: dict[str, str] = {}
         old_aliases: list[ServingEndpoint] = []
         new_aliases: list[ServingEndpoint] = []
+        removed_roles = set()
         for target, identities, endpoints in ((old_target, old_ids, old_aliases), (new_target, new_ids, new_aliases)):
+            if target is new_target and inherit_aliases and old_aliases:
+                alias_plan = {role: [ep.network for ep in old_aliases if ep.role == role] for role in SERVING_ROLES}
             for role in SERVING_ROLES:
-                info = self.ops.inspect(
-                    target.containers[role],
-                    timeout=self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS)) or {}
+                name = target.containers[role]
+                if require_known_state and target is old_target:
+                    info, removed = self.inspect_or_missing(name, deadline=deadline)
+                    if removed:
+                        removed_roles.add(role)
+                        continue
+                    if not info or not isinstance(info.get("State", {}).get("Running"), bool):
+                        raise FallbackFailed("cannot confirm shared alias coverage while the retiring serving "
+                                             "container state is unknown. Both serving pairs were kept")
+                else:
+                    info = self.ops.inspect(name, timeout=self.recovery_timeout(deadline, DOCKER_STATUS_TIMEOUT_SECONDS))
                 if not info:
                     continue
                 identities[role] = info["Id"]
@@ -3053,7 +3049,9 @@ class Deployer:
                     if self.cfg.serving_alias in aliases:
                         endpoints.append(ServingEndpoint.from_inspect(role, network, endpoint, aliases))
 
-        if not self.alias_networks(retiring).issubset({(ep.network, ep.network_ref) for ep in new_aliases}):
+        retiring_roles = tuple(role for role in SERVING_ROLES if role not in removed_roles)
+        if not self.alias_networks(retiring, roles=retiring_roles, deadline=deadline).issubset(
+                {(ep.network, ep.network_ref) for ep in new_aliases}):
             raise FallbackFailed("rollback target does not provide the shared alias on all required networks. "
                                  "Both serving pairs were kept")
         if old_aliases:
@@ -3072,31 +3070,31 @@ class Deployer:
             self.record_alias_overlap(state, "alias_handoff", [retiring["slot"], route.serving["slot"]],
                                       "publish shared alias" if alias_plan else "retire previous serving",
                                       alias_handoff=True)
-        self.wait_for_nginx_drain(state, route)
+        self.wait_for_nginx_drain(state, route, deadline=deadline)
         expected_aliases = {(ep.network, ep.network_ref) for ep in new_aliases}
         if alias_plan:
             try:
-                route = self.publish_routed_aliases(state, route, retiring, new_ids, new_aliases,
-                                                    allow_draining=allow_draining, deadline=deadline)
+                route = self.publish_routed_aliases(state, route, retiring=retiring, receiving=receiving,
+                                                    identities=new_ids, endpoints=new_aliases,
+                                                    allow_draining=allow_draining, deadline=deadline,
+                                                    require_endpoints=inherit_aliases, retiring_roles=retiring_roles)
                 if old_aliases:
-                    self.ops.sleep(ALIAS_DNS_GRACE_SECONDS)
-                self.wait_for_nginx_drain(state, route)
+                    self.ops.sleep(self.recovery_timeout(deadline, ALIAS_DNS_GRACE_SECONDS))
+                self.wait_for_nginx_drain(state, route, deadline=deadline)
                 self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True,
                                      deadline=deadline)
-                if not expected_aliases.issubset(self.alias_networks(route.serving)):
+                if not expected_aliases.issubset(self.alias_networks(receiving, deadline=deadline)):
                     raise DeployError("the shared alias is not active on all expected networks")
             except (Exception, KeyboardInterrupt) as err:
                 raise AliasPublicationFailed(str(err) or type(err).__name__) from err
         if old_aliases:
             # Confirm coverage before anything is stopped: a gap discovered
             # afterwards would already have removed the last provider.
-            if not self.alias_networks(retiring).issubset(self.alias_networks(route.serving)):
+            if not self.alias_networks(retiring, roles=retiring_roles, deadline=deadline).issubset(self.alias_networks(receiving, deadline=deadline)):
                 raise FallbackFailed("the receiving slot does not provide the shared alias on every "
                                      "network. Both serving pairs were kept")
-        if deadline is not None:
-            # PR60's bounded recovery cleanup: never touch the last live provider.
-            self.require_not_sole_alias_provider(retiring, state)
-        self.retire_serving(retiring, state=state, deadline=deadline, require_known_state=require_known_state)
+        self.retire_serving(retiring, state=state, deadline=deadline, require_known_state=require_known_state,
+                            roles=retiring_roles)
         if old_aliases:
             # Let in-flight requests finish before removing the old alias
             # configuration, including from stopped containers that can restart.
@@ -3108,30 +3106,37 @@ class Deployer:
             self.configure_rollback_aliases(old_target, old_ids, old_aliases, shared=False, deadline=deadline)
             self.end_alias_overlap(state, [retiring["slot"], route.serving["slot"]])
 
-    def publish_routed_aliases(self, state: dict[str, Any], route: MainRoute, retiring: dict[str, Any],
-                               identities: dict[str, str], endpoints: list[ServingEndpoint], *,
-                               allow_draining: bool = False,
-                               deadline: float | None = None) -> MainRoute:
+    def publish_routed_aliases(self, state: dict[str, Any], route: MainRoute, *,
+                               retiring: dict[str, Any], receiving: dict[str, Any],
+                               identities: dict[str, str], endpoints: list[ServingEndpoint],
+                               allow_draining: bool = False, deadline: float | None = None,
+                               require_endpoints: bool = False,
+                               retiring_roles: tuple[str, ...] = SERVING_ROLES) -> MainRoute:
         self.verify_topology(state, route, retiring, allow_draining=allow_draining, wait=True, deadline=deadline)
-        if self.alias_networks(retiring) and not planned_alias_overlap(state["in_progress"], route.serving, retiring):
+        if self.alias_networks(retiring, roles=retiring_roles, deadline=deadline) and not planned_alias_overlap(
+                state["in_progress"], receiving, retiring):
             raise RoutingUnconfirmed("the shared alias was not withdrawn from the old slot")
-        target = Target.from_view(route.serving, self.cfg.runtime_token_file)
+        target = Target.from_view(receiving, self.cfg.runtime_token_file)
         active = route
         for role in reversed(SERVING_ROLES):
             selected = [endpoint for endpoint in endpoints if endpoint.role == role]
             if not selected:
                 continue
-            info = self.serving_info(route.serving, role, None)
+            info = self.serving_info(receiving, role, None, deadline=deadline)
             if info.get("Id") != identities[role]:
                 raise DeployError(f"cannot identify the selected {role} for shared alias publication")
             networks = info.get("NetworkSettings", {}).get("Networks", {})
+            if require_endpoints and any(ep.network not in networks or
+                                         (networks[ep.network].get("NetworkID") or ep.network) != ep.network_ref
+                                         for ep in selected):
+                raise DeployError("the receiving slot lost a required network for the shared alias")
             if all(endpoint.matches(networks.get(endpoint.network), endpoint.aliases) for endpoint in selected):
                 continue
             if active.excluded_serving != role:
-                remaining = MainRoute(route.serving, route.admin, excluded_serving=role)
-                self.apply_route(state, active, remaining, retiring, allow_draining=allow_draining)
+                remaining = MainRoute(receiving, route.admin, excluded_serving=role)
+                self.apply_route(state, active, remaining, retiring, allow_draining=allow_draining, deadline=deadline)
                 active = remaining
-            self.wait_for_nginx_drain(state, active)
+            self.wait_for_nginx_drain(state, active, deadline=deadline)
             cid = identities[role]
             # Let the routed peer accept new work; this instance still has all
             # its endpoints until the requests already on it finish.
@@ -3139,13 +3144,13 @@ class Deployer:
             self.configure_rollback_aliases(target, identities, selected, shared=True, deadline=deadline)
             self.ops.run(["docker", "start", cid], mutate=True,
                          timeout=self.recovery_timeout(deadline, 600))
-            self.wait_ready(target.ports[role], self.token_for(route.serving, role), "serving", self.cfg.ready_timeout,
+            self.wait_ready(target.ports[role], self.token_for(receiving, role), "serving", self.cfg.ready_timeout,
                             container=cid, check_health=True, deadline=deadline)
             self.ops.run(["docker", "update", "--restart=unless-stopped", cid], mutate=True,
                          timeout=self.recovery_timeout(deadline, 600))
         if active.excluded_serving is not None:
-            complete = MainRoute(route.serving, route.admin)
-            self.apply_route(state, active, complete, retiring, allow_draining=allow_draining)
+            complete = MainRoute(receiving, route.admin)
+            self.apply_route(state, active, complete, retiring, allow_draining=allow_draining, deadline=deadline)
             active = complete
         return active
 
@@ -3759,7 +3764,7 @@ class Deployer:
                     info = self.ops.inspect(target.containers[role]) or {}
                     if info.get("State", {}).get("Running") and info.get("Id") != (owned.get(role) or candidates.get(role)):
                         raise DeployError("candidate serving identity is unconfirmed; keep it outside the restored route")
-                self.retire_and_transfer(state, active, target.view(), alias_plan=alias_plan)
+                self.retire_and_transfer(state, active, retiring=target.view(), receiving=current, alias_plan=alias_plan)
             for role, cid in candidates.items():
                 if role not in owned:
                     self.stop_owned_serving(target, role, cid, allow_missing=True)
@@ -3933,7 +3938,8 @@ class Deployer:
         reclaimed = self.rebuild_held_isolation(target, identities, endpoints, held)
         original_endpoints = self.original_serving_endpoints(state)
         original_ids = state["in_progress"].get("original_serving_ids", {})
-        self.publish_routed_aliases(state, route, target.view(), original_ids, original_endpoints)
+        self.publish_routed_aliases(state, route, retiring=target.view(), receiving=original,
+                                   identities=original_ids, endpoints=original_endpoints)
         observed = {}
         for endpoint in original_endpoints:
             info = self.serving_info(original, endpoint.role, observed)
@@ -4028,7 +4034,7 @@ class Deployer:
                     self.wait_for_nginx_drain(state, route)
                     signalled = self.retire_serving(current, state=state)
                 else:
-                    self.retire_and_transfer(state, route, current, alias_plan=alias_plan)
+                    self.retire_and_transfer(state, route, retiring=current, receiving=target.view(), alias_plan=alias_plan)
             except AliasPublicationFailed as err:
                 if held is None or endpoints is None:
                     raise FallbackFailed(f"shared alias publication incomplete ({err}); inspect 'status' or retry 'abort'") from err
