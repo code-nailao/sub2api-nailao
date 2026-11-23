@@ -297,6 +297,17 @@ class DeployTest(unittest.TestCase):
         self.assertIn("upstream sources_main_admin", text)
         self.assertIn("server 127.0.0.1:9403;", text)
 
+    def test_render_upstreams_omits_a_backup_that_is_not_written(self):
+        text = deploy.render_upstreams(9401, None, 9403)
+        self.assertNotIn("backup", text)
+        self.assertEqual(([9401], 9403), deploy.loaded_upstream_ports(text))
+
+    def test_admin_only_write_leaves_the_loaded_serving_block_alone(self):
+        text = deploy.render_upstreams(9401, 9402, 9403)
+        updated = deploy.replace_admin_port(text, 9413)
+        self.assertEqual(([9401, 9402], 9413), deploy.loaded_upstream_ports(updated))
+        self.assertEqual(text.replace("127.0.0.1:9403;", "127.0.0.1:9413;"), updated)
+
     def test_nginx_readiness_reports_version_named_upstreams(self):
         problems = deploy.nginx_ready_for_fixed_upstreams("proxy_pass http://sources_main_001_serving;")
         self.assertEqual(3, len(problems))
@@ -521,8 +532,6 @@ class DeployTest(unittest.TestCase):
                 self.deploy()
         self.assertEqual([target["containers"]["background"], LEGACY["containers"]["background"],
                           target["containers"]["background"]], starts)
-        # Serving returns to the healthy previous slot first; admin stays on the
-        # candidate until a background is probed as ready, and here none is.
         expected = self.upstreams_for({"ports": {**LEGACY["ports"],
                                                  "background": target["ports"]["background"]}})
         self.assertEqual(expected, self.ops.loaded_upstreams)

@@ -619,9 +619,8 @@ class Deployer:
         except OSError as err:
             return result(False, "unreadable", f"runtime token unreadable ({err})")
         started = self.ops.monotonic()
-        runtime = (self.runtime_request_before(
+        runtime = self.runtime_request_before(
             lambda timeout: self.runtime(port, token, timeout=timeout), deadline)
-            if deadline is not None else self.runtime(port, token))
         elapsed = self.ops.monotonic() - started
         if not runtime:
             if docker_note:
@@ -1077,6 +1076,10 @@ class Deployer:
             return self.publish_routes(view, admin=None, deadline=deadline,
                                        note=note).probes["background"]
         updated = replace_admin_port(text, probe.port)
+        if updated == text and loaded_upstream_ports(text)[1] != probe.port:
+            raise RouteRefused(
+                f"the loaded upstream file names no admin upstream to move to slot {view['slot']} "
+                f"port {probe.port}; {probe.evidence()}")
         if updated != text:
             self.install_upstreams(updated)
             self.log(f"   admin route written: slot {view['slot']} port {probe.port} ({probe.evidence()})")
