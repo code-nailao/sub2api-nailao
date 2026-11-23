@@ -1133,6 +1133,213 @@ class DeployTest(unittest.TestCase):
         self.assertIsNone(self.state()["in_progress"])
         self.assertEqual("ok", self.history()[-1]["result"])
 
+    # -- property: no dead port survives a route write -------------------------
+    # The review findings are one family: a probe goes stale between the moment
+    # it is taken and the moment its answer is used. One property, swept over
+    # every (role x probe point), instead of one test per reproduction.
+    PROPERTY_FLOWS = ("normal release", "guard rollback", "manual rollback")
+
+    def property_views(self):
+        """Every slot a flow can write into, with its ports and containers."""
+        views = {}
+        for view in (LEGACY, self.cfg.slot_view("a")):
+            views.setdefault(view["slot"], view)
+        state = self.state()
+        for view in (state.get("slots") or {}).values():
+            views.setdefault(view["slot"], view)
+        return views
+
+    def property_flow(self, flow):
+        """One whole flow. A guard failure is the flow's own outcome, so the
+        error a person would see is returned instead of raised."""
+        if flow == "guard rollback":
+            self.ops.memory_after_switch = 20 * GIB
+        try:
+            self.deploy()
+            if flow == "manual rollback":
+                deploy.Deployer(self.cfg, self.ops).rollback()
+        except deploy.DeployError as err:
+            return err
+        return None
+
+    def property_port_index(self):
+        views = self.property_views()
+        return {(view["ports"][role]): (view["slot"], role)
+                for view in views.values() for role in deploy.ROLES}
+
+    def property_probe_counts(self, flow):
+        """How many HTTP probes the flow makes to each role's port. Every one
+        of them is a probe point the property has to stop a role at."""
+        counts: dict[tuple[str, str], int] = {}
+        index = self.property_port_index()
+        real = self.ops.http_json
+
+        def counting(url, **kw):
+            if url.startswith("http://127.0.0.1:"):
+                port = int(url.split(":")[2].split("/")[0])
+                if port in index:
+                    counts[index[port]] = counts.get(index[port], 0) + 1
+            return real(url, **kw)
+
+        with mock.patch.object(self.ops, "http_json", counting):
+            self.property_flow(flow)
+        return counts
+
+    def property_run(self, flow, slot, role, index, after):
+        """Stop one role at one probe point, then run the whole flow.
+
+        `after` stops it just after the given probe answers, so the write or
+        the next settlement probe is the one that has to notice; otherwise it
+        stops just before that probe, which then answers "not there"."""
+        views = self.property_views()
+        view = views[slot]
+        port, name = view["ports"][role], view["containers"][role]
+        writes: list[str] = []
+        real_write, real_http = self.ops.write_file_atomic, self.ops.http_json
+        seen = {"probe": 0, "stopped": False}
+
+        def stop():
+            container = self.ops.containers.get(name)
+            if container is not None:
+                seen["stopped"] = True
+                container["State"].update(Running=False, Status="exited")
+
+        def tracked_write(path, text, **kw):
+            if path == self.cfg.upstream_file:
+                writes.append(text)
+            return real_write(path, text, **kw)
+
+        def probe(url, **kw):
+            if url.startswith(f"http://127.0.0.1:{port}/"):
+                n = seen["probe"]
+                seen["probe"] += 1
+                if not after and n == index:
+                    stop()
+                result = real_http(url, **kw)
+                if after and n == index:
+                    stop()
+                return result
+            return real_http(url, **kw)
+
+        with mock.patch.object(self.ops, "write_file_atomic", tracked_write), \
+                mock.patch.object(self.ops, "http_json", probe):
+            error = self.property_flow(flow)
+        return {"error": error, "writes": writes, "stopped": seen["stopped"]}
+
+    def assert_reported(self, slot, role, label):
+        """B segment: status and the resident watch both name the slot, the
+        role and the time it was found."""
+        progress = deploy.status(self.cfg, self.ops).get("in_progress") or {}
+        found = [i for i in progress.get("route_issues") or []
+                 if i["slot"] == slot and i["role"] == role and i.get("found_at")]
+        self.assertTrue(found, f"{label}: status does not name {slot} {role} with the time it "
+                               f"was found: {progress}")
+        alerts = deploy.watch_once(self.cfg, self.ops, {})
+        named = [a for a in alerts if a["alert"] == ["in_progress"]
+                 and any(i["slot"] == slot and i["role"] == role and i.get("found_at")
+                         for i in a.get("route_issues") or [])]
+        self.assertTrue(named, f"{label}: the watch alert does not carry {slot} {role}: {alerts}")
+
+    def assert_route_property(self, flow, slot, role, run):
+        """The final loaded route names no role that stopped answering, unless
+        nothing could have replaced it; then that role must be reported."""
+        label = (f"{flow}: {slot} {role} stopped at probe {run['index']}"
+                 f"{' (after)' if run['after'] else ''}")
+        if not run["writes"]:
+            return  # nothing was written in this flow; there is no route decision to judge
+        views = self.property_views()
+        loaded = self.ops.loaded_upstreams
+        serving_ports, admin_port = deploy.loaded_upstream_ports(loaded or "")
+        written = set()
+        for text in run["writes"]:
+            ports, admin = deploy.loaded_upstream_ports(text)
+            written.update(ports)
+            if admin is not None:
+                written.add(admin)
+        self.assertEqual(loaded, self.ops.files[self.cfg.upstream_file],
+                         f"{label}: the file on disk is not what Nginx was told to load")
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        dead = []
+        for view in views.values():
+            for r in deploy.SERVING_ROLES:
+                if view["ports"][r] in serving_ports:
+                    probe = deployer.probe_role(view, r)
+                    if not probe.usable:
+                        dead.append((view, r, probe))
+            if admin_port is not None and view["ports"]["background"] == admin_port:
+                probe = deployer.probe_role(view, "background")
+                if not probe.usable:
+                    dead.append((view, "background", probe))
+        for view, r, probe in dead:
+            if r == "standby":
+                # A backup is always droppable: it never has to be replaced.
+                self.fail(f"{label}: the loaded route still names slot {view['slot']} standby "
+                          f"port {probe.port}, which does not answer")
+            if r == "serving":
+                replaceable = any(deployer.probe_role(other, "standby").usable
+                                  for other in views.values() if other["slot"] == view["slot"])
+            else:
+                replaceable = any(deployer.probe_role(other, "background").usable
+                                  for other in views.values() if other["slot"] != view["slot"])
+            self.assertFalse(replaceable,
+                             f"{label}: the loaded route names slot {view['slot']} {r} port "
+                             f"{probe.port}, which does not answer, while another role could "
+                             f"have replaced it")
+            self.assert_reported(view["slot"], r, label)
+        # The role we stopped: if its port made it into a written route and it
+        # does not answer now, the run must leave that where a person can see
+        # it - even if the role is back before the next look.
+        view = views[slot]
+        if run["stopped"] and view["ports"][role] in written:
+            if not deployer.probe_role(view, role).usable:
+                self.assert_reported(slot, role, label)
+
+    def property_fresh(self):
+        case = DeployTest("test_first_deploy_from_legacy_moves_everything_to_slot_a")
+        case.setUp()
+        return case
+
+    def property_scenarios(self, flow):
+        case = self.property_fresh()
+        try:
+            counts = case.property_probe_counts(flow)
+        finally:
+            case.tearDown()
+        scenarios = []
+        for (slot, role), count in sorted(counts.items()):
+            for index in range(count):
+                scenarios.append((slot, role, index, False))
+            # A probe with no later probe of the same role cannot be followed:
+            # stopping after it is "after the last look", not a race.
+            for index in range(count - 1):
+                scenarios.append((slot, role, index, True))
+        return scenarios
+
+    def test_property_no_role_is_left_written_after_it_stops_answering(self):
+        """The whole family, one sweep: for every flow, every role and every
+        probe point, stop that role and require the final loaded route to name
+        no role that stopped answering - or, when nothing could replace it, to
+        report it with slot, role and time in status and in the watch alert."""
+        failures = []
+        checked = 0
+        for flow in self.PROPERTY_FLOWS:
+            for slot, role, index, after in self.property_scenarios(flow):
+                case = self.property_fresh()
+                try:
+                    run = case.property_run(flow, slot, role, index, after)
+                    run.update(index=index, after=after)
+                    checked += 1
+                    try:
+                        case.assert_route_property(flow, slot, role, run)
+                    except AssertionError as err:
+                        failures.append(str(err))
+                finally:
+                    case.tearDown()
+        self.assertGreater(checked, 20, "the sweep checked too few stop points to mean anything")
+        if failures:
+            self.fail(f"{len(failures)} of {checked} stop points left a route decision that "
+                      "does not hold:\n- " + "\n- ".join(failures[:12]))
+
     # -- watch coverage (B segment: report, do not silently skip) -------------
     def test_watch_keeps_both_slots_after_two_releases(self):
         self.deploy()
