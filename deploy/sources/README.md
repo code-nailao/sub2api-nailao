@@ -55,7 +55,9 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 
 回滚会复用上一槽位已停止的容器。启动前检查当前后台是否在创建定时备份。备份进行中默认中止，可用 `deploy.py rollback --allow-running-backup` 继续。
 
-如果某次运行没有走完（`status` 里 `in_progress` 不为空），下一次 `main` 会拒绝执行。先用 `status` 和 `docker ps` 看清现场，处理完后再把 `state.json` 的 `in_progress` 清空。`FAILED AND NOT RESTORED` 时原因写在 `in_progress.failed`；`status` 里的 `restart_policy` 可用来确认容器的重启策略。
+如果 `status` 里显示 `in_progress.phase=held`，使用 `resume` 完成发布，或用 `abort` 移除候选实例。`phase=aborting` 时，检查剩余容器后重试 `abort`。启动暂停、演练和验证步骤见[暂停发布](../../docs/sources/DEPLOY.md#暂停发布)。
+
+发布因错误或中断留下 `in_progress` 时，下一次 `main` 会拒绝执行。先用 `status` 和 `docker ps` 确认现场，处理完后再把 `state.json` 的 `in_progress` 清空。`FAILED AND NOT RESTORED` 时原因写在 `in_progress.failed`。`status` 里的 `restart_policy` 可用来确认容器的重启策略。
 
 常规排空、备份延长和恢复等待期间，Docker 的 `inspect` 和容器列表查询共用当前期限。超过 `background_exit_timeout` 和适用的备份等待期后，状态查询、退出确认、恢复后台和清理新 serving 共用一个 30 秒恢复窗口。备份状态读不到时在窗口内重试。切流前若确认旧后台退出，就按原重启策略恢复当前槽位。若 Docker 确认旧容器已被移除，则继续交接给已准备好的目标后台。恢复就绪检查为写失败记录预留最后 5 秒。切流失败或守护失败后若进入恢复窗口，交还后台后的 serving 清理仍沿用原截止时间。清理未完成时会留下失败记录并释放发布锁。详见 [发布与部署](../../docs/sources/DEPLOY.md)。
 
@@ -82,9 +84,9 @@ ssh <host> 'sudo -n /opt/sources-deploy/bin/deploy.py status'
 
 ## 内部调用方使用稳定别名
 
-`deploy.py` 创建的每个 serving 容器（主和备）都在它所在的每个网络上带一个固定别名 `sources-main-serving`（`main.json` 的 `serving_alias`），后台容器没有。旧版本容器退役停止后，会自动从这个名字的解析结果里消失，所以同一 Docker 网络内的调用方（例如 Portal）应使用 `http://sources-main-serving:8080`，不要写死某个容器的 IP 或名称，否则那个容器就无法退役。
+正式接流的 serving 容器（主和备）在它所在的每个网络上带 `main.json` 中 `serving_alias` 指定的固定别名。旧版本容器退役停止后，会从这个名字的解析结果里消失。因此同一 Docker 网络内的调用方（例如 Portal）应使用旧版和新版共用的别名。暂停实例在 `resume` 校验通过之后才注册共享别名。
 
-注意：Docker 只能在创建容器时附加网络别名。`adopt` 记录的旧容器没有这个别名，只有经 `deploy.py` 发布后的容器才有；调用方应在第一次正式发版之后再切换到别名，并在确认旧地址不再有连接后再退役旧容器。
+`adopt` 只登记旧容器。调用方应在第一次正式发版之后再切换到别名，并在确认旧地址不再有连接后再退役旧容器。
 
 ## Portal
 
