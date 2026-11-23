@@ -1893,6 +1893,32 @@ class Deployer:
 # Status, watch and adopt
 
 
+def observe_release(cfg: Config) -> tuple[dict[str, Any], bool]:
+    """Read release state and confirm an unfinished step has no lock owner."""
+    state = load_state(cfg)
+    progress = state.get("in_progress") or {}
+    if not progress or progress.get("phase") == "held" or progress.get("failed") or progress.get("reason"):
+        return state, False
+    try:
+        lock = Path(cfg.lock_file).open("rb")
+    except FileNotFoundError:
+        return state, True
+    except OSError:
+        return state, False
+    with lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return state, False
+        # The writer may have completed between the first read and the lock
+        # probe. Take a new snapshot while no writer can change the state.
+        return load_state(cfg), True
+
+
+RELEASE_INTERRUPTED = "The release lock is free but a release step remains. Check live routing and containers before recovery."
+ABORT_INTERRUPTED = "The release lock is free but paused release cleanup remains. Check the containers and retry 'abort'."
+
+
 def held_containers(cfg: Config, ops: Ops, held: dict[str, Any]) -> dict[str, Any]:
     deployer = Deployer(cfg, ops)
     containers = {}
@@ -1912,7 +1938,7 @@ def held_containers(cfg: Config, ops: Ops, held: dict[str, Any]) -> dict[str, An
 
 
 def status(cfg: Config, ops: Ops) -> dict[str, Any]:
-    state = load_state(cfg)
+    state, lock_free = observe_release(cfg)
     progress = state.get("in_progress")
     report: dict[str, Any] = {"in_progress": progress}
     if progress and progress.get("phase") in ("held", "aborting"):
@@ -1920,11 +1946,14 @@ def status(cfg: Config, ops: Ops) -> dict[str, Any]:
         age = max(0, int((dt.datetime.now(dt.timezone.utc) - held_at).total_seconds()))
         warning = None
         if progress["phase"] == "aborting":
-            warning = "paused release cleanup is incomplete. Inspect the containers and retry 'abort'"
+            warning = (ABORT_INTERRUPTED if lock_free and not progress.get("reason") else
+                       "paused release cleanup is incomplete. Inspect the containers and retry 'abort'")
         elif age >= cfg.hold_warning_seconds:
             warning = "release has been paused for a long time. Verify it, then resume or abort"
         report["in_progress"] = {**progress, "age_seconds": age, "warning": warning,
                                  "live_containers": held_containers(cfg, ops, progress)}
+    elif progress and lock_free and not progress.get("failed"):
+        report["in_progress"] = {**progress, "phase": "interrupted", "warning": RELEASE_INTERRUPTED}
     for key in ("current", "previous"):
         view = state.get(key)
         if not view:
@@ -1949,19 +1978,24 @@ def status(cfg: Config, ops: Ops) -> dict[str, Any]:
 
 def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]]) -> list[dict[str, Any]]:
     """One resident sample of the current release; returns alerts."""
-    state = load_state(cfg)
+    state, lock_free = observe_release(cfg)
     current = state.get("current")
     if not current:
         return []
     deployer = Deployer(cfg, ops)
     alerts = []
     progress = state.get("in_progress") or {}
-    if progress.get("phase") == "aborting" and progress.get("reason"):
-        alerts.append({"alert": ["abort_incomplete"], "at": now(), "phase": "aborting",
-                       "slot": progress["target"]["slot"], "reason": progress["reason"]})
+    if progress.get("phase") == "aborting":
+        reason = progress.get("reason") or (ABORT_INTERRUPTED if lock_free else None)
+        if reason:
+            alerts.append({"alert": ["abort_incomplete"], "at": now(), "phase": "aborting",
+                           "slot": progress["target"]["slot"], "reason": reason})
     elif progress.get("failed"):
         alerts.append({"alert": ["release_incomplete"], "at": now(), "step": progress.get("step"),
                        "reason": progress["failed"]})
+    elif lock_free and progress and progress.get("phase") != "held":
+        alerts.append({"alert": ["release_incomplete"], "at": now(), "phase": "interrupted",
+                       "step": progress.get("step"), "reason": RELEASE_INTERRUPTED})
     t = ops.monotonic()
     for role, name in current["containers"].items():
         token = None

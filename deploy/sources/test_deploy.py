@@ -2609,6 +2609,63 @@ class HoldTest(unittest.TestCase):
             self.assertEqual(1, result)
             self.assertIn("unfinished release requires manual recovery", error)
 
+    def test_reports_release_interrupted_after_resume_releases_its_lock(self):
+        held = self.hold()
+        serving_id = held["containers"]["serving"]
+        self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
+        run = self.ops.run
+
+        def exit_during_activation(args, **kwargs):
+            if args == ["docker", "update", "--restart=no", serving_id]:
+                progress = deploy.status(self.cfg, self.ops)["in_progress"]
+                self.assertEqual("activate held serving", progress["step"])
+                self.assertNotEqual("interrupted", progress.get("phase"))
+                self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
+                # Exit before the deployment can write a failure record.
+                raise SystemExit(97)
+            return run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "run", side_effect=exit_during_activation):
+            with self.assertRaisesRegex(SystemExit, "97"):
+                self.cli("resume")
+
+        with deploy.release_lock(self.cfg.lock_file):
+            self.assertNotIn("failed", self.state()["in_progress"])
+        state_file = Path(self.cfg.state_file)
+        saved = state_file.read_bytes()
+        progress = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertEqual("interrupted", progress.get("phase"))
+        self.assertEqual("activate held serving", progress["step"])
+        self.assertIn("release lock is free", progress["warning"])
+        alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertEqual(["release_incomplete"], alerts[0]["alert"])
+        self.assertEqual("activate held serving", alerts[0]["step"])
+        self.assertIn("release lock is free", alerts[0]["reason"])
+        self.assertEqual(saved, state_file.read_bytes())
+
+    def test_reports_interrupted_abort_and_allows_retry(self):
+        held = self.hold()
+        serving_id = held["containers"]["serving"]
+        run = self.ops.run
+
+        def exit_during_cleanup(args, **kwargs):
+            if args == ["docker", "update", "--restart=no", serving_id]:
+                self.assertEqual([], deploy.watch_once(self.cfg, self.ops, {}))
+                raise SystemExit(97)
+            return run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "run", side_effect=exit_during_cleanup):
+            with self.assertRaisesRegex(SystemExit, "97"):
+                self.cli("abort")
+
+        self.assertNotIn("reason", self.state()["in_progress"])
+        progress = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertEqual("aborting", progress["phase"])
+        self.assertIn("release lock is free", progress["warning"])
+        self.assertEqual(["abort_incomplete"], deploy.watch_once(self.cfg, self.ops, {})[0]["alert"])
+        self.assertEqual((0, ""), self.cli("abort"))
+        self.assertIsNone(self.state()["in_progress"])
+
     def test_main_and_rollback_cannot_replace_a_held_release(self):
         self.hold()
         self.ops.commands.clear()
