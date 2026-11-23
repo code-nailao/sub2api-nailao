@@ -18,10 +18,11 @@ The description is read from the PR_BODY environment variable. It passes with
 
 HTML comments, fenced code blocks and code spans are ignored: GitHub shows none
 of them as links, so the hints in the pull request template and the examples in
-a description do not answer for it. Only the form is checked: whether the
-number is a real issue, and whether the reason is an accepted one, is for the
-reviewer. The rule is in the "Issue 与 PR" section of
-docs/sources/WORKSPACE.md.
+a description do not answer for it. A fence or a span inside a block quote is
+read the same way, since quoting an example does not make it an answer. Only
+the form is checked: whether the number is a real issue, and whether the reason
+is an accepted one, is for the reviewer. The rule is in the "Issue 与 PR"
+section of docs/sources/WORKSPACE.md.
 
 Nothing here uses the network, and nothing from the description is printed
 except the matched reference.
@@ -44,11 +45,15 @@ REFERENCE = rf'(?:(?:{NAME}/{NAME})?#{NUMBER}|https://github\.com/{NAME}/{NAME}/
 LINKED = re.compile(rf'(?<![\w-])({KEYWORD}):?[ \t]+({REFERENCE})(?!\w)', re.I)
 # The reference is read back as a repository and a number. The number stays a
 # string: it is canonical without leading zeros, and a number long enough to
-# overflow int() is still just a number no issue has.
-SHORT_REFERENCE = re.compile(rf'^(?:(?P<slug>{NAME}/{NAME}))?#(?P<number>{NUMBER})$')
+# overflow int() is still just a number no issue has. These read the same
+# references LINKED matches, which ignores case, so they ignore it too.
+SHORT_REFERENCE = re.compile(rf'^(?:(?P<slug>{NAME}/{NAME}))?#(?P<number>{NUMBER})$', re.I)
 URL_REFERENCE = re.compile(
-    rf'^https://github\.com/(?P<slug>{NAME}/{NAME})/issues/(?P<number>{NUMBER})$')
+    rf'^https://github\.com/(?P<slug>{NAME}/{NAME})/issues/(?P<number>{NUMBER})$', re.I)
 FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})')
+# A block quote marker: up to three spaces, `>`, and at most one space or tab.
+# These repeat for nesting.
+QUOTE = re.compile(r' {0,3}>[ \t]?')
 BACKTICKS = re.compile(r'`+')
 # A full-width colon is accepted after either label. No two neighbouring
 # repeats can match the same character, which keeps a long run of `*` linear.
@@ -94,20 +99,42 @@ def blank_spans(text):
     return ''.join(out)
 
 
+def unquote(line):
+    """Returns a line's block quote depth and its content without the markers.
+
+    GitHub reads a quoted line as Markdown in its own right, so a fence or a
+    span inside a quote is one. A quote ends at the first line without a
+    marker, and that ends a fence opened inside it, as GitHub ends it.
+    """
+    depth = 0
+    position = 0
+    while True:
+        marker = QUOTE.match(line, position)
+        if not marker:
+            return depth, line[position:]
+        depth += 1
+        position = marker.end()
+
+
 def strip_code(text):
     """Drops fenced blocks and code spans, which GitHub never links from."""
     kept = []
-    fence = None
+    fence = None  # (character, length, depth in quotes) of the open fence
     for line in text.splitlines():
-        opening = FENCE.match(line)
+        depth, content = unquote(line)
+        if fence is not None and depth < fence[2]:
+            fence = None  # the quote holding this fence ended, so the fence did
         if fence is None:
+            opening = FENCE.match(content)
             if opening:
-                fence = opening.group(1)
+                fence = (opening.group(1)[0], len(opening.group(1)), depth)
             else:
-                kept.append(line)
-        elif (opening and opening.group(1)[0] == fence[0]
-              and len(opening.group(1)) >= len(fence)
-              and not line[opening.end():].strip()):
+                kept.append(content)
+            continue
+        opening = FENCE.match(content)
+        if (opening and opening.group(1)[0] == fence[0]
+                and len(opening.group(1)) >= fence[1]
+                and not content[opening.end():].strip()):
             fence = None
         # Every other line of an open fence is code, and an unclosed fence runs
         # to the end of the description.
@@ -115,8 +142,15 @@ def strip_code(text):
 
 
 def issue_in(reference):
-    """Returns ((repository, number), display) for a matched reference."""
+    """Returns ((repository, number), display) for a matched reference.
+
+    Raises ValueError for anything the two forms do not read, rather than
+    guessing: the keyword scan and this one share a grammar, so a reference
+    that reaches here unread is a mismatch to report, not to drop.
+    """
     match = SHORT_REFERENCE.match(reference) or URL_REFERENCE.match(reference)
+    if match is None:
+        raise ValueError(reference)
     number = match.group('number')
     slug = match.group('slug')
     repository = (slug or os.environ.get('REPO', '')).lower()
@@ -130,7 +164,14 @@ def verdict(body):
     closing = {}  # (repository, number) -> the first reference that closes it
     mention = None
     for match in LINKED.finditer(text):
-        issue, display = issue_in(match.group(2))
+        try:
+            issue, display = issue_in(match.group(2))
+        except ValueError:
+            # Never guess at one, and never pass by dropping it: say what to fix.
+            return False, (f'the pull request description names "{match.group(2)}", '
+                           f'which this check cannot read as an issue. Write it as '
+                           f'`Closes #N`, `Closes owner/repo#N` or an issue URL, then '
+                           f're-run this job.')
         if match.group(1).lower() in CLOSING_KEYWORDS:
             closing.setdefault(issue, (match.group(0), display))
         elif mention is None:

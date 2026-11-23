@@ -6,7 +6,8 @@ import time
 import unittest
 from unittest import mock
 
-from check_pr_issue import verdict
+import check_pr_issue
+from check_pr_issue import issue_in, verdict
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = Path(__file__).with_name('check_pr_issue.py')
@@ -63,6 +64,15 @@ class LinkedIssueTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertFalse(passes(body))
 
+    def test_a_reference_is_read_in_any_case(self):
+        # The keyword scan ignores case, so reading the reference back must too.
+        for body in ('Closes HTTPS://GITHUB.COM/example-owner/example-repo/issues/12',
+                     'cLoSeS https://GitHub.com/example-owner/example-repo/issues/12',
+                     'FIXES example-owner/example-repo#12',
+                     'ClOsEs #12'):
+            with self.subTest(body=body):
+                self.assertTrue(passes(body))
+
 
 class OneClosingIssueTests(unittest.TestCase):
     """A pull request closes exactly one issue; a second issue means a split."""
@@ -80,6 +90,25 @@ class OneClosingIssueTests(unittest.TestCase):
                      'closes example-owner/example-repo#12'):
             with self.subTest(body=body):
                 self.assertTrue(passes(body))
+
+    def test_the_same_issue_in_another_case_counts_once(self):
+        # A short reference and a URL written in capitals are one issue.
+        with mock.patch.dict(os.environ, {'REPO': 'owner/repo'}):
+            for body in ('Closes #12\nFixes https://GITHUB.COM/owner/repo/issues/12',
+                         'Closes https://GITHUB.COM/owner/repo/issues/12\nFixes #12',
+                         'Closes HTTPS://github.com/owner/repo/issues/12, closes #12',
+                         'Closes OWNER/REPO#12, closes #12'):
+                with self.subTest(body=body):
+                    passed, detail = verdict(body)
+                    self.assertTrue(passed, detail)
+
+    def test_another_issue_in_another_case_still_counts_as_a_second(self):
+        with mock.patch.dict(os.environ, {'REPO': 'owner/repo'}):
+            passed, detail = verdict(
+                'Closes #12\nFixes https://GITHUB.COM/other-owner/other-repo/issues/9')
+        self.assertFalse(passed)
+        self.assertIn('2 issues', detail)
+        self.assertIn('#9', detail)
 
     def test_this_repository_is_named_by_the_environment(self):
         # The workflow passes REPO, so a bare number is that repository's issue.
@@ -128,6 +157,30 @@ class OneClosingIssueTests(unittest.TestCase):
         self.assertTrue(passes('Closes #12, #15'))
 
 
+class ReferenceReadingTests(unittest.TestCase):
+    """Reading a matched reference back never fails silently or with a crash."""
+
+    def test_every_reference_the_keyword_scan_accepts_is_read_back(self):
+        for reference in ('#12', 'example-owner/example-repo#12',
+                          'https://github.com/example-owner/example-repo/issues/12',
+                          'HTTPS://GitHub.com/example-owner/example-repo/issues/12'):
+            with self.subTest(reference=reference):
+                self.assertEqual(issue_in(reference)[0][1], '12')
+
+    def test_an_unreadable_reference_is_named_as_one(self):
+        for reference in ('', '#012', '#0',
+                          'https://github.com/example-owner/example-repo/pull/12'):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ValueError):
+                    issue_in(reference)
+
+    def test_an_unreadable_reference_fails_the_check_instead_of_crashing(self):
+        with mock.patch.object(check_pr_issue, 'issue_in', side_effect=ValueError('x')):
+            passed, detail = verdict('Closes #12')
+        self.assertFalse(passed)
+        self.assertIn('#12', detail)
+
+
 class CodeTests(unittest.TestCase):
     """GitHub shows code without links, so an example in a description is not
     an answer either."""
@@ -143,6 +196,39 @@ class CodeTests(unittest.TestCase):
                      'Example:\n\n```\nNo issue: typo\n```\n'):
             with self.subTest(body=body):
                 self.assertFalse(passes(body))
+
+    def test_a_fence_inside_a_quote_does_not_count(self):
+        for body in ('> ~~~\n> Closes #12\n> ~~~\n',
+                     'Example:\n\n> ~~~\n> Closes #12\n> ~~~\n',
+                     '> ```\n> Closes #12\n> ```\n',
+                     '> > ~~~\n> > Closes #12\n> > ~~~\n',
+                     '> > ```\n> > No issue: typo\n> > ```\n',
+                     '> ```\n> Closes #12\n'):
+            with self.subTest(body=body):
+                self.assertFalse(passes(body))
+
+    def test_a_span_inside_a_quote_does_not_count(self):
+        for body in ('> Issue: `Closes #12`', '> Use `Closes #12` here.\n',
+                     '> > Use ``Closes #12`` here.\n'):
+            with self.subTest(body=body):
+                self.assertFalse(passes(body))
+
+    def test_a_reference_a_quote_does_not_hide_still_counts(self):
+        for body in ('> Closes #12\n',
+                     '> > Closes #12\n',
+                     'See the note:\n\n> Closes #12\n',
+                     '> Issue: Closes #12',
+                     '> ~~~\n> Closes #12\n> ~~~\n\nCloses #15\n',
+                     '```\n> a quoted line is code\n```\n\nCloses #15\n'):
+            with self.subTest(body=body):
+                self.assertTrue(passes(body))
+
+    def test_a_fence_ends_where_its_quote_ends(self):
+        # The quote stops at a line without a marker, and so does its fence.
+        for body in ('> ```\n> an example\n\nCloses #12\n',
+                     '> ~~~\n> No issue: example\n\nNo issue: typo\n'):
+            with self.subTest(body=body):
+                self.assertTrue(passes(body))
 
     def test_a_reference_outside_code_still_counts(self):
         self.assertTrue(passes('`Closes #12` is how it is written.\n\nCloses #15'))
