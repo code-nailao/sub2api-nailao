@@ -542,6 +542,27 @@ class DeployTest(unittest.TestCase):
         self.assert_release_failure("held")
         self.assertNotIn("fixture-inherited", Path(self.cfg.state_file).read_text())
 
+    def test_rejected_resume_does_not_persist_retired_alias_window_end(self):
+        self.deploy()
+        retiring = self.state()["current"]
+        for role in deploy.SERVING_ROLES:
+            name = retiring["containers"][role]
+            # The held containers reuse these names with different identities.
+            self.ops.containers[name]["Id"] += "-retiring"
+            self.ops.drain_seconds[name] = 30
+        self.deploy(image="fixture:second")
+        self.ops.sleep(31)
+        self.deploy(image="fixture:paused", hold_before_switch=True)
+        state_path = Path(self.cfg.state_file)
+        self.assertNotIn("ended_at", self.state()["alias_overlap"])
+        self.assertIn("ended_at", deploy.status(self.cfg, self.ops)["alias_overlap"])
+        before = state_path.read_bytes()
+        self.ops.files[self.cfg.env_files["background"]] += "FIXTURE=changed\n"
+
+        with self.assertRaisesRegex(deploy.DeployError, "changed during pause.*Held pause unchanged"):
+            deploy.Deployer(self.cfg, self.ops).resume()
+        self.assertEqual(before, state_path.read_bytes())
+
     def test_resume_rejects_fifo_input_and_releases_lock(self):
         source = self.tmp / "mounted-input"
         source.mkdir()
@@ -1968,6 +1989,25 @@ class DeployTest(unittest.TestCase):
                 deploy.Deployer(self.cfg, self.ops).rollback()
         self.assertIn("ended_at", self.state()["alias_overlap"])
 
+    def test_watch_reports_unrecorded_standby_on_the_alias_after_ordinary_release(self):
+        self.deploy()
+        previous = self.state()["current"]
+        standby = previous["containers"]["standby"]
+        self.ops.run(["docker", "kill", "--signal=TERM", standby], mutate=True)
+        self.ops.drain_seconds[previous["containers"]["serving"]] = 30
+        self.deploy(image="fixture:second")
+        retiring = self.state()["retiring_serving"]
+        self.assertEqual(previous["slot"], retiring["slot"])
+        self.assertEqual({"serving"}, set(retiring["containers"]))
+
+        def conflicts():
+            return [alert["slots"] for alert in deploy.watch_once(self.cfg, self.ops, {})
+                    if alert["alert"] == ["shared_alias_conflict"]]
+
+        self.assertEqual([], conflicts(), "the recorded primary may still drain")
+        self.ops.run(["docker", "start", standby], mutate=True)
+        self.assertEqual([[previous["slot"]]], conflicts())
+
     def test_watch_reports_a_third_slot_sharing_the_alias_inside_a_recorded_window(self):
         self.deploy()
         state = self.state()
@@ -2411,6 +2451,43 @@ class DeployTest(unittest.TestCase):
         deploy.Deployer(self.cfg, self.ops).rollback()
         self.assertNotIn(["docker", "kill", "--signal=TERM", name], self.ops.commands)
         self.assert_live_release(LEGACY)
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_resume_guard_restores_the_previous_primary_when_its_standby_is_stopped(self):
+        self.deploy()
+        previous = self.state()["current"]
+        self.deploy(image="fixture:second", hold_before_switch=True)
+        target = self.state()["in_progress"]["target"]
+        self.ops.run(["docker", "kill", "--signal=TERM", previous["containers"]["standby"]], mutate=True)
+        inspect = self.ops.inspect
+        failed_health = []
+
+        def stop_candidate_during_guard(name, **kw):
+            if (not failed_health and name == target["containers"]["serving"]
+                    and (self.state()["in_progress"] or {}).get("step") == "guard"):
+                for role in deploy.SERVING_ROLES:
+                    container = self.ops.containers[target["containers"][role]]
+                    container["State"].update(Running=False, Status="exited")
+                failed_health.append(self.ops.probe_nginx_serving("", 1)[0])
+            return inspect(name, **kw)
+
+        runner = deploy.Deployer(self.cfg, self.ops)
+        with mock.patch.object(self.ops, "inspect", stop_candidate_during_guard):
+            with self.assertRaisesRegex(deploy.DeployError, "guard failed"):
+                runner.resume()
+
+        self.assertEqual([502], failed_health)
+        self.assertEqual(200, self.ops.probe_nginx_serving("", 1)[0])
+        expected = deploy.render_upstreams(previous["ports"]["serving"], None, previous["ports"]["background"])
+        self.assertEqual(expected, self.upstreams_only(self.ops.loaded_upstreams))
+        self.assertEqual(self.ops.loaded_upstreams, self.ops.files[self.cfg.upstream_file])
+        self.assertTrue(runner.background_answering(previous))
+        self.assertEqual(previous["slot"], self.state()["current"]["slot"])
+        self.assert_release_failure("failed", "standby")
+        self.assertEqual("guard", self.state()["in_progress"]["failed_step"])
+
+        runner.abort()
+        self.assert_loaded_interfaces(previous, previous)
         self.assertIsNone(self.state()["in_progress"])
 
     def test_guard_rollback_refuses_a_serving_port_that_stops_answering_during_switch(self):
@@ -2866,6 +2943,28 @@ class DeployTest(unittest.TestCase):
         self.ops.unready_ports.clear()
         deploy.Deployer(self.cfg, self.ops).resume()
         self.assertEqual("a", self.state()["current"]["slot"])
+
+    def test_resume_preserves_pause_when_candidate_standby_health_fails(self):
+        held = self.hold()
+        target = held["target"]
+        before = Path(self.cfg.state_file).read_bytes()
+        http_json = self.ops.http_json
+
+        def fail_standby_health(url, **kw):
+            if url.endswith(f":{target['ports']['standby']}/health"):
+                return 503, None
+            return http_json(url, **kw)
+
+        runner = deploy.Deployer(self.cfg, self.ops)
+        with mock.patch.object(self.ops, "http_json", fail_standby_health):
+            with self.assertRaises(deploy.DeployError) as failure:
+                runner.resume()
+        self.assertEqual(before, Path(self.cfg.state_file).read_bytes())
+        self.assertIn("Held pause unchanged", str(failure.exception))
+        self.assert_live_release(LEGACY)
+        for role in deploy.SERVING_ROLES:
+            self.assertTrue(self.ops.inspect(target["containers"][role])["State"]["Running"])
+        self.assert_no_shared_serving(target)
 
     def test_resume_rejects_changed_configuration_routing_or_current_owner(self):
         self.hold()

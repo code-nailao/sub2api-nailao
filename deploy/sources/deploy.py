@@ -2240,8 +2240,11 @@ class Deployer:
         retiring = active.serving
         candidate = Target.from_view(active.admin, self.cfg.runtime_token_file)
         receiver = Target.from_view(previous, self.cfg.runtime_token_file)
-        serving_route = MainRoute(previous, active.admin)
         try:
+            standby = self.serving_info(previous, "standby", None)
+            standby_healthy = standby.get("State", {}).get("Running") and self.health(previous["ports"]["standby"])
+            excluded = None if standby_healthy else "standby"
+            serving_route = MainRoute(previous, active.admin, excluded_serving=excluded)
             # Move only serving. The admin port already belongs to the loaded
             # route and remains selected throughout the background handoff.
             self.apply_route(state, active, serving_route, retiring, guard_serving_only=True)
@@ -2262,7 +2265,7 @@ class Deployer:
             # The loaded generation must be confirmed before further changes.
             raise RoutingUnconfirmed(f"guard failed ({reason}); admin route unconfirmed ({err})") from err
         except (Exception, KeyboardInterrupt) as err:
-            if isinstance(err, BackgroundRestored):
+            if isinstance(err, BackgroundRestored) and serving_route.excluded_serving is None:
                 # The serving-only route is already loaded. If its pair
                 # already provides the alias and admin has recovered, finish
                 # the degraded serving retirement behind the same safeguards.
@@ -2275,6 +2278,12 @@ class Deployer:
             failure = self.rollback_admin_owner(state, serving_route, retiring, candidate, reason, err)
             raise RollbackIncomplete(str(failure)) from err
 
+        if route.excluded_serving is not None:
+            # Keep the proven single-peer route and its recovery record. Alias
+            # publication may have to take a receiving instance offline.
+            raise ServingCleanupFailed(f"guard failed ({reason}). The previous primary serves traffic and the "
+                                       "previous background owns admin. The standby is unavailable. "
+                                       "Serving retirement did not start. Inspect 'status' or retry 'abort'")
         protect = finish_handoff_cleanup(ignore=True) if deadline is not None else contextlib.nullcontext()
         with protect:
             try:
@@ -2385,7 +2394,8 @@ class Deployer:
                 f"background (slot {previous['slot']} for the rollback) and verify live routing before clearing in_progress")
         if owner["slot"] != loaded.admin["slot"]:
             try:
-                self.apply_route(state, loaded, MainRoute(previous, owner), retiring)
+                route = MainRoute(previous, owner, excluded_serving=loaded.excluded_serving)
+                self.apply_route(state, loaded, route, retiring)
             except (Exception, KeyboardInterrupt) as route_err:  # noqa: BLE001
                 return FallbackFailed(
                     f"guard failed ({reason}); handing the background back to slot {previous['slot']} did not "
@@ -2432,7 +2442,8 @@ class Deployer:
         view = target.view()
         current = loaded.admin
         peer = view if guard_peer is None else guard_peer
-        pending = MainRoute(view, view)
+        excluded = None if guard_peer is None else loaded.excluded_serving
+        pending = MainRoute(view, view, excluded_serving=excluded)
         handoff_started = handoff_complete = reload_attempted = False
 
         def mark_reload_attempted() -> None:
@@ -3432,7 +3443,7 @@ class Deployer:
                     raise DeployError(f"{role} must be stopped to restore its recorded isolation")
                 continue
             runtime = self.wait_ready(target.ports[role], self.token_for(target.view(), role), "serving",
-                                      self.cfg.ready_timeout, container=target.containers[role])
+                                      self.cfg.ready_timeout, container=target.containers[role], check_health=True)
             if runtime.get("owns_background") or runtime.get("draining"):
                 raise DeployError(f"held {role} is not an ordinary serving instance")
         current = state["current"]
@@ -3620,7 +3631,6 @@ class Deployer:
 
     def _resume(self, *, allow_running_backup: bool = False) -> None:
         state = load_main_state(self.cfg)
-        self.close_retired_alias_overlap(state)
         current = state.get("current")
         if current:
             # A backup started after the pause must finish (or be explicitly
@@ -3649,6 +3659,10 @@ class Deployer:
                   "paused_at": held["held_at"]}
         try:
             active = self.current_route(state, state["current"], target.view(), install_probe=False)
+            # Save the closed window with the activation state, after the
+            # read-only checks have accepted the resume.
+            if "alias_overlap" in state:
+                state["alias_overlap"] = self.observed_alias_overlap(state["alias_overlap"])
             self._finish_switch(state, state["current"], target, record, create_background=True,
                                 active=active, held=held, endpoints=endpoints)
         except (Exception, KeyboardInterrupt) as err:
@@ -4353,10 +4367,11 @@ def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]
     with contextlib.suppress(DeployError, OSError, subprocess.SubprocessError):
         for slot, view in alias_slot_views(cfg, state, progress).items():
             if slot == retiring_slot:
-                # Once a role is marked for TERM, only that same container
-                # start may continue draining on the alias.
-                roles = tuple(retiring or ())
-                if roles and deployer.alias_networks(view, retiring=retiring, roles=roles):
+                # During a release, roles not yet marked for TERM are covered
+                # by the planned overlap. After it finishes, only the recorded
+                # draining instances are exempt.
+                roles = tuple(retiring or ()) if progress else SERVING_ROLES
+                if deployer.alias_networks(view, retiring=retiring, roles=roles):
                     conflict.add(slot)
             elif slot not in allowed and deployer.alias_networks(view):
                 conflict.add(slot)
