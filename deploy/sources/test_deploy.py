@@ -305,6 +305,19 @@ class DeployTest(unittest.TestCase):
         self.assertNotIn("backup", text)
         self.assertEqual(([9401], 9403), deploy.loaded_upstream_ports(text))
 
+    def test_replace_serving_changes_only_the_serving_block(self):
+        """One write names one block: the admin block and the header survive
+        byte for byte."""
+        text = deploy.render_upstreams(9401, 9402, 9403)
+        updated = deploy.replace_serving(text, [9411])
+        self.assertIn("server 127.0.0.1:9411 max_fails=1 fail_timeout=5s;", updated)
+        self.assertNotIn("127.0.0.1:9402", updated)
+        self.assertIn("server 127.0.0.1:9403;", updated)
+        self.assertEqual(text.split("upstream sources_main_admin")[1],
+                         updated.split("upstream sources_main_admin")[1])
+        with self.assertRaisesRegex(deploy.DeployError, "no serving upstream"):
+            deploy.replace_serving("upstream sources_main_admin {\n}\n", [9411])
+
     def test_admin_only_write_leaves_the_loaded_serving_block_alone(self):
         text = deploy.render_upstreams(9401, 9402, 9403)
         updated = deploy.replace_admin_port(text, 9413)
@@ -1210,6 +1223,11 @@ class DeployTest(unittest.TestCase):
         with self.assertRaisesRegex(deploy.RouteUnverified, "probe budget"):
             deployer.install_from(snapshot, lambda text: text)
         self.assertEqual(before, self.ops.files[self.cfg.upstream_file])
+        # The success gate refuses an incomplete verification for the same
+        # reason: "not checked" is not "the route holds".
+        with self.assertRaisesRegex(deploy.FallbackFailed, "probe budget.*before clearing in_progress"):
+            deployer.finish_ok(deploy.Verification(snapshot.taken_at, "2020-01-01T00:00:00+00:00", snapshot),
+                               action="test")
 
     def test_a_failed_probe_is_recorded_when_the_snapshot_is_built(self):
         """B#8: a probe that fails is recorded by the snapshot itself, so a
