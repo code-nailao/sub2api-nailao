@@ -23,7 +23,7 @@
 | 余额自动刷新 | 持久化余额快照，成功后定时刷新，长查询与短轮询分离并限制并发 | `account_wallet*`、Portal |
 | 共享钱包与提醒 | 管理员把多个账号关联到同一钱包、指定代表账号；低余额与恢复提醒按事件去重投递 | `wallet*`、Portal |
 | V1 渠道监控 | 默认黄色 20 秒、总超时 60 秒且可热更新；管理员手动排序；覆盖请求为 stream 时按 SSE 终态判断；管理员列表附带探测 Key 当前所属计费分组 | `channel_monitor*` |
-| V2 渠道卡片 | 按品牌分区的卡片，显示倍率、缓存率、可用率、首 Token 延迟和状态条；管理员可两级排序、覆盖分类、选择生图分组方式，配置与版本号同事务保存；普通用户只看授权展示的数据；V1 保留 | `features/sources/monitor-v2-cards`、`channel_monitor_v2_display_order*`；本地预览见 [extensions/sources-monitor-local](extensions/sources-monitor-local/README.md) |
+| V2 渠道卡片 | 按品牌分区的卡片，显示倍率、缓存率、可用率、首 Token 延迟和状态条；管理员可两级排序、覆盖分类、选择生图分组方式，配置与版本号同事务保存；分组卡片、筛选和矩阵仅展示启用且未删除的分组，平台和模型统计仍计入历史流量；普通用户只看授权展示的数据；V1 保留 | `features/sources/monitor-v2-cards`、`channel_monitor_v2_display_order*`、`channel_monitor_v2_repo.go`；本地预览见 [extensions/sources-monitor-local](extensions/sources-monitor-local/README.md) |
 | 渠道状态设计预览 | 主站导航默认使用同源路径，有效的本地配置可指定主站源 | [渠道状态设计预览](extensions/sources-monitor-design/README.md) |
 | 用量缓存列 | 管理员用量表的“性能”列改为缓存比例；缺失或零分母显示为未知；原生 TPS 保留 | `features/sources/usage` |
 | Fast / Ultrafast 档位 | 分组档位策略、自定义价卡、倍率预设和不可变账单快照；显式开启的分组可按 Key 档位选择固定供应商账号，普通分组行为不变；覆盖 HTTP、SSE、WebSocket | `request_speed*`、`openai_group_service_tier*`、`features/sources/pricing` |

@@ -168,11 +168,11 @@ func (r *channelMonitorV2Repository) GetDimensions(ctx context.Context, filter s
 	// group allow-list, display-model collapse) still applies.
 	catalogFilter := channelMonitorV2CatalogFilter(channelMonitorV2CommonCoverageFilter(filter, *coverage))
 	where, args, _ := channelMonitorV2WhereWithRollup(catalogFilter, cfg, "m")
-	query := `SELECT m.platform, COALESCE(g.name, ''), lower(COALESCE(NULLIF(TRIM(g.platform), ''), 'unknown')), m.group_id, m.model,
+	query := `SELECT m.platform, COALESCE(g.name, ''), lower(COALESCE(NULLIF(TRIM(g.platform), ''), 'unknown')), m.group_id, g.id, m.model,
 	                 SUM(m.success_requests + m.error_requests)
 	          FROM ` + channelMonitorV2MetricsTable(catalogFilter) + ` m
-	          LEFT JOIN groups g ON g.id = NULLIF(m.group_id, 0) ` + where + `
-	          GROUP BY m.platform, g.name, g.platform, m.group_id, m.model`
+	          LEFT JOIN groups g ON g.id = NULLIF(m.group_id, 0) AND g.deleted_at IS NULL AND g.status = 'active' ` + where + `
+	          GROUP BY m.platform, g.name, g.platform, m.group_id, g.id, m.model`
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -213,7 +213,8 @@ func (r *channelMonitorV2Repository) GetDimensions(ctx context.Context, filter s
 	for rows.Next() {
 		var platform, groupName, groupPlatform, model string
 		var groupID, count int64
-		if err := rows.Scan(&platform, &groupName, &groupPlatform, &groupID, &model, &count); err != nil {
+		var validGroup sql.NullInt64
+		if err := rows.Scan(&platform, &groupName, &groupPlatform, &groupID, &validGroup, &model, &count); err != nil {
 			return nil, err
 		}
 		platformCounts[platform] += count
@@ -225,7 +226,7 @@ func (r *channelMonitorV2Repository) GetDimensions(ctx context.Context, filter s
 			currentModel.platform = platform
 		}
 		modelCounts[modelKey] = currentModel
-		if groupID > 0 {
+		if groupID > 0 && validGroup.Valid {
 			current := groupCounts[groupID]
 			current.name = groupName
 			current.platform = groupPlatform
@@ -977,7 +978,7 @@ func (r *channelMonitorV2Repository) GetUsers(ctx context.Context, filter servic
 func (r *channelMonitorV2Repository) loadFacts(ctx context.Context, filter service.ChannelMonitorV2Filter, cfg service.ChannelMonitorV2Config, byBucket bool) ([]channelMonitorV2Fact, error) {
 	where, args, bucketSeconds := channelMonitorV2WhereWithRollup(filter, cfg, "m")
 	bucketExpr := "MIN(m.bucket_start)"
-	group := "m.platform,m.group_id,g.name,m.model"
+	group := "m.platform,m.group_id,g.id,g.name,m.model"
 	if byBucket {
 		if bucketSeconds > 0 {
 			bucketExpr = "m.bucket_start"
@@ -989,7 +990,13 @@ func (r *channelMonitorV2Repository) loadFacts(ctx context.Context, filter servi
 			group = bucketExpr + "," + group
 		}
 	}
-	query := `SELECT ` + bucketExpr + `,m.platform,m.group_id,COALESCE(g.name,''),m.model,SUM(m.success_requests),SUM(m.error_requests),SUM(m.upstream_affected_requests),SUM(m.upstream_attempt_count),SUM(m.input_tokens),SUM(m.output_tokens),SUM(m.cache_creation_tokens),SUM(m.cache_read_tokens),SUM(m.ttft_sum_ms),SUM(m.ttft_count),SUM(m.duration_sum_ms),SUM(m.duration_count) FROM ` + channelMonitorV2MetricsTable(filter) + ` m LEFT JOIN groups g ON g.id=NULLIF(m.group_id,0) ` + where + ` GROUP BY ` + group
+	query := `SELECT ` + bucketExpr + `, m.platform, m.group_id, g.id, COALESCE(g.name, ''), m.model,
+	                 SUM(m.success_requests), SUM(m.error_requests), SUM(m.upstream_affected_requests), SUM(m.upstream_attempt_count),
+	                 SUM(m.input_tokens), SUM(m.output_tokens), SUM(m.cache_creation_tokens), SUM(m.cache_read_tokens),
+	                 SUM(m.ttft_sum_ms), SUM(m.ttft_count), SUM(m.duration_sum_ms), SUM(m.duration_count)
+	          FROM ` + channelMonitorV2MetricsTable(filter) + ` m
+	          LEFT JOIN groups g ON g.id = NULLIF(m.group_id, 0) AND g.deleted_at IS NULL AND g.status = 'active' ` + where + `
+	          GROUP BY ` + group
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -999,8 +1006,13 @@ func (r *channelMonitorV2Repository) loadFacts(ctx context.Context, filter servi
 	for rows.Next() {
 		var bucket time.Time
 		var f channelMonitorV2Fact
-		if err := rows.Scan(&bucket, &f.Platform, &f.GroupID, &f.GroupName, &f.Model, &f.Success, &f.Errors, &f.UpstreamAffected, &f.UpstreamAttempts, &f.Input, &f.Output, &f.CacheCreation, &f.CacheRead, &f.TTFTSum, &f.TTFTCount, &f.DurationSum, &f.DurationCount); err != nil {
+		var validGroup sql.NullInt64
+		if err := rows.Scan(&bucket, &f.Platform, &f.GroupID, &validGroup, &f.GroupName, &f.Model, &f.Success, &f.Errors, &f.UpstreamAffected, &f.UpstreamAttempts, &f.Input, &f.Output, &f.CacheCreation, &f.CacheRead, &f.TTFTSum, &f.TTFTCount, &f.DurationSum, &f.DurationCount); err != nil {
 			return nil, err
+		}
+		// Keep the fact in platform and model totals without emitting a group row.
+		if f.GroupID > 0 && !validGroup.Valid {
+			f.GroupID = 0
 		}
 		f.BucketStart = bucket.UTC().Format(time.RFC3339Nano)
 		facts = append(facts, f)
