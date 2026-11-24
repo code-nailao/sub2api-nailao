@@ -1145,8 +1145,9 @@ class Deployer:
         return text
 
     def _install(self, text: str) -> None:
-        """Write the file and reload Nginx. Private: every write goes through
-        `install_from`, which is where the snapshot is checked."""
+        """Write the file and reload Nginx. Private: every Main route write
+        goes through `install_from`, which is where the snapshot is checked
+        (Portal reuses this for its own single upstream)."""
         previous = self.ops.read_text(self.cfg.upstream_file) if Path(self.cfg.upstream_file).exists() else None
         self.ops.write_file_atomic(self.cfg.upstream_file, text)
         test = self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False,
@@ -1430,6 +1431,12 @@ class Deployer:
             why = probe.evidence() if probe else (
                 "the probe budget ran out before it could be checked")
             raise RouteRefused(f"not writing the admin route: {why}")
+        if loaded_upstream_ports(text)[1] is None:
+            self.settle_loaded_route(related, note=f"{note or 'admin route'}: refused write",
+                                     deadline=deadline)
+            raise RouteRefused(
+                f"the loaded upstream file names no admin upstream to move to slot {view['slot']} "
+                f"port {probe.port}; {probe.evidence()}")
         if loaded_upstream_ports(text)[1] == probe.port:
             self.log(f"   admin route already points at slot {view['slot']} port {probe.port}; no reload")
             verification = self.settle_loaded_route(related, note=f"{note or 'admin route'}: after writing",
