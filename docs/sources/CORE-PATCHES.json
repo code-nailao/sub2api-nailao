@@ -441,10 +441,11 @@
         "dependency_security_20261106",
         "image_decoder_security",
         "media_engine_native_boundary",
-        "upstream_022_request_speed_root_upstream_integration"
+        "upstream_022_request_speed_root_upstream_integration",
+        "websocket_prng_security_20261124"
       ],
-      "sha256": "0354bc980a139df5b0b31f813b120768e25f640148de7fbbf8ca8a94d5eb603a",
-      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Upgrades golang.org/x/image to fix a WebP decoding vulnerability while keeping the existing decode and size checks. Raises the Go toolchain and module versions to patched versions for published security advisories, changing only versions and checksums. Upgrades golang.org/x/net and the x/* modules it requires to patched versions for published advisories, without adding audit exceptions. Upgrades brotli and klauspost/compress to patched versions for reachable published advisories, with verified checksums. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Go module dependency file."
+      "sha256": "fe0180dd737004d357c0d403c897f6f54d28343c047f76f3f80297baca9a49ed",
+      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Upgrades golang.org/x/image to fix a WebP decoding vulnerability while keeping the existing decode and size checks. Raises the Go toolchain and module versions to patched versions for published security advisories, changing only versions and checksums. Upgrades golang.org/x/net and the x/* modules it requires to patched versions for published advisories, without adding audit exceptions. Upgrades brotli and klauspost/compress to patched versions for reachable published advisories, with verified checksums. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. Go module dependency file. Pins gorilla/websocket to the revision that generates mask keys from a cryptographic source, fixing GO-2026-6278; only the version and checksums change."
     },
     {
       "path": "backend/go.sum",
@@ -452,10 +453,11 @@
         "dependency_security_20261102",
         "dependency_security_20261106",
         "group_service_tier_pricing",
-        "image_decoder_security"
+        "image_decoder_security",
+        "websocket_prng_security_20261124"
       ],
-      "sha256": "8d26353930b203954fd23bf0da4ab9fe9fd829307f53040e2eb7cee9f453cbba",
-      "reason": "Upgrades golang.org/x/image to fix a WebP decoding vulnerability while keeping the existing decode and size checks. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Upgrades golang.org/x/net and the x/* modules it requires to patched versions for published advisories, without adding audit exceptions. Upgrades brotli and klauspost/compress to patched versions for reachable published advisories, with verified checksums. Go module dependency file."
+      "sha256": "77521715999b32ee2bad687d9659d8edbd35f392ed46efe1c508949cbbbee00d",
+      "reason": "Upgrades golang.org/x/image to fix a WebP decoding vulnerability while keeping the existing decode and size checks. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Upgrades golang.org/x/net and the x/* modules it requires to patched versions for published advisories, without adding audit exceptions. Upgrades brotli and klauspost/compress to patched versions for reachable published advisories, with verified checksums. Go module dependency file. Pins gorilla/websocket to the revision that generates mask keys from a cryptographic source, fixing GO-2026-6278; only the version and checksums change."
     },
     {
       "path": "backend/internal/config/config.go",
