@@ -4049,6 +4049,34 @@ docker kill --signal=TERM old-spare
         self.assertEqual([LEGACY["ports"]["serving"]],
                          deploy.loaded_upstream_ports(self.ops.loaded_upstreams)[0])
 
+
+    def test_an_unanswered_reload_keeps_the_candidate_that_may_be_serving(self):
+        """A reload that does not report back may already have been applied.
+        The file must therefore stay as written and the route count as this
+        process's: restoring the old file would make the cleanup remove
+        containers that are answering requests."""
+        run = self.ops.run
+        first_reload = [True]
+
+        def reload_then_timeout(args, **kwargs):
+            result = run(args, **kwargs)
+            if first_reload[0] and args == [self.cfg.nginx_bin, "-s", "reload"]:
+                first_reload[0] = False
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return result
+
+        with mock.patch.object(self.ops, "run", reload_then_timeout):
+            with self.assertRaisesRegex(deploy.DeployError, "nginx reload did not report back"):
+                self.deploy()
+        self.assertFalse(first_reload[0])
+        loaded_ports, _ = deploy.loaded_upstream_ports(self.ops.loaded_upstreams)
+        live = [bool((self.ops.by_port(port) or {}).get("State", {}).get("Running")) for port in loaded_ports]
+        # Whatever Nginx loaded, no endpoint it names may have been deleted.
+        self.assertTrue(any(live), loaded_ports)
+        status = deploy.status(self.cfg, self.ops)
+        self.assertEqual(loaded_ports, status["loaded_route"]["serving_ports"],
+                         "status must describe the route that was written, not a stale file")
+
 class HoldOps(FakeOps):
     """Model the image and network identities used by pause and resume."""
 

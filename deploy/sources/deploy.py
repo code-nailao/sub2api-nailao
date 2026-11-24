@@ -1178,7 +1178,17 @@ class Deployer:
         try:
             self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True, timeout=NGINX_OP_TIMEOUT_SECONDS)
         except (OSError, subprocess.SubprocessError) as err:
-            raise restore(f"nginx reload could not finish ({err})") from err
+            # A reload that does not report back is not a validation failure:
+            # the signal may already have been delivered and the new route may
+            # be the one serving. Restoring the file here would make `status`
+            # and the cleanup below believe the candidate is gone, and the
+            # cleanup would then remove containers that answer requests. The
+            # file stays as written, the route counts as this process's route,
+            # and the caller puts the previous route back with a fresh write.
+            self._loaded = text
+            self._last_write_at = self.ops.monotonic()
+            raise DeployError(f"nginx reload did not report back ({err}); the loaded route is unknown "
+                              "until it is verified again") from err
         self._loaded = text
         self._last_write_at = self.ops.monotonic()
 
