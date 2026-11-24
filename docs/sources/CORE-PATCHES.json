@@ -1583,12 +1583,20 @@
       "reason": "Adds a brand-grouped card view to the V2 channel-status page, with admin-controlled ordering, category overrides and image-model grouping stored in a settings key saved in the same transaction as the configuration version; public statistics only gain has-data flags. Tests for this behaviour."
     },
     {
+      "path": "backend/internal/repository/channel_monitor_v2_group_visibility_integration_test.go",
+      "features": [
+        "channel_monitor_v2_cards"
+      ],
+      "sha256": "f53f1801c0af68f0b8891f01424577fc485cd46e4c2f62e3fd0203d8822e55ef",
+      "reason": "Verifies group visibility and unchanged platform and model history for each V2 monitoring window on PostgreSQL, including soft deletion, disabling and same-name group recreation."
+    },
+    {
       "path": "backend/internal/repository/channel_monitor_v2_repo.go",
       "features": [
         "channel_monitor_v2_cards"
       ],
-      "sha256": "456fc607addf30d4189b3cfb6bcfcb981778a002e0586c336c558fb2e6c065c7",
-      "reason": "Adds a brand-grouped card view to the V2 channel-status page, with admin-controlled ordering, category overrides and image-model grouping stored in a settings key saved in the same transaction as the configuration version; public statistics only gain has-data flags."
+      "sha256": "6408b7661e05096fabf93aa1ea94847dbd27fc7f987f17a4f55c935960d99aa0",
+      "reason": "Adds a brand-grouped card view to the V2 channel-status page, with admin-controlled ordering, category overrides and image-model grouping stored in a settings key saved in the same transaction as the configuration version; public statistics only gain has-data flags. Hides deleted and inactive groups in V2 dimensions and matrix rows while preserving their history in platform and model statistics."
     },
     {
       "path": "backend/internal/repository/concurrency_cache.go",
