@@ -1179,6 +1179,213 @@ class DeployTest(unittest.TestCase):
         self.assertTrue(any(a["alert"] == ["route_findings"] and a.get("route_findings") for a in alerts),
                         alerts)
 
+    # -- freshness: snapshot, TTL, budget and the success gate ----------------
+    def test_a_snapshot_past_its_ttl_refuses_the_write_and_touches_nothing(self):
+        """A#1 / P2: the write entry itself refuses a snapshot that aged past
+        the TTL. Nothing is written and no command is run."""
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        before = self.ops.files[self.cfg.upstream_file]
+        commands = len(self.ops.commands)
+        snapshot = deployer.snapshot_now([(LEGACY, "serving")], note="ttl test")
+        self.ops.clock += deploy.SNAPSHOT_TTL_SECONDS + 1
+        with self.assertRaisesRegex(deploy.RouteUnverified, "snapshot TTL"):
+            deployer.install_from(snapshot, lambda text: deploy.replace_admin_port(text, 9999))
+        self.assertEqual(before, self.ops.files[self.cfg.upstream_file])
+        self.assertEqual(commands, len(self.ops.commands), "a refused write runs no nginx command")
+
+    def test_a_snapshot_that_ran_out_of_budget_is_reported_as_unchecked(self):
+        """B#10: a role the budget did not reach is "not checked" - recorded as
+        probe_budget_exhausted, never as unusable and never as usable."""
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        before = self.ops.files[self.cfg.upstream_file]
+        snapshot = deployer.snapshot_now([(LEGACY, "serving"), (LEGACY, "standby")],
+                                         budget=0.0, note="budget test")
+        self.assertTrue(snapshot.incomplete)
+        self.assertIsNone(snapshot.probe("legacy", "serving"))
+        self.assertIsNone(snapshot.probe("legacy", "standby"))
+        issues = self.state()["in_progress"]["route_issues"]
+        self.assertEqual({"probe_budget_exhausted"}, {i["kind"] for i in issues}, issues)
+        self.assertEqual({"serving", "standby"}, {i["role"] for i in issues}, issues)
+        self.assertIn("was not checked", deploy.describe_route_issues(issues))
+        with self.assertRaisesRegex(deploy.RouteUnverified, "probe budget"):
+            deployer.install_from(snapshot, lambda text: text)
+        self.assertEqual(before, self.ops.files[self.cfg.upstream_file])
+
+    def test_a_failed_probe_is_recorded_when_the_snapshot_is_built(self):
+        """B#8: a probe that fails is recorded by the snapshot itself, so a
+        later probe of the same decision cannot overwrite it."""
+        self.ops.containers["old-bg"]["State"].update(Running=False, Status="exited")
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        snapshot = deployer.snapshot_now([(LEGACY, "background")], note="first look")
+        probe = snapshot.probe("legacy", "background")
+        self.assertFalse(probe.usable)
+        self.assertEqual("stopped", probe.outcome)
+        report = deploy.status(self.cfg, self.ops)
+        found = [i for i in report["route_findings"]
+                 if i["slot"] == "legacy" and i["role"] == "background" and i.get("found_at")]
+        self.assertEqual(1, len(found), report["route_findings"])
+
+    def test_route_state_comes_from_the_probe_after_the_write(self):
+        """P3 / A#4: the pre-write probe decided what to write; it is not the
+        state. When the background vanishes after the file was loaded, status
+        says no background answers, not "verified"."""
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        deployer.publish_admin_route(LEGACY, note="admin move")
+        self.assertEqual("verified", self.state()["in_progress"]["admin_route"]["source"])
+        self.ops.containers["old-bg"]["State"].update(Running=False, Status="exited")
+        verification = deployer.verify_loaded_route((LEGACY,), note="after the exit")
+        self.assertFalse(verification.clean)
+        admin = self.state()["in_progress"]["admin_route"]
+        self.assertEqual("no background answers", admin["source"])
+        self.assertEqual(LEGACY["ports"]["background"], admin["port"])
+        self.assertEqual("legacy", admin["restore"])
+        self.assertEqual("stopped", admin["probe"]["outcome"])
+
+    def test_finish_ok_refuses_to_clear_progress_without_a_verification(self):
+        """P0: clearing in_progress is a claim about the loaded route, so it
+        needs a verification taken after the last write."""
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        deploy.save_state(self.cfg, {"current": LEGACY, "previous": None,
+                                     "in_progress": {"step": "switch"}, "slots": {"legacy": LEGACY}})
+        deployer._last_write_at = deployer.ops.monotonic()
+        with self.assertRaisesRegex(deploy.FallbackFailed, "not verified after its last write"):
+            deployer.finish_ok(None, action="test")
+        self.assertIsNotNone(self.state()["in_progress"])
+
+    def test_finish_ok_refuses_a_verification_older_than_the_last_write(self):
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        snapshot = deployer.snapshot_now([(LEGACY, "serving")], note="test")
+        verification = deploy.Verification(snapshot.taken_at, "2020-01-01T00:00:00+00:00", snapshot)
+        deployer._last_write_at = deployer.ops.monotonic() + 5
+        with self.assertRaisesRegex(deploy.FallbackFailed, "older than the last write"):
+            deployer.finish_ok(verification, action="test")
+
+    def test_finish_ok_refuses_a_verification_that_found_something(self):
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        self.ops.containers["old-bg"]["State"].update(Running=False, Status="exited")
+        verification = deployer.verify_loaded_route((LEGACY,), note="test")
+        with self.assertRaisesRegex(deploy.FallbackFailed,
+                                    "does not hold.*before clearing in_progress"):
+            deployer.finish_ok(verification, action="test")
+        self.assertIsNotNone(self.state()["in_progress"])
+
+    def test_finish_ok_clears_progress_after_a_clean_verification(self):
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        verification = deployer.verify_loaded_route((LEGACY,), note="test")
+        self.assertTrue(verification.clean)
+        deployer._last_write_at = verification.at - 1
+        deployer.finish_ok(verification, action="test")
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_a_refused_write_keeps_the_candidate_containers(self):
+        """A#1: a snapshot that expired refuses the serving write. The
+        candidate containers are healthy, so the cleanup path must not remove
+        them - "refused" and "the role is broken" are different outcomes."""
+        real = deploy.Deployer.publish_serving
+        calls: list[int] = []
+        refused_at: list[int] = []
+
+        def first_write_expired(deployer, *args, **kwargs):
+            if not calls:
+                calls.append(1)
+                refused_at.append(len(self.ops.commands))
+                with mock.patch.object(deploy, "SNAPSHOT_TTL_SECONDS", -1.0):
+                    return real(deployer, *args, **kwargs)
+            return real(deployer, *args, **kwargs)
+
+        with mock.patch.object(deploy.Deployer, "publish_serving", first_write_expired):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "snapshot TTL"):
+                self.deploy()
+        self.assertTrue(calls)
+        for role in deploy.SERVING_ROLES:
+            name = self.cfg.container("a", role)
+            self.assertIn(name, self.ops.containers, "a refused write must not remove the candidate")
+            self.assertTrue(self.ops.containers[name]["State"]["Running"],
+                            f"{name} was stopped by the cleanup of a refused write")
+        after = self.ops.commands[refused_at[0]:]
+        self.assertFalse(any(c[:2] == ["docker", "rm"] and name in c
+                             for c in after
+                             for name in (self.cfg.container("a", "serving"),
+                                          self.cfg.container("a", "standby"))),
+                         "a refused write went through the rm cleanup path")
+        self.assertEqual("failed", self.state()["in_progress"]["phase"])
+
+    def test_an_admin_block_that_already_matches_is_not_written_or_reloaded(self):
+        """A#6: the second write is only made when admin actually moves. A
+        no-op move is verified, not rewritten."""
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        before = len(self.ops.commands)
+        writes: list[str] = []
+        write = self.ops.write_file_atomic
+
+        def record(path, text, **kw):
+            if path == self.cfg.upstream_file:
+                writes.append(text)
+            return write(path, text, **kw)
+
+        with mock.patch.object(self.ops, "write_file_atomic", record):
+            owner = deployer.publish_admin_route(LEGACY)
+        self.assertEqual(LEGACY["ports"]["background"], owner.port)
+        self.assertEqual([], writes, "an admin block that already matches was rewritten")
+        self.assertFalse(any(c[1:] == ["-s", "reload"] for c in self.ops.commands[before:]),
+                         "an admin block that already matches was reloaded")
+        self.assertEqual("verified", self.state()["in_progress"]["admin_route"]["source"])
+
+    def test_manual_rollback_skips_a_standby_whose_restart_policy_update_fails(self):
+        """A#3: a standby whose restart policy cannot be set is as absent as
+        one that will not start. It must not keep a healthy previous primary
+        from taking traffic."""
+        self.deploy()
+        run = self.ops.run
+
+        def fail_update(args, **kw):
+            if args == ["docker", "update", "--restart=unless-stopped", "old-spare"]:
+                raise deploy.DeployError("fixture: standby disappeared")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", fail_update):
+            deploy.Deployer(self.cfg, self.ops).rollback()
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['serving']} max_fails", upstream)
+        self.assertNotIn(f"127.0.0.1:{LEGACY['ports']['standby']}", upstream)
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_status_reports_an_unchecked_container_as_unknown_not_missing(self):
+        """B#11: Docker's failed inspect is "unknown"; only a confirmed listing
+        makes a container "missing"."""
+        self.deploy()
+        inspect = self.ops.inspect
+
+        def denied(name, **kw):
+            if name == "sources-main-a-standby":
+                return None
+            return inspect(name, **kw)
+
+        with mock.patch.object(self.ops, "inspect", denied):
+            report = deploy.status(self.cfg, self.ops)
+        self.assertEqual("unknown", report["current"]["containers"]["standby"]["status"])
+
+    def test_watch_names_an_inactive_slot_it_could_not_inspect(self):
+        """B#11: a retired slot is skipped only when Docker confirms its
+        containers are gone. An inspect that fails is named, not skipped."""
+        self.deploy()
+        self.deploy(image="newer@sha256:3")
+        previous = self.state()["previous"]
+        names = set(previous["containers"].values())
+        inspect = self.ops.inspect
+
+        def denied(name, **kw):
+            if name in names:
+                return None
+            return inspect(name, **kw)
+
+        with mock.patch.object(self.ops, "inspect", denied):
+            alerts = deploy.watch_once(self.cfg, self.ops, {})
+        named = [a for a in alerts if a.get("alert") == ["docker_inspect_failed"]
+                 and a.get("slot") == previous["slot"]]
+        self.assertEqual(names, {a["name"] for a in named}, alerts)
+
     def test_second_rollback_judges_the_state_it_finds(self):
         """A#2 and B#9: two rollbacks in a row each report the roles they found.
 
