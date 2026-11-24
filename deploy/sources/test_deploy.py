@@ -48,6 +48,11 @@ class FakeOps(deploy.Ops):
         self.memory_after_switch: int | None = None
         self.error_log = ""
         self.switched = False
+        # Upstream file content Nginx was last told to load. A route write is
+        # only observable through this, not through the file on disk (which is
+        # written before `nginx -t` and may be restored when the test fails).
+        self.upstream_file: str | None = None
+        self.loaded_upstreams: str | None = None
         self.oneoffs: list[list[str]] = []
         self.local_images: set[str] = set()
         self.busy_ports: set[int] = set()
@@ -141,6 +146,8 @@ class FakeOps(deploy.Ops):
             rc = self.nginx_test_rc
         elif args[1:] == ["-s", "reload"]:
             self.switched = True
+            if self.upstream_file is not None:
+                self.loaded_upstreams = self.files.get(self.upstream_file)
             if self.public_status_after_reload is not None:
                 self.public_status, self.public_status_after_reload = self.public_status_after_reload, None
         if check and rc != 0:
@@ -257,10 +264,14 @@ class DeployTest(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.cfg = make_config(self.tmp)
         self.ops = FakeOps(self.tmp)
+        self.ops.upstream_file = self.cfg.upstream_file
         for role, name in LEGACY["containers"].items():
             self.ops.add(name, LEGACY["ports"][role])
             self.ops.containers[name]["role"] = "background" if role == "background" else "serving"
-        deploy.save_state(self.cfg, {"current": LEGACY, "previous": None, "in_progress": None})
+        self.ops.files[self.cfg.upstream_file] = self.upstreams_for(LEGACY)
+        self.ops.loaded_upstreams = self.ops.files[self.cfg.upstream_file]
+        deploy.save_state(self.cfg, {"current": LEGACY, "previous": None, "in_progress": None,
+                                     "slots": {"legacy": LEGACY}})
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -279,12 +290,39 @@ class DeployTest(unittest.TestCase):
     def deploy(self, image="new@sha256:2", **kw):
         deploy.Deployer(self.cfg, self.ops).deploy(image, **kw)
 
+    def upstreams_for(self, view):
+        return deploy.render_upstreams(*(view["ports"][role] for role in deploy.ROLES))
+
     def test_render_upstreams_uses_fixed_names(self):
         text = deploy.render_upstreams(9401, 9402, 9403)
         self.assertIn("upstream sources_main_serving", text)
         self.assertIn("server 127.0.0.1:9402 backup", text)
         self.assertIn("upstream sources_main_admin", text)
         self.assertIn("server 127.0.0.1:9403;", text)
+
+    def test_render_upstreams_omits_a_backup_that_is_not_written(self):
+        text = deploy.render_upstreams(9401, None, 9403)
+        self.assertNotIn("backup", text)
+        self.assertEqual(([9401], 9403), deploy.loaded_upstream_ports(text))
+
+    def test_replace_serving_changes_only_the_serving_block(self):
+        """One write names one block: the admin block and the header survive
+        byte for byte."""
+        text = deploy.render_upstreams(9401, 9402, 9403)
+        updated = deploy.replace_serving(text, [9411])
+        self.assertIn("server 127.0.0.1:9411 max_fails=1 fail_timeout=5s;", updated)
+        self.assertNotIn("127.0.0.1:9402", updated)
+        self.assertIn("server 127.0.0.1:9403;", updated)
+        self.assertEqual(text.split("upstream sources_main_admin")[1],
+                         updated.split("upstream sources_main_admin")[1])
+        with self.assertRaisesRegex(deploy.DeployError, "no serving upstream"):
+            deploy.replace_serving("upstream sources_main_admin {\n}\n", [9411])
+
+    def test_admin_only_write_leaves_the_loaded_serving_block_alone(self):
+        text = deploy.render_upstreams(9401, 9402, 9403)
+        updated = deploy.replace_admin_port(text, 9413)
+        self.assertEqual(([9401, 9402], 9413), deploy.loaded_upstream_ports(updated))
+        self.assertEqual(text.replace("127.0.0.1:9403;", "127.0.0.1:9413;"), updated)
 
     def test_nginx_readiness_reports_version_named_upstreams(self):
         problems = deploy.nginx_ready_for_fixed_upstreams("proxy_pass http://sources_main_001_serving;")
@@ -343,8 +381,24 @@ class DeployTest(unittest.TestCase):
                         [re.sub(r"oneoff-\d+-\d+", "oneoff", arg.replace(self._tmp.name, "<TMP>")) for arg in args]
                         for args in self.ops.commands
                     ]
-                    self.assertEqual(69, len(commands))
-                    self.assertEqual(expected, hashlib.sha256(json.dumps(commands).encode()).hexdigest(), commands)
+                    # Since the route is written as two upstream blocks, a
+                    # successful release has one more `nginx -t` + reload pair
+                    # than the baseline: the admin block's own (approved
+                    # 2026-11-24). Remove exactly that pair - the second of the
+                    # two back-to-back write pairs - and every remaining call
+                    # must match the baseline byte for byte.
+                    pairs = [i for i, c in enumerate(commands)
+                             if c[1:] == ["-t"] and i + 1 < len(commands)
+                             and commands[i + 1][1:] == ["-s", "reload"]]
+                    self.assertEqual(2, len(pairs), commands)
+                    self.assertEqual(pairs[0] + 2, pairs[1],
+                                     "the serving and admin writes are back to back")
+                    self.assertEqual(["/usr/sbin/nginx -t", "/usr/sbin/nginx -s reload"],
+                                     [" ".join(commands[i]) for i in (pairs[1], pairs[1] + 1)])
+                    reduced = commands[:pairs[1]] + commands[pairs[1] + 2:]
+                    self.assertEqual(69, len(reduced))
+                    self.assertEqual(expected, hashlib.sha256(json.dumps(reduced).encode()).hexdigest(),
+                                     reduced)
 
     def test_containers_run_the_binary_directly_like_production(self):
         self.deploy()
@@ -516,6 +570,34 @@ class DeployTest(unittest.TestCase):
         self.assertTrue(deploy.Deployer(self.cfg, self.ops).background_answering(LEGACY))
         self.assertIsNone(self.state()["in_progress"])
         self.assertEqual("failed", self.history()[-1]["result"])
+
+    def test_guard_rollback_does_not_reload_when_neither_background_is_available(self):
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+        run = self.ops.run
+        starts = []
+
+        def fail_backgrounds(args, **kw):
+            if args[:2] == ["docker", "start"] and args[-1] in (
+                    LEGACY["containers"]["background"], target["containers"]["background"]):
+                starts.append(args[-1])
+                if starts != [target["containers"]["background"]]:
+                    raise deploy.DeployError("fixture: background failed to start")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", fail_backgrounds):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "verify.*before clearing in_progress"):
+                self.deploy()
+        self.assertEqual([target["containers"]["background"], LEGACY["containers"]["background"],
+                          target["containers"]["background"]], starts)
+        expected = self.upstreams_for({"ports": {**LEGACY["ports"],
+                                                 "background": target["ports"]["background"]}})
+        self.assertEqual(expected, self.ops.loaded_upstreams)
+        self.assertEqual(expected, self.ops.files[self.cfg.upstream_file])
+        self.assertEqual("failed", self.state()["in_progress"]["phase"])
+        log = "\n".join(self.ops.logs)
+        self.assertIn("FAILED AND NOT RESTORED", log)
+        self.assertIn("restore one background", log)
 
     def test_guard_rollback_records_incomplete_recovery_when_the_previous_background_never_answers(self):
         self.ops.memory_after_switch = 20 * GIB
@@ -856,6 +938,1452 @@ class DeployTest(unittest.TestCase):
         self.assertEqual("guard", progress["step"])
         self.assertIn("failed", progress, "an interrupt must still record the failure")
         self.assertIn("failed_at", progress)
+
+    # -- invariants of the guard rollback route ------------------------------
+    def test_guard_rollback_is_not_written_when_the_previous_primary_stops_answering(self):
+        """Invariant 1: a route decision holds only at the probe before the
+        write. If the previous primary is gone by then, nothing is written and
+        the loaded candidate route stays."""
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+        http_json = self.ops.http_json
+
+        def probe(url, **kw):
+            # The legacy primary answered until traffic switched; by the time
+            # the rollback probes it, it no longer does.
+            if self.ops.switched and url.startswith(f"http://127.0.0.1:{LEGACY['ports']['serving']}/"):
+                return 0, None
+            return http_json(url, **kw)
+
+        with mock.patch.object(self.ops, "http_json", probe):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "rollback service route was not written"):
+                self.deploy()
+        self.assertEqual(self.upstreams_for(target), self.ops.loaded_upstreams,
+                         "the failing candidate route is what stayed loaded")
+        progress = self.state()["in_progress"]
+        self.assertEqual("failed", progress["phase"])
+        self.assertIn("verify slot legacy's serving containers", progress["failed"])
+
+    def test_guard_rollback_records_a_standby_that_exits_after_the_route_is_written(self):
+        """Invariant 2: a role that was probed into the route and then exits is
+        found again in the same round, with slot, role and time, and progress
+        is not cleared."""
+        self.ops.memory_after_switch = 20 * GIB
+        write = self.ops.write_file_atomic
+
+        def stop_standby_after_write(path, text, **kw):
+            result = write(path, text, **kw)
+            if path == self.cfg.upstream_file and f"127.0.0.1:{LEGACY['ports']['serving']} max_fails" in text:
+                self.ops.containers["old-spare"]["State"].update(Running=False, Status="exited")
+            return result
+
+        with mock.patch.object(self.ops, "write_file_atomic", stop_standby_after_write):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "before clearing in_progress"):
+                self.deploy()
+
+        progress = self.state()["in_progress"]
+        self.assertEqual("failed", progress["phase"])
+        issues = progress["route_issues"]
+        self.assertTrue(any(i["slot"] == "legacy" and i["role"] == "standby" and i.get("found_at")
+                            for i in issues), issues)
+        self.assertEqual(progress, deploy.status(self.cfg, self.ops)["in_progress"])
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['serving']} max_fails",
+                      self.ops.files[self.cfg.upstream_file], "healthy primary still serves")
+        alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertTrue(any(a["alert"] == ["in_progress"] and a.get("route_issues") for a in alerts), alerts)
+
+    def test_guard_rollback_keeps_the_record_of_a_role_that_recovers_before_the_next_probe(self):
+        """B segment: a role that exits between probes and comes back before
+        anyone looks again still leaves slot, role and time behind."""
+        self.ops.memory_after_switch = 20 * GIB
+        candidate_serving = self.cfg.container("a", "serving")
+        write, run = self.ops.write_file_atomic, self.ops.run
+
+        def stop_after_write(path, text, **kw):
+            result = write(path, text, **kw)
+            if path == self.cfg.upstream_file and f"127.0.0.1:{LEGACY['ports']['serving']} max_fails" in text:
+                self.ops.containers["old-spare"]["State"].update(Running=False, Status="exited")
+            return result
+
+        def restart_during_retirement(args, **kw):
+            result = run(args, **kw)
+            if args == ["docker", "kill", "--signal=TERM", candidate_serving]:
+                self.ops.containers["old-spare"]["State"].update(Running=True, Status="running")
+            return result
+
+        with mock.patch.object(self.ops, "write_file_atomic", stop_after_write), \
+                mock.patch.object(self.ops, "run", restart_during_retirement):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "before clearing in_progress"):
+                self.deploy()
+
+        self.assertTrue(self.ops.containers["old-spare"]["State"]["Running"],
+                        "the role is back, but nobody verified the route since it dropped")
+        progress = self.state()["in_progress"]
+        self.assertEqual("failed", progress["phase"])
+        recorded = [i for i in progress["route_issues"] if i["slot"] == "legacy" and i["role"] == "standby"]
+        self.assertEqual(1, len(recorded))
+        self.assertTrue(recorded[0]["found_at"])
+        alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertTrue(any(a["alert"] == ["in_progress"] and a.get("route_issues") for a in alerts), alerts)
+
+    def test_guard_rollback_reports_the_admin_owner_that_exits_during_retirement(self):
+        """Invariant 2 and 5: the admin entry must still name a probe-backed
+        owner after the last step. If it exits there, the finding is kept and
+        the slot to restore is named."""
+        self.ops.memory_after_switch = 20 * GIB
+        candidate_serving = self.cfg.container("a", "serving")
+        run = self.ops.run
+
+        def stop_owner_during_retirement(args, **kw):
+            result = run(args, **kw)
+            if args == ["docker", "kill", "--signal=TERM", candidate_serving]:
+                self.ops.containers["old-bg"]["State"].update(Running=False, Status="exited")
+            return result
+
+        with mock.patch.object(self.ops, "run", stop_owner_during_retirement):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "before clearing in_progress"):
+                self.deploy()
+
+        progress = self.state()["in_progress"]
+        self.assertEqual("failed", progress["phase"])
+        self.assertTrue(any(i["slot"] == "legacy" and i["role"] == "background"
+                            for i in progress["route_issues"]), progress["route_issues"])
+        admin = progress["admin_route"]
+        self.assertEqual("no background answers", admin["source"],
+                         "state comes from the post-write verification, not from the probe that moved admin")
+        self.assertEqual(LEGACY["ports"]["background"], admin["port"])
+        self.assertEqual("legacy", admin["restore"])
+        move = progress["admin_move"]
+        self.assertEqual(LEGACY["ports"]["background"], move["port"])
+        self.assertEqual("answers", move["probe"]["outcome"],
+                         "the move was justified by this probe; the later exit is the finding")
+        log = "\n".join(self.ops.logs)
+        self.assertIn(f"admin route written: slot legacy port {LEGACY['ports']['background']}", log)
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['serving']} max_fails",
+                      self.ops.files[self.cfg.upstream_file], "user traffic still reaches the healthy primary")
+
+    def test_guard_rollback_serves_from_the_previous_primary_when_its_standby_is_down(self):
+        """Invariant 3: the standby only decides whether it is written. The
+        primary alone brings traffic back."""
+        self.ops.containers["old-spare"]["State"].update(Running=False, Status="exited")
+        self.ops.memory_after_switch = 20 * GIB
+        with self.assertRaisesRegex(deploy.DeployError, "guard failed"):
+            self.deploy()
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['serving']} max_fails", upstream)
+        self.assertNotIn(f"127.0.0.1:{LEGACY['ports']['standby']}", upstream,
+                         "a standby that did not answer is not written as a backup")
+        self.assertEqual(upstream, self.ops.loaded_upstreams)
+        self.assertIsNone(self.state()["in_progress"],
+                          "the rollback completed; the missing backup is not an unfinished recovery")
+
+    def test_route_write_includes_a_standby_only_after_it_answers_again(self):
+        """Invariant 4: usability is a probe result, not a property. The same
+        slot is excluded and then included across two writes."""
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        self.ops.containers["old-spare"]["State"].update(Running=False, Status="exited")
+        omitted = deployer.publish_serving(LEGACY)
+        self.assertFalse(omitted.probes["standby"].usable)
+        self.assertEqual("stopped", omitted.probes["standby"].outcome)
+        self.assertNotIn(f"127.0.0.1:{LEGACY['ports']['standby']}", deployer.current_upstreams())
+
+        self.ops.containers["old-spare"]["State"].update(Running=True, Status="running")
+        included = deployer.publish_serving(LEGACY)
+        self.assertTrue(included.probes["standby"].usable)
+        self.assertEqual("answers", included.probes["standby"].outcome)
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['standby']} backup", deployer.current_upstreams())
+
+    def test_guard_rollback_names_the_probe_that_justified_the_admin_move(self):
+        """Invariant 5: every admin move states which probe allowed it."""
+        self.ops.memory_after_switch = 20 * GIB
+        with self.assertRaisesRegex(deploy.DeployError, "guard failed"):
+            self.deploy()
+        log = "\n".join(self.ops.logs)
+        self.assertIn(f"admin route written: slot legacy port {LEGACY['ports']['background']}", log)
+        self.assertIn("holds the background lock and answers /health 200", log)
+
+    def test_guard_rollback_status_names_the_background_to_restore_when_none_answers(self):
+        """Invariant 5: no owner is reported as such, never as "unconfirmed"."""
+        ctx, _, _, _, _ = self.failed_handback_admin_owner(previous_stays_up=False)
+        progress = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertEqual("no background answers", progress["admin_route"]["source"])
+        self.assertEqual("legacy", progress["admin_route"]["restore"])
+        self.assertIn("restore one background", str(ctx.exception))
+        self.assertIn("admin entry is unavailable", str(ctx.exception))
+
+    def test_role_probe_separates_timeout_refusal_and_unreadable_state(self):
+        """The three failure shapes are reported separately: a timeout, an
+        exited container and a Docker read that never answered."""
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        http_json = self.ops.http_json
+
+        def slow(url, **kw):
+            if url.startswith(f"http://127.0.0.1:{LEGACY['ports']['serving']}/"):
+                self.ops.clock += deploy.RUNTIME_STATUS_TIMEOUT_SECONDS + 1
+                return 0, None
+            return http_json(url, **kw)
+
+        with mock.patch.object(self.ops, "http_json", slow):
+            timed_out = deployer.probe_role(LEGACY, "serving")
+        self.assertFalse(timed_out.usable)
+        self.assertEqual("timeout", timed_out.outcome)
+        self.assertIn("probe timeout", timed_out.detail)
+
+        self.ops.containers["old-spare"]["State"].update(Running=False, Status="exited")
+        stopped = deployer.probe_role(LEGACY, "standby")
+        self.assertFalse(stopped.usable)
+        self.assertEqual("stopped", stopped.outcome)
+
+        self.ops.containers.pop("old-bg")
+        missing = deployer.probe_role(LEGACY, "background")
+        self.assertFalse(missing.usable)
+        self.assertEqual("missing", missing.outcome)
+
+        inspect = self.ops.inspect
+
+        def unreadable(name, **kw):
+            if name == "old-serving":
+                raise subprocess.TimeoutExpired(["docker", "inspect", name], 30)
+            return inspect(name, **kw)
+
+        with mock.patch.object(self.ops, "inspect", unreadable), \
+                mock.patch.object(self.ops, "http_json", slow):
+            unknown = deployer.probe_role(LEGACY, "serving")
+        self.assertFalse(unknown.usable)
+        self.assertEqual("state unknown", unknown.outcome)
+        self.assertIn("unreadable", unknown.detail)
+
+    # -- the three rollback paths share the same write gate -------------------
+    def test_manual_rollback_writes_a_verified_route_and_clears_progress(self):
+        self.deploy()
+        deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertEqual(self.upstreams_for(LEGACY), self.ops.loaded_upstreams)
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual("ok", self.history()[-1]["result"])
+
+    def test_manual_rollback_corrects_a_written_role_that_exits(self):
+        """A#2 and B#8: the previous primary exits after the rollback route is
+        loaded. The same round drops it, the route holds on the remaining
+        roles, and the finding stays visible in status after in_progress is
+        cleared."""
+        self.deploy()
+        current_serving = self.cfg.container("a", "serving")
+        run = self.ops.run
+
+        def stop_primary_during_retirement(args, **kw):
+            result = run(args, **kw)
+            # The rollback route is loaded and the guard passed; the previous
+            # primary exits while the old slot is being retired.
+            if args == ["docker", "kill", "--signal=TERM", current_serving]:
+                self.ops.containers["old-serving"]["State"].update(Running=False, Status="exited")
+            return result
+
+        with mock.patch.object(self.ops, "run", stop_primary_during_retirement):
+            deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+        report = deploy.status(self.cfg, self.ops)
+        self.assertEqual([LEGACY["ports"]["standby"]], report["loaded_route"]["serving_ports"])
+        found = [i for i in report["route_findings"]
+                 if i["slot"] == "legacy" and i["role"] == "serving" and i.get("found_at")]
+        self.assertEqual(1, len(found), report["route_findings"])
+        alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertTrue(any(a["alert"] == ["route_findings"] and a.get("route_findings") for a in alerts),
+                        alerts)
+
+    # -- freshness: snapshot, TTL, budget and the success gate ----------------
+    def test_a_snapshot_past_its_ttl_refuses_the_write_and_touches_nothing(self):
+        """A#1 / P2: the write entry itself refuses a snapshot that aged past
+        the TTL. Nothing is written and no command is run."""
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        before = self.ops.files[self.cfg.upstream_file]
+        commands = len(self.ops.commands)
+        snapshot = deployer.snapshot_now([(LEGACY, "serving")], note="ttl test")
+        self.ops.clock += deploy.SNAPSHOT_TTL_SECONDS + 1
+        with self.assertRaisesRegex(deploy.RouteUnverified, "snapshot TTL"):
+            deployer.install_from(snapshot, lambda text: deploy.replace_admin_port(text, 9999))
+        self.assertEqual(before, self.ops.files[self.cfg.upstream_file])
+        self.assertEqual(commands, len(self.ops.commands), "a refused write runs no nginx command")
+
+    def test_a_snapshot_that_ran_out_of_budget_is_reported_as_unchecked(self):
+        """B#10: a pair the budget did not reach is "not checked" - recorded as
+        probe_budget_exhausted, never as unusable and never as usable.
+
+        The pair a write rests on is probed last and keeps its own window, so
+        an exhausted snapshot always means an *earlier* pair went unchecked;
+        only a caller that needs that pair refuses the write."""
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        before = self.ops.files[self.cfg.upstream_file]
+        snapshot = deployer.snapshot_now([(LEGACY, "standby"), (LEGACY, "serving")],
+                                         budget=0.0, note="budget test")
+        self.assertTrue(snapshot.incomplete)
+        self.assertIsNone(snapshot.probe("legacy", "standby"))
+        self.assertIsNotNone(snapshot.probe("legacy", "serving"),
+                             "the pair the write rests on must keep its window")
+        issues = self.state()["in_progress"]["route_issues"]
+        self.assertEqual({"probe_budget_exhausted"}, {i["kind"] for i in issues}, issues)
+        self.assertEqual({"standby"}, {i["role"] for i in issues}, issues)
+        self.assertIn("was not checked", deploy.describe_route_issues(issues))
+        # Anything else in the snapshot missing still refuses a write that
+        # does not say what it needs.
+        with self.assertRaisesRegex(deploy.RouteUnverified, "probe budget"):
+            deployer.install_from(snapshot, lambda text: text)
+        self.assertEqual(before, self.ops.files[self.cfg.upstream_file])
+        # The success gate refuses an incomplete verification for the same
+        # reason: "not checked" is not "the route holds".
+        with self.assertRaisesRegex(deploy.FallbackFailed, "probe budget.*before clearing in_progress"):
+            deployer.finish_ok(deploy.Verification(snapshot.taken_at, "2020-01-01T00:00:00+00:00", snapshot),
+                               action="test")
+        # A caller that only needs the pair it probed may write without the
+        # unchecked one: the standby staying out of the route is not a reason
+        # to leave traffic where it is.
+        deployer.install_from(snapshot, lambda text: deploy.replace_serving(text, [LEGACY["ports"]["serving"]]),
+                              required={("legacy", "serving")})
+
+    def test_a_failed_probe_is_recorded_when_the_snapshot_is_built(self):
+        """B#8: a probe that fails is recorded by the snapshot itself, so a
+        later probe of the same decision cannot overwrite it."""
+        self.ops.containers["old-bg"]["State"].update(Running=False, Status="exited")
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        snapshot = deployer.snapshot_now([(LEGACY, "background")], note="first look")
+        probe = snapshot.probe("legacy", "background")
+        self.assertFalse(probe.usable)
+        self.assertEqual("stopped", probe.outcome)
+        report = deploy.status(self.cfg, self.ops)
+        found = [i for i in report["route_findings"]
+                 if i["slot"] == "legacy" and i["role"] == "background" and i.get("found_at")]
+        self.assertEqual(1, len(found), report["route_findings"])
+
+    def test_route_state_comes_from_the_probe_after_the_write(self):
+        """P3 / A#4: the pre-write probe decided what to write; it is not the
+        state. When the background vanishes after the file was loaded, status
+        says no background answers, not "verified"."""
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        deployer.publish_admin_route(LEGACY, note="admin move")
+        self.assertEqual("verified", self.state()["in_progress"]["admin_route"]["source"])
+        self.ops.containers["old-bg"]["State"].update(Running=False, Status="exited")
+        verification = deployer.verify_loaded_route((LEGACY,), note="after the exit")
+        self.assertFalse(verification.clean)
+        admin = self.state()["in_progress"]["admin_route"]
+        self.assertEqual("no background answers", admin["source"])
+        self.assertEqual(LEGACY["ports"]["background"], admin["port"])
+        self.assertEqual("legacy", admin["restore"])
+        self.assertEqual("stopped", admin["probe"]["outcome"])
+
+    def test_finish_ok_refuses_to_clear_progress_without_a_verification(self):
+        """P0: clearing in_progress is a claim about the loaded route, so it
+        needs a verification taken after the last write."""
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        deploy.save_state(self.cfg, {"current": LEGACY, "previous": None,
+                                     "in_progress": {"step": "switch"}, "slots": {"legacy": LEGACY}})
+        deployer._last_write_at = deployer.ops.monotonic()
+        with self.assertRaisesRegex(deploy.FallbackFailed, "not verified after its last write"):
+            deployer.finish_ok(None, action="test")
+        self.assertIsNotNone(self.state()["in_progress"])
+
+    def test_finish_ok_refuses_a_verification_older_than_the_last_write(self):
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        snapshot = deployer.snapshot_now([(LEGACY, "serving")], note="test")
+        verification = deploy.Verification(snapshot.taken_at, "2020-01-01T00:00:00+00:00", snapshot)
+        deployer._last_write_at = deployer.ops.monotonic() + 5
+        with self.assertRaisesRegex(deploy.FallbackFailed, "older than the last write"):
+            deployer.finish_ok(verification, action="test")
+
+    def test_finish_ok_refuses_a_verification_that_found_something(self):
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        self.ops.containers["old-bg"]["State"].update(Running=False, Status="exited")
+        verification = deployer.verify_loaded_route((LEGACY,), note="test")
+        with self.assertRaisesRegex(deploy.FallbackFailed,
+                                    "does not hold.*before clearing in_progress"):
+            deployer.finish_ok(verification, action="test")
+        self.assertIsNotNone(self.state()["in_progress"])
+
+    def test_finish_ok_clears_progress_after_a_clean_verification(self):
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        verification = deployer.verify_loaded_route((LEGACY,), note="test")
+        self.assertTrue(verification.clean)
+        deployer._last_write_at = verification.at - 1
+        deployer.finish_ok(verification, action="test")
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_a_refused_write_keeps_the_candidate_containers(self):
+        """A#1: a snapshot that expired refuses the serving write. The
+        candidate containers are healthy, so the cleanup path must not remove
+        them - "refused" and "the role is broken" are different outcomes."""
+        real = deploy.Deployer.publish_serving
+        calls: list[int] = []
+        refused_at: list[int] = []
+
+        def first_write_expired(deployer, *args, **kwargs):
+            if not calls:
+                calls.append(1)
+                refused_at.append(len(self.ops.commands))
+                with mock.patch.object(deploy, "SNAPSHOT_TTL_SECONDS", -1.0):
+                    return real(deployer, *args, **kwargs)
+            return real(deployer, *args, **kwargs)
+
+        with mock.patch.object(deploy.Deployer, "publish_serving", first_write_expired):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "snapshot TTL"):
+                self.deploy()
+        self.assertTrue(calls)
+        for role in deploy.SERVING_ROLES:
+            name = self.cfg.container("a", role)
+            self.assertIn(name, self.ops.containers, "a refused write must not remove the candidate")
+            self.assertTrue(self.ops.containers[name]["State"]["Running"],
+                            f"{name} was stopped by the cleanup of a refused write")
+        after = self.ops.commands[refused_at[0]:]
+        self.assertFalse(any(c[:2] == ["docker", "rm"] and name in c
+                             for c in after
+                             for name in (self.cfg.container("a", "serving"),
+                                          self.cfg.container("a", "standby"))),
+                         "a refused write went through the rm cleanup path")
+        self.assertEqual("failed", self.state()["in_progress"]["phase"])
+
+    def test_an_admin_block_that_already_matches_is_not_written_or_reloaded(self):
+        """A#6: the second write is only made when admin actually moves. A
+        no-op move is verified, not rewritten."""
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        before = len(self.ops.commands)
+        writes: list[str] = []
+        write = self.ops.write_file_atomic
+
+        def record(path, text, **kw):
+            if path == self.cfg.upstream_file:
+                writes.append(text)
+            return write(path, text, **kw)
+
+        with mock.patch.object(self.ops, "write_file_atomic", record):
+            owner = deployer.publish_admin_route(LEGACY)
+        self.assertEqual(LEGACY["ports"]["background"], owner.port)
+        self.assertEqual([], writes, "an admin block that already matches was rewritten")
+        self.assertFalse(any(c[1:] == ["-s", "reload"] for c in self.ops.commands[before:]),
+                         "an admin block that already matches was reloaded")
+        self.assertEqual("verified", self.state()["in_progress"]["admin_route"]["source"])
+
+    def test_manual_rollback_skips_a_standby_whose_restart_policy_update_fails(self):
+        """A#3: a standby whose restart policy cannot be set is as absent as
+        one that will not start. It must not keep a healthy previous primary
+        from taking traffic."""
+        self.deploy()
+        run = self.ops.run
+
+        def fail_update(args, **kw):
+            if args == ["docker", "update", "--restart=unless-stopped", "old-spare"]:
+                raise deploy.DeployError("fixture: standby disappeared")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", fail_update):
+            deploy.Deployer(self.cfg, self.ops).rollback()
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['serving']} max_fails", upstream)
+        self.assertNotIn(f"127.0.0.1:{LEGACY['ports']['standby']}", upstream)
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_status_reports_an_unchecked_container_as_unknown_not_missing(self):
+        """B#11: Docker's failed inspect is "unknown"; only a confirmed listing
+        makes a container "missing"."""
+        self.deploy()
+        inspect = self.ops.inspect
+
+        def denied(name, **kw):
+            if name == "sources-main-a-standby":
+                return None
+            return inspect(name, **kw)
+
+        with mock.patch.object(self.ops, "inspect", denied):
+            report = deploy.status(self.cfg, self.ops)
+        self.assertEqual("unknown", report["current"]["containers"]["standby"]["status"])
+
+    def test_watch_names_an_inactive_slot_it_could_not_inspect(self):
+        """B#11: a retired slot is skipped only when Docker confirms its
+        containers are gone. An inspect that fails is named, not skipped."""
+        self.deploy()
+        self.deploy(image="newer@sha256:3")
+        previous = self.state()["previous"]
+        names = set(previous["containers"].values())
+        inspect = self.ops.inspect
+
+        def denied(name, **kw):
+            if name in names:
+                return None
+            return inspect(name, **kw)
+
+        with mock.patch.object(self.ops, "inspect", denied):
+            alerts = deploy.watch_once(self.cfg, self.ops, {})
+        named = [a for a in alerts if a.get("alert") == ["docker_inspect_failed"]
+                 and a.get("slot") == previous["slot"]]
+        self.assertEqual(names, {a["name"] for a in named}, alerts)
+
+    def test_second_rollback_judges_the_state_it_finds(self):
+        """A#2 and B#9: two rollbacks in a row each report the roles they found.
+
+        Each run writes the rollback route and then stops the previous primary
+        and background just before the final re-probe after retirement. Both
+        runs end unfinished, and the second one records the same roles again: a
+        role that is down in this run is this run's finding, not a repeat of
+        the last run's."""
+        self.deploy()
+        retire_serving = deploy.Deployer.retire_serving
+
+        def retire_then_stop(self, *args, **kw):
+            result = retire_serving(self, *args, **kw)
+            # The rollback route is loaded; the roles it names exit just before
+            # the final re-probe that follows retirement.
+            for name in ("old-serving", "old-bg"):
+                self.ops.containers[name]["State"].update(Running=False, Status="exited")
+            return result
+
+        for attempt in (1, 2):
+            with self.subTest(attempt=attempt):
+                before = len(self.history())
+                with mock.patch.object(deploy.Deployer, "retire_serving", retire_then_stop):
+                    with self.assertRaisesRegex(deploy.FallbackFailed, "before clearing in_progress"):
+                        deploy.Deployer(self.cfg, self.ops).rollback()
+                progress = self.state()["in_progress"]
+                self.assertIsNotNone(progress, f"rollback {attempt} cleared the recovery record")
+                self.assertEqual("failed", progress["phase"])
+                for role in ("serving", "background"):
+                    self.assertTrue(any(i["slot"] == "legacy" and i["role"] == role
+                                        for i in progress["route_issues"]),
+                                    f"rollback {attempt} did not record slot legacy {role}: "
+                                    f"{progress['route_issues']}")
+                self.assertEqual("failed", self.history()[before]["result"],
+                                 f"rollback {attempt} was written into the history as a success")
+
+    def test_normal_release_probes_both_upstreams_before_clearing_progress(self):
+        self.deploy()
+        target = self.state()["current"]
+        self.assertEqual(self.upstreams_for(target), self.ops.loaded_upstreams)
+        self.assertEqual({"a", "legacy"}, set(self.state()["slots"]))
+        log = "\n".join(self.ops.logs)
+        self.assertIn("route written: serving slot a port 9401", log)
+        self.assertIn("admin route written: slot a port 9403", log)
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertEqual("ok", self.history()[-1]["result"])
+
+    # -- property: no dead port survives a route write -------------------------
+    # The review findings are one family: a probe goes stale between the moment
+    # it is taken and the moment its answer is used. One property, swept over
+    # every (role x probe point), instead of one test per reproduction.
+    PROPERTY_FLOWS = ("normal release", "guard rollback", "manual rollback")
+
+    def property_views(self):
+        """Every slot a flow can write into, with its ports and containers."""
+        views = {}
+        for view in (LEGACY, self.cfg.slot_view("a")):
+            views.setdefault(view["slot"], view)
+        state = self.state()
+        for view in (state.get("slots") or {}).values():
+            views.setdefault(view["slot"], view)
+        return views
+
+    def property_flow(self, flow):
+        """One whole flow. A guard failure is the flow's own outcome, so the
+        error a person would see is returned instead of raised."""
+        if flow == "guard rollback":
+            self.ops.memory_after_switch = 20 * GIB
+        try:
+            self.deploy()
+            if flow == "manual rollback":
+                deploy.Deployer(self.cfg, self.ops).rollback()
+        except deploy.DeployError as err:
+            return err
+        return None
+
+
+
+
+    def assert_reported(self, slot, role, label):
+        """B segment: status and the resident watch both name the slot, the
+        role and the time it was found. A finding recorded while the route was
+        live stays visible after a successful release (status.route_findings),
+        so this checks the in_progress findings and the durable ones."""
+        report = deploy.status(self.cfg, self.ops)
+        progress = report.get("in_progress") or {}
+        recorded = list(progress.get("route_issues") or []) + list(report.get("route_findings") or [])
+        found = [i for i in recorded
+                 if i["slot"] == slot and i["role"] == role and i.get("found_at")]
+        self.assertTrue(found, f"{label}: status does not name {slot} {role} with the time it "
+                               f"was found: {report}")
+        alerts = deploy.watch_once(self.cfg, self.ops, {})
+        named = [a for a in alerts if a["alert"] in (["in_progress"], ["route_findings"])
+                 and any(i["slot"] == slot and i["role"] == role and i.get("found_at")
+                         for i in (a.get("route_issues") or []) + (a.get("route_findings") or []))]
+        self.assertTrue(named, f"{label}: the watch alert does not carry {slot} {role}: {alerts}")
+
+    def assert_route_property(self, flow, slot, role, run):
+        """The final loaded route names no role that stopped answering, unless
+        nothing could have replaced it; then that role must be reported."""
+        label = (f"{flow}: {slot} {role} stopped at probe {run['index']}"
+                 f"{' (after)' if run['after'] else ''}")
+        if not run["writes"]:
+            return  # nothing was written in this flow; there is no route decision to judge
+        views = self.property_views()
+        loaded = self.ops.loaded_upstreams
+        serving_ports, admin_port = deploy.loaded_upstream_ports(loaded or "")
+        written = set()
+        for text in run["writes"]:
+            ports, admin = deploy.loaded_upstream_ports(text)
+            written.update(ports)
+            if admin is not None:
+                written.add(admin)
+        self.assertEqual(loaded, self.ops.files[self.cfg.upstream_file],
+                         f"{label}: the file on disk is not what Nginx was told to load")
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        dead = []
+        for view in views.values():
+            for r in deploy.SERVING_ROLES:
+                if view["ports"][r] in serving_ports:
+                    probe = deployer.probe_role(view, r)
+                    if not probe.usable:
+                        dead.append((view, r, probe))
+            if admin_port is not None and view["ports"]["background"] == admin_port:
+                probe = deployer.probe_role(view, "background")
+                if not probe.usable:
+                    dead.append((view, "background", probe))
+        for view, r, probe in dead:
+            if r == "standby":
+                # A backup is always droppable: it never has to be replaced.
+                self.fail(f"{label}: the loaded route still names slot {view['slot']} standby "
+                          f"port {probe.port}, which does not answer")
+            if r == "serving":
+                replaceable = any(deployer.probe_role(other, "standby").usable
+                                  for other in views.values() if other["slot"] == view["slot"])
+            else:
+                replaceable = any(deployer.probe_role(other, "background").usable
+                                  for other in views.values() if other["slot"] != view["slot"])
+            self.assertFalse(replaceable,
+                             f"{label}: the loaded route names slot {view['slot']} {r} port "
+                             f"{probe.port}, which does not answer, while another role could "
+                             f"have replaced it")
+            self.assert_reported(view["slot"], r, label)
+        # The role we stopped: if it was written into the route, its slot is
+        # still part of the final route and it is now gone, a person has to be
+        # able to see that from status and from the watch - even if the role is
+        # back before the next look. A slot the route moved away from entirely
+        # (the rollback went to the other slot) is not a dropped role.
+        view = views[slot]
+        base_role = "background" if role == "admin" else role
+        final_ports = set(serving_ports) | ({admin_port} if admin_port is not None else set())
+        slot_ports = {view["ports"][r] for r in deploy.ROLES}
+        if (run["stopped"] and view["ports"][base_role] in written
+                and final_ports & slot_ports and view["ports"][base_role] not in final_ports
+                and not deployer.probe_role(view, base_role).usable):
+            if (base_role == "background" and admin_port is not None
+                    and admin_port != view["ports"]["background"]):
+                # The admin entry moved to another slot's background in this
+                # same run: the move is the correction, and status names the
+                # new owner in admin_route. That is not a silent exclusion.
+                return
+            self.assert_reported(slot, base_role, label)
+
+    def property_fresh(self):
+        case = DeployTest("test_first_deploy_from_legacy_moves_everything_to_slot_a")
+        case.setUp()
+        return case
+
+
+
+
+    def property_probe_timeline(self, flow):
+        """One whole flow, recording every probe point and which role
+        containers are running at that moment. A probe point is any HTTP probe
+        of a role port, not only the probed role's own: the family under test
+        is a role that dies while a different role is being probed."""
+        views = self.property_views()
+        index = {view["ports"][role]: (view["slot"], role)
+                 for view in views.values() for role in deploy.ROLES}
+        owners = {view["ports"]["background"]: view["slot"] for view in views.values()}
+        points: list[dict] = []
+        real = self.ops.http_json
+
+        def recording(url, **kw):
+            if url.startswith("http://127.0.0.1:"):
+                port = int(url.split(":")[2].split("/")[0])
+                if port in index:
+                    loaded_admin = deploy.loaded_upstream_ports(self.ops.loaded_upstreams or "")[1]
+                    running = [(view["slot"], role) for view in views.values() for role in deploy.ROLES
+                               if (self.ops.containers.get(view["containers"][role]) or {})
+                               .get("State", {}).get("Running")]
+                    points.append({"port": port, "role": index[port], "running": running,
+                                   "admin_slot": owners.get(port) if port == loaded_admin else None})
+            return real(url, **kw)
+
+        with mock.patch.object(self.ops, "http_json", recording):
+            self.property_flow(flow)
+        return points
+
+    def property_sweep_scenarios(self, flow):
+        """Every role, stopped at every probe point of the flow, before and
+        after that probe. The admin entry is a slot's background seen through
+        the admin upstream: at each admin probe point it is one more role."""
+        case = self.property_fresh()
+        try:
+            points = case.property_probe_timeline(flow)
+        finally:
+            case.tearDown()
+        scenarios = []
+        views = self.property_views()
+        for index, point in enumerate(points):
+            targets = list(point["running"])
+            admin_slot = point["admin_slot"]
+            if admin_slot is not None and (admin_slot, "background") in targets:
+                targets.append((admin_slot, "admin"))
+            for slot, role in targets:
+                base = "background" if role == "admin" else role
+                port = views[slot]["ports"][base]
+                same_port = point["port"] == port
+                later = any(later["port"] == port for later in points[index + 1:])
+                # A stop just before this role's own probe is a look the tool
+                # can still act on. Any other stop needs a later probe of the
+                # role, otherwise it is "after the last look" and no code could
+                # have seen it. A stop just after its own last probe is the
+                # same "after the last look" case.
+                if same_port or later:
+                    scenarios.append((slot, role, index, False))
+                if later:
+                    scenarios.append((slot, role, index, True))
+        return scenarios
+
+    def property_run_at(self, flow, slot, role, index, after):
+        """Stop one role at one probe point of the whole flow, not only at a
+        probe of that role, then run the flow. This is the cross-role race the
+        review family describes: the role answered when last probed, another
+        role is probed next, and the write must not use the stale answer."""
+        views = self.property_views()
+        view = views[slot]
+        base_role = "background" if role == "admin" else role
+        port, name = view["ports"][base_role], view["containers"][base_role]
+        owners = {other["ports"]["background"]: other["slot"] for other in views.values()}
+        known = {other["ports"][r] for other in views.values() for r in deploy.ROLES}
+        writes: list[str] = []
+        write_before: list[str | None] = []
+        write_probes: list[int] = []
+        probes: list[dict] = []
+        real_write, real_http = self.ops.write_file_atomic, self.ops.http_json
+        seen = {"probe": 0, "stopped": False, "admin_at_stop": False}
+
+        def stop():
+            container = self.ops.containers.get(name)
+            if container is not None:
+                seen["stopped"] = True
+                container["State"].update(Running=False, Status="exited")
+
+        def tracked_write(path, text, **kw):
+            if path == self.cfg.upstream_file:
+                writes.append(text)
+                write_before.append(self.ops.files.get(self.cfg.upstream_file))
+                write_probes.append(len(probes))
+            return real_write(path, text, **kw)
+
+        def probe(url, **kw):
+            if not url.startswith("http://127.0.0.1:"):
+                return real_http(url, **kw)
+            target = int(url.split(":")[2].split("/")[0])
+            if target in known:
+                loaded_admin = deploy.loaded_upstream_ports(self.ops.loaded_upstreams or "")[1]
+                probes.append({"port": target,
+                               "admin_slot": owners.get(target) if target == loaded_admin else None})
+                n = seen["probe"]
+                seen["probe"] += 1
+                if not after and n == index:
+                    stop()
+                result = real_http(url, **kw)
+                if after and n == index:
+                    stop()
+                if n == index:
+                    seen["admin_at_stop"] = (target == loaded_admin and owners.get(target) == slot)
+                return result
+            return real_http(url, **kw)
+
+        with mock.patch.object(self.ops, "write_file_atomic", tracked_write), \
+                mock.patch.object(self.ops, "http_json", probe):
+            error = self.property_flow(flow)
+        return {"error": error, "writes": writes, "write_before": write_before,
+                "write_probes": write_probes, "probes": probes,
+                "stopped": seen["stopped"], "admin_at_stop": seen["admin_at_stop"]}
+
+    def assert_write_rests_on_a_probe_taken_after_the_stop(self, flow, slot, role, run):
+        """A#1: a write may only add a role to the route on the strength of a
+        probe taken after that role was last seen answering. A write that adds
+        a port whose last probe predates the stop used a stale answer, even if
+        the same round corrects it afterwards."""
+        if not run["stopped"]:
+            return
+        base = "background" if role == "admin" else role
+        label = (f"{flow}: {slot} {role} stopped at probe {run['index']}"
+                 f"{' (after)' if run['after'] else ''}")
+        views = self.property_views()
+        port = views[slot]["ports"][base]
+        for index, text in enumerate(run["writes"]):
+            mark = run["write_probes"][index]
+            if mark <= run["index"]:
+                continue  # the write happened before the role stopped
+            before = run["write_before"][index] or ""
+            before_serving, before_admin = deploy.loaded_upstream_ports(before)
+            serving, admin = deploy.loaded_upstream_ports(text)
+            added = set(serving) - set(before_serving)
+            if admin is not None and admin != before_admin:
+                added.add(admin)
+            if port not in added:
+                continue
+            last = max((i for i in range(mark) if run["probes"][i]["port"] == port),
+                       default=-1)
+            previous_mark = run["write_probes"][index - 1] if index else 0
+            self.assertGreaterEqual(
+                last, previous_mark,
+                f"{label}: write {index + 1} added port {port} from a probe taken before the "
+                f"previous write; the answer was carried over instead of taken in this write")
+            if last == mark - 1:
+                # The role this write depends on most - the serving primary,
+                # the admin target - is probed last, so its answer must be
+                # taken after the role stopped. A role probed earlier inside
+                # the same snapshot (the standby) keeps the accepted residual:
+                # it can stop while the primary is probed, and the post-write
+                # verification of this same round has to find it.
+                self.assertGreaterEqual(
+                    last, run["index"],
+                    f"{label}: write {index + 1} added port {port}, but its last probe was "
+                    f"probe {last + 1} of {mark}, before the role stopped at probe "
+                    f"{run['index'] + 1}; the write used a stale answer")
+
+    def status_route_records(self):
+        """Every place status keeps a route decision: the findings that need a
+        person, the excluded backup, and the admin owner or its probes."""
+        status = deploy.status(self.cfg, self.ops)
+        progress = status.get("in_progress") or {}
+        last = status.get("last_route") or {}
+        records: list[dict] = []
+        for issue in progress.get("route_issues") or []:
+            records.append({"kind": "route_issue", **issue})
+        for issue in status.get("route_findings") or []:
+            records.append({"kind": "route_issue", **issue})
+        for entry in (progress.get("serving_route"), last.get("serving")):
+            for probe in (entry or {}).get("excluded") or []:
+                records.append({"kind": "excluded", **probe})
+        for entry in (progress.get("admin_route"), last.get("admin")):
+            if not entry:
+                continue
+            records.append({"kind": "admin_route", "slot": entry.get("slot"),
+                            "role": "background", "port": entry.get("port"),
+                            "at": entry.get("at"), "source": entry.get("source"),
+                            "restore": entry.get("restore")})
+            for probe in (entry.get("probes") or {}).values():
+                records.append({"kind": "admin_probe", **probe})
+        return status, progress, last, records
+
+    def assert_role_was_not_silently_excluded(self, flow, slot, role, run):
+        """A#2 / B#8: once the role was a route member, leaving it out of the
+        loaded route is only allowed if the same round either corrected the
+        route and kept a record, or kept it for manual recovery."""
+        if not run["stopped"] or not run["writes"]:
+            return  # no route decision was made, so no role was left out of one
+        base = "background" if role == "admin" else role
+        label = (f"{flow}: {slot} {role} stopped at probe {run['index']}"
+                 f"{' (after)' if run['after'] else ''}")
+        views = self.property_views()
+        view = views[slot]
+        port = view["ports"][base]
+        final = self.ops.loaded_upstreams or ""
+        final_ports, final_admin = deploy.loaded_upstream_ports(final)
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        alive = deployer.probe_role(view, base).usable
+        status, progress, last, records = self.status_route_records()
+        named = [r for r in records if r.get("slot") == slot and r.get("role") == base
+                 and (r.get("found_at") or r.get("at"))]
+        if f"127.0.0.1:{port}" in final:
+            return  # still part of the loaded route; assert_route_property judges it
+        final_ports_set = set(final_ports) | ({final_admin} if final_admin is not None else set())
+        if not (final_ports_set & {view["ports"][r] for r in deploy.ROLES}):
+            # The flow moved away from this slot entirely (a rollback or a
+            # switch retired it). That is the correction, not an exclusion
+            # from a route the slot still serves.
+            return
+        added_to_a_write = False
+        for text, before in zip(run["writes"], run["write_before"]):
+            was_serving, was_admin = deploy.loaded_upstream_ports(before or "")
+            now_serving, now_admin = deploy.loaded_upstream_ports(text)
+            prior = set(was_serving) | ({was_admin} if was_admin is not None else set())
+            current = set(now_serving) | ({now_admin} if now_admin is not None else set())
+            if port in current - prior:
+                added_to_a_write = True
+                break
+        if added_to_a_write:
+            # This run put it into the route and it is now gone: the same
+            # settlement had to record it for a person even when the
+            # corrective rewrite succeeded.
+            self.assertTrue(named, f"{label}: {slot} {base} port {port} was written and then dropped "
+                                   f"without a finding in status: {progress}")
+            return
+        # It never made it into a write: the decision excluded it.
+        if role in ("background", "admin"):
+            if final_admin is not None and final_admin != port:
+                # The admin entry moved to another background; the move itself
+                # is the correction. The final route check has already proved
+                # the new owner answers.
+                return
+            if final_admin == port:
+                self.fail(f"{label}: the admin entry still names slot {slot} port {port}, "
+                          f"which does not answer and was not excluded")
+            self.assertTrue(progress.get("admin_route", {}).get("source") == "no background answers"
+                            and progress.get("admin_route", {}).get("restore"),
+                            f"{label}: no admin owner was recorded after excluding slot {slot} "
+                            f"background port {port}: {progress.get('admin_route')}")
+            return
+        if role == "standby":
+            if view["ports"]["serving"] not in final_ports:
+                return  # the flow moved to another slot; this slot's backup is not a member
+            self.assertTrue(named, f"{label}: the route serves from slot {slot} without standby port "
+                                   f"{port}, and status keeps no record of the exclusion: {progress}")
+            return
+        # A serving primary is never merely excluded: either it is written, or
+        # the write was refused and the run says which role stopped it.
+        if view["ports"]["serving"] in final_ports:
+            self.fail(f"{label}: the final route serves slot {slot} from another port while "
+                      f"port {port} does not answer")
+            return
+        failed = progress.get("failed") or ""
+        self.assertTrue((f"slot {slot} {base}" in failed and progress.get("failed_at"))
+                        or named,
+                        f"{label}: no record explains why slot {slot} {base} port {port} was "
+                        f"left out of the route: {progress}")
+
+    def assert_admin_entry_property(self, flow, slot, run):
+        """A#4 / A#5: when the admin entry's server was the role stopped at the
+        probe, the loaded admin port must answer, or status must say that no
+        background answers and which slot to restore. A move must be visible."""
+        if not run.get("admin_at_stop"):
+            return
+        label = (f"{flow}: admin entry on slot {slot} stopped at probe {run['index']}"
+                 f"{' (after)' if run['after'] else ''}")
+        views = self.property_views()
+        view = views[slot]
+        port = view["ports"]["background"]
+        status, progress, last, records = self.status_route_records()
+        final_admin = status["loaded_route"]["admin_port"]
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        alive = deployer.probe_role(view, "background").usable
+        found = [r for r in records if r.get("slot") == slot and r.get("role") == "background"
+                 and (r.get("found_at") or r.get("at"))]
+        if final_admin == port and not alive:
+            replaceable = [other["slot"] for other in views.values()
+                           if other["slot"] != slot
+                           and deployer.probe_role(other, "background").usable]
+            self.assertFalse(replaceable,
+                             f"{label}: admin still names slot {slot} port {port}, which does not "
+                             f"answer, while another background could have replaced it"
+                             + (f" (slot {replaceable[0]})" if replaceable else ""))
+            admin = progress.get("admin_route") or {}
+            self.assertTrue(found or (admin.get("source") == "no background answers"
+                                      and admin.get("restore")),
+                            f"{label}: the admin entry lost its only server and status does not "
+                            f"say who to restore: {progress}")
+        if final_admin is not None and final_admin != port:
+            moved_to = deploy.Deployer.admin_port_slot(final_admin, tuple(views.values()))
+            admin = progress.get("admin_route") or last.get("admin") or {}
+            logged = any(f"correcting the admin route to slot {moved_to} port {final_admin}" in line
+                         for line in self.ops.logs)
+            self.assertTrue(admin.get("port") == final_admin or logged,
+                            f"{label}: admin moved from slot {slot} port {port} to port "
+                            f"{final_admin}, but neither status nor the log states the move")
+
+    def test_property_every_role_and_probe_point_keeps_the_route_truthful(self):
+        """The acceptance sweep: for 服务主, 备用, 后台 and 管理入口, at every
+        probe point each flow takes, stop that role and run the whole flow
+        (normal release, guard rollback, manual rollback). The final upstream
+        file must name no role that stopped answering, unless nothing could
+        replace it; then status and the watch must name slot, role and time.
+        A role left out of a write must be corrected in the same round or kept
+        for manual recovery. One case, every combination."""
+        failures = []
+        checked = 0
+        admin_checked = 0
+        for flow in self.PROPERTY_FLOWS:
+            for slot, role, index, after in self.property_sweep_scenarios(flow):
+                case = self.property_fresh()
+                try:
+                    run = case.property_run_at(flow, slot, role, index, after)
+                    run.update(index=index, after=after)
+                    if role == "admin":
+                        admin_checked += 1
+                    else:
+                        checked += 1
+                    for check in (case.assert_route_property,
+                                  case.assert_role_was_not_silently_excluded,
+                                  case.assert_write_rests_on_a_probe_taken_after_the_stop):
+                        try:
+                            check(flow, slot, role, run)
+                        except AssertionError as err:
+                            failures.append(str(err))
+                    if run.get("admin_at_stop"):
+                        admin_checked += 1
+                        try:
+                            case.assert_admin_entry_property(flow, slot, run)
+                        except AssertionError as err:
+                            failures.append(str(err))
+                finally:
+                    case.tearDown()
+        self.assertGreaterEqual(checked, 800, "the sweep checked too few role/probe points")
+        self.assertGreaterEqual(admin_checked, 100, "the admin entry was checked too rarely")
+        if failures:
+            self.fail(f"{len(failures)} route decisions out of {checked + admin_checked} "
+                      "stop points do not hold:\n- " + "\n- ".join(failures[:20]))
+
+    # -- watch coverage (B segment: report, do not silently skip) -------------
+    def test_watch_keeps_both_slots_after_two_releases(self):
+        self.deploy()
+        self.deploy(image="newer@sha256:3")
+        self.assertEqual({"legacy", "a", "b"}, set(self.state()["slots"]))
+        self.ops.containers["old-serving"]["State"].update(Running=False, Status="exited")
+        alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertTrue(any(a.get("slot") == "legacy" and a.get("role") == "serving"
+                            and "unhealthy" in a["alert"] for a in alerts), alerts)
+
+    def test_watch_reports_a_slot_it_cannot_inspect_instead_of_skipping_it(self):
+        self.deploy()
+        inspect = self.ops.inspect
+
+        def timeout(name, **kw):
+            if name == "sources-main-a-standby":
+                raise subprocess.TimeoutExpired(["docker", "inspect", name], 30)
+            return inspect(name, **kw)
+
+        with mock.patch.object(self.ops, "inspect", timeout):
+            alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertTrue(any(a.get("alert") == ["docker_inspect_failed"] and a.get("slot") == "a"
+                            and a.get("role") == "standby" for a in alerts), alerts)
+
+    # -- review round: probe ordering, retirement and admin evidence ----------
+    BASE_SUCCESS_COMMANDS = """\
+docker image inspect new@sha256:2
+docker pull new@sha256:2
+/usr/sbin/nginx -T
+inspector sources-main-a-serving
+inspector sources-main-a-standby
+inspector sources-main-a-background
+docker create --name sources-main-oneoff-<pid>-<t> --user 1001:1001 --entrypoint /app/sub2api --network app-data --label com.sources.deploy.role=oneoff --env-file /opt/x/background.env -e SOURCES_PROCESS_ROLE=background --mount type=bind,source=/state/main,target=/app/data new@sha256:2 -list-pending-migrations
+docker network connect app-upstream sources-main-oneoff-<pid>-<t>
+docker start --attach sources-main-oneoff-<pid>-<t>
+docker rm -f sources-main-oneoff-<pid>-<t>
+docker create --name sources-main-oneoff-<pid>-<t> --user 1001:1001 --entrypoint /app/sub2api --network app-data --label com.sources.deploy.role=oneoff --env-file /opt/x/background.env -e SOURCES_PROCESS_ROLE=background --mount type=bind,source=/state/main,target=/app/data new@sha256:2 -migrate-only 001_add.sql
+docker network connect app-upstream sources-main-oneoff-<pid>-<t>
+docker start --attach sources-main-oneoff-<pid>-<t>
+docker rm -f sources-main-oneoff-<pid>-<t>
+docker create --name sources-main-oneoff-<pid>-<t> --user 1001:1001 --entrypoint /app/sub2api --network app-data --label com.sources.deploy.role=oneoff --env-file /opt/x/serving.env -e SOURCES_PROCESS_ROLE=serving --mount type=bind,source=/state/main,target=/app/data new@sha256:2 -check-startup
+docker network connect app-upstream sources-main-oneoff-<pid>-<t>
+docker start --attach sources-main-oneoff-<pid>-<t>
+docker rm -f sources-main-oneoff-<pid>-<t>
+docker create --name sources-main-oneoff-<pid>-<t> --user 1001:1001 --entrypoint /app/sub2api --network app-data --label com.sources.deploy.role=oneoff --env-file /opt/x/background.env -e SOURCES_PROCESS_ROLE=background --mount type=bind,source=/state/main,target=/app/data new@sha256:2 -check-startup
+docker network connect app-upstream sources-main-oneoff-<pid>-<t>
+docker start --attach sources-main-oneoff-<pid>-<t>
+docker rm -f sources-main-oneoff-<pid>-<t>
+rm -rf <tmp>/work/assets-staging
+install -d -o 1001 -m 0755 <tmp>/work/assets-staging
+docker create --name sources-main-oneoff-<pid>-<t> --user 1001:1001 --entrypoint /app/sub2api --network app-data --label com.sources.deploy.role=oneoff --env-file /opt/x/serving.env -e SOURCES_PROCESS_ROLE=serving --mount type=bind,source=/state/main,target=/app/data --mount type=bind,source=<tmp>/work/assets-staging,target=/export new@sha256:2 -export-web-assets /export
+docker network connect app-upstream sources-main-oneoff-<pid>-<t>
+docker start --attach sources-main-oneoff-<pid>-<t>
+docker rm -f sources-main-oneoff-<pid>-<t>
+cp -Rn <tmp>/work/assets-staging/. /opt/sources-web/main/assets/
+docker rm -f sources-main-a-serving
+docker rm -f sources-main-a-standby
+docker rm -f sources-main-a-background
+rm -rf <tmp>/work/containers/sources-main-a-serving/pricing-cache
+mkdir -p <tmp>/work/containers/sources-main-a-serving
+cp -a /opt/x/inputs/serving/pricing-cache <tmp>/work/containers/sources-main-a-serving/pricing-cache
+docker create --name sources-main-a-serving --hostname sources-main-a-serving --user 1001:1001 --entrypoint /app/sub2api --restart unless-stopped --memory 24g --cpus 12 --pids-limit 4096 --log-opt max-size=10m --log-opt max-file=3 --publish 127.0.0.1:9401:8080 --network app-data --network-alias sources-main-a-serving --network-alias sources-main-serving --label com.sources.deploy.slot=a --label com.sources.deploy.role=serving --label com.sources.deploy.created=<ts> --env-file /opt/x/serving.env -e SOURCES_PROCESS_ROLE=serving --mount type=bind,source=/state/main,target=/app/data --mount type=bind,source=<tmp>/work/containers/sources-main-a-serving/pricing-cache,target=/runtime/pricing-cache new@sha256:2
+docker network connect --alias sources-main-a-serving --alias sources-main-serving app-upstream sources-main-a-serving
+docker start sources-main-a-serving
+rm -rf <tmp>/work/containers/sources-main-a-standby/pricing-cache
+mkdir -p <tmp>/work/containers/sources-main-a-standby
+cp -a /opt/x/inputs/serving/pricing-cache <tmp>/work/containers/sources-main-a-standby/pricing-cache
+docker create --name sources-main-a-standby --hostname sources-main-a-standby --user 1001:1001 --entrypoint /app/sub2api --restart unless-stopped --memory 24g --cpus 12 --pids-limit 4096 --log-opt max-size=10m --log-opt max-file=3 --publish 127.0.0.1:9402:8080 --network app-data --network-alias sources-main-a-standby --network-alias sources-main-serving --label com.sources.deploy.slot=a --label com.sources.deploy.role=standby --label com.sources.deploy.created=<ts> --env-file /opt/x/serving.env -e SOURCES_PROCESS_ROLE=serving --mount type=bind,source=/state/main,target=/app/data --mount type=bind,source=<tmp>/work/containers/sources-main-a-standby/pricing-cache,target=/runtime/pricing-cache new@sha256:2
+docker network connect --alias sources-main-a-standby --alias sources-main-serving app-upstream sources-main-a-standby
+docker start sources-main-a-standby
+inspector old-bg
+docker create --name sources-main-a-background --hostname sources-main-a-background --user 1001:1001 --entrypoint /app/sub2api --restart unless-stopped --memory 24g --cpus 12 --pids-limit 4096 --log-opt max-size=10m --log-opt max-file=3 --publish 127.0.0.1:9403:8080 --network app-data --network-alias sources-main-a-background --label com.sources.deploy.slot=a --label com.sources.deploy.role=background --label com.sources.deploy.created=<ts> --env-file /opt/x/background.env -e SOURCES_PROCESS_ROLE=background --mount type=bind,source=/state/main,target=/app/data new@sha256:2
+docker network connect --alias sources-main-a-background app-upstream sources-main-a-background
+docker update --restart=no old-bg
+docker kill --signal=TERM old-bg
+inspector old-bg
+docker update --restart=unless-stopped sources-main-a-background
+docker start sources-main-a-background
+inspector sources-main-a-background
+/usr/sbin/nginx -t
+/usr/sbin/nginx -s reload
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector sources-main-a-serving
+inspector old-serving
+docker update --restart=no old-serving
+docker kill --signal=TERM old-serving
+inspector old-spare
+docker update --restart=no old-spare
+docker kill --signal=TERM old-spare
+"""
+
+    def normalised_commands(self):
+        """Every Docker, Nginx and inspect call, in order, with volatile parts
+        replaced. `inspect` is recorded because the real tool runs it as a
+        Docker command; the stock fake answers it without going through run()."""
+        original = self.ops.inspect
+
+        def recording_inspect(name, **kw):
+            self.ops.commands.append(["inspector", name])
+            return original(name, **kw)
+
+        with mock.patch.object(self.ops, "inspect", recording_inspect):
+            self.deploy()
+        lines = []
+        for cmd in self.ops.commands:
+            text = " ".join(cmd)
+            text = __import__("re").sub(r"sources-main-oneoff-\d+-\d+", "sources-main-oneoff-<pid>-<t>", text)
+            text = text.replace(str(self.tmp), "<tmp>")
+            text = __import__("re").sub(r"created=[0-9T:+.\-]+", "created=<ts>", text)
+            lines.append(text)
+        return lines
+
+    def test_success_command_sequence_matches_base(self):
+        """A successful release runs the baseline commands, in order, with one
+        documented difference.
+
+        The route is now written as two upstream blocks - serving, then admin -
+        so each block is validated and reloaded on its own. That is exactly one
+        more `nginx -t` + `nginx -s reload` pair, the admin write's own
+        (approved 2026-11-24). Every other call is unchanged, in the same order,
+        with no probe-specific `docker inspect`.
+        """
+        base = self.BASE_SUCCESS_COMMANDS.splitlines()
+        reloads = [i for i, line in enumerate(base) if line == "/usr/sbin/nginx -s reload"]
+        self.assertEqual(1, len(reloads), "the baseline has one route write")
+        index = reloads[0] + 1
+        admin_write_pair = ["/usr/sbin/nginx -t", "/usr/sbin/nginx -s reload"]
+        expected = base[:index] + admin_write_pair + base[index:]
+        actual = self.normalised_commands()
+        self.assertEqual(expected, actual, "the successful release command sequence changed")
+
+    def stop_during_probe(self, stop, *, port, path="/internal/sources/runtime", step=None):
+        """Stop containers while a chosen probe is in flight, then answer it.
+        `step` limits the hook to the rollback (the guard step), so the stop
+        happens during the rollback's own probes, not earlier in the release."""
+        real = self.ops.http_json
+        fired = []
+
+        def probe(url, **kw):
+            if not fired and url.startswith(f"http://127.0.0.1:{port}{path}"):
+                current = (self.state().get("in_progress") or {}).get("step")
+                if step is None or current == step:
+                    fired.append(1)
+                    stop()
+            return real(url, **kw)
+
+        return mock.patch.object(self.ops, "http_json", probe)
+
+    def test_rollback_prewrite_serving_exits_during_standby_probe(self):
+        """Invariant 1: the rollback's serving write probes the standby first
+        and the primary last, so a primary that exits during the standby probe
+        is not written."""
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+
+        def stop_primary():
+            self.ops.containers["old-serving"]["State"].update(Running=False, Status="exited")
+
+        with self.stop_during_probe(stop_primary, port=LEGACY["ports"]["standby"], step="guard"):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "rollback service route was not written"):
+                self.deploy()
+        self.assertEqual(self.upstreams_for(target), self.ops.loaded_upstreams,
+                         "a dead primary was not written into the service route")
+        self.assertNotIn(f"127.0.0.1:{LEGACY['ports']['serving']}",
+                         self.ops.files[self.cfg.upstream_file])
+        progress = self.state()["in_progress"]
+        self.assertEqual("failed", progress["phase"])
+        self.assertIn("slot legacy's serving containers", progress["failed"])
+
+    def test_rollback_prewrite_standby_exits_during_its_own_probe(self):
+        """Invariant 3: a standby that exits while it is probed is simply not
+        written; the primary still takes traffic."""
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+
+        def stop_standby():
+            self.ops.containers["old-spare"]["State"].update(Running=False, Status="exited")
+
+        with self.stop_during_probe(stop_standby, port=LEGACY["ports"]["standby"], step="guard"):
+            with self.assertRaisesRegex(deploy.DeployError, "guard failed"):
+                self.deploy()
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['serving']} max_fails", upstream)
+        self.assertNotIn(f"127.0.0.1:{LEGACY['ports']['standby']}", upstream)
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_manual_rollback_accepts_healthy_primary_without_standby(self):
+        """Invariant 3: a missing standby does not block returning to a healthy
+        previous primary."""
+        self.deploy()
+        self.ops.containers.pop("old-spare")
+        deploy.Deployer(self.cfg, self.ops).rollback()
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['serving']} max_fails", upstream)
+        self.assertNotIn(f"127.0.0.1:{LEGACY['ports']['standby']}", upstream)
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+        self.assertIsNone(self.state()["in_progress"])
+
+    def test_manual_rollback_serves_from_the_primary_when_its_standby_never_becomes_ready(self):
+        """Invariant 3: the standby only decides whether it is written. A
+        container that exists but never becomes ready must not keep a healthy
+        previous primary from serving."""
+        self.deploy()
+        self.ops.unready_ports.add(LEGACY["ports"]["standby"])
+        deploy.Deployer(self.cfg, self.ops).rollback()
+        upstream = self.ops.files[self.cfg.upstream_file]
+        self.assertIn(f"127.0.0.1:{LEGACY['ports']['serving']} max_fails", upstream)
+        self.assertNotIn(f"127.0.0.1:{LEGACY['ports']['standby']}", upstream,
+                         "a standby that never became ready is not written as a backup")
+        self.assertEqual("legacy", self.state()["current"]["slot"])
+        self.assertIsNone(self.state()["in_progress"])
+        self.assertIn("did not become ready", "\n".join(self.ops.logs))
+
+    def test_normal_release_does_not_write_a_background_that_stopped_before_the_write(self):
+        """Invariant 1: the admin target has no fallback inside the file, so it
+        is the last probe before the write. A background that exits while the
+        serving roles are probed is not written."""
+        target = self.cfg.slot_view("a")
+        writes: list[str] = []
+        write, http_json = self.ops.write_file_atomic, self.ops.http_json
+        fired = []
+
+        def record(path, text, **kw):
+            if path == self.cfg.upstream_file:
+                writes.append(text)
+            return write(path, text, **kw)
+
+        def stop_during_serving_probe(url, **kw):
+            if (not fired
+                    and url.startswith(f"http://127.0.0.1:{target['ports']['serving']}/internal/sources/runtime")
+                    and (self.state().get("in_progress") or {}).get("step") == "switch"):
+                fired.append(1)
+                self.ops.containers[target["containers"]["background"]]["State"].update(
+                    Running=False, Status="exited")
+            return http_json(url, **kw)
+
+        with mock.patch.object(self.ops, "http_json", stop_during_serving_probe), \
+                mock.patch.object(self.ops, "write_file_atomic", record):
+            with self.assertRaisesRegex(deploy.DeployError, "not writing the admin route"):
+                self.deploy()
+        self.assertTrue(fired)
+        self.assertEqual([], [text for text in writes
+                              if f"127.0.0.1:{target['ports']['background']};" in text],
+                         "a background that stopped before the write was not written")
+
+    def test_normal_release_does_not_write_a_primary_that_stopped_during_the_standby_probe(self):
+        """A#1: the serving write probes the standby first and the primary
+        last, so a primary that exits during the standby probe is found by its
+        own probe and the write is refused."""
+        target = self.cfg.slot_view("a")
+        writes: list[str] = []
+        write, http_json = self.ops.write_file_atomic, self.ops.http_json
+        fired: list[int] = []
+
+        def record(path, text, **kw):
+            if path == self.cfg.upstream_file:
+                writes.append(text)
+            return write(path, text, **kw)
+
+        def stop_primary_during_standby_probe(url, **kw):
+            if (not fired
+                    and url.startswith(f"http://127.0.0.1:{target['ports']['standby']}/internal/sources/runtime")
+                    and (self.state().get("in_progress") or {}).get("step") == "switch"):
+                fired.append(1)
+                self.ops.containers[target["containers"]["serving"]]["State"].update(
+                    Running=False, Status="exited")
+            return http_json(url, **kw)
+
+        with mock.patch.object(self.ops, "http_json", stop_primary_during_standby_probe), \
+                mock.patch.object(self.ops, "write_file_atomic", record):
+            with self.assertRaisesRegex(deploy.DeployError, "not writing the service route"):
+                self.deploy()
+        self.assertTrue(fired, "the standby was not probed before the primary")
+        self.assertEqual([], [text for text in writes
+                              if f"127.0.0.1:{target['ports']['serving']}" in text],
+                         "a primary that stopped before the write was written into the route")
+        self.assertIn(target["containers"]["serving"], self.ops.containers,
+                      "a refused write keeps the candidate containers")
+
+    def test_rollback_checks_written_roles_when_retirement_fails(self):
+        """Invariant 2: a retirement error must not skip the check of the roles
+        already written; a primary that exited is named."""
+        self.ops.memory_after_switch = 20 * GIB
+        candidate_serving = self.cfg.container("a", "serving")
+        run = self.ops.run
+
+        def fail_retirement(args, **kw):
+            if args == ["docker", "update", "--restart=no", candidate_serving]:
+                self.ops.containers["old-serving"]["State"].update(Running=False, Status="exited")
+                raise deploy.DeployError("fixture: cannot retire the candidate")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", fail_retirement):
+            with self.assertRaisesRegex(deploy.ServingCleanupFailed, "slot legacy serving"):
+                self.deploy()
+        progress = self.state()["in_progress"]
+        self.assertEqual("failed", progress["phase"])
+        self.assertTrue(any(i["slot"] == "legacy" and i["role"] == "serving"
+                            for i in progress["route_issues"]), progress["route_issues"])
+
+    def test_transient_exit_during_failed_retire_surfaces_in_status_and_watch(self):
+        """B segment 8: the exit is recorded even when the role is back before
+        the next watch sample."""
+        self.ops.memory_after_switch = 20 * GIB
+        candidate_serving = self.cfg.container("a", "serving")
+        run = self.ops.run
+        retired_failed = False
+
+        def fail_retirement(args, **kw):
+            nonlocal retired_failed
+            if args == ["docker", "update", "--restart=no", candidate_serving] and not retired_failed:
+                retired_failed = True
+                self.ops.containers["old-serving"]["State"].update(Running=False, Status="exited")
+                raise deploy.DeployError("fixture: cannot retire the candidate")
+            return run(args, **kw)
+
+        with mock.patch.object(self.ops, "run", fail_retirement):
+            with self.assertRaises(deploy.ServingCleanupFailed):
+                self.deploy()
+        # The role is back by the time anyone looks again.
+        self.ops.containers["old-serving"]["State"].update(Running=True, Status="running")
+
+        progress = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertTrue(any(i["slot"] == "legacy" and i["role"] == "serving" and i.get("found_at")
+                            for i in progress["route_issues"]), progress["route_issues"])
+        alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertTrue(any(a["alert"] == ["in_progress"] and a.get("route_issues") for a in alerts), alerts)
+        self.assertIn("route issue", "\n".join(self.ops.logs))
+
+    def test_successful_publish_preserves_prewrite_admin_probe(self):
+        """Invariant 4: a successful release keeps the probe that moved admin
+        (admin_move) and the verification that held afterwards, after
+        in_progress is cleared."""
+        self.deploy()
+        self.assertIsNone(self.state()["in_progress"])
+        route = deploy.status(self.cfg, self.ops)["last_route"]
+        admin = route["admin"]
+        self.assertEqual("verified", admin["source"])
+        self.assertEqual("a", admin["slot"])
+        self.assertEqual(9403, admin["port"])
+        self.assertEqual("answers", admin["probe"]["outcome"])
+        self.assertTrue(admin["at"])
+        self.assertEqual(9403, route["admin_move"]["port"])
+        self.assertEqual("answers", route["admin_move"]["probe"]["outcome"])
+        self.assertEqual([9401, 9402], route["serving"]["written"])
+        log = "\n".join(self.ops.logs)
+        self.assertIn("admin route written: slot a port 9403", log)
+
+    def test_successful_rollback_preserves_prewrite_admin_probe(self):
+        self.deploy()
+        deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertIsNone(self.state()["in_progress"])
+        route = deploy.status(self.cfg, self.ops)["last_route"]
+        admin = route["admin"]
+        self.assertEqual("verified", admin["source"])
+        self.assertEqual("legacy", admin["slot"])
+        self.assertEqual(LEGACY["ports"]["background"], admin["port"])
+        self.assertEqual("answers", admin["probe"]["outcome"])
+        self.assertEqual(LEGACY["ports"]["background"], route["admin_move"]["port"])
+
+    def test_guard_reports_no_background_when_service_route_is_refused(self):
+        """Invariant 5: a refused serving write still says that no background
+        answers admin and names the one to restore."""
+        self.ops.memory_after_switch = 20 * GIB
+        target = self.cfg.slot_view("a")
+        candidate_background = target["containers"]["background"]
+
+        def stop_everything():
+            self.ops.containers["old-serving"]["State"].update(Running=False, Status="exited")
+            self.ops.containers["old-bg"]["State"].update(Running=False, Status="exited")
+            self.ops.containers[candidate_background]["State"].update(Running=False, Status="exited")
+
+        # The previous primary is the last probe before the rollback write.
+        with self.stop_during_probe(stop_everything, port=LEGACY["ports"]["serving"], step="guard"):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "No background answers admin now") as ctx:
+                self.deploy()
+        self.assertIn("restore one background (slot legacy", str(ctx.exception))
+        progress = deploy.status(self.cfg, self.ops)["in_progress"]
+        self.assertEqual("no background answers", progress["admin_route"]["source"])
+        self.assertEqual("legacy", progress["admin_route"]["restore"])
+
+    def test_guard_keeps_loaded_admin_after_failed_postwrite_probe(self):
+        """Invariant 5: after the admin write, a failed probe stops on the
+        loaded route. No second reload, no trying the other slot."""
+        self.ops.memory_after_switch = 20 * GIB
+        old_admin = LEGACY["ports"]["background"]
+        candidate_background = self.cfg.container("a", "background")
+        write = self.ops.write_file_atomic
+        admin_writes = []
+
+        def stop_after_admin_write(path, text, **kw):
+            before = self.ops.files.get(self.cfg.upstream_file) if path == self.cfg.upstream_file else None
+            result = write(path, text, **kw)
+            if path == self.cfg.upstream_file:
+                moved = deploy.loaded_upstream_ports(before or "")[1] != deploy.loaded_upstream_ports(text)[1]
+                if moved and deploy.loaded_upstream_ports(text)[1] == old_admin:
+                    admin_writes.append(len(self.ops.commands))
+                    self.ops.containers["old-bg"]["State"].update(Running=False, Status="exited")
+            return result
+
+        with mock.patch.object(self.ops, "write_file_atomic", stop_after_admin_write):
+            with self.assertRaisesRegex(deploy.FallbackFailed, "no further reload"):
+                self.deploy()
+        self.assertEqual(1, len(admin_writes), "admin moved exactly once")
+        after = self.ops.commands[admin_writes[0]:]
+        self.assertEqual(1, sum(1 for c in after if c[1:] == ["-s", "reload"]),
+                         "only the admin move's own reload happens after the write")
+        self.assertNotIn(["docker", "start", candidate_background], after,
+                         "the candidate background is not restarted after the failed probe")
+        self.assertIn(f"127.0.0.1:{old_admin};", self.ops.loaded_upstreams)
+        progress = self.state()["in_progress"]
+        self.assertTrue(any(i["slot"] == "legacy" and i["role"] == "background"
+                            for i in progress["route_issues"]), progress["route_issues"])
+
+    def test_watch_alerts_on_runtime_timeout_with_healthy_port(self):
+        """B segment 10: a running container with /health 200 but no runtime
+        answer is reported, not skipped."""
+        self.deploy()
+        real = self.ops.http_json
+
+        def slow_runtime(url, **kw):
+            if url.startswith("http://127.0.0.1:9401/internal/sources/runtime"):
+                return 0, None
+            return real(url, **kw)
+
+        with mock.patch.object(self.ops, "http_json", slow_runtime):
+            alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertTrue(any(a.get("alert") == ["runtime_unavailable"] and a.get("slot") == "a"
+                            and a.get("role") == "serving" for a in alerts), alerts)
+
+    def test_watch_alerts_when_the_runtime_token_cannot_be_read(self):
+        """B segment 10: the container is up and /health is 200, but the token
+        that would let the tool read its runtime state cannot be read. That is
+        an alert, not a silent pass."""
+        self.deploy()
+        # The token files still exist for the other roles; only these cannot be read.
+        readable = self.ops.read_text
+
+        def unreadable(path):
+            if path == "/opt/x/runtime.token" or path.startswith("/legacy/"):
+                raise PermissionError(f"fixture: cannot read {path}")
+            return readable(path)
+
+        with mock.patch.object(self.ops, "read_text", unreadable):
+            alerts = deploy.watch_once(self.cfg, self.ops, {})
+        self.assertTrue(any(a.get("alert") == ["runtime_unavailable"] and a.get("slot") == "a"
+                            and a.get("role") == "serving" for a in alerts), alerts)
 
     def test_guard_counts_connect_failures_only_for_new_ports(self):
         line = 'connect() failed (111) while connecting to upstream, upstream: "http://127.0.0.1:{}/v1"'
@@ -2342,6 +3870,320 @@ class DeployTest(unittest.TestCase):
         self.assertEqual("legacy", state["current"]["slot"])
         self.assertEqual("/rel/bg/runtime.token", state["current"]["runtime_token_files"]["background"])
 
+
+    def test_a_failed_second_write_keeps_the_containers_the_loaded_route_names(self):
+        """The serving block is written and reloaded, then the admin block's
+        `nginx -t` fails. Cleanup must not remove the containers the loaded
+        route still points at: that would leave Nginx proxying to nothing."""
+        run = self.ops.run
+        write = self.ops.write_file_atomic
+        upstream = self.tmp / "upstreams.conf"
+        original_path = self.cfg.upstream_file
+        self.cfg.upstream_file = self.ops.upstream_file = str(upstream)
+        self.ops.files[self.cfg.upstream_file] = self.ops.files.pop(original_path)
+        upstream.write_text(self.ops.files[self.cfg.upstream_file])
+
+        def record(path, text, **kwargs):
+            if path == self.cfg.upstream_file:
+                upstream.write_text(text)
+            return write(path, text, **kwargs)
+
+        config_tests = 0
+
+        def nginx(args, **kwargs):
+            nonlocal config_tests
+            if args == [self.cfg.nginx_bin, "-t"]:
+                config_tests += 1
+                if config_tests == 2:
+                    from subprocess import CompletedProcess
+                    return CompletedProcess(args, 1, "", "fixture: admin block rejected")
+            return run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "write_file_atomic", record), \
+                mock.patch.object(self.ops, "run", nginx):
+            with self.assertRaises(deploy.DeployError):
+                self.deploy()
+        serving_ports = deploy.loaded_upstream_ports(upstream.read_text())[0]
+        running = {c.get("port") for c in self.ops.containers.values()
+                   if (c.get("State") or {}).get("Running")}
+        self.assertTrue(set(serving_ports) & running,
+                        (serving_ports, running, self.state()["in_progress"]))
+        # The failed second write must put the route back on the previous
+        # release, not leave the candidate serving a half-written file.
+        self.assertEqual([LEGACY["ports"]["serving"], LEGACY["ports"]["standby"]], serving_ports)
+
+    def test_correction_does_not_name_an_admin_that_failed_its_fresh_probe(self):
+        """A correction is built from its own snapshot; an admin the snapshot
+        finds stopped must not be carried into the corrected file."""
+        self.deploy()
+        current_serving = self.cfg.container("a", "serving")
+        run = self.ops.run
+        probe_role = deploy.Deployer.probe_role
+        install = deploy.Deployer.install_from
+        state = {"retired": False, "admin_probes": 0}
+        corrections = []
+
+        def tracked_run(args, **kwargs):
+            result = run(args, **kwargs)
+            if args == ["docker", "kill", "--signal=TERM", current_serving]:
+                state["retired"] = True
+                self.ops.containers["old-serving"]["State"].update(Running=False, Status="exited")
+            return result
+
+        def tracked_probe(deployer, view, role, **kwargs):
+            if state["retired"] and (view["slot"], role) == ("legacy", "background"):
+                state["admin_probes"] += 1
+                if state["admin_probes"] == 2:
+                    self.ops.containers["old-bg"]["State"].update(Running=False, Status="exited")
+            return probe_role(deployer, view, role, **kwargs)
+
+        def tracked_install(deployer, snapshot, build, **kwargs):
+            result = install(deployer, snapshot, build, **kwargs)
+            if "correction" in kwargs.get("note", ""):
+                admin = snapshot.probe("legacy", "background")
+                corrections.append((admin.outcome if admin else None,
+                                    deploy.loaded_upstream_ports(self.ops.loaded_upstreams)[1]))
+            return result
+
+        with mock.patch.object(self.ops, "run", tracked_run), \
+                mock.patch.object(deploy.Deployer, "probe_role", tracked_probe), \
+                mock.patch.object(deploy.Deployer, "install_from", tracked_install):
+            with self.assertRaises(deploy.FallbackFailed):
+                deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertEqual([], corrections, "a correction named an admin the snapshot had just found stopped")
+
+    def test_a_corrective_admin_move_records_the_probe_that_authorized_it(self):
+        """A4: the admin block moved as part of a correction, so the recorded
+        evidence must be that correction's probe, not the previous move's."""
+        self.deploy()
+        current = self.state()["current"]
+        background = current["containers"]["background"]
+        self.ops.containers[background]["State"].update(Running=False, Status="exited")
+        self.ops.containers["old-bg"]["State"].update(Running=True, Status="running")
+        verification = deploy.Deployer(self.cfg, self.ops).settle_loaded_route((current, LEGACY))
+        self.assertTrue(verification.clean, verification.findings)
+        route = deploy.status(self.cfg, self.ops)["last_route"]
+        self.assertEqual(LEGACY["ports"]["background"], route["admin"]["port"])
+        self.assertEqual(route["admin"]["port"], route["admin_move"]["port"],
+                         "the admin move's evidence still names the previous move")
+        self.assertEqual("legacy", route["admin_move"]["slot"])
+
+    def test_a_rollback_survives_an_unreadable_old_standby(self):
+        """A3: the old standby only decides whether it is written. Failing to
+        read its state must not stop traffic from returning to the old primary."""
+        self.deploy()
+        inspect = self.ops.inspect
+
+        def timeout(name, **kwargs):
+            if name == "old-spare":
+                from subprocess import TimeoutExpired
+                raise TimeoutExpired(["docker", "inspect", name], 30)
+            return inspect(name, **kwargs)
+
+        with mock.patch.object(self.ops, "inspect", timeout):
+            deploy.Deployer(self.cfg, self.ops).rollback()
+        serving_ports, _ = deploy.loaded_upstream_ports(self.ops.loaded_upstreams)
+        self.assertEqual([LEGACY["ports"]["serving"]], serving_ports)
+
+    def test_watch_names_a_current_container_docker_confirms_is_gone(self):
+        """A current-slot container that Docker confirms does not exist is an
+        outage to report, not a crash: the sample cannot be built from a
+        container that is not there."""
+        self.deploy()
+        current = self.state()["current"]
+        name = current["containers"]["standby"]
+        self.ops.containers.pop(name, None)
+        alerts = deploy.watch_once(self.cfg, self.ops, {})
+        named = [a for a in alerts if a.get("name") == name]
+        self.assertTrue(named, alerts)
+        self.assertIn("missing", named[0]["alert"])
+
+
+
+    def test_a_second_nginx_test_timeout_restores_the_file_and_reports(self):
+        """A hang in `nginx -t` is a failure like a non-zero exit: Nginx never
+        loaded the text, so the disk must not keep it, and the switch must go
+        through the same recovery as a rejected file."""
+        run = self.ops.run
+        write = self.ops.write_file_atomic
+        upstream = self.tmp / "upstreams.conf"
+        original_path = self.cfg.upstream_file
+        self.cfg.upstream_file = self.ops.upstream_file = str(upstream)
+        self.ops.files[self.cfg.upstream_file] = self.ops.files.pop(original_path)
+        upstream.write_text(self.ops.files[self.cfg.upstream_file])
+        validations = []
+
+        def record(path, text, **kwargs):
+            if path == self.cfg.upstream_file:
+                upstream.write_text(text)
+            return write(path, text, **kwargs)
+
+        def nginx(args, **kwargs):
+            if args == [self.cfg.nginx_bin, "-t"]:
+                validations.append(1)
+                if len(validations) == 2:
+                    raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "write_file_atomic", record), \
+                mock.patch.object(self.ops, "run", nginx):
+            with self.assertRaises(deploy.DeployError) as caught:
+                self.deploy()
+        self.assertNotIsInstance(caught.exception, subprocess.TimeoutExpired,
+                                 "a hang must be reported as a deploy failure, not leak the raw timeout")
+        self.assertIn("previous file restored", str(caught.exception))
+        serving_ports, admin_port = deploy.loaded_upstream_ports(upstream.read_text())
+        self.assertEqual([LEGACY["ports"]["serving"], LEGACY["ports"]["standby"]], serving_ports,
+                         "the disk kept a route Nginx never loaded")
+        self.assertEqual(LEGACY["ports"]["background"], admin_port)
+        # The route is back on the previous release, so the state may be clean;
+        # what must not happen is the run looking successful.
+        self.assertEqual("failed", self.history()[-1]["result"])
+
+    def test_a_rollback_survives_an_unreadable_old_standby_token(self):
+        """A3: the old standby's token file is unreadable, so its readiness
+        cannot be checked. That is "skip the standby", not "stop the rollback"."""
+        self.deploy()
+        previous = self.state()["previous"]
+        previous.setdefault("runtime_token_files", {})["standby"] = "/fixture/standby.token"
+        state = self.state()
+        state["previous"] = previous
+        deploy.save_state(self.cfg, state)
+        read_text = self.ops.read_text
+
+        def unreadable(path):
+            if path == "/fixture/standby.token":
+                raise PermissionError("fixture: old standby runtime token cannot be read")
+            return read_text(path)
+
+        with mock.patch.object(self.ops, "read_text", unreadable):
+            deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertEqual([LEGACY["ports"]["serving"]],
+                         deploy.loaded_upstream_ports(self.ops.loaded_upstreams)[0])
+
+
+    def test_an_unanswered_reload_keeps_the_candidate_that_may_be_serving(self):
+        """A reload that does not report back may already have been applied.
+        The file must therefore stay as written and the route count as this
+        process's: restoring the old file would make the cleanup remove
+        containers that are answering requests."""
+        run = self.ops.run
+        first_reload = [True]
+
+        def reload_then_timeout(args, **kwargs):
+            result = run(args, **kwargs)
+            if first_reload[0] and args == [self.cfg.nginx_bin, "-s", "reload"]:
+                first_reload[0] = False
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return result
+
+        with mock.patch.object(self.ops, "run", reload_then_timeout):
+            with self.assertRaisesRegex(deploy.DeployError, "nginx reload did not report back"):
+                self.deploy()
+        self.assertFalse(first_reload[0])
+        loaded_ports, _ = deploy.loaded_upstream_ports(self.ops.loaded_upstreams)
+        live = [bool((self.ops.by_port(port) or {}).get("State", {}).get("Running")) for port in loaded_ports]
+        # Whatever Nginx loaded, no endpoint it names may have been deleted.
+        self.assertTrue(any(live), loaded_ports)
+        status = deploy.status(self.cfg, self.ops)
+        self.assertEqual(loaded_ports, status["loaded_route"]["serving_ports"],
+                         "status must describe the route that was written, not a stale file")
+
+
+    def assert_a_slow_old_standby_does_not_block_the_old_primary(self, *, automatic):
+        if automatic:
+            self.ops.memory_after_switch = 20 * GIB
+        else:
+            self.deploy()
+        standby_port = LEGACY["ports"]["standby"]
+        primary_port = LEGACY["ports"]["serving"]
+        real_http = self.ops.http_json
+        fired = []
+
+        def http_json(url, **kwargs):
+            progress = self.state().get("in_progress") or {}
+            step = "guard" if automatic else "switch"
+            if (not fired and progress.get("step") == step
+                    and url == f"http://127.0.0.1:{standby_port}/internal/sources/runtime"):
+                fired.append(True)
+                # A standby response that runs to the snapshot deadline: the
+                # shared budget is gone by the time the primary is reached.
+                self.ops.clock += deploy.PROBE_BUDGET_SECONDS
+                return 0, None
+            return real_http(url, **kwargs)
+
+        with mock.patch.object(self.ops, "http_json", http_json):
+            try:
+                if automatic:
+                    self.deploy()
+                else:
+                    deploy.Deployer(self.cfg, self.ops).rollback()
+            except deploy.DeployError:
+                pass
+        self.assertTrue(fired, "the slow standby probe never ran")
+        self.assertEqual(200, real_http(f"http://127.0.0.1:{primary_port}/health")[0])
+        ports = deploy.loaded_upstream_ports(self.ops.loaded_upstreams)[0]
+        self.assertEqual([primary_port], ports,
+                         "a slow standby kept traffic off the healthy old primary")
+
+    def test_guard_rollback_slow_old_standby_does_not_block_healthy_primary(self):
+        self.assert_a_slow_old_standby_does_not_block_the_old_primary(automatic=True)
+
+    def test_manual_rollback_slow_old_standby_does_not_block_healthy_primary(self):
+        self.assert_a_slow_old_standby_does_not_block_the_old_primary(automatic=False)
+
+
+    def assert_a_standby_past_the_ttl_does_not_block_the_old_primary(self, *, automatic):
+        if automatic:
+            self.ops.memory_after_switch = 20 * GIB
+        else:
+            self.deploy()
+        standby_port = LEGACY["ports"]["standby"]
+        primary_port = LEGACY["ports"]["serving"]
+        real_http = self.ops.http_json
+        fired = []
+
+        def http_json(url, **kwargs):
+            progress = self.state().get("in_progress") or {}
+            step = "guard" if automatic else "switch"
+            if (not fired and progress.get("step") == step
+                    and url == f"http://127.0.0.1:{standby_port}/health"):
+                fired.append(True)
+                # Long enough that this pair answers past the snapshot TTL.
+                self.ops.clock += deploy.SNAPSHOT_TTL_SECONDS + 1
+                return 0, None
+            return real_http(url, **kwargs)
+
+        with mock.patch.object(self.ops, "http_json", http_json):
+            try:
+                if automatic:
+                    self.deploy()
+                else:
+                    deploy.Deployer(self.cfg, self.ops).rollback()
+            except deploy.DeployError:
+                pass
+        self.assertTrue(fired, "the slow standby probe never ran")
+        ports = deploy.loaded_upstream_ports(self.ops.loaded_upstreams)[0]
+        self.assertEqual([primary_port], ports,
+                         "a standby older than the TTL kept traffic off the healthy old primary")
+
+    def test_guard_rollback_standby_past_the_ttl_does_not_block_healthy_primary(self):
+        self.assert_a_standby_past_the_ttl_does_not_block_the_old_primary(automatic=True)
+
+    def test_manual_rollback_standby_past_the_ttl_does_not_block_healthy_primary(self):
+        self.assert_a_standby_past_the_ttl_does_not_block_the_old_primary(automatic=False)
+
+    def test_rebuilding_a_missing_upstream_file_records_the_admin_move(self):
+        """A4: creating the file also names an admin upstream, so the move must
+        record the probe that authorized it -- not the one before it."""
+        self.deploy()
+        self.ops.files.pop(self.cfg.upstream_file, None)
+        deploy.Deployer(self.cfg, self.ops).rollback()
+        route = deploy.status(self.cfg, self.ops)["last_route"]
+        self.assertEqual(LEGACY["ports"]["background"], route["admin"]["port"])
+        self.assertIsNotNone(route["admin_move"], route)
+        self.assertEqual(route["admin"]["port"], route["admin_move"]["port"])
+        self.assertEqual("legacy", route["admin_move"]["slot"])
 
 class HoldOps(FakeOps):
     """Model the image and network identities used by pause and resume."""

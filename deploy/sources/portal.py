@@ -356,7 +356,7 @@ class PortalDeployer(deploy.Deployer):
             return None
 
     def install(self, port: int) -> None:
-        self.install_upstreams(render_upstream(self.cfg.upstream_name, port))
+        self._install(render_upstream(self.cfg.upstream_name, port))
 
     # steps ------------------------------------------------------------------------
     def preflight(self, current: dict[str, Any], previous: dict[str, Any] | None,  # type: ignore[override]
@@ -480,7 +480,7 @@ class PortalDeployer(deploy.Deployer):
         """(a) stop the new Portal, which holds the state lock; (b) start the
         old one (waiting first for it to exit if it was signalled and is still
         draining); (c) point Nginx back at it if the upstream file was changed
-        (a rejected file was already restored by install_upstreams)."""
+        (a rejected file was already restored by the install)."""
         self.log(f"   {cause}; restoring {old['container']}")
         try:
             self.ops.run(["docker", "update", "--restart=no", new["container"]], mutate=True)
