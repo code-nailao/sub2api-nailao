@@ -1679,6 +1679,395 @@ class DeployTest(unittest.TestCase):
             self.fail(f"{len(failures)} of {checked} stop points left a route decision that "
                       "does not hold:\n- " + "\n- ".join(failures[:12]))
 
+    # -- property: four roles, every probe point, all three flows ------------
+    # The admin entry has no container of its own: its server is a slot's
+    # background. Stopping that background at an admin probe point is the same
+    # physical stop as the background sweep, but it is judged against the admin
+    # upstream as well, so the role axis covers 服务主 / 备用 / 后台 / 管理入口.
+    def property_probe_points(self, flow):
+        """Both probe counts from one run: every role port, and the admin
+        entry port the loaded upstream names at each probe."""
+        counts: dict[tuple[str, str], int] = {}
+        admin: dict[str, int] = {}
+        views = self.property_views()
+        index = {view["ports"][role]: (view["slot"], role)
+                 for view in views.values() for role in deploy.ROLES}
+        owners = {view["ports"]["background"]: view["slot"] for view in views.values()}
+        real = self.ops.http_json
+
+        def counting(url, **kw):
+            if url.startswith("http://127.0.0.1:"):
+                port = int(url.split(":")[2].split("/")[0])
+                if port in index:
+                    counts[index[port]] = counts.get(index[port], 0) + 1
+                loaded_admin = deploy.loaded_upstream_ports(self.ops.loaded_upstreams or "")[1]
+                if port == loaded_admin and port in owners:
+                    admin[owners[port]] = admin.get(owners[port], 0) + 1
+            return real(url, **kw)
+
+        with mock.patch.object(self.ops, "http_json", counting):
+            self.property_flow(flow)
+        return counts, admin
+
+    def property_scenarios_with_admin(self, flow):
+        case = self.property_fresh()
+        try:
+            counts, admin = case.property_probe_points(flow)
+        finally:
+            case.tearDown()
+        fixed = []
+        for (slot, role), count in sorted(counts.items()):
+            for index in range(count):
+                fixed.append((slot, role, index, False))
+            for index in range(count - 1):
+                fixed.append((slot, role, index, True))
+        admin_scenarios = []
+        for slot, count in sorted(admin.items()):
+            for index in range(count):
+                admin_scenarios.append((slot, "admin", index, False))
+            for index in range(count - 1):
+                admin_scenarios.append((slot, "admin", index, True))
+        return fixed, admin_scenarios
+
+    def property_probe_timeline(self, flow):
+        """One whole flow, recording every probe point and which role
+        containers are running at that moment. A probe point is any HTTP probe
+        of a role port, not only the probed role's own: the family under test
+        is a role that dies while a different role is being probed."""
+        views = self.property_views()
+        index = {view["ports"][role]: (view["slot"], role)
+                 for view in views.values() for role in deploy.ROLES}
+        owners = {view["ports"]["background"]: view["slot"] for view in views.values()}
+        points: list[dict] = []
+        real = self.ops.http_json
+
+        def recording(url, **kw):
+            if url.startswith("http://127.0.0.1:"):
+                port = int(url.split(":")[2].split("/")[0])
+                if port in index:
+                    loaded_admin = deploy.loaded_upstream_ports(self.ops.loaded_upstreams or "")[1]
+                    running = [(view["slot"], role) for view in views.values() for role in deploy.ROLES
+                               if (self.ops.containers.get(view["containers"][role]) or {})
+                               .get("State", {}).get("Running")]
+                    points.append({"port": port, "role": index[port], "running": running,
+                                   "admin_slot": owners.get(port) if port == loaded_admin else None})
+            return real(url, **kw)
+
+        with mock.patch.object(self.ops, "http_json", recording):
+            self.property_flow(flow)
+        return points
+
+    def property_sweep_scenarios(self, flow):
+        """Every role, stopped at every probe point of the flow, before and
+        after that probe. The admin entry is a slot's background seen through
+        the admin upstream: at each admin probe point it is one more role."""
+        case = self.property_fresh()
+        try:
+            points = case.property_probe_timeline(flow)
+        finally:
+            case.tearDown()
+        scenarios = []
+        views = self.property_views()
+        for index, point in enumerate(points):
+            targets = list(point["running"])
+            admin_slot = point["admin_slot"]
+            if admin_slot is not None and (admin_slot, "background") in targets:
+                targets.append((admin_slot, "admin"))
+            for slot, role in targets:
+                base = "background" if role == "admin" else role
+                port = views[slot]["ports"][base]
+                if not any(later["port"] == port for later in points[index + 1:]):
+                    # No later probe of this role: stopping it here is "after
+                    # the last look", not a race the tool could see.
+                    continue
+                scenarios.append((slot, role, index, False))
+                scenarios.append((slot, role, index, True))
+        return scenarios
+
+    def property_run_at(self, flow, slot, role, index, after):
+        """Stop one role at one probe point of the whole flow, not only at a
+        probe of that role, then run the flow. This is the cross-role race the
+        review family describes: the role answered when last probed, another
+        role is probed next, and the write must not use the stale answer."""
+        views = self.property_views()
+        view = views[slot]
+        base_role = "background" if role == "admin" else role
+        port, name = view["ports"][base_role], view["containers"][base_role]
+        owners = {other["ports"]["background"]: other["slot"] for other in views.values()}
+        known = {other["ports"][r] for other in views.values() for r in deploy.ROLES}
+        writes: list[str] = []
+        write_before: list[str | None] = []
+        write_probes: list[int] = []
+        probes: list[dict] = []
+        real_write, real_http = self.ops.write_file_atomic, self.ops.http_json
+        seen = {"probe": 0, "stopped": False, "admin_at_stop": False}
+
+        def stop():
+            container = self.ops.containers.get(name)
+            if container is not None:
+                seen["stopped"] = True
+                container["State"].update(Running=False, Status="exited")
+
+        def tracked_write(path, text, **kw):
+            if path == self.cfg.upstream_file:
+                writes.append(text)
+                write_before.append(self.ops.files.get(self.cfg.upstream_file))
+                write_probes.append(len(probes))
+            return real_write(path, text, **kw)
+
+        def probe(url, **kw):
+            if not url.startswith("http://127.0.0.1:"):
+                return real_http(url, **kw)
+            target = int(url.split(":")[2].split("/")[0])
+            if target in known:
+                loaded_admin = deploy.loaded_upstream_ports(self.ops.loaded_upstreams or "")[1]
+                probes.append({"port": target,
+                               "admin_slot": owners.get(target) if target == loaded_admin else None})
+                n = seen["probe"]
+                seen["probe"] += 1
+                if not after and n == index:
+                    stop()
+                result = real_http(url, **kw)
+                if after and n == index:
+                    stop()
+                if n == index:
+                    seen["admin_at_stop"] = (target == loaded_admin and owners.get(target) == slot)
+                return result
+            return real_http(url, **kw)
+
+        with mock.patch.object(self.ops, "write_file_atomic", tracked_write), \
+                mock.patch.object(self.ops, "http_json", probe):
+            error = self.property_flow(flow)
+        return {"error": error, "writes": writes, "write_before": write_before,
+                "write_probes": write_probes, "probes": probes,
+                "stopped": seen["stopped"], "admin_at_stop": seen["admin_at_stop"]}
+
+    def assert_write_rests_on_a_probe_taken_after_the_stop(self, flow, slot, role, run):
+        """A#1: a write may only add a role to the route on the strength of a
+        probe taken after that role was last seen answering. A write that adds
+        a port whose last probe predates the stop used a stale answer, even if
+        the same round corrects it afterwards."""
+        if not run["stopped"]:
+            return
+        base = "background" if role == "admin" else role
+        label = (f"{flow}: {slot} {role} stopped at probe {run['index']}"
+                 f"{' (after)' if run['after'] else ''}")
+        views = self.property_views()
+        port = views[slot]["ports"][base]
+        for index, text in enumerate(run["writes"]):
+            mark = run["write_probes"][index]
+            if mark <= run["index"]:
+                continue  # the write happened before the role stopped
+            before = run["write_before"][index] or ""
+            before_serving, before_admin = deploy.loaded_upstream_ports(before)
+            serving, admin = deploy.loaded_upstream_ports(text)
+            added = set(serving) - set(before_serving)
+            if admin is not None and admin != before_admin:
+                added.add(admin)
+            if port not in added:
+                continue
+            last = max((i for i in range(mark) if run["probes"][i]["port"] == port),
+                       default=-1)
+            previous_mark = run["write_probes"][index - 1] if index else 0
+            self.assertGreaterEqual(
+                last, previous_mark,
+                f"{label}: write {index + 1} added port {port} from a probe taken before the "
+                f"previous write; the answer was carried over instead of taken in this write")
+            if last == mark - 1:
+                # The role this write depends on most - the serving primary,
+                # the admin target - is probed last, so its answer must be
+                # taken after the role stopped. A role probed earlier inside
+                # the same snapshot (the standby) keeps the accepted residual:
+                # it can stop while the primary is probed, and the post-write
+                # verification of this same round has to find it.
+                self.assertGreaterEqual(
+                    last, run["index"],
+                    f"{label}: write {index + 1} added port {port}, but its last probe was "
+                    f"probe {last + 1} of {mark}, before the role stopped at probe "
+                    f"{run['index'] + 1}; the write used a stale answer")
+
+    def status_route_records(self):
+        """Every place status keeps a route decision: the findings that need a
+        person, the excluded backup, and the admin owner or its probes."""
+        status = deploy.status(self.cfg, self.ops)
+        progress = status.get("in_progress") or {}
+        last = status.get("last_route") or {}
+        records: list[dict] = []
+        for issue in progress.get("route_issues") or []:
+            records.append({"kind": "route_issue", **issue})
+        for issue in status.get("route_findings") or []:
+            records.append({"kind": "route_issue", **issue})
+        for entry in (progress.get("serving_route"), last.get("serving")):
+            for probe in (entry or {}).get("excluded") or []:
+                records.append({"kind": "excluded", **probe})
+        for entry in (progress.get("admin_route"), last.get("admin")):
+            if not entry:
+                continue
+            records.append({"kind": "admin_route", "slot": entry.get("slot"),
+                            "role": "background", "port": entry.get("port"),
+                            "at": entry.get("at"), "source": entry.get("source"),
+                            "restore": entry.get("restore")})
+            for probe in (entry.get("probes") or {}).values():
+                records.append({"kind": "admin_probe", **probe})
+        return status, progress, last, records
+
+    def assert_role_was_not_silently_excluded(self, flow, slot, role, run):
+        """A#2 / B#8: once the role was a route member, leaving it out of the
+        loaded route is only allowed if the same round either corrected the
+        route and kept a record, or kept it for manual recovery."""
+        if not run["stopped"] or not run["writes"]:
+            return  # no route decision was made, so no role was left out of one
+        base = "background" if role == "admin" else role
+        label = (f"{flow}: {slot} {role} stopped at probe {run['index']}"
+                 f"{' (after)' if run['after'] else ''}")
+        views = self.property_views()
+        view = views[slot]
+        port = view["ports"][base]
+        final = self.ops.loaded_upstreams or ""
+        final_ports, final_admin = deploy.loaded_upstream_ports(final)
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        alive = deployer.probe_role(view, base).usable
+        status, progress, last, records = self.status_route_records()
+        named = [r for r in records if r.get("slot") == slot and r.get("role") == base
+                 and (r.get("found_at") or r.get("at"))]
+        if f"127.0.0.1:{port}" in final:
+            return  # still part of the loaded route; assert_route_property judges it
+        final_ports_set = set(final_ports) | ({final_admin} if final_admin is not None else set())
+        if not (final_ports_set & {view["ports"][r] for r in deploy.ROLES}):
+            # The flow moved away from this slot entirely (a rollback or a
+            # switch retired it). That is the correction, not an exclusion
+            # from a route the slot still serves.
+            return
+        added_to_a_write = False
+        for text, before in zip(run["writes"], run["write_before"]):
+            was_serving, was_admin = deploy.loaded_upstream_ports(before or "")
+            now_serving, now_admin = deploy.loaded_upstream_ports(text)
+            prior = set(was_serving) | ({was_admin} if was_admin is not None else set())
+            current = set(now_serving) | ({now_admin} if now_admin is not None else set())
+            if port in current - prior:
+                added_to_a_write = True
+                break
+        if added_to_a_write:
+            # This run put it into the route and it is now gone: the same
+            # settlement had to record it for a person even when the
+            # corrective rewrite succeeded.
+            self.assertTrue(named, f"{label}: {slot} {base} port {port} was written and then dropped "
+                                   f"without a finding in status: {progress}")
+            return
+        # It never made it into a write: the decision excluded it.
+        if role in ("background", "admin"):
+            if final_admin is not None and final_admin != port:
+                # The admin entry moved to another background; the move itself
+                # is the correction. The final route check has already proved
+                # the new owner answers.
+                return
+            if final_admin == port:
+                self.fail(f"{label}: the admin entry still names slot {slot} port {port}, "
+                          f"which does not answer and was not excluded")
+            self.assertTrue(progress.get("admin_route", {}).get("source") == "no background answers"
+                            and progress.get("admin_route", {}).get("restore"),
+                            f"{label}: no admin owner was recorded after excluding slot {slot} "
+                            f"background port {port}: {progress.get('admin_route')}")
+            return
+        if role == "standby":
+            if view["ports"]["serving"] not in final_ports:
+                return  # the flow moved to another slot; this slot's backup is not a member
+            self.assertTrue(named, f"{label}: the route serves from slot {slot} without standby port "
+                                   f"{port}, and status keeps no record of the exclusion: {progress}")
+            return
+        # A serving primary is never merely excluded: either it is written, or
+        # the write was refused and the run says which role stopped it.
+        if view["ports"]["serving"] in final_ports:
+            self.fail(f"{label}: the final route serves slot {slot} from another port while "
+                      f"port {port} does not answer")
+            return
+        failed = progress.get("failed") or ""
+        self.assertTrue((f"slot {slot} {base}" in failed and progress.get("failed_at"))
+                        or named,
+                        f"{label}: no record explains why slot {slot} {base} port {port} was "
+                        f"left out of the route: {progress}")
+
+    def assert_admin_entry_property(self, flow, slot, run):
+        """A#4 / A#5: when the admin entry's server was the role stopped at the
+        probe, the loaded admin port must answer, or status must say that no
+        background answers and which slot to restore. A move must be visible."""
+        if not run.get("admin_at_stop"):
+            return
+        label = (f"{flow}: admin entry on slot {slot} stopped at probe {run['index']}"
+                 f"{' (after)' if run['after'] else ''}")
+        views = self.property_views()
+        view = views[slot]
+        port = view["ports"]["background"]
+        status, progress, last, records = self.status_route_records()
+        final_admin = status["loaded_route"]["admin_port"]
+        deployer = deploy.Deployer(self.cfg, self.ops)
+        alive = deployer.probe_role(view, "background").usable
+        found = [r for r in records if r.get("slot") == slot and r.get("role") == "background"
+                 and (r.get("found_at") or r.get("at"))]
+        if final_admin == port and not alive:
+            replaceable = [other["slot"] for other in views.values()
+                           if other["slot"] != slot
+                           and deployer.probe_role(other, "background").usable]
+            self.assertFalse(replaceable,
+                             f"{label}: admin still names slot {slot} port {port}, which does not "
+                             f"answer, while another background could have replaced it"
+                             + (f" (slot {replaceable[0]})" if replaceable else ""))
+            admin = progress.get("admin_route") or {}
+            self.assertTrue(found or (admin.get("source") == "no background answers"
+                                      and admin.get("restore")),
+                            f"{label}: the admin entry lost its only server and status does not "
+                            f"say who to restore: {progress}")
+        if final_admin is not None and final_admin != port:
+            moved_to = deploy.Deployer.admin_port_slot(final_admin, tuple(views.values()))
+            admin = progress.get("admin_route") or last.get("admin") or {}
+            logged = any(f"correcting the admin route to slot {moved_to} port {final_admin}" in line
+                         for line in self.ops.logs)
+            self.assertTrue(admin.get("port") == final_admin or logged,
+                            f"{label}: admin moved from slot {slot} port {port} to port "
+                            f"{final_admin}, but neither status nor the log states the move")
+
+    def test_property_every_role_and_probe_point_keeps_the_route_truthful(self):
+        """The acceptance sweep: for 服务主, 备用, 后台 and 管理入口, at every
+        probe point each flow takes, stop that role and run the whole flow
+        (normal release, guard rollback, manual rollback). The final upstream
+        file must name no role that stopped answering, unless nothing could
+        replace it; then status and the watch must name slot, role and time.
+        A role left out of a write must be corrected in the same round or kept
+        for manual recovery. One case, every combination."""
+        failures = []
+        checked = 0
+        admin_checked = 0
+        for flow in self.PROPERTY_FLOWS:
+            for slot, role, index, after in self.property_sweep_scenarios(flow):
+                case = self.property_fresh()
+                try:
+                    run = case.property_run_at(flow, slot, role, index, after)
+                    run.update(index=index, after=after)
+                    if role == "admin":
+                        admin_checked += 1
+                    else:
+                        checked += 1
+                    for check in (case.assert_route_property,
+                                  case.assert_role_was_not_silently_excluded,
+                                  case.assert_write_rests_on_a_probe_taken_after_the_stop):
+                        try:
+                            check(flow, slot, role, run)
+                        except AssertionError as err:
+                            failures.append(str(err))
+                    if run.get("admin_at_stop"):
+                        admin_checked += 1
+                        try:
+                            case.assert_admin_entry_property(flow, slot, run)
+                        except AssertionError as err:
+                            failures.append(str(err))
+                finally:
+                    case.tearDown()
+        self.assertGreaterEqual(checked, 800, "the sweep checked too few role/probe points")
+        self.assertGreaterEqual(admin_checked, 100, "the admin entry was checked too rarely")
+        if failures:
+            self.fail(f"{len(failures)} route decisions out of {checked + admin_checked} "
+                      "stop points do not hold:\n- " + "\n- ".join(failures[:20]))
+
     # -- watch coverage (B segment: report, do not silently skip) -------------
     def test_watch_keeps_both_slots_after_two_releases(self):
         self.deploy()
