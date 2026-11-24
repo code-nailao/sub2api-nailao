@@ -1207,19 +1207,26 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(commands, len(self.ops.commands), "a refused write runs no nginx command")
 
     def test_a_snapshot_that_ran_out_of_budget_is_reported_as_unchecked(self):
-        """B#10: a role the budget did not reach is "not checked" - recorded as
-        probe_budget_exhausted, never as unusable and never as usable."""
+        """B#10: a pair the budget did not reach is "not checked" - recorded as
+        probe_budget_exhausted, never as unusable and never as usable.
+
+        The pair a write rests on is probed last and keeps its own window, so
+        an exhausted snapshot always means an *earlier* pair went unchecked;
+        only a caller that needs that pair refuses the write."""
         deployer = deploy.Deployer(self.cfg, self.ops)
         before = self.ops.files[self.cfg.upstream_file]
-        snapshot = deployer.snapshot_now([(LEGACY, "serving"), (LEGACY, "standby")],
+        snapshot = deployer.snapshot_now([(LEGACY, "standby"), (LEGACY, "serving")],
                                          budget=0.0, note="budget test")
         self.assertTrue(snapshot.incomplete)
-        self.assertIsNone(snapshot.probe("legacy", "serving"))
         self.assertIsNone(snapshot.probe("legacy", "standby"))
+        self.assertIsNotNone(snapshot.probe("legacy", "serving"),
+                             "the pair the write rests on must keep its window")
         issues = self.state()["in_progress"]["route_issues"]
         self.assertEqual({"probe_budget_exhausted"}, {i["kind"] for i in issues}, issues)
-        self.assertEqual({"serving", "standby"}, {i["role"] for i in issues}, issues)
+        self.assertEqual({"standby"}, {i["role"] for i in issues}, issues)
         self.assertIn("was not checked", deploy.describe_route_issues(issues))
+        # Anything else in the snapshot missing still refuses a write that
+        # does not say what it needs.
         with self.assertRaisesRegex(deploy.RouteUnverified, "probe budget"):
             deployer.install_from(snapshot, lambda text: text)
         self.assertEqual(before, self.ops.files[self.cfg.upstream_file])
@@ -1228,6 +1235,11 @@ class DeployTest(unittest.TestCase):
         with self.assertRaisesRegex(deploy.FallbackFailed, "probe budget.*before clearing in_progress"):
             deployer.finish_ok(deploy.Verification(snapshot.taken_at, "2020-01-01T00:00:00+00:00", snapshot),
                                action="test")
+        # A caller that only needs the pair it probed may write without the
+        # unchecked one: the standby staying out of the route is not a reason
+        # to leave traffic where it is.
+        deployer.install_from(snapshot, lambda text: deploy.replace_serving(text, [LEGACY["ports"]["serving"]]),
+                              required={("legacy", "serving")})
 
     def test_a_failed_probe_is_recorded_when_the_snapshot_is_built(self):
         """B#8: a probe that fails is recorded by the snapshot itself, so a
@@ -4076,6 +4088,49 @@ docker kill --signal=TERM old-spare
         status = deploy.status(self.cfg, self.ops)
         self.assertEqual(loaded_ports, status["loaded_route"]["serving_ports"],
                          "status must describe the route that was written, not a stale file")
+
+
+    def assert_a_slow_old_standby_does_not_block_the_old_primary(self, *, automatic):
+        if automatic:
+            self.ops.memory_after_switch = 20 * GIB
+        else:
+            self.deploy()
+        standby_port = LEGACY["ports"]["standby"]
+        primary_port = LEGACY["ports"]["serving"]
+        real_http = self.ops.http_json
+        fired = []
+
+        def http_json(url, **kwargs):
+            progress = self.state().get("in_progress") or {}
+            step = "guard" if automatic else "switch"
+            if (not fired and progress.get("step") == step
+                    and url == f"http://127.0.0.1:{standby_port}/internal/sources/runtime"):
+                fired.append(True)
+                # A standby response that runs to the snapshot deadline: the
+                # shared budget is gone by the time the primary is reached.
+                self.ops.clock += deploy.PROBE_BUDGET_SECONDS
+                return 0, None
+            return real_http(url, **kwargs)
+
+        with mock.patch.object(self.ops, "http_json", http_json):
+            try:
+                if automatic:
+                    self.deploy()
+                else:
+                    deploy.Deployer(self.cfg, self.ops).rollback()
+            except deploy.DeployError:
+                pass
+        self.assertTrue(fired, "the slow standby probe never ran")
+        self.assertEqual(200, real_http(f"http://127.0.0.1:{primary_port}/health")[0])
+        ports = deploy.loaded_upstream_ports(self.ops.loaded_upstreams)[0]
+        self.assertEqual([primary_port], ports,
+                         "a slow standby kept traffic off the healthy old primary")
+
+    def test_guard_rollback_slow_old_standby_does_not_block_healthy_primary(self):
+        self.assert_a_slow_old_standby_does_not_block_the_old_primary(automatic=True)
+
+    def test_manual_rollback_slow_old_standby_does_not_block_healthy_primary(self):
+        self.assert_a_slow_old_standby_does_not_block_the_old_primary(automatic=False)
 
 class HoldOps(FakeOps):
     """Model the image and network identities used by pause and resume."""

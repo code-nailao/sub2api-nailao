@@ -77,6 +77,11 @@ RUNTIME_STATUS_TIMEOUT_SECONDS = 5
 # snapshot may sit around before a write refuses to use it. Both are checked by
 # the write entry itself (`install_from`), not by its callers.
 PROBE_BUDGET_SECONDS = 12.0
+# Time kept back for the last pair of a snapshot. The standby is probed
+# before the primary so the primary is the freshest at the write; without a
+# reserve a hung standby can spend the whole budget and leave the primary
+# unchecked, which turns "no backup" into "no rollback at all".
+PROBE_RESERVE_SECONDS = 8.0
 SNAPSHOT_TTL_SECONDS = 30.0
 # `nginx -t` and a reload are local commands; the 600s default is for image and
 # container work and would turn a stuck reload into minutes of "written but
@@ -1093,12 +1098,21 @@ class Deployer:
         probes: dict[tuple[str, str], RoleProbe] = {}
         exhausted: list[tuple[str, str]] = []
         findings: list[dict[str, Any]] = []
-        for view, role in pairs:
+        # Every pair but the last is capped short of the budget, so the final
+        # probe - the one the write rests on - always gets its own time.
+        reserve = PROBE_RESERVE_SECONDS if len(pairs) > 1 else 0.0
+        last = len(pairs) - 1
+        for index, (view, role) in enumerate(pairs):
             self._view_index.setdefault(view["slot"], view)
             key = (view["slot"], role)
             if key in probes or key in exhausted:
                 continue
-            if self.ops.monotonic() >= until:
+            # The final pair gets its own window starting now: an earlier probe
+            # that ignores its deadline must not be able to starve the role the
+            # write rests on. Its age still stays inside the snapshot TTL.
+            cap = (self.ops.monotonic() + reserve) if (reserve and index == last) else (
+                until if index == last else min(until, until - reserve))
+            if self.ops.monotonic() >= cap:
                 exhausted.append(key)
                 findings.append({
                     "slot": view["slot"], "role": role,
@@ -1108,7 +1122,7 @@ class Deployer:
                     "found_at": now(),
                 })
                 continue
-            probe = self.probe_role(view, role, deadline=until)
+            probe = self.probe_role(view, role, deadline=cap)
             probes[key] = probe
             if not probe.usable:
                 findings.append(route_issue(kind, probe))
@@ -1117,7 +1131,7 @@ class Deployer:
         return snapshot
 
     def install_from(self, snapshot: RouteSnapshot, build: Callable[[str], str], *,
-                     note: str = "") -> str:
+                     note: str = "", required: set[tuple[str, str]] | None = None) -> str:
         """The only way the upstream file changes.
 
         A snapshot that is incomplete or past its TTL cannot write: the caller
@@ -1125,10 +1139,15 @@ class Deployer:
         from an unusable role - no role is known to be broken, so the
         candidate containers are kept. `nginx -t` and the reload run after the
         rename with their own short timeout, so they cannot extend the TTL."""
-        if snapshot.incomplete:
+        # A role the write does not depend on may go unchecked: a standby the
+        # budget did not reach simply stays out of the route. Only a role the
+        # caller needs can block the write.
+        blocking = ([pair for pair in snapshot.exhausted if pair in required]
+                    if required is not None else list(snapshot.exhausted))
+        if blocking:
             self.log(f"   route not written ({note}): the probe budget ran out before "
-                     f"{len(snapshot.exhausted)} role(s) were checked")
-            detail = ", ".join(f"slot {slot} {role}" for slot, role in snapshot.exhausted)
+                     f"{len(blocking)} role(s) were checked")
+            detail = ", ".join(f"slot {slot} {role}" for slot, role in blocking)
             raise RouteUnverified(
                 f"not writing the route ({note}): the {snapshot.budget:.0f}s probe budget ran out before "
                 f"{detail} could be checked; the loaded route is unchanged and the candidate containers "
@@ -1428,7 +1447,8 @@ class Deployer:
         written = text != existing
         if written:
             verification = self.write_route(snapshot, build, related,
-                                            note=note or "route write", deadline=deadline)
+                                            note=note or "route write", deadline=deadline,
+                                            required={(serving_slot, "serving")})
             backup_note = "" if backup_port is not None else "; no backup"
             self.log(f"   route written: serving slot {serving_slot} port {primary.port}{backup_note} "
                      f"({primary.evidence()}); admin block unchanged")
@@ -1510,9 +1530,10 @@ class Deployer:
 
     def write_route(self, snapshot: RouteSnapshot, build: Callable[[str], str],
                     views: tuple[dict[str, Any], ...] | list[dict[str, Any]],
-                    *, note: str, deadline: float | None = None) -> Verification:
+                    *, note: str, deadline: float | None = None,
+                    required: set[tuple[str, str]] | None = None) -> Verification:
         """One write, then one verification of what the file now names."""
-        self.install_from(snapshot, build, note=note)
+        self.install_from(snapshot, build, note=note, required=required)
         return self.settle_loaded_route(views, note=note, deadline=deadline)
 
     def settle_loaded_route(self, views: tuple[dict[str, Any], ...] | list[dict[str, Any]],
