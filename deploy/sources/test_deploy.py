@@ -3859,6 +3859,134 @@ docker kill --signal=TERM old-spare
         self.assertEqual("/rel/bg/runtime.token", state["current"]["runtime_token_files"]["background"])
 
 
+    def test_a_failed_second_write_keeps_the_containers_the_loaded_route_names(self):
+        """The serving block is written and reloaded, then the admin block's
+        `nginx -t` fails. Cleanup must not remove the containers the loaded
+        route still points at: that would leave Nginx proxying to nothing."""
+        run = self.ops.run
+        write = self.ops.write_file_atomic
+        upstream = self.tmp / "upstreams.conf"
+        original_path = self.cfg.upstream_file
+        self.cfg.upstream_file = self.ops.upstream_file = str(upstream)
+        self.ops.files[self.cfg.upstream_file] = self.ops.files.pop(original_path)
+        upstream.write_text(self.ops.files[self.cfg.upstream_file])
+
+        def record(path, text, **kwargs):
+            if path == self.cfg.upstream_file:
+                upstream.write_text(text)
+            return write(path, text, **kwargs)
+
+        config_tests = 0
+
+        def nginx(args, **kwargs):
+            nonlocal config_tests
+            if args == [self.cfg.nginx_bin, "-t"]:
+                config_tests += 1
+                if config_tests == 2:
+                    from subprocess import CompletedProcess
+                    return CompletedProcess(args, 1, "", "fixture: admin block rejected")
+            return run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "write_file_atomic", record), \
+                mock.patch.object(self.ops, "run", nginx):
+            with self.assertRaises(deploy.DeployError):
+                self.deploy()
+        serving_ports = deploy.loaded_upstream_ports(upstream.read_text())[0]
+        running = {c.get("port") for c in self.ops.containers.values()
+                   if (c.get("State") or {}).get("Running")}
+        self.assertTrue(set(serving_ports) & running,
+                        (serving_ports, running, self.state()["in_progress"]))
+        # The failed second write must put the route back on the previous
+        # release, not leave the candidate serving a half-written file.
+        self.assertEqual([LEGACY["ports"]["serving"], LEGACY["ports"]["standby"]], serving_ports)
+
+    def test_correction_does_not_name_an_admin_that_failed_its_fresh_probe(self):
+        """A correction is built from its own snapshot; an admin the snapshot
+        finds stopped must not be carried into the corrected file."""
+        self.deploy()
+        current_serving = self.cfg.container("a", "serving")
+        run = self.ops.run
+        probe_role = deploy.Deployer.probe_role
+        install = deploy.Deployer.install_from
+        state = {"retired": False, "admin_probes": 0}
+        corrections = []
+
+        def tracked_run(args, **kwargs):
+            result = run(args, **kwargs)
+            if args == ["docker", "kill", "--signal=TERM", current_serving]:
+                state["retired"] = True
+                self.ops.containers["old-serving"]["State"].update(Running=False, Status="exited")
+            return result
+
+        def tracked_probe(deployer, view, role, **kwargs):
+            if state["retired"] and (view["slot"], role) == ("legacy", "background"):
+                state["admin_probes"] += 1
+                if state["admin_probes"] == 2:
+                    self.ops.containers["old-bg"]["State"].update(Running=False, Status="exited")
+            return probe_role(deployer, view, role, **kwargs)
+
+        def tracked_install(deployer, snapshot, build, **kwargs):
+            result = install(deployer, snapshot, build, **kwargs)
+            if "correction" in kwargs.get("note", ""):
+                admin = snapshot.probe("legacy", "background")
+                corrections.append((admin.outcome if admin else None,
+                                    deploy.loaded_upstream_ports(self.ops.loaded_upstreams)[1]))
+            return result
+
+        with mock.patch.object(self.ops, "run", tracked_run), \
+                mock.patch.object(deploy.Deployer, "probe_role", tracked_probe), \
+                mock.patch.object(deploy.Deployer, "install_from", tracked_install):
+            with self.assertRaises(deploy.FallbackFailed):
+                deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertEqual([], corrections, "a correction named an admin the snapshot had just found stopped")
+
+    def test_a_corrective_admin_move_records_the_probe_that_authorized_it(self):
+        """A4: the admin block moved as part of a correction, so the recorded
+        evidence must be that correction's probe, not the previous move's."""
+        self.deploy()
+        current = self.state()["current"]
+        background = current["containers"]["background"]
+        self.ops.containers[background]["State"].update(Running=False, Status="exited")
+        self.ops.containers["old-bg"]["State"].update(Running=True, Status="running")
+        verification = deploy.Deployer(self.cfg, self.ops).settle_loaded_route((current, LEGACY))
+        self.assertTrue(verification.clean, verification.findings)
+        route = deploy.status(self.cfg, self.ops)["last_route"]
+        self.assertEqual(LEGACY["ports"]["background"], route["admin"]["port"])
+        self.assertEqual(route["admin"]["port"], route["admin_move"]["port"],
+                         "the admin move's evidence still names the previous move")
+        self.assertEqual("legacy", route["admin_move"]["slot"])
+
+    def test_a_rollback_survives_an_unreadable_old_standby(self):
+        """A3: the old standby only decides whether it is written. Failing to
+        read its state must not stop traffic from returning to the old primary."""
+        self.deploy()
+        inspect = self.ops.inspect
+
+        def timeout(name, **kwargs):
+            if name == "old-spare":
+                from subprocess import TimeoutExpired
+                raise TimeoutExpired(["docker", "inspect", name], 30)
+            return inspect(name, **kwargs)
+
+        with mock.patch.object(self.ops, "inspect", timeout):
+            deploy.Deployer(self.cfg, self.ops).rollback()
+        serving_ports, _ = deploy.loaded_upstream_ports(self.ops.loaded_upstreams)
+        self.assertEqual([LEGACY["ports"]["serving"]], serving_ports)
+
+    def test_watch_names_a_current_container_docker_confirms_is_gone(self):
+        """A current-slot container that Docker confirms does not exist is an
+        outage to report, not a crash: the sample cannot be built from a
+        container that is not there."""
+        self.deploy()
+        current = self.state()["current"]
+        name = current["containers"]["standby"]
+        self.ops.containers.pop(name, None)
+        alerts = deploy.watch_once(self.cfg, self.ops, {})
+        named = [a for a in alerts if a.get("name") == name]
+        self.assertTrue(named, alerts)
+        self.assertIn("missing", named[0]["alert"])
+
+
 class HoldOps(FakeOps):
     """Model the image and network identities used by pause and resume."""
 

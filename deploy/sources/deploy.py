@@ -1148,7 +1148,13 @@ class Deployer:
         """Write the file and reload Nginx. Private: every Main route write
         goes through `install_from`, which is where the snapshot is checked
         (Portal reuses this for its own single upstream)."""
-        previous = self.ops.read_text(self.cfg.upstream_file) if Path(self.cfg.upstream_file).exists() else None
+        # Read through the Ops boundary, not the filesystem: the file may not
+        # exist yet (first deploy) and the restore below depends on knowing
+        # exactly what was there before this write.
+        try:
+            previous = self.ops.read_text(self.cfg.upstream_file)
+        except OSError:
+            previous = None
         self.ops.write_file_atomic(self.cfg.upstream_file, text)
         test = self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False,
                             timeout=NGINX_OP_TIMEOUT_SECONDS)
@@ -1536,9 +1542,16 @@ class Deployer:
         surviving = [p for p in surviving if p in reachable]
         if not surviving:
             return False
-        new_admin = admin_port if keep_admin else next(
-            (probe.port for probe in snapshot.probes.values()
-             if probe.role == "background" and probe.usable), None)
+        # Whatever the earlier verification said, the admin this write is about
+        # to name must come out of *this* snapshot: a role the correction has
+        # just found stopped cannot be carried into the file because it was
+        # fine a round ago. "Not checked" is not usable either.
+        admin_probe = next((probe for probe in snapshot.probes.values() if probe.port == admin_port), None)
+        if keep_admin and admin_probe is not None and admin_probe.usable:
+            new_admin = admin_port
+        else:
+            new_admin = next((probe.port for probe in snapshot.probes.values()
+                              if probe.role == "background" and probe.usable), None)
         if new_admin is None:
             return False
 
@@ -1547,6 +1560,13 @@ class Deployer:
 
         if build(text) == text:
             return False
+        if new_admin != admin_port:
+            # A4: this correction moved the admin, so the evidence recorded for
+            # the move must be this snapshot's probe - not whatever the last
+            # admin move left behind.
+            moved = next(probe for probe in snapshot.probes.values() if probe.port == new_admin)
+            self._admin_move = {"at": now(), "note": f"{note}: correction", "slot": moved.slot,
+                                "port": new_admin, "probe": moved.record()}
         self.install_from(snapshot, build, note=f"{note}: correction")
         dropped = sorted(set(serving_ports) - set(surviving))
         self.log(f"   route corrected ({note}): removed serving ports {dropped or 'none'}, "
@@ -2738,7 +2758,15 @@ class Deployer:
         # A container that is missing, will not start or never becomes ready
         # must not keep a healthy previous primary from serving; the route
         # write probes it again and leaves it out while it does not answer.
-        standby_skipped = not self.ops.inspect(previous["containers"]["standby"])
+        # "Cannot read its state" is treated like "not there": an unreadable
+        # standby must not stop a healthy previous primary from serving. The
+        # route write probes it again and leaves it out while it does not answer.
+        try:
+            standby_skipped = not self.ops.inspect(previous["containers"]["standby"])
+        except (DeployError, OSError, subprocess.SubprocessError) as err:
+            standby_skipped = True
+            self.log(f"   previous standby {previous['containers']['standby']} could not be inspected "
+                     f"({err}); the rollback will serve from the primary only")
         target = Target.from_view(previous, self.cfg.runtime_token_file)
         record: dict[str, Any] = {"started_at": now(), "action": "rollback", "image": target.image, "slot": target.slot}
         try:
@@ -2827,8 +2855,24 @@ class Deployer:
             except FallbackFailed:
                 raise
             except DeployError as err:
+                # The serving block may already have been written and reloaded
+                # when the admin write failed. Only then is there a route to put
+                # back: when the first write itself failed, the file was restored
+                # and nothing of the candidate is loaded.
+                already_loaded = bool(set(self.loaded_route_ports()[0])
+                                      & {target.ports[role] for role in SERVING_ROLES})
                 self.log("   switch failed; handing the background back")
                 recovery_deadline = self.hand_back(target, current)
+                if already_loaded:
+                    self.log("   the candidate is still serving; restoring the previous route")
+                    try:
+                        self.switch_to(current, note=f"restoring slot {current['slot']} after: {err}")
+                    except DeployError as restore_err:
+                        raise FallbackFailed(
+                            f"{err}; the previous release owns the background again, but returning the route "
+                            f"to slot {current['slot']} failed ({restore_err}); traffic may still use slot "
+                            f"{target.slot}. Check the loaded route before clearing in_progress",
+                            cleanup_deadline=recovery_deadline) from err
                 raise DeployError(f"{err}; the previous release owns the background again",
                                   cleanup_deadline=recovery_deadline) from err
         if not self.ops.dry_run:
@@ -2959,12 +3003,22 @@ class Deployer:
             self.log(f"FAILED AND NOT CLEANED UP: {failure}")
             return failure
         if step in (None, "migrate", "start serving", "background handoff", "switch"):
+            # A failure after a second write leaves the first one loaded, so the
+            # route can already be serving from the candidate. Removing that
+            # container would point Nginx at a port nobody answers on: whatever
+            # the loaded route names is kept and reported instead.
+            serving_now, admin_now = self.loaded_route_ports()
+            in_route = set(serving_now) | ({admin_now} if admin_now is not None else set())
+            kept: list[str] = []
             deadline = err.cleanup_deadline
             protect = finish_handoff_cleanup(ignore=True) if deadline is not None else contextlib.nullcontext()
             with protect:
                 try:
                     for role in SERVING_ROLES:
                         name = target.containers[role]
+                        if target.ports[role] in in_route:
+                            kept.append(f"{name} (port {target.ports[role]})")
+                            continue
                         result = self.ops.run(["docker", "rm", "-f", name], mutate=True, check=False,
                                               timeout=self.recovery_timeout(deadline, 600))
                         if deadline is not None and result.returncode:
@@ -2979,6 +3033,13 @@ class Deployer:
                     self._record_unrestored(state, failure)
                     self.log(f"FAILED: {failure}")
                     return
+            if kept:
+                failure = FallbackFailed(
+                    f"{err}. The loaded route still names {', '.join(kept)}, so those containers were kept; "
+                    "check live routing and the background lock before clearing in_progress.")
+                self._record_unrestored(state, failure)
+                self.log(f"FAILED AND NOT CLEANED UP: {failure}")
+                return failure
         issues = self.pending_route_issues()
         if issues:
             # A probe wrote down a role that failed while the route was being
@@ -3201,6 +3262,14 @@ def watch_once(cfg: Config, ops: Ops, history: dict[str, list[tuple[float, int]]
                 # skipped below; a slot Docker could not check is named.
                 alerts.append({"slot": slot, "role": role, "name": name, "alert": ["docker_inspect_failed"],
                                "detail": f"could not inspect {name}; this slot was not checked",
+                               "at": now()})
+                continue
+            if info is None and missing and view["slot"] == (state.get("current") or {}).get("slot"):
+                # Docker confirmed it is gone. In a retired slot that is
+                # expected; in the live slot it is the outage itself. Naming it
+                # is the only useful sample - there is no container to sample.
+                alerts.append({"slot": slot, "role": role, "name": name, "alert": ["missing"],
+                               "detail": f"{name} does not exist; slot {slot} cannot serve {role}",
                                "at": now()})
                 continue
             if not info and view["slot"] != (state.get("current") or {}).get("slot"):
