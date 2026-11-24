@@ -589,9 +589,18 @@ class RouteSnapshot:
     exhausted: tuple[tuple[str, str], ...]
     findings: tuple[dict[str, Any], ...]
     budget: float
+    times: dict[tuple[str, str], float] = field(default_factory=dict)
 
     def age(self, ops: "Ops") -> float:
         return ops.monotonic() - self.taken_at
+
+    def age_of(self, ops: "Ops", slot: str, role: str) -> float | None:
+        """How long ago this pair answered, or None when it was not checked.
+
+        Age is per pair, not per snapshot: a standby that took 30s must not
+        make a primary probed a second ago look stale."""
+        taken = self.times.get((slot, role))
+        return None if taken is None else ops.monotonic() - taken
 
     def probe(self, slot: str, role: str) -> RoleProbe | None:
         return self.probes.get((slot, role))
@@ -1096,6 +1105,7 @@ class Deployer:
         if deadline is not None:
             until = min(until, deadline)
         probes: dict[tuple[str, str], RoleProbe] = {}
+        times: dict[tuple[str, str], float] = {}
         exhausted: list[tuple[str, str]] = []
         findings: list[dict[str, Any]] = []
         # Every pair but the last is capped short of the budget, so the final
@@ -1124,9 +1134,10 @@ class Deployer:
                 continue
             probe = self.probe_role(view, role, deadline=cap)
             probes[key] = probe
+            times[key] = self.ops.monotonic()
             if not probe.usable:
                 findings.append(route_issue(kind, probe))
-        snapshot = RouteSnapshot(started, probes, tuple(exhausted), tuple(findings), budget)
+        snapshot = RouteSnapshot(started, probes, tuple(exhausted), tuple(findings), budget, times)
         self._record_route_issues(findings, note or "probe snapshot")
         return snapshot
 
@@ -1152,13 +1163,25 @@ class Deployer:
                 f"not writing the route ({note}): the {snapshot.budget:.0f}s probe budget ran out before "
                 f"{detail} could be checked; the loaded route is unchanged and the candidate containers "
                 "are kept")
-        age = snapshot.age(self.ops)
-        if age > SNAPSHOT_TTL_SECONDS:
-            self.log(f"   route not written ({note}): the probe snapshot is {age:.1f}s old")
+        # The TTL applies per pair, not to the moment the round started: a
+        # standby that took 30s answering must not make a primary probed a
+        # second ago look stale. Only the pairs this write rests on can expire
+        # it; an optional pair that went stale is dropped by its caller.
+        needed = required if required is not None else set(snapshot.probes)
+        stale: list[tuple[str, str, float | None]] = []
+        for pair in needed:
+            pair_age = snapshot.age_of(self.ops, *pair)
+            if pair_age is None or pair_age > SNAPSHOT_TTL_SECONDS:
+                stale.append((pair[0], pair[1], pair_age))
+        if stale:
+            worst = max((age for _, _, age in stale if age is not None), default=SNAPSHOT_TTL_SECONDS)
+            detail = ", ".join(
+                f"slot {slot} {role}" + (" was not checked" if age is None else f" answered {age:.1f}s ago")
+                for slot, role, age in stale)
+            self.log(f"   route not written ({note}): {detail}")
             raise RouteUnverified(
-                f"not writing the route ({note}): the probes that justified it are {age:.1f}s old, past "
-                f"the {SNAPSHOT_TTL_SECONDS:.0f}s snapshot TTL; the loaded route is unchanged and the "
-                "candidate containers are kept")
+                f"not writing the route ({note}): {detail}, past the {SNAPSHOT_TTL_SECONDS:.0f}s snapshot "
+                "TTL; the loaded route is unchanged and the candidate containers are kept")
         text = build(self.current_upstreams() or "")
         self._install(text)
         return text
@@ -1420,7 +1443,12 @@ class Deployer:
             why = primary.evidence() if primary else (
                 f"the probe budget ran out before slot {serving_slot} serving could be checked")
             raise RouteRefused(f"not writing the service route: {why}; the loaded route is unchanged")
-        backup_port = backup.port if backup is not None and backup.usable else None
+        # The standby only decides whether it is written, so a standby whose own
+        # probe went stale is left out instead of refusing the write.
+        backup_age = snapshot.age_of(self.ops, serving_slot, "standby")
+        backup_stale = backup_age is not None and backup_age > SNAPSHOT_TTL_SECONDS
+        backup_port = (backup.port if backup is not None and backup.usable and not backup_stale
+                       else None)
         if backup is None:
             self.log(f"   slot {serving_slot} standby was not checked within the probe budget; "
                      "it stays out of the route")
@@ -1437,6 +1465,12 @@ class Deployer:
                 raise RouteRefused(
                     f"not writing the upstream file (it does not exist yet): slot {serving_slot} "
                     f"background {why}; the loaded route is unchanged")
+
+            # Creating the file also names the admin upstream: that is a move
+            # and needs the probe that authorized it, like any other.
+            self._admin_move = {"at": now(), "note": f"{note or 'route write'}: first file",
+                                "slot": serving_slot, "port": admin_probe.port,
+                                "probe": admin_probe.record()}
 
             def build(_current: str) -> str:
                 return render_upstreams(primary.port, backup_port, admin_probe.port)

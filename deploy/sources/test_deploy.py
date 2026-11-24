@@ -4132,6 +4132,59 @@ docker kill --signal=TERM old-spare
     def test_manual_rollback_slow_old_standby_does_not_block_healthy_primary(self):
         self.assert_a_slow_old_standby_does_not_block_the_old_primary(automatic=False)
 
+
+    def assert_a_standby_past_the_ttl_does_not_block_the_old_primary(self, *, automatic):
+        if automatic:
+            self.ops.memory_after_switch = 20 * GIB
+        else:
+            self.deploy()
+        standby_port = LEGACY["ports"]["standby"]
+        primary_port = LEGACY["ports"]["serving"]
+        real_http = self.ops.http_json
+        fired = []
+
+        def http_json(url, **kwargs):
+            progress = self.state().get("in_progress") or {}
+            step = "guard" if automatic else "switch"
+            if (not fired and progress.get("step") == step
+                    and url == f"http://127.0.0.1:{standby_port}/health"):
+                fired.append(True)
+                # Long enough that this pair answers past the snapshot TTL.
+                self.ops.clock += deploy.SNAPSHOT_TTL_SECONDS + 1
+                return 0, None
+            return real_http(url, **kwargs)
+
+        with mock.patch.object(self.ops, "http_json", http_json):
+            try:
+                if automatic:
+                    self.deploy()
+                else:
+                    deploy.Deployer(self.cfg, self.ops).rollback()
+            except deploy.DeployError:
+                pass
+        self.assertTrue(fired, "the slow standby probe never ran")
+        ports = deploy.loaded_upstream_ports(self.ops.loaded_upstreams)[0]
+        self.assertEqual([primary_port], ports,
+                         "a standby older than the TTL kept traffic off the healthy old primary")
+
+    def test_guard_rollback_standby_past_the_ttl_does_not_block_healthy_primary(self):
+        self.assert_a_standby_past_the_ttl_does_not_block_the_old_primary(automatic=True)
+
+    def test_manual_rollback_standby_past_the_ttl_does_not_block_healthy_primary(self):
+        self.assert_a_standby_past_the_ttl_does_not_block_the_old_primary(automatic=False)
+
+    def test_rebuilding_a_missing_upstream_file_records_the_admin_move(self):
+        """A4: creating the file also names an admin upstream, so the move must
+        record the probe that authorized it -- not the one before it."""
+        self.deploy()
+        self.ops.files.pop(self.cfg.upstream_file, None)
+        deploy.Deployer(self.cfg, self.ops).rollback()
+        route = deploy.status(self.cfg, self.ops)["last_route"]
+        self.assertEqual(LEGACY["ports"]["background"], route["admin"]["port"])
+        self.assertIsNotNone(route["admin_move"], route)
+        self.assertEqual(route["admin"]["port"], route["admin_move"]["port"])
+        self.assertEqual("legacy", route["admin_move"]["slot"])
+
 class HoldOps(FakeOps):
     """Model the image and network identities used by pause and resume."""
 
