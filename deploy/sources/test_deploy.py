@@ -1480,92 +1480,8 @@ class DeployTest(unittest.TestCase):
             return err
         return None
 
-    def property_port_index(self):
-        views = self.property_views()
-        return {view["ports"][role]: (view["slot"], role)
-                for view in views.values() for role in deploy.ROLES}
 
-    def property_probe_counts(self, flow):
-        """How many HTTP probes the flow makes to each role's port. Every one
-        of them is a probe point the property has to stop a role at."""
-        counts: dict[tuple[str, str], int] = {}
-        index = self.property_port_index()
-        real = self.ops.http_json
 
-        def counting(url, **kw):
-            if url.startswith("http://127.0.0.1:"):
-                port = int(url.split(":")[2].split("/")[0])
-                if port in index:
-                    counts[index[port]] = counts.get(index[port], 0) + 1
-            return real(url, **kw)
-
-        with mock.patch.object(self.ops, "http_json", counting):
-            self.property_flow(flow)
-        return counts
-
-    def property_run(self, flow, slot, role, index, after):
-        """Stop one role at one probe point, then run the whole flow.
-
-        `after` stops it just after the given probe answers, so the write or
-        the next settlement probe is the one that has to notice; otherwise it
-        stops just before that probe, which then answers "not there".
-
-        `role` may be "admin": the admin entry has no container of its own, its
-        server is the slot's background. The stop then counts only the probes
-        that hit the port the loaded admin upstream names at that moment, so
-        every admin-entry probe point is swept too."""
-        views = self.property_views()
-        view = views[slot]
-        base_role = "background" if role == "admin" else role
-        port, name = view["ports"][base_role], view["containers"][base_role]
-        owners = {other["ports"]["background"]: other["slot"] for other in views.values()}
-        writes: list[str] = []
-        write_before: list[str | None] = []
-        write_probes: list[int] = []
-        probes: list[dict] = []
-        real_write, real_http = self.ops.write_file_atomic, self.ops.http_json
-        seen = {"probe": 0, "stopped": False, "admin_at_stop": False}
-
-        def stop():
-            container = self.ops.containers.get(name)
-            if container is not None:
-                seen["stopped"] = True
-                container["State"].update(Running=False, Status="exited")
-
-        def tracked_write(path, text, **kw):
-            if path == self.cfg.upstream_file:
-                writes.append(text)
-                write_before.append(self.ops.files.get(self.cfg.upstream_file))
-                write_probes.append(len(probes))
-            return real_write(path, text, **kw)
-
-        def probe(url, **kw):
-            if not url.startswith("http://127.0.0.1:"):
-                return real_http(url, **kw)
-            target = int(url.split(":")[2].split("/")[0])
-            loaded_admin = deploy.loaded_upstream_ports(self.ops.loaded_upstreams or "")[1]
-            probes.append({"port": target,
-                           "admin_slot": owners.get(target) if target == loaded_admin else None})
-            counted = target == port and (role != "admin" or target == loaded_admin)
-            if counted:
-                n = seen["probe"]
-                seen["probe"] += 1
-                if not after and n == index:
-                    stop()
-                result = real_http(url, **kw)
-                if after and n == index:
-                    stop()
-                if n == index:
-                    seen["admin_at_stop"] = target == loaded_admin
-                return result
-            return real_http(url, **kw)
-
-        with mock.patch.object(self.ops, "write_file_atomic", tracked_write), \
-                mock.patch.object(self.ops, "http_json", probe):
-            error = self.property_flow(flow)
-        return {"error": error, "writes": writes, "write_before": write_before,
-                "write_probes": write_probes, "probes": probes,
-                "stopped": seen["stopped"], "admin_at_stop": seen["admin_at_stop"]}
 
     def assert_reported(self, slot, role, label):
         """B segment: status and the resident watch both name the slot, the
@@ -1656,96 +1572,8 @@ class DeployTest(unittest.TestCase):
         case.setUp()
         return case
 
-    def property_scenarios(self, flow):
-        case = self.property_fresh()
-        try:
-            counts = case.property_probe_counts(flow)
-        finally:
-            case.tearDown()
-        scenarios = []
-        for (slot, role), count in sorted(counts.items()):
-            for index in range(count):
-                scenarios.append((slot, role, index, False))
-            # A probe with no later probe of the same role cannot be followed:
-            # stopping after it is "after the last look", not a race.
-            for index in range(count - 1):
-                scenarios.append((slot, role, index, True))
-        return scenarios
 
-    def test_property_no_role_is_left_written_after_it_stops_answering(self):
-        """The whole family, one sweep: for every flow, every role and every
-        probe point, stop that role and require the final loaded route to name
-        no role that stopped answering - or, when nothing could replace it, to
-        report it with slot, role and time in status and in the watch alert."""
-        failures = []
-        checked = 0
-        for flow in self.PROPERTY_FLOWS:
-            for slot, role, index, after in self.property_scenarios(flow):
-                case = self.property_fresh()
-                try:
-                    run = case.property_run(flow, slot, role, index, after)
-                    run.update(index=index, after=after)
-                    checked += 1
-                    try:
-                        case.assert_route_property(flow, slot, role, run)
-                    except AssertionError as err:
-                        failures.append(str(err))
-                finally:
-                    case.tearDown()
-        self.assertGreater(checked, 20, "the sweep checked too few stop points to mean anything")
-        if failures:
-            self.fail(f"{len(failures)} of {checked} stop points left a route decision that "
-                      "does not hold:\n- " + "\n- ".join(failures[:12]))
 
-    # -- property: four roles, every probe point, all three flows ------------
-    # The admin entry has no container of its own: its server is a slot's
-    # background. Stopping that background at an admin probe point is the same
-    # physical stop as the background sweep, but it is judged against the admin
-    # upstream as well, so the role axis covers 服务主 / 备用 / 后台 / 管理入口.
-    def property_probe_points(self, flow):
-        """Both probe counts from one run: every role port, and the admin
-        entry port the loaded upstream names at each probe."""
-        counts: dict[tuple[str, str], int] = {}
-        admin: dict[str, int] = {}
-        views = self.property_views()
-        index = {view["ports"][role]: (view["slot"], role)
-                 for view in views.values() for role in deploy.ROLES}
-        owners = {view["ports"]["background"]: view["slot"] for view in views.values()}
-        real = self.ops.http_json
-
-        def counting(url, **kw):
-            if url.startswith("http://127.0.0.1:"):
-                port = int(url.split(":")[2].split("/")[0])
-                if port in index:
-                    counts[index[port]] = counts.get(index[port], 0) + 1
-                loaded_admin = deploy.loaded_upstream_ports(self.ops.loaded_upstreams or "")[1]
-                if port == loaded_admin and port in owners:
-                    admin[owners[port]] = admin.get(owners[port], 0) + 1
-            return real(url, **kw)
-
-        with mock.patch.object(self.ops, "http_json", counting):
-            self.property_flow(flow)
-        return counts, admin
-
-    def property_scenarios_with_admin(self, flow):
-        case = self.property_fresh()
-        try:
-            counts, admin = case.property_probe_points(flow)
-        finally:
-            case.tearDown()
-        fixed = []
-        for (slot, role), count in sorted(counts.items()):
-            for index in range(count):
-                fixed.append((slot, role, index, False))
-            for index in range(count - 1):
-                fixed.append((slot, role, index, True))
-        admin_scenarios = []
-        for slot, count in sorted(admin.items()):
-            for index in range(count):
-                admin_scenarios.append((slot, "admin", index, False))
-            for index in range(count - 1):
-                admin_scenarios.append((slot, "admin", index, True))
-        return fixed, admin_scenarios
 
     def property_probe_timeline(self, flow):
         """One whole flow, recording every probe point and which role
@@ -1794,12 +1622,17 @@ class DeployTest(unittest.TestCase):
             for slot, role in targets:
                 base = "background" if role == "admin" else role
                 port = views[slot]["ports"][base]
-                if not any(later["port"] == port for later in points[index + 1:]):
-                    # No later probe of this role: stopping it here is "after
-                    # the last look", not a race the tool could see.
-                    continue
-                scenarios.append((slot, role, index, False))
-                scenarios.append((slot, role, index, True))
+                same_port = point["port"] == port
+                later = any(later["port"] == port for later in points[index + 1:])
+                # A stop just before this role's own probe is a look the tool
+                # can still act on. Any other stop needs a later probe of the
+                # role, otherwise it is "after the last look" and no code could
+                # have seen it. A stop just after its own last probe is the
+                # same "after the last look" case.
+                if same_port or later:
+                    scenarios.append((slot, role, index, False))
+                if later:
+                    scenarios.append((slot, role, index, True))
         return scenarios
 
     def property_run_at(self, flow, slot, role, index, after):
