@@ -3987,6 +3987,68 @@ docker kill --signal=TERM old-spare
         self.assertIn("missing", named[0]["alert"])
 
 
+
+    def test_a_second_nginx_test_timeout_restores_the_file_and_reports(self):
+        """A hang in `nginx -t` is a failure like a non-zero exit: Nginx never
+        loaded the text, so the disk must not keep it, and the switch must go
+        through the same recovery as a rejected file."""
+        run = self.ops.run
+        write = self.ops.write_file_atomic
+        upstream = self.tmp / "upstreams.conf"
+        original_path = self.cfg.upstream_file
+        self.cfg.upstream_file = self.ops.upstream_file = str(upstream)
+        self.ops.files[self.cfg.upstream_file] = self.ops.files.pop(original_path)
+        upstream.write_text(self.ops.files[self.cfg.upstream_file])
+        validations = []
+
+        def record(path, text, **kwargs):
+            if path == self.cfg.upstream_file:
+                upstream.write_text(text)
+            return write(path, text, **kwargs)
+
+        def nginx(args, **kwargs):
+            if args == [self.cfg.nginx_bin, "-t"]:
+                validations.append(1)
+                if len(validations) == 2:
+                    raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return run(args, **kwargs)
+
+        with mock.patch.object(self.ops, "write_file_atomic", record), \
+                mock.patch.object(self.ops, "run", nginx):
+            with self.assertRaises(deploy.DeployError) as caught:
+                self.deploy()
+        self.assertNotIsInstance(caught.exception, subprocess.TimeoutExpired,
+                                 "a hang must be reported as a deploy failure, not leak the raw timeout")
+        self.assertIn("previous file restored", str(caught.exception))
+        serving_ports, admin_port = deploy.loaded_upstream_ports(upstream.read_text())
+        self.assertEqual([LEGACY["ports"]["serving"], LEGACY["ports"]["standby"]], serving_ports,
+                         "the disk kept a route Nginx never loaded")
+        self.assertEqual(LEGACY["ports"]["background"], admin_port)
+        # The route is back on the previous release, so the state may be clean;
+        # what must not happen is the run looking successful.
+        self.assertEqual("failed", self.history()[-1]["result"])
+
+    def test_a_rollback_survives_an_unreadable_old_standby_token(self):
+        """A3: the old standby's token file is unreadable, so its readiness
+        cannot be checked. That is "skip the standby", not "stop the rollback"."""
+        self.deploy()
+        previous = self.state()["previous"]
+        previous.setdefault("runtime_token_files", {})["standby"] = "/fixture/standby.token"
+        state = self.state()
+        state["previous"] = previous
+        deploy.save_state(self.cfg, state)
+        read_text = self.ops.read_text
+
+        def unreadable(path):
+            if path == "/fixture/standby.token":
+                raise PermissionError("fixture: old standby runtime token cannot be read")
+            return read_text(path)
+
+        with mock.patch.object(self.ops, "read_text", unreadable):
+            deploy.Deployer(self.cfg, self.ops).rollback()
+        self.assertEqual([LEGACY["ports"]["serving"]],
+                         deploy.loaded_upstream_ports(self.ops.loaded_upstreams)[0])
+
 class HoldOps(FakeOps):
     """Model the image and network identities used by pause and resume."""
 

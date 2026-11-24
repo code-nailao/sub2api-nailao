@@ -1156,15 +1156,29 @@ class Deployer:
         except OSError:
             previous = None
         self.ops.write_file_atomic(self.cfg.upstream_file, text)
-        test = self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False,
-                            timeout=NGINX_OP_TIMEOUT_SECONDS)
-        if test.returncode != 0:
+
+        def restore(why: str) -> DeployError:
+            # Every way `nginx -t` can fail - a non-zero exit, a hang, a binary
+            # that cannot be run - means Nginx never loaded this text. The disk
+            # must not keep it either, or `status` would report a route nobody
+            # serves from.
             if previous is not None:
                 self.ops.write_file_atomic(self.cfg.upstream_file, previous)
-            raise DeployError("nginx -t rejected the upstream file; previous file restored, routing unchanged")
+            return DeployError(f"{why}; previous file restored, routing unchanged")
+
+        try:
+            test = self.ops.run([self.cfg.nginx_bin, "-t"], mutate=True, check=False,
+                                timeout=NGINX_OP_TIMEOUT_SECONDS)
+        except (OSError, subprocess.SubprocessError) as err:
+            raise restore(f"nginx -t could not finish ({err})") from err
+        if test.returncode != 0:
+            raise restore(f"nginx -t rejected the upstream file (exit {test.returncode})")
         # A zero exit means the signal was accepted, not that Nginx loaded the
         # file. `_loaded` records only what this process told it to load.
-        self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True, timeout=NGINX_OP_TIMEOUT_SECONDS)
+        try:
+            self.ops.run([self.cfg.nginx_bin, "-s", "reload"], mutate=True, timeout=NGINX_OP_TIMEOUT_SECONDS)
+        except (OSError, subprocess.SubprocessError) as err:
+            raise restore(f"nginx reload could not finish ({err})") from err
         self._loaded = text
         self._last_write_at = self.ops.monotonic()
 
@@ -2797,7 +2811,7 @@ class Deployer:
                         try:
                             self.wait_ready(target.ports[role], self.token_for(previous, role), "serving",
                                             self.cfg.ready_timeout)
-                        except DeployError as err:
+                        except (DeployError, OSError) as err:
                             if role != "standby":
                                 raise
                             standby_skipped = True
@@ -2854,7 +2868,7 @@ class Deployer:
                                 "again") from err
             except FallbackFailed:
                 raise
-            except DeployError as err:
+            except (DeployError, OSError, subprocess.SubprocessError) as err:
                 # The serving block may already have been written and reloaded
                 # when the admin write failed. Only then is there a route to put
                 # back: when the first write itself failed, the file was restored
