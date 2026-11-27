@@ -25,7 +25,8 @@ export const PER_MILLION = 1_000_000
  */
 export const CN_SEGMENT = 'cn'
 
-const DOMESTIC_MODEL_PREFIX = /^(deepseek|glm|chatglm|kimi|moonshot|qwen|qwq|minimax|abab|ernie|hunyuan|doubao|seedance|seedream|step|yi|baichuan|spark|internlm|hailuo)([-._]|$)/i
+// 结尾允许数字：qwen3.8、hy3、k3、minimax-m3 这类不带分隔符的写法也要认出来。
+const DOMESTIC_MODEL_PREFIX = /^(deepseek|glm|chatglm|kimi|moonshot|qwen|qwq|minimax|abab|ernie|hunyuan|doubao|seedance|seedream|step|yi|baichuan|spark|internlm|hailuo|mimo|hy|k3)([-._0-9]|$)/i
 
 export function isDomesticModel(name: string): boolean {
   return DOMESTIC_MODEL_PREFIX.test(name)

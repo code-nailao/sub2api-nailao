@@ -1,28 +1,33 @@
 <template>
   <div class="space-y-4 rounded-2xl border border-gray-200/70 bg-white p-4 shadow-sm dark:border-dark-700/60 dark:bg-dark-800/50">
-    <!-- 平台：一眼看清在卖哪几家 -->
-    <div class="flex flex-wrap items-center gap-1.5">
-      <button type="button" class="pill" :class="pillClass(platform === 'all')" @click="$emit('update:platform', 'all')">
+    <!-- 平台：一条胶囊轨道，选中项用主色浅底 + 描边，计数放在右侧 -->
+    <div class="flex flex-wrap items-center gap-1 rounded-2xl bg-gray-50/90 p-1.5 ring-1 ring-inset ring-gray-200/60 dark:bg-dark-900/40 dark:ring-dark-700/60">
+      <button
+        type="button"
+        class="segment"
+        :class="pillClass(platform === 'all')"
+        @click="$emit('update:platform', 'all')"
+      >
         {{ t('modelPlaza.filters.all') }}
-        <span class="count">{{ totalModels }}</span>
+        <span class="count" :class="{ 'count-active': platform === 'all' }">{{ totalModels }}</span>
       </button>
       <button
         v-for="item in platforms"
         :key="item.platform"
         type="button"
-        class="pill"
+        class="segment"
         :class="pillClass(platform === item.platform)"
         @click="$emit('update:platform', item.platform)"
       >
         <span
           v-if="item.platform === CN_SEGMENT"
-          class="flex h-4 w-4 items-center justify-center text-emerald-600 dark:text-emerald-400"
+          class="flex h-4 w-4 items-center justify-center text-gray-500 dark:text-dark-300"
         >
           <Icon name="cube" size="xs" class="h-4 w-4" />
         </span>
         <PlatformIcon v-else :platform="item.platform as GroupPlatform" size="xs" />
         {{ segmentLabel(item.platform) }}
-        <span class="count">{{ item.count }}</span>
+        <span class="count" :class="{ 'count-active': platform === item.platform }">{{ item.count }}</span>
       </button>
     </div>
 
@@ -50,7 +55,7 @@
         <button
           v-if="hiddenGroupCount > 0 || groupsExpanded"
           type="button"
-          class="rounded-full px-3 py-1.5 text-[13px] font-medium text-gray-500 transition hover:bg-gray-50 hover:text-gray-900 dark:text-dark-400 dark:hover:bg-dark-700/60 dark:hover:text-white"
+          class="rounded-xl px-3 py-1.5 text-[13px] font-medium text-gray-500 transition hover:bg-gray-50 hover:text-gray-900 dark:text-dark-400 dark:hover:bg-dark-700/60 dark:hover:text-white"
           @click="toggleGroups"
         >
           {{ groupsExpanded ? t('modelPlaza.toolbar.collapseGroups') : t('modelPlaza.toolbar.moreGroups', { count: hiddenGroupCount }) }}
@@ -176,7 +181,7 @@ import type { ModelPlazaGroup } from '@/api/modelPlaza'
 import type { GroupPlatform } from '@/types'
 import { buildPlazaCsv, downloadCsv, plazaApiUrl } from './plazaExport'
 import { useClipboard } from '@/composables/useClipboard'
-import { CN_SEGMENT, effectiveRate, type PlazaRow } from './plazaDisplay'
+import { CN_SEGMENT, effectiveRate, groupSegment, type PlazaRow } from './plazaDisplay'
 
 const props = defineProps<{
   platforms: Array<{ platform: string; count: number }>
@@ -209,8 +214,11 @@ const apiUrl = plazaApiUrl()
 const GROUP_PREVIEW_LIMIT = 6
 const groupsExpanded = ref(false)
 
+/** 分组按「归集」过滤：国模集合下面要看到【国模】1、【国模】2 这些分组。 */
 const filteredGroups = computed(() =>
-  props.platform === 'all' ? props.groups : props.groups.filter((g) => g.platform === props.platform)
+  props.platform === 'all'
+    ? props.groups
+    : props.groups.filter((g) => groupSegment(g) === props.platform)
 )
 
 const visibleGroups = computed(() => {
@@ -248,8 +256,8 @@ function segmentLabel(segment: string): string {
 
 function pillClass(active: boolean): string {
   return active
-    ? 'bg-gray-900 text-white shadow-sm dark:bg-white dark:text-gray-900'
-    : 'bg-white text-gray-600 ring-1 ring-inset ring-gray-200 hover:bg-gray-50 hover:text-gray-900 dark:bg-dark-800 dark:text-dark-300 dark:ring-dark-700 dark:hover:bg-dark-700 dark:hover:text-white'
+    ? 'bg-primary-50 text-primary-700 ring-1 ring-inset ring-primary-300/70 shadow-sm dark:bg-primary-500/15 dark:text-primary-200 dark:ring-primary-500/40'
+    : 'text-gray-600 hover:bg-white hover:text-gray-900 dark:text-dark-300 dark:hover:bg-dark-700 dark:hover:text-white'
 }
 
 function toggleGroups() {
@@ -284,10 +292,18 @@ function closeMenu() {
 
 <style scoped>
 .pill {
-  @apply inline-flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1.5 text-[13px] font-medium transition;
+  @apply inline-flex shrink-0 items-center gap-1.5 rounded-xl px-3 py-1.5 text-[13px] font-medium transition;
+}
+
+.segment {
+  @apply inline-flex shrink-0 items-center gap-2 rounded-[10px] px-3.5 py-1.5 text-[13px] font-medium transition;
 }
 
 .count {
-  @apply rounded-full bg-black/5 px-1.5 py-0.5 font-mono text-[10px] opacity-80 dark:bg-white/10;
+  @apply rounded-md bg-gray-200/70 px-1.5 py-0.5 font-mono text-[11px] font-normal text-gray-500 dark:bg-dark-700 dark:text-dark-400;
+}
+
+.count-active {
+  @apply bg-primary-100/80 text-primary-700 dark:bg-primary-500/20 dark:text-primary-200;
 }
 </style>

@@ -5241,7 +5241,7 @@
       "features": [
         "model_plaza_model_first"
       ],
-      "sha256": "8de22e25efbe605c4ee232aa450e6c424cab436abcf672ce2619c0ad75ce4f3d",
+      "sha256": "1771b2ed7a07550283206a6b165f0711371f12e0dc6a4f8585c9010cea5fe51d",
       "reason": "Platform and group-rate selectors, result count, search and the low-profile export menu. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
     },
     {
@@ -5281,7 +5281,7 @@
       "features": [
         "model_plaza_model_first"
       ],
-      "sha256": "919c0e0f45e8b82e70cd86edf6774a2da4c986d6aeb864bcc9c5ae9c875d7b03",
+      "sha256": "c5ee00aea823c981f1527436fc759778fab9b27a79c3be6979ae8b4a13ed1905",
       "reason": "Pure helpers that group the payload by model, pick the lowest-price group and compute paid prices. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
     },
     {
