@@ -57,9 +57,19 @@
           :class="platformBorderStrongClass(section.platform)"
         >
           <header class="flex flex-wrap items-center gap-2 border-b border-gray-100 px-5 py-3 dark:border-dark-700/60">
-            <PlatformIcon :platform="section.platform as GroupPlatform" size="sm" />
+            <PlatformIcon
+              v-if="section.platform !== CN_SEGMENT"
+              :platform="section.platform as GroupPlatform"
+              size="sm"
+            />
+            <span
+              v-else
+              class="flex h-6 w-6 items-center justify-center rounded-md bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+            >
+              <Icon name="cube" size="sm" />
+            </span>
             <h2 class="text-base font-semibold text-gray-900 dark:text-white">
-              {{ platformLabel(section.platform) }}
+              {{ segmentLabel(section.platform) }}
             </h2>
             <span class="text-xs text-gray-400 dark:text-dark-500">
               {{ t('modelPlaza.section.models', { count: section.rows.length }) }}
@@ -69,6 +79,7 @@
             :rows="section.rows"
             :show-groups="isAllGroups"
             :is-group-mode="!isAllGroups"
+            @select-group="onGroupChange"
           />
         </section>
       </div>
@@ -91,7 +102,14 @@ import Icon from '@/components/icons/Icon.vue'
 import PlatformIcon from '@/components/common/PlatformIcon.vue'
 import PlazaToolbar from './PlazaToolbar.vue'
 import PlazaModelTable from './PlazaModelTable.vue'
-import { buildPlazaRows, sortPlatforms, type PlazaRow } from './plazaDisplay'
+import {
+  buildPlazaRows,
+  CN_SEGMENT,
+  groupSegment,
+  rowSegment,
+  sortPlatforms,
+  type PlazaRow
+} from './plazaDisplay'
 import type { ModelPlazaGroup, ModelPlazaResponse } from '@/api/modelPlaza'
 import { useAuthStore } from '@/stores/auth'
 import { platformBorderStrongClass, platformLabel } from '@/utils/platformColors'
@@ -129,12 +147,15 @@ const descriptionHtml = computed(() => {
 /** 全站模型行（未按平台/搜索过滤）：用于计数、平台分布与全量导出。 */
 const allRows = computed(() => buildPlazaRows(groups.value, 'all'))
 
+const segments = computed(() => [...new Set(allRows.value.map(rowSegment))])
+
 const platformTabs = computed(() => {
   const counts = new Map<string, number>()
   for (const row of allRows.value) {
-    counts.set(row.platform, (counts.get(row.platform) ?? 0) + 1)
+    const segment = rowSegment(row)
+    counts.set(segment, (counts.get(segment) ?? 0) + 1)
   }
-  return sortPlatforms([...counts.keys()]).map((platform) => ({
+  return sortPlatforms(segments.value).map((platform) => ({
     platform,
     count: counts.get(platform) ?? 0
   }))
@@ -146,7 +167,7 @@ const rows = computed(() => buildPlazaRows(groups.value, selectedGroupId.value))
 const filteredRows = computed(() => {
   let list = rows.value
   if (selectedPlatform.value !== 'all') {
-    list = list.filter((row) => row.platform === selectedPlatform.value)
+    list = list.filter((row) => rowSegment(row) === selectedPlatform.value)
   }
   const q = searchQuery.value.trim().toLowerCase()
   if (q) {
@@ -156,27 +177,33 @@ const filteredRows = computed(() => {
 })
 
 const visibleSections = computed(() => {
-  const byPlatform = new Map<string, PlazaRow[]>()
+  const bySegment = new Map<string, PlazaRow[]>()
   for (const row of filteredRows.value) {
-    const list = byPlatform.get(row.platform) ?? []
+    const segment = rowSegment(row)
+    const list = bySegment.get(segment) ?? []
     list.push(row)
-    byPlatform.set(row.platform, list)
+    bySegment.set(segment, list)
   }
-  return sortPlatforms([...byPlatform.keys()]).map((platform) => ({
+  return sortPlatforms([...bySegment.keys()]).map((platform) => ({
     platform,
-    rows: byPlatform.get(platform) ?? []
+    rows: bySegment.get(platform) ?? []
   }))
 })
 
+/** 标签文案：国模集合单独命名，其余用平台显示名。 */
+function segmentLabel(segment: string): string {
+  return segment === CN_SEGMENT ? t('modelPlaza.segments.cn') : platformLabel(segment)
+}
+
 /**
- * 分组口径会限定平台：选中分组时切到它的平台，避免出现「平台 + 分组」无交集的空表；
+ * 分组口径会限定归集：选中分组时切到它所在的平台/集合，避免出现「平台 + 分组」无交集的空表；
  * 反向切换平台时清掉分组，回到最低价展示。
  */
 function onGroupChange(value: number | 'all') {
   selectedGroupId.value = value
   if (value !== 'all') {
     const group = groups.value.find((g) => g.id === value)
-    if (group) selectedPlatform.value = group.platform
+    if (group) selectedPlatform.value = groupSegment(group)
   }
 }
 
@@ -184,7 +211,7 @@ function onPlatformChange(value: string) {
   selectedPlatform.value = value
   if (selectedGroupId.value !== 'all') {
     const group = selectedGroup.value
-    if (!group || (value !== 'all' && group.platform !== value)) {
+    if (!group || (value !== 'all' && groupSegment(group) !== value)) {
       selectedGroupId.value = 'all'
     }
   }
@@ -195,7 +222,7 @@ watch(groups, (list) => {
   if (selectedGroupId.value !== 'all' && !list.some((g) => g.id === selectedGroupId.value)) {
     selectedGroupId.value = 'all'
   }
-  if (selectedPlatform.value !== 'all' && !list.some((g) => g.platform === selectedPlatform.value)) {
+  if (selectedPlatform.value !== 'all' && !segments.value.includes(selectedPlatform.value)) {
     selectedPlatform.value = 'all'
   }
 })

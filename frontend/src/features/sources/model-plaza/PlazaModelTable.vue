@@ -152,14 +152,17 @@
                 <Icon name="chevronDown" size="xs" class="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
               </summary>
               <div class="absolute right-0 z-20 mt-1 w-64 rounded-xl border border-gray-200 bg-white p-2 shadow-lg dark:border-dark-700 dark:bg-dark-800">
-                <div
+                <button
                   v-for="offering in row.offerings"
                   :key="offering.group.id"
-                  class="flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-xs hover:bg-gray-50 dark:hover:bg-dark-700/60"
+                  type="button"
+                  class="flex w-full items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition-colors hover:bg-gray-50 dark:hover:bg-dark-700/60"
+                  :title="t('modelPlaza.table.jumpToGroup', { group: offering.group.name })"
+                  @click="selectGroup($event, offering.group.id)"
                 >
                   <span class="min-w-0 truncate text-gray-700 dark:text-dark-200">{{ offering.group.name }}</span>
                   <span class="shrink-0 font-mono font-semibold text-primary-600 dark:text-primary-400">{{ offeringRate(offering) }}x</span>
-                </div>
+                </button>
               </div>
             </details>
           </td>
@@ -204,8 +207,20 @@ const props = defineProps<{
   isGroupMode?: boolean
 }>()
 
+const emit = defineEmits<{
+  /** 点「可用分组」里的某个分组：整表切到该分组的实付价。 */
+  'select-group': [id: number]
+}>()
+
 const { t } = useI18n()
 const { copyToClipboard } = useClipboard()
+
+/** 选中分组后收起浮层，用户能立刻看到价格已切换。 */
+function selectGroup(event: MouseEvent, id: number) {
+  emit('select-group', id)
+  const details = (event.currentTarget as HTMLElement)?.closest('details')
+  if (details) details.open = false
+}
 
 type PriceKey = 'input_price' | 'output_price' | 'cache_write_price' | 'cache_read_price'
 

@@ -3,8 +3,11 @@ import type { ModelPlazaGroup, PlazaModel } from '@/api/modelPlaza'
 import {
   buildPlazaRows,
   comparablePrice,
+  CN_SEGMENT,
+  groupSegment,
   offeringRate,
   paidPrice,
+  rowSegment,
   sortPlatforms,
   tierLabel,
   type PlazaOffering
@@ -159,6 +162,48 @@ describe('paidPrice / offeringRate', () => {
 
     expect(paidPrice(2.948069751e-6, offering)).toBe('$2.94807')
     expect(paidPrice(5e-6 * PER_MILLION, { ...offering, rate: 1 / PER_MILLION })).toBe('$5')
+  })
+})
+
+describe('rowSegment', () => {
+  it('moves domestic models served by OpenAI groups into the Chinese segment', () => {
+    const rows = buildPlazaRows([group({ models: [model({ name: 'deepseek-v4-pro', platform: 'openai' })] })], 'all')
+
+    expect(rowSegment(rows[0])).toBe(CN_SEGMENT)
+  })
+
+  it('keeps native DeepSeek groups under their own platform', () => {
+    const rows = buildPlazaRows(
+      [group({ platform: 'deepseek', models: [model({ name: 'deepseek-v4-pro', platform: 'deepseek' })] })],
+      'all'
+    )
+
+    expect(rowSegment(rows[0])).toBe('deepseek')
+  })
+
+  it('leaves foreign models on OpenAI', () => {
+    const rows = buildPlazaRows([group({ models: [model({ name: 'gpt-6.2-sol' })] })], 'all')
+
+    expect(rowSegment(rows[0])).toBe('openai')
+  })
+})
+
+describe('groupSegment', () => {
+  it('moves an all-domestic OpenAI group into the Chinese segment', () => {
+    const target = group({
+      models: [model({ name: 'glm-5.3', platform: 'openai' }), model({ name: 'kimi-k3', platform: 'openai' })]
+    })
+    expect(groupSegment(target)).toBe(CN_SEGMENT)
+  })
+
+  it('keeps a native Zhipu group separate', () => {
+    const target = group({ platform: 'zhipu', models: [model({ name: 'glm-5.3', platform: 'zhipu' })] })
+    expect(groupSegment(target)).toBe('zhipu')
+  })
+
+  it('does not move a mixed OpenAI group', () => {
+    const target = group({ models: [model({ name: 'gpt-6.2-sol' }), model({ name: 'glm-5.3' })] })
+    expect(groupSegment(target)).toBe('openai')
   })
 })
 

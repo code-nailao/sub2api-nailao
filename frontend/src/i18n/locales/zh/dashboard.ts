@@ -690,10 +690,14 @@ export default {
       imageRate: '生图独立倍率 {rate}x',
       videoRate: '视频独立倍率 {rate}x',
       moreGroups: '更多分组（{count}）',
-      collapseGroups: '收起分组'
+      collapseGroups: '收起分组',
+      saved: '省 {percent}%'
     },
     section: {
       models: '{count} 个模型'
+    },
+    segments: {
+      cn: '国模集合'
     },
     export: {
       title: '导出 / 对接',
@@ -740,6 +744,7 @@ export default {
       lowest: '最低',
       groups: '可用分组',
       groupCount: '{count} 个分组',
+      jumpToGroup: '切到「{group}」的实付价',
       cacheWrite1hShort: '1h',
       cacheWrite12hShort: '12h',
       unitPerMillion: '$ / 1M token',

@@ -19,12 +19,25 @@ import type { ModelPlazaGroup, PlazaModel, PlazaTimePricingPeriod } from '@/api/
 
 export const PER_MILLION = 1_000_000
 
+/**
+ * 「国模集合」：国产模型常挂在 openai 平台的分组下（广场按分组平台归类），
+ * 单看平台会把 deepseek / GLM 之类混进 OpenAI。这里按模型名识别，统一收进一个集合。
+ */
+export const CN_SEGMENT = 'cn'
+
+const DOMESTIC_MODEL_PREFIX = /^(deepseek|glm|chatglm|kimi|moonshot|qwen|qwq|minimax|abab|ernie|hunyuan|doubao|seedance|seedream|step|yi|baichuan|spark|internlm|hailuo)([-._]|$)/i
+
+export function isDomesticModel(name: string): boolean {
+  return DOMESTIC_MODEL_PREFIX.test(name)
+}
+
 /** 平台在标签栏中的固定顺序；未列出的平台排在后面。 */
 const PLATFORM_ORDER = [
   'openai',
   'anthropic',
   'gemini',
   'grok',
+  CN_SEGMENT,
   'deepseek',
   'zhipu',
   'kimi',
@@ -55,6 +68,27 @@ export interface PlazaRow {
 
 export function effectiveRate(group: ModelPlazaGroup): number {
   return group.user_rate_multiplier ?? group.rate_multiplier
+}
+
+/**
+ * 模型在广场里的归类：
+ * 只有挂在 OpenAI 接口下的国产模型（如 openai 分组里的 deepseek / GLM）才拆进「国模集合」；
+ * DeepSeek、GLM 等自己的接口分组保持独立，不合并。
+ */
+export function rowSegment(row: PlazaRow): string {
+  return row.platform === 'openai' && isDomesticModel(row.name) ? CN_SEGMENT : row.platform
+}
+
+/** 分组所属的归集：OpenAI 接口下整组都是国产模型时归入「国模集合」。 */
+export function groupSegment(group: ModelPlazaGroup): string {
+  if (
+    group.platform === 'openai' &&
+    group.models.length > 0 &&
+    group.models.every((m) => isDomesticModel(m.name))
+  ) {
+    return CN_SEGMENT
+  }
+  return group.platform
 }
 
 export function billingMode(model: PlazaModel): BillingMode {

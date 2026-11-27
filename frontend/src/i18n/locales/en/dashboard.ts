@@ -685,10 +685,14 @@ export default {
       imageRate: 'Image rate {rate}x',
       videoRate: 'Video rate {rate}x',
       moreGroups: 'More groups ({count})',
-      collapseGroups: 'Show fewer'
+      collapseGroups: 'Show fewer',
+      saved: 'save {percent}%'
     },
     section: {
       models: '{count} models'
+    },
+    segments: {
+      cn: 'Chinese models'
     },
     export: {
       title: 'Export / integrate',
@@ -736,6 +740,7 @@ export default {
       lowest: 'lowest',
       groups: 'Groups',
       groupCount: '{count} groups',
+      jumpToGroup: 'Switch to {group} pricing',
       cacheWrite1hShort: '1h',
       cacheWrite12hShort: '12h',
       unitPerMillion: '$ / 1M tokens',
