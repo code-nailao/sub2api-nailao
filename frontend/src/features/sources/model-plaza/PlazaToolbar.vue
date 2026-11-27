@@ -210,11 +210,10 @@ const { copyToClipboard } = useClipboard()
 const exportMenu = ref<HTMLDetailsElement | null>(null)
 const apiUrl = plazaApiUrl()
 
-/** 分组条默认只展示倍率最低的几个，避免几十个分组把页面撑乱。 */
+/** 分组条只展示倍率最低的几个。 */
 const GROUP_PREVIEW_LIMIT = 6
 const groupsExpanded = ref(false)
 
-/** 分组按「归集」过滤：国模集合下面要看到【国模】1、【国模】2 这些分组。 */
 const filteredGroups = computed(() =>
   props.platform === 'all'
     ? props.groups
@@ -226,7 +225,7 @@ const visibleGroups = computed(() => {
   if (groupsExpanded.value || list.length <= GROUP_PREVIEW_LIMIT) return list
   const preview = list.slice(0, GROUP_PREVIEW_LIMIT)
   const selected = list.find((g) => g.id === props.groupId)
-  // 选中的分组不在预览里时补到最前面，保证当前口径始终可见。
+  // 选中的分组不在预览里时补到最前。
   return selected && !preview.includes(selected) ? [selected, ...preview] : preview
 })
 
@@ -234,7 +233,7 @@ const hiddenGroupCount = computed(() =>
   groupsExpanded.value ? 0 : Math.max(0, filteredGroups.value.length - visibleGroups.value.length)
 )
 
-/** 倍率语义换算：0.035x 即按官方价 3.5 折，省 96.5%。 */
+/** 倍率换算成节省百分比。 */
 const savedPercent = computed(() => {
   if (!props.group) return ''
   const rate = effectiveRate(props.group)
@@ -271,7 +270,7 @@ watch(
   }
 )
 
-/** 导出当前口径或全量分组明细；导出后收起菜单，保持页面干净。 */
+/** 导出当前口径或全量分组明细。 */
 function exportCsv(mode: 'view' | 'all-groups') {
   const rows = mode === 'all-groups' ? props.allRows : props.rows
   const stamp = new Date().toISOString().slice(0, 10)

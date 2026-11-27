@@ -144,7 +144,7 @@ const descriptionHtml = computed(() => {
   return DOMPurify.sanitize(marked.parse(md) as string)
 })
 
-/** 全站模型行（未按平台/搜索过滤）：用于计数、平台分布与全量导出。 */
+/** 未按平台、搜索过滤的行：用于计数与全量导出。 */
 const allRows = computed(() => buildPlazaRows(groups.value, 'all'))
 
 const segments = computed(() => [...new Set(allRows.value.map(rowSegment))])
@@ -161,7 +161,7 @@ const platformTabs = computed(() => {
   }))
 })
 
-/** 当前口径的行：选定分组时只保留该分组的模型。 */
+/** 选定分组时只保留该分组的模型。 */
 const rows = computed(() => buildPlazaRows(groups.value, selectedGroupId.value))
 
 const filteredRows = computed(() => {
@@ -190,15 +190,12 @@ const visibleSections = computed(() => {
   }))
 })
 
-/** 标签文案：国模集合单独命名，其余用平台显示名。 */
+/** 国模集合单独命名，其余用平台显示名。 */
 function segmentLabel(segment: string): string {
   return segment === CN_SEGMENT ? t('modelPlaza.segments.cn') : platformLabel(segment)
 }
 
-/**
- * 分组口径会限定归集：选中分组时切到它所在的平台/集合，避免出现「平台 + 分组」无交集的空表；
- * 反向切换平台时清掉分组，回到最低价展示。
- */
+/** 选中分组时切到它所在的归集；切换平台时清掉不再匹配的分组。 */
 function onGroupChange(value: number | 'all') {
   selectedGroupId.value = value
   if (value !== 'all') {
@@ -217,7 +214,7 @@ function onPlatformChange(value: string) {
   }
 }
 
-/** 数据刷新后选中的分组/平台可能不复存在，回落到全部。 */
+/** 数据刷新后分组或平台可能不存在，回落到全部。 */
 watch(groups, (list) => {
   if (selectedGroupId.value !== 'all' && !list.some((g) => g.id === selectedGroupId.value)) {
     selectedGroupId.value = 'all'

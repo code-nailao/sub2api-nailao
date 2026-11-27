@@ -215,7 +215,7 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const { copyToClipboard } = useClipboard()
 
-/** 选中分组后收起浮层，用户能立刻看到价格已切换。 */
+/** 选中分组后收起浮层。 */
 function selectGroup(event: MouseEvent, id: number) {
   emit('select-group', id)
   const details = (event.currentTarget as HTMLElement)?.closest('details')

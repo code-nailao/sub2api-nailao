@@ -25,7 +25,7 @@ export const PER_MILLION = 1_000_000
  */
 export const CN_SEGMENT = 'cn'
 
-// 结尾允许数字：qwen3.8、hy3、k3、minimax-m3 这类不带分隔符的写法也要认出来。
+// 结尾允许数字，兼容 qwen3.8、hy3 这类写法。
 const DOMESTIC_MODEL_PREFIX = /^(deepseek|glm|chatglm|kimi|moonshot|qwen|qwq|minimax|abab|ernie|hunyuan|doubao|seedance|seedream|step|yi|baichuan|spark|internlm|hailuo|mimo|hy|k3)([-._0-9]|$)/i
 
 export function isDomesticModel(name: string): boolean {
@@ -71,11 +71,7 @@ export function effectiveRate(group: ModelPlazaGroup): number {
   return group.user_rate_multiplier ?? group.rate_multiplier
 }
 
-/**
- * 模型在广场里的归类：
- * 只有挂在 OpenAI 接口下的国产模型（如 openai 分组里的 deepseek / GLM）才拆进「国模集合」；
- * DeepSeek、GLM 等自己的接口分组保持独立，不合并。
- */
+/** 只有 OpenAI 接口下的国产模型归入「国模集合」，原生供应商分组保持独立。 */
 export function rowSegment(row: PlazaRow): string {
   return row.platform === 'openai' && isDomesticModel(row.name) ? CN_SEGMENT : row.platform
 }
@@ -159,10 +155,7 @@ function trimZero(n: number): string {
   return String(Math.round(n * 100) / 100)
 }
 
-/**
- * 美元价格统一格式：保留 6 位有效数字并去掉尾零。
- * 目录价常带长尾小数（如 2.948069751），直接展示会让表格显得杂乱。
- */
+/** 美元价格：保留 6 位有效数字，去掉目录价的长尾小数。 */
 function formatUsd(scaled: number): string {
   if (!Number.isFinite(scaled)) return '-'
   if (scaled === 0) return '$0'
@@ -241,7 +234,7 @@ export function buildPlazaRows(
   const list = [...rows.values()]
   for (const row of list) {
     row.offerings.sort((a, b) => offeringRate(a) - offeringRate(b) || a.group.name.localeCompare(b.group.name))
-    // 未配置价格的行排在最后比较用的 Infinity 之上没有意义，保持其原分组顺序。
+    // 无价模型不再比较，保持原分组顺序。
   }
   return list
 }
