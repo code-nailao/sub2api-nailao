@@ -178,7 +178,8 @@ const routes: RouteRecordRaw[] = [
   {
     path: '/model-plaza',
     name: 'ModelPlaza',
-    component: () => import('@/views/ModelPlazaView.vue'),
+    // Sources 实现：上游 views/ModelPlazaView.vue 保持不动，这里只切换实现入口。
+    component: () => import('@/features/sources/model-plaza/SourcesModelPlazaView.vue'),
     meta: {
       requiresAuth: false,
       title: 'Model Plaza',
@@ -265,16 +266,11 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
+    // 可用渠道已下线：模型清单统一由模型广场（按模型去重 + 分组倍率）展示，
+    // 旧链接仍可打开，直接落到后台内嵌形态的广场。
     path: '/available-channels',
     name: 'UserAvailableChannels',
-    component: () => import('@/views/user/AvailableChannelsView.vue'),
-    meta: {
-      requiresAuth: true,
-      requiresAdmin: false,
-      title: 'Available Channels',
-      titleKey: 'availableChannels.title',
-      descriptionKey: 'availableChannels.description'
-    }
+    redirect: () => ({ path: '/model-plaza', query: { embedded: '1' } })
   },
   {
     path: '/settings/mcp',
