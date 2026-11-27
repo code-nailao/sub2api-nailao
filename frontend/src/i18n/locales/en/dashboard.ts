@@ -676,7 +676,30 @@ export default {
       rateLabel: 'Rate',
       modelLabel: 'Model',
       searchPlaceholder: 'Search models',
-      all: 'All'
+      all: 'All',
+      lowestSuffix: 'lowest'
+    },
+    toolbar: {
+      summary: '{models} models · {groups} groups',
+      personalRate: 'Personal rate; group default {rate}x',
+      imageRate: 'Image rate {rate}x',
+      videoRate: 'Video rate {rate}x',
+      moreGroups: 'More groups ({count})',
+      collapseGroups: 'Show fewer',
+      saved: 'save {percent}%'
+    },
+    section: {
+      models: '{count} models'
+    },
+    segments: {
+      cn: 'Chinese models'
+    },
+    export: {
+      title: 'Export / integrate',
+      view: 'Export current view (CSV)',
+      allGroups: 'Export all models × groups (CSV)',
+      copyApi: 'Copy public API URL',
+      copied: 'API URL copied'
     },
     badges: {
       exclusive: 'Exclusive',
@@ -710,9 +733,16 @@ export default {
         '; prices in this row exclude the peak-hour rate — where this period overlaps the peak hours {window}, the overlapping portion is additionally multiplied by ×{multiplier}',
       timePricingWeekdays: 'Weekdays',
       timePricingRateHint: 'Effective rate {rate} × period multiplier {multiplier}',
-      paidPrice: 'Your Price (Discounted)',
+      paidPrice: 'Your Price',
       officialPrice: 'Official Price',
+      officialShort: 'official',
       rate: 'Rate',
+      lowest: 'lowest',
+      groups: 'Groups',
+      groupCount: '{count} groups',
+      jumpToGroup: 'Switch to {group} pricing',
+      cacheWrite1hShort: '1h',
+      cacheWrite12hShort: '12h',
       unitPerMillion: '$ / 1M tokens',
       perUnitRequest: '/ request',
       perUnitImage: '/ image',

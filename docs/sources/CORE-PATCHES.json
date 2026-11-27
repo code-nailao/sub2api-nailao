@@ -4952,10 +4952,11 @@
       "path": "frontend/src/components/layout/AppSidebar.vue",
       "features": [
         "local_theme_preferences",
-        "media_engine_native_boundary"
+        "media_engine_native_boundary",
+        "model_plaza_model_first"
       ],
-      "sha256": "63df1b2a1b38590ae9ce64a125fcddc9ca48ab45138246e50f0fadb4fe96d99f",
-      "reason": "Lets each browser pick one of eight local colour palettes and light or dark mode, synchronised across same-origin pages, through a sidebar picker; upstream components keep only small hooks and no API or database setting is added. Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream."
+      "sha256": "822fc4749e897b8ebd4b4f42cb04f82ce9d64181911350f1c04d417d57e25ea8",
+      "reason": "Lets each browser pick one of eight local colour palettes and light or dark mode, synchronised across same-origin pages, through a sidebar picker; upstream components keep only small hooks and no API or database setting is added. Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
     },
     {
       "path": "frontend/src/components/layout/__tests__/AppSidebar.operations.spec.ts",
@@ -5228,6 +5229,70 @@
       "reason": "Applies the fork's brand colour palette as CSS variables through the Tailwind configuration and the frontend entry point. Lets each browser pick one of eight local colour palettes and light or dark mode, synchronised across same-origin pages, through a sidebar picker; upstream components keep only small hooks and no API or database setting is added."
     },
     {
+      "path": "frontend/src/features/sources/model-plaza/PlazaModelTable.vue",
+      "features": [
+        "model_plaza_model_first"
+      ],
+      "sha256": "47461f82fd1f8105eddbfab99ff930e1b32d68aa0c1dc3239ec3ba8fffa5b809",
+      "reason": "One row per model with paid and official prices inline, multiplier column and group breakdown. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
+    },
+    {
+      "path": "frontend/src/features/sources/model-plaza/PlazaToolbar.vue",
+      "features": [
+        "model_plaza_model_first"
+      ],
+      "sha256": "8de22e25efbe605c4ee232aa450e6c424cab436abcf672ce2619c0ad75ce4f3d",
+      "reason": "Platform and group-rate selectors, result count, search and the low-profile export menu. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
+    },
+    {
+      "path": "frontend/src/features/sources/model-plaza/SourcesModelPlazaContent.vue",
+      "features": [
+        "model_plaza_model_first"
+      ],
+      "sha256": "f9695b2a55aab8631bb7861e0d85fd7e05cf5fcc264fc538472fd746b842bad5",
+      "reason": "Model-first plaza layout: platform tabs, group-rate lens, per-platform model sections, search. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
+    },
+    {
+      "path": "frontend/src/features/sources/model-plaza/SourcesModelPlazaView.vue",
+      "features": [
+        "model_plaza_model_first"
+      ],
+      "sha256": "4b36debdbeaea6eab38f3a76f0cc540324be41c3d54d50257d6c5f88ffb03f3a",
+      "reason": "Sources page shell that keeps the upstream embedded/standalone contract and loads the same data. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
+    },
+    {
+      "path": "frontend/src/features/sources/model-plaza/__tests__/plazaDisplay.spec.ts",
+      "features": [
+        "model_plaza_model_first"
+      ],
+      "sha256": "1d4b2a47f6ce7727c6e504dd62f90481833c9b05f39a559240ed74c2bc336273",
+      "reason": "Unit tests for model deduplication, lowest-price selection, segment rules and price formatting. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
+    },
+    {
+      "path": "frontend/src/features/sources/model-plaza/__tests__/plazaExport.spec.ts",
+      "features": [
+        "model_plaza_model_first"
+      ],
+      "sha256": "a45ec958e2f88d2be1674762c84b10278c38b405ef3f5bc6d28ad802ccfd8fe2",
+      "reason": "Unit tests for the CSV export shape, tier rows and escaping. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
+    },
+    {
+      "path": "frontend/src/features/sources/model-plaza/plazaDisplay.ts",
+      "features": [
+        "model_plaza_model_first"
+      ],
+      "sha256": "919c0e0f45e8b82e70cd86edf6774a2da4c986d6aeb864bcc9c5ae9c875d7b03",
+      "reason": "Pure helpers that group the payload by model, pick the lowest-price group and compute paid prices. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
+    },
+    {
+      "path": "frontend/src/features/sources/model-plaza/plazaExport.ts",
+      "features": [
+        "model_plaza_model_first"
+      ],
+      "sha256": "38086ca6798c706aaa682965bcb3feb51eec8e18b9943ad5058851e2a500163a",
+      "reason": "CSV export (current view or all groups) and the public JSON API address for downstream use. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
+    },
+    {
       "path": "frontend/src/features/sources/monitor-v2-cards/ChannelCard.vue",
       "features": [
         "channel_monitor_v2_cards"
@@ -5419,10 +5484,11 @@
       "path": "frontend/src/i18n/locales/en/dashboard.ts",
       "features": [
         "admin_cache_display",
-        "group_service_tier_pricing"
+        "group_service_tier_pricing",
+        "model_plaza_model_first"
       ],
-      "sha256": "6a8b4f65cccc1330a1355a4884d6be5163be437c6bc6c05030bef6b216072428",
-      "reason": "Replaces the performance column of the admin usage table with a cache-hit ratio (cache reads over all input tokens) that shows a dash when data is missing; the upstream table only gains a slot and locale strings. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings."
+      "sha256": "8a83b275c1d0c50db3c31e56b34a3138f74280795013f2b136162561184b9474",
+      "reason": "Replaces the performance column of the admin usage table with a cache-hit ratio (cache reads over all input tokens) that shows a dash when data is missing; the upstream table only gains a slot and locale strings. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
     },
     {
       "path": "frontend/src/i18n/locales/en/deepseekTools.ts",
@@ -5537,10 +5603,11 @@
       "path": "frontend/src/i18n/locales/zh/dashboard.ts",
       "features": [
         "admin_cache_display",
-        "group_service_tier_pricing"
+        "group_service_tier_pricing",
+        "model_plaza_model_first"
       ],
-      "sha256": "cc8553e406b16ad5aa79f46c535c522c20667bd8bc3c8e38cfc2abd8ca9b1a9a",
-      "reason": "Replaces the performance column of the admin usage table with a cache-hit ratio (cache reads over all input tokens) that shows a dash when data is missing; the upstream table only gains a slot and locale strings. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings."
+      "sha256": "9b606a2cde5bcfa7840410c8c67beaf43b0bccf342b12d5850f32f7fd9638dc7",
+      "reason": "Replaces the performance column of the admin usage table with a cache-hit ratio (cache reads over all input tokens) that shows a dash when data is missing; the upstream table only gains a slot and locale strings. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
     },
     {
       "path": "frontend/src/i18n/locales/zh/deepseekTools.ts",
@@ -5619,10 +5686,11 @@
     {
       "path": "frontend/src/router/index.ts",
       "features": [
-        "media_engine_native_boundary"
+        "media_engine_native_boundary",
+        "model_plaza_model_first"
       ],
-      "sha256": "8978c01534f329c807e49878c19065ae5241b76c4960b4cc7b78ec582302f745",
-      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream."
+      "sha256": "299779de06d1e91d94e96a694435b0b339775a1a5f229334d788ca28ae7a6505",
+      "reason": "Connects the external media engine image-task engine through minimal async handler and Wire hooks, an optional native money ledger, an external SQLite module dependency, signed object references, the Idempotency-Key CORS header and admin review screens. A default-off settlement option skips the balance-cache deduction for amounts already frozen; ordinary OpenAI and Grok handling stays upstream. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
     },
     {
       "path": "frontend/src/types/index.ts",
