@@ -27,6 +27,7 @@
 | `frontend/src` | 原版页面、状态和 API 客户端；二开组件集中在 `features/sources/`，原版文件只保留小挂接 |
 | `extensions/sources-brand` | 品牌色板与外观偏好 |
 | `extensions/sources-portal` | 首页与编辑器、上游余额、工作台授权、智商检测等独立服务 |
+| `extensions/sources-pricing-feed` | 只读公开模型广场的价格协议适配，独立构建和持久快照 |
 | `extensions/sources-media-engine` | 媒体引擎（持久图片任务引擎） |
 | `extensions/sources-monitor-*` | 渠道状态页的本地预览，不进入生产构建 |
 | `scripts/sources_extensions` | 基线获取、核心差异和扩展边界检查，公开目录与 PR 正文检查 |

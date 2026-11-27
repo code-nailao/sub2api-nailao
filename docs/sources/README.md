@@ -24,6 +24,7 @@
 
 ## 扩展模块
 
+- [extensions/sources-pricing-feed](../../extensions/sources-pricing-feed/README.md)：只读公开价格适配与持久报价快照。
 - [extensions/sources-portal](../../extensions/sources-portal/README.md)：首页、余额、工作台授权与智商检测服务。
 - [extensions/sources-media-engine](../../extensions/sources-media-engine/README.md)：媒体引擎（任务引擎）。
 - [extensions/sources-monitor-local](../../extensions/sources-monitor-local/README.md)、[extensions/sources-monitor-design](../../extensions/sources-monitor-design/README.md)：渠道状态页的本地预览。

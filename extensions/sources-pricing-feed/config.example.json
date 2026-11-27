@@ -1,0 +1,13 @@
+{
+  "source_url": "https://YOUR_MAIN_ORIGIN/api/v1/model-plaza",
+  "site_name": "YOUR_SITE_NAME",
+  "site_domain": "YOUR_MAIN_ORIGIN",
+  "cny_per_credit": 1,
+  "quotes": [
+    {
+      "group_id": 101,
+      "group_name": "YOUR_STABLE_GROUP_ID",
+      "models": ["gpt-YOUR_MODEL_ID"]
+    }
+  ]
+}
