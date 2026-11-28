@@ -48,6 +48,12 @@
         @update:search="searchQuery = $event"
       />
 
+      <!-- 价格口径说明：实付价的来源，避免被读成汇率换算 -->
+      <p class="flex items-start gap-1.5 text-xs leading-5 text-gray-400 dark:text-dark-500">
+        <Icon name="infoCircle" size="xs" class="mt-0.5 h-3.5 w-3.5 shrink-0" />
+        {{ t('modelPlaza.priceNote') }}
+      </p>
+
       <!-- 按平台分节的模型清单：一个模型只出现一次 -->
       <div v-if="visibleSections.length > 0" class="space-y-5">
         <section

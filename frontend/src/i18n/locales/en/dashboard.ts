@@ -670,6 +670,7 @@ export default {
     loadFailed: 'Failed to load model plaza',
     noSearchResult: 'No matching models',
     anonymousHint: 'Sign in to see your exclusive groups and personal rates',
+    priceNote: 'Prices shown are what you pay: model unit price × group rate. Prices are configured and billed in USD; $ / 1M tokens only scales the per-token price to one million tokens.',
     filters: {
       platformLabel: 'Platform',
       groupLabel: 'Group',
@@ -741,6 +742,7 @@ export default {
       groups: 'Groups',
       groupCount: '{count} groups',
       jumpToGroup: 'Switch to {group} pricing',
+      rateFormula: 'Unit price {base} × {rate} = {paid}',
       cacheWrite1hShort: '1h',
       cacheWrite12hShort: '12h',
       unitPerMillion: '$ / 1M tokens',

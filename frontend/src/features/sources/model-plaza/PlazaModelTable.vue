@@ -133,8 +133,11 @@
             </div>
           </td>
 
-          <!-- 倍率 -->
-          <td class="border-l border-gray-100 px-2 py-3 text-center align-top font-mono text-xs dark:border-dark-700/60">
+          <!-- 倍率（悬停给出「单价 × 倍率 = 实付」的算式） -->
+          <td
+            class="border-l border-gray-100 px-2 py-3 text-center align-top font-mono text-xs dark:border-dark-700/60"
+            :title="rateFormula(row)"
+          >
             <div v-if="row.primary.personal" class="text-gray-400 line-through dark:text-dark-500">
               {{ row.primary.group.rate_multiplier }}x
             </div>
@@ -321,6 +324,19 @@ function timePricingHint(row: PlazaRow, period: PlazaTimePricingPeriod): string 
     timezone: row.primary.model.time_pricing?.timezone ?? '',
     rate: offeringRate(row.primary),
     multiplier: period.multiplier
+  })
+}
+
+/** 倍率单元格的算式：标价 × 倍率 = 实付，按 token 取首档输入价。 */
+function rateFormula(row: PlazaRow): string {
+  const model = row.primary.model
+  const first = tokenIntervals(model)[0]
+  const base = first ? first.input_price : model.pricing?.input_price
+  if (base == null) return ''
+  return t('modelPlaza.table.rateFormula', {
+    base: officialPrice(base),
+    rate: offeringRate(row.primary),
+    paid: paidPrice(base, row.primary)
   })
 }
 </script>
