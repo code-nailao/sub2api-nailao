@@ -399,6 +399,7 @@ func (h *SettingHandler) GetSettings(c *gin.Context) {
 		PluginManagementEnabled: settings.PluginManagementEnabled,
 		ModelPlazaDescription:   settings.ModelPlazaDescription,
 		ModelPlazaCNNote:        settings.ModelPlazaCNNote,
+		ModelPlazaCNPrefixes:    settings.ModelPlazaCNPrefixes,
 
 		AffiliateEnabled: settings.AffiliateEnabled,
 

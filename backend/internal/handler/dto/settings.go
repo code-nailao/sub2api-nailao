@@ -336,6 +336,7 @@ type SystemSettings struct {
 	ModelPlazaRequireAuth   bool   `json:"model_plaza_require_auth"`
 	ModelPlazaDescription   string `json:"model_plaza_description"`
 	ModelPlazaCNNote        string `json:"model_plaza_cn_note"`
+	ModelPlazaCNPrefixes    string `json:"model_plaza_cn_prefixes"`
 	PluginManagementEnabled bool   `json:"plugin_management_enabled"`
 
 	// 风控中心功能开关

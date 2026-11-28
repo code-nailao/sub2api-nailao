@@ -563,6 +563,10 @@ const (
 	// sections that only offer domestic models. Empty = frontend built-in text.
 	SettingKeyModelPlazaCNNote = "model_plaza_cn_note"
 
+	// SettingKeyModelPlazaCNPrefixes stores the comma-separated model-name
+	// prefixes that mark a model as domestic. Empty = frontend built-in list.
+	SettingKeyModelPlazaCNPrefixes = "model_plaza_cn_prefixes"
+
 	// SettingKeyPluginManagementEnabled controls sidebar visibility only; it does
 	// not stop or otherwise change already loaded plugin runtimes.
 	SettingKeyPluginManagementEnabled = "plugin_management_enabled"

@@ -453,6 +453,7 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	updates[SettingKeyModelPlazaRequireAuth] = strconv.FormatBool(settings.ModelPlazaRequireAuth)
 	updates[SettingKeyModelPlazaDescription] = settings.ModelPlazaDescription
 	updates[SettingKeyModelPlazaCNNote] = settings.ModelPlazaCNNote
+	updates[SettingKeyModelPlazaCNPrefixes] = settings.ModelPlazaCNPrefixes
 	updates[SettingKeyPluginManagementEnabled] = strconv.FormatBool(settings.PluginManagementEnabled)
 
 	// Affiliate (邀请返利) feature switch

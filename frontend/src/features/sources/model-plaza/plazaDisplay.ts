@@ -25,11 +25,54 @@ export const PER_MILLION = 1_000_000
  */
 export const CN_SEGMENT = 'cn'
 
-// 结尾允许数字，兼容 qwen3.8、hy3 这类写法。
-const DOMESTIC_MODEL_PREFIX = /^(deepseek|glm|chatglm|kimi|moonshot|qwen|qwq|minimax|abab|ernie|hunyuan|doubao|seedance|seedream|step|yi|baichuan|spark|internlm|hailuo|mimo|hy|k3)([-._0-9]|$)/i
+/** 默认的国产模型识别前缀；管理员可在系统设置中用逗号分隔的列表覆盖。 */
+export const DEFAULT_DOMESTIC_PREFIXES = [
+  'deepseek',
+  'glm',
+  'chatglm',
+  'kimi',
+  'moonshot',
+  'qwen',
+  'qwq',
+  'minimax',
+  'abab',
+  'ernie',
+  'hunyuan',
+  'doubao',
+  'seedance',
+  'seedream',
+  'step',
+  'yi',
+  'baichuan',
+  'spark',
+  'internlm',
+  'hailuo',
+  'mimo',
+  'hy',
+  'k3'
+]
 
-export function isDomesticModel(name: string): boolean {
-  return DOMESTIC_MODEL_PREFIX.test(name)
+export type DomesticMatcher = (name: string) => boolean
+
+/**
+ * 前缀命中规则：忽略大小写，前缀后必须是结尾或非字母（兼容 qwen3.8、hy3，
+ * 同时避免 hy 命中 hystrix）。配置为空时回退内置列表。
+ */
+export function createDomesticMatcher(prefixes?: string[] | null): DomesticMatcher {
+  const configured = (prefixes ?? []).map((prefix) => prefix.trim().toLowerCase()).filter(Boolean)
+  const active = configured.length > 0 ? configured : DEFAULT_DOMESTIC_PREFIXES
+  return (name: string) => {
+    const lower = name.toLowerCase()
+    return active.some(
+      (prefix) =>
+        lower.startsWith(prefix) &&
+        (lower.length === prefix.length || !/[a-z]/.test(lower[prefix.length]))
+    )
+  }
+}
+
+export function isDomesticModel(name: string, prefixes?: string[] | null): boolean {
+  return createDomesticMatcher(prefixes)(name)
 }
 
 /** 平台在标签栏中的固定顺序；未列出的平台排在后面。 */
@@ -72,16 +115,19 @@ export function effectiveRate(group: ModelPlazaGroup): number {
 }
 
 /** 只有 OpenAI 接口下的国产模型归入「国模集合」，原生供应商分组保持独立。 */
-export function rowSegment(row: PlazaRow): string {
-  return row.platform === 'openai' && isDomesticModel(row.name) ? CN_SEGMENT : row.platform
+export function rowSegment(row: PlazaRow, isDomestic: DomesticMatcher = isDomesticModel): string {
+  return row.platform === 'openai' && isDomestic(row.name) ? CN_SEGMENT : row.platform
 }
 
 /** 分组所属的归集：OpenAI 接口下整组都是国产模型时归入「国模集合」。 */
-export function groupSegment(group: ModelPlazaGroup): string {
+export function groupSegment(
+  group: ModelPlazaGroup,
+  isDomestic: DomesticMatcher = isDomesticModel
+): string {
   if (
     group.platform === 'openai' &&
     group.models.length > 0 &&
-    group.models.every((m) => isDomesticModel(m.name))
+    group.models.every((m) => isDomestic(m.name))
   ) {
     return CN_SEGMENT
   }
@@ -89,8 +135,11 @@ export function groupSegment(group: ModelPlazaGroup): string {
 }
 
 /** 区块内全是国产模型时，展示管理员配置的国模分组说明。 */
-export function isDomesticSection(rows: PlazaRow[]): boolean {
-  return rows.length > 0 && rows.every((row) => isDomesticModel(row.name))
+export function isDomesticSection(
+  rows: PlazaRow[],
+  isDomestic: DomesticMatcher = isDomesticModel
+): boolean {
+  return rows.length > 0 && rows.every((row) => isDomestic(row.name))
 }
 
 export function billingMode(model: PlazaModel): BillingMode {

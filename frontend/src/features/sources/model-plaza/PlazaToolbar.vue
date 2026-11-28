@@ -181,7 +181,7 @@ import type { ModelPlazaGroup } from '@/api/modelPlaza'
 import type { GroupPlatform } from '@/types'
 import { buildPlazaCsv, downloadCsv, plazaApiUrl } from './plazaExport'
 import { useClipboard } from '@/composables/useClipboard'
-import { CN_SEGMENT, effectiveRate, groupSegment, type PlazaRow } from './plazaDisplay'
+import { CN_SEGMENT, effectiveRate, type PlazaRow } from './plazaDisplay'
 
 const props = defineProps<{
   platforms: Array<{ platform: string; count: number }>
@@ -196,6 +196,8 @@ const props = defineProps<{
   rows: PlazaRow[]
   /** 全量行（导出「全部模型 × 分组」用）。 */
   allRows: PlazaRow[]
+  /** 归入国模集合的分组 id，由当前前缀配置决定。 */
+  cnGroupIds: number[]
 }>()
 
 defineEmits<{
@@ -214,11 +216,15 @@ const apiUrl = plazaApiUrl()
 const GROUP_PREVIEW_LIMIT = 6
 const groupsExpanded = ref(false)
 
-const filteredGroups = computed(() =>
-  props.platform === 'all'
-    ? props.groups
-    : props.groups.filter((g) => groupSegment(g) === props.platform)
-)
+const filteredGroups = computed(() => {
+  if (props.platform === 'all') return props.groups
+  if (props.platform === CN_SEGMENT) {
+    return props.groups.filter((g) => props.cnGroupIds.includes(g.id))
+  }
+  return props.groups.filter(
+    (g) => g.platform === props.platform && !props.cnGroupIds.includes(g.id)
+  )
+})
 
 const visibleGroups = computed(() => {
   const list = filteredGroups.value

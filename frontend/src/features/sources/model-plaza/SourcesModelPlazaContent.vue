@@ -43,6 +43,7 @@
         :group="selectedGroup"
         :rows="filteredRows"
         :all-rows="allRows"
+        :cn-group-ids="cnGroupIds"
         @update:platform="onPlatformChange"
         @update:group-id="onGroupChange"
         @update:search="searchQuery = $event"
@@ -111,6 +112,7 @@ import PlazaModelTable from './PlazaModelTable.vue'
 import {
   buildPlazaRows,
   CN_SEGMENT,
+  createDomesticMatcher,
   groupSegment,
   isDomesticSection,
   rowSegment,
@@ -151,15 +153,24 @@ const descriptionHtml = computed(() => {
   return DOMPurify.sanitize(marked.parse(md) as string)
 })
 
+/** 国产模型识别前缀由管理员配置，留空时前端回退内置列表。 */
+const isDomestic = computed(() => createDomesticMatcher(props.response?.cn_prefixes))
+
 /** 未按平台、搜索过滤的行：用于计数与全量导出。 */
 const allRows = computed(() => buildPlazaRows(groups.value, 'all'))
 
-const segments = computed(() => [...new Set(allRows.value.map(rowSegment))])
+const cnGroupIds = computed(() =>
+  groups.value
+    .filter((group) => groupSegment(group, isDomestic.value) === CN_SEGMENT)
+    .map((group) => group.id)
+)
+
+const segments = computed(() => [...new Set(allRows.value.map((row) => rowSegment(row, isDomestic.value)))])
 
 const platformTabs = computed(() => {
   const counts = new Map<string, number>()
   for (const row of allRows.value) {
-    const segment = rowSegment(row)
+    const segment = rowSegment(row, isDomestic.value)
     counts.set(segment, (counts.get(segment) ?? 0) + 1)
   }
   return sortPlatforms(segments.value).map((platform) => ({
@@ -174,7 +185,7 @@ const rows = computed(() => buildPlazaRows(groups.value, selectedGroupId.value))
 const filteredRows = computed(() => {
   let list = rows.value
   if (selectedPlatform.value !== 'all') {
-    list = list.filter((row) => rowSegment(row) === selectedPlatform.value)
+    list = list.filter((row) => rowSegment(row, isDomestic.value) === selectedPlatform.value)
   }
   const q = searchQuery.value.trim().toLowerCase()
   if (q) {
@@ -186,7 +197,7 @@ const filteredRows = computed(() => {
 const visibleSections = computed(() => {
   const bySegment = new Map<string, PlazaRow[]>()
   for (const row of filteredRows.value) {
-    const segment = rowSegment(row)
+    const segment = rowSegment(row, isDomestic.value)
     const list = bySegment.get(segment) ?? []
     list.push(row)
     bySegment.set(segment, list)
@@ -203,7 +214,7 @@ const domesticNote = computed(
 
 /** 只含国产模型的区块显示国模说明，其余区块不显示。 */
 function sectionNote(rows: PlazaRow[]): string {
-  return isDomesticSection(rows) ? domesticNote.value : ''
+  return isDomesticSection(rows, isDomestic.value) ? domesticNote.value : ''
 }
 
 /** 国模集合单独命名，其余用平台显示名。 */
@@ -216,7 +227,7 @@ function onGroupChange(value: number | 'all') {
   selectedGroupId.value = value
   if (value !== 'all') {
     const group = groups.value.find((g) => g.id === value)
-    if (group) selectedPlatform.value = groupSegment(group)
+    if (group) selectedPlatform.value = groupSegment(group, isDomestic.value)
   }
 }
 
@@ -224,7 +235,7 @@ function onPlatformChange(value: string) {
   selectedPlatform.value = value
   if (selectedGroupId.value !== 'all') {
     const group = selectedGroup.value
-    if (!group || (value !== 'all' && groupSegment(group) !== value)) {
+    if (!group || (value !== 'all' && groupSegment(group, isDomestic.value) !== value)) {
       selectedGroupId.value = 'all'
     }
   }

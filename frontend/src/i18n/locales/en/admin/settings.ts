@@ -74,8 +74,10 @@ export default {
           priceDescription: 'Pricing notes (Markdown)',
           priceDescriptionHint: 'Rendered at the top of the plaza page. Use it for billing rules, exchange rates, promotions, etc.',
           cnNote: 'Domestic-model note',
-          cnNoteHint: 'Shown next to the title of sections that only list domestic models (CN collection, DeepSeek, GLM, Kimi, MiniMax, ...). Leave empty for the default text.',
+          cnNoteHint: 'Shown next to the title of sections that only list domestic models. Which models count as domestic is decided by the prefix list below. Leave empty for the default text.',
           cnNotePlaceholder: 'Priced in CNY; balance is deducted 1:1',
+          cnPrefixes: 'Domestic model prefixes',
+          cnPrefixesHint: 'Comma-separated, case-insensitive. A model whose name starts with one of these joins the CN collection and shows the note above; adding a new domestic model needs no code change. Leave empty for the built-in list shown in the placeholder.',
         },
         pluginManagement: {
           title: 'Plugin Management',

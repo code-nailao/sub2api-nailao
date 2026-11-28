@@ -305,3 +305,9 @@ func TestModelPlazaHandler_VaryKeepsCORSOrigin(t *testing.T) {
 		require.Equal(t, []string{"Origin", "Accept-Language"}, w.Header().Values("Vary"))
 	}
 }
+
+func TestSplitModelPlazaCNPrefixes(t *testing.T) {
+	got := splitModelPlazaCNPrefixes(" DeepSeek, glm，GLM  kimi\nqwen,, ")
+	require.Equal(t, []string{"deepseek", "glm", "kimi", "qwen"}, got)
+	require.Empty(t, splitModelPlazaCNPrefixes("  ,， \n"))
+}
