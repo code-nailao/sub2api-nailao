@@ -5249,7 +5249,7 @@
       "features": [
         "model_plaza_model_first"
       ],
-      "sha256": "ebdcb3919d18d8517f78b1c8e426267c8beb4b88c675bd6fa95864e18de19adb",
+      "sha256": "4cd3c49f13d53f2517db63bdb74619b6c33b08edc181a34448cf5d7f0fa96ea7",
       "reason": "Model-first plaza layout: platform tabs, group-rate lens, per-platform model sections, search. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
     },
     {
@@ -5487,7 +5487,7 @@
         "group_service_tier_pricing",
         "model_plaza_model_first"
       ],
-      "sha256": "db1907c69a3b057d6e044b4e0a976aa1ff128b2c44b009946e535ca516ef01a6",
+      "sha256": "cdd8b62c6e39baf436e1ddf98ffe39cb8ce8ee188136dcb7cd916e640731c87e",
       "reason": "Replaces the performance column of the admin usage table with a cache-hit ratio (cache reads over all input tokens) that shows a dash when data is missing; the upstream table only gains a slot and locale strings. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
     },
     {
@@ -5606,7 +5606,7 @@
         "group_service_tier_pricing",
         "model_plaza_model_first"
       ],
-      "sha256": "5e6e4e6ceea0c2d4eb9d3676f21ce6e713f58d37a365508df051316b81cbe32a",
+      "sha256": "387d1dda96e2ade0aaa0455dd83f8d333db424c86e1774e4e655dbf82bbad14d",
       "reason": "Replaces the performance column of the admin usage table with a cache-hit ratio (cache reads over all input tokens) that shows a dash when data is missing; the upstream table only gains a slot and locale strings. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
     },
     {

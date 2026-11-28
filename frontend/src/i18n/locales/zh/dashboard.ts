@@ -675,7 +675,6 @@ export default {
     loadFailed: '加载模型广场失败',
     noSearchResult: '没有匹配的模型',
     anonymousHint: '登录后可查看你的专属分组与专属倍率',
-    priceNote: '表中为实付价 = 模型单价 × 分组倍率；单价按美元配置、按美元扣费，$ / 1M token 只是把每 token 单价换算成每百万 token 展示。',
     filters: {
       platformLabel: '平台',
       groupLabel: '分组',
