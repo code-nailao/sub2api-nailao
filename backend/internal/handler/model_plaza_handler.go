@@ -105,6 +105,7 @@ type modelPlazaGroup struct {
 // modelPlazaResponse 广场页响应。
 type modelPlazaResponse struct {
 	Description string            `json:"description"`
+	CNNote      string            `json:"cn_note,omitempty"`
 	Groups      []modelPlazaGroup `json:"groups"`
 }
 
@@ -160,6 +161,7 @@ func (h *ModelPlazaHandler) Get(c *gin.Context) {
 	out := toLocalizedModelPlazaGroups(visible, userRates, c.GetHeader("Accept-Language"))
 	response.Success(c, modelPlazaResponse{
 		Description: rt.Description,
+		CNNote:      rt.CNNote,
 		Groups:      out,
 	})
 }

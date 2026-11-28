@@ -5,6 +5,7 @@ import {
   comparablePrice,
   CN_SEGMENT,
   groupSegment,
+  isDomesticSection,
   offeringRate,
   paidPrice,
   rowSegment,
@@ -204,6 +205,27 @@ describe('groupSegment', () => {
   it('does not move a mixed OpenAI group', () => {
     const target = group({ models: [model({ name: 'gpt-6.2-sol' }), model({ name: 'glm-5.3' })] })
     expect(groupSegment(target)).toBe('openai')
+  })
+})
+
+describe('isDomesticSection', () => {
+  it('marks a section made only of domestic models', () => {
+    const rows = buildPlazaRows(
+      [group({ platform: 'deepseek', models: [model({ name: 'deepseek-v4-pro', platform: 'deepseek' })] })],
+      'all'
+    )
+
+    expect(isDomesticSection(rows)).toBe(true)
+  })
+
+  it('rejects a section that contains a foreign model', () => {
+    const rows = buildPlazaRows([group({ models: [model({ name: 'gpt-6.2-sol' })] })], 'all')
+
+    expect(isDomesticSection(rows)).toBe(false)
+  })
+
+  it('rejects an empty section', () => {
+    expect(isDomesticSection([])).toBe(false)
   })
 })
 

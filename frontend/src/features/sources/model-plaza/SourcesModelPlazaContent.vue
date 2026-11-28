@@ -75,10 +75,10 @@
               {{ t('modelPlaza.section.models', { count: section.rows.length }) }}
             </span>
             <span
-              v-if="section.platform === CN_SEGMENT"
+              v-if="sectionNote(section.rows)"
               class="text-xs text-emerald-600 dark:text-emerald-400"
             >
-              {{ t('modelPlaza.section.cnPricing') }}
+              {{ sectionNote(section.rows) }}
             </span>
           </header>
           <PlazaModelTable
@@ -112,6 +112,7 @@ import {
   buildPlazaRows,
   CN_SEGMENT,
   groupSegment,
+  isDomesticSection,
   rowSegment,
   sortPlatforms,
   type PlazaRow
@@ -195,6 +196,15 @@ const visibleSections = computed(() => {
     rows: bySegment.get(platform) ?? []
   }))
 })
+
+const domesticNote = computed(
+  () => props.response?.cn_note?.trim() || t('modelPlaza.section.cnPricing')
+)
+
+/** 只含国产模型的区块显示国模说明，其余区块不显示。 */
+function sectionNote(rows: PlazaRow[]): string {
+  return isDomesticSection(rows) ? domesticNote.value : ''
+}
 
 /** 国模集合单独命名，其余用平台显示名。 */
 function segmentLabel(segment: string): string {

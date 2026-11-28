@@ -527,6 +527,7 @@ type ModelPlazaRuntime struct {
 	Enabled     bool
 	RequireAuth bool
 	Description string
+	CNNote      string
 }
 
 // GetModelPlazaRuntime reads the model-plaza feature switches directly from the
@@ -537,6 +538,7 @@ func (s *SettingService) GetModelPlazaRuntime(ctx context.Context) ModelPlazaRun
 		SettingKeyModelPlazaEnabled,
 		SettingKeyModelPlazaRequireAuth,
 		SettingKeyModelPlazaDescription,
+		SettingKeyModelPlazaCNNote,
 	})
 	if err != nil {
 		return ModelPlazaRuntime{Enabled: false}
@@ -545,6 +547,7 @@ func (s *SettingService) GetModelPlazaRuntime(ctx context.Context) ModelPlazaRun
 		Enabled:     vals[SettingKeyModelPlazaEnabled] == "true",
 		RequireAuth: vals[SettingKeyModelPlazaRequireAuth] == "true",
 		Description: vals[SettingKeyModelPlazaDescription],
+		CNNote:      vals[SettingKeyModelPlazaCNNote],
 	}
 }
 

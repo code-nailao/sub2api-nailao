@@ -88,6 +88,11 @@ export function groupSegment(group: ModelPlazaGroup): string {
   return group.platform
 }
 
+/** 区块内全是国产模型时，展示管理员配置的国模分组说明。 */
+export function isDomesticSection(rows: PlazaRow[]): boolean {
+  return rows.length > 0 && rows.every((row) => isDomesticModel(row.name))
+}
+
 export function billingMode(model: PlazaModel): BillingMode {
   return (model.pricing?.billing_mode || BILLING_MODE_TOKEN) as BillingMode
 }

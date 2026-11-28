@@ -73,6 +73,9 @@ export default {
           requireAuthHint: 'When on, anonymous visitors are redirected to the login page; when off, the page is public and anonymous visitors only see non-exclusive groups.',
           priceDescription: 'Pricing notes (Markdown)',
           priceDescriptionHint: 'Rendered at the top of the plaza page. Use it for billing rules, exchange rates, promotions, etc.',
+          cnNote: 'Domestic-model note',
+          cnNoteHint: 'Shown next to the title of sections that only list domestic models (CN collection, DeepSeek, GLM, Kimi, MiniMax, ...). Leave empty for the default text.',
+          cnNotePlaceholder: 'Priced in CNY; balance is deducted 1:1',
         },
         pluginManagement: {
           title: 'Plugin Management',

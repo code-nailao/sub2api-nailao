@@ -73,6 +73,9 @@ export default {
           requireAuthHint: '开启后未登录访问将跳转登录页；关闭则公开可见，匿名访客仅展示非专属分组。',
           priceDescription: '价格说明（Markdown）',
           priceDescriptionHint: '展示在模型广场页面顶部，可用于说明计费规则、汇率、优惠活动等。',
+          cnNote: '国模分组说明',
+          cnNoteHint: '显示在只含国产模型的分组区块标题旁（国模集合、DeepSeek、GLM、Kimi、MiniMax 等）。留空使用默认文案。',
+          cnNotePlaceholder: '按人民币定价，余额按 1:1 扣减',
         },
         pluginManagement: {
           title: '插件管理',
