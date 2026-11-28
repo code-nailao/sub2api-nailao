@@ -5,6 +5,11 @@ import re
 ROOT=Path(__file__).resolve().parents[2]
 portal=ROOT/'extensions/sources-portal'
 errors=[]
+for path in (ROOT/'extensions/sources-pricing-feed').rglob('*.go'):
+    if path.name.endswith('_test.go'):continue
+    source=path.read_text()
+    for forbidden in ('"database/sql"','github.com/Wei-Shaw/sub2api','github.com/jackc/pgx','github.com/lib/pq','entgo.io/ent','/api/v1/admin/','/api/v1/auth/','DATABASE_PASSWORD'):
+        if forbidden in source:errors.append(f'{path.relative_to(ROOT)}: pricing feed private dependency {forbidden}')
 for path in portal.rglob('*.go'):
     if path.name.endswith('_test.go'):continue
     source=path.read_text()

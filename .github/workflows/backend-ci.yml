@@ -307,6 +307,8 @@ jobs:
         working-directory: extensions/sources-portal
       - run: go test -race ./... && go vet ./...
         working-directory: extensions/sources-media-engine
+      - run: go test -race ./... && go vet ./... && go build ./cmd/pricing-feed
+        working-directory: extensions/sources-pricing-feed
       - run: python3 scripts/sources_extensions/core_parity.py
       - run: python3 scripts/sources_extensions/check_boundaries.py
       - run: python3 -m unittest discover -s scripts/sources_extensions -p 'test_*.py'

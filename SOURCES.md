@@ -19,6 +19,7 @@
 | --- | --- | --- |
 | 品牌、主题、首页 | Sources 品牌；8 套本地色板和深浅色，首页与控制台同源同步；独立首页与内容编辑器；福利按钮只导航 | `extensions/sources-brand`、`extensions/sources-portal`、`frontend/src/features/sources/`；[主题偏好](docs/sources/THEME-PREFERENCES.md) |
 | API 域名的主站提示 | 直接用浏览器打开 API 域名时，404 JSON 的错误信息里附带主站地址；状态码、类型和模型接口不变 | `deploy/nginx/sub2api-api-only-locations.conf` |
+| 公开价格适配器 | 独立服务读取已有模型广场，只发布显式选择的模型与分组；将价格转换为人民币并输出标准价格 JSON，持久快照限时有效；不持有登录凭据、不参与主站计费 | [独立价格服务](extensions/sources-pricing-feed/README.md) |
 | 上游账号余额 | 账号列表增加上游钱包余额列和配置抽屉；支持 New API 个人访问令牌和 Sub2API 复用账号 Key 两种来源；来源加密存于 Portal；凭据、地址或代理变化需要重新确认关联；查询失败不显示为 0；只改模型映射等元数据时保留已验证的绑定和快照 | `account_wallet*`、`features/sources/balances`、Portal；[上游余额](docs/sources/UPSTREAM-BALANCE.md) |
 | 余额自动刷新 | 持久化余额快照，成功后定时刷新，长查询与短轮询分离并限制并发 | `account_wallet*`、Portal |
 | 共享钱包与提醒 | 管理员把多个账号关联到同一钱包、指定代表账号；低余额与恢复提醒按事件去重投递 | `wallet*`、Portal |
