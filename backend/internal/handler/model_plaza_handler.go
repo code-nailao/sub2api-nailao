@@ -2,6 +2,8 @@ package handler
 
 import (
 	"log/slog"
+	"strings"
+	"unicode"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
@@ -105,6 +107,8 @@ type modelPlazaGroup struct {
 // modelPlazaResponse 广场页响应。
 type modelPlazaResponse struct {
 	Description string            `json:"description"`
+	CNNote      string            `json:"cn_note,omitempty"`
+	CNPrefixes  []string          `json:"cn_prefixes,omitempty"`
 	Groups      []modelPlazaGroup `json:"groups"`
 }
 
@@ -160,8 +164,31 @@ func (h *ModelPlazaHandler) Get(c *gin.Context) {
 	out := toLocalizedModelPlazaGroups(visible, userRates, c.GetHeader("Accept-Language"))
 	response.Success(c, modelPlazaResponse{
 		Description: rt.Description,
+		CNNote:      rt.CNNote,
+		CNPrefixes:  splitModelPlazaCNPrefixes(rt.CNPrefixes),
 		Groups:      out,
 	})
+}
+
+// splitModelPlazaCNPrefixes 把逗号/空白分隔的前缀配置整理成小写去重列表。
+func splitModelPlazaCNPrefixes(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == '，' || unicode.IsSpace(r)
+	})
+	seen := make(map[string]struct{}, len(fields))
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		prefix := strings.ToLower(strings.TrimSpace(field))
+		if prefix == "" {
+			continue
+		}
+		if _, ok := seen[prefix]; ok {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		out = append(out, prefix)
+	}
+	return out
 }
 
 // filterPlazaVisibleGroups 按登录态裁剪分组可见性。

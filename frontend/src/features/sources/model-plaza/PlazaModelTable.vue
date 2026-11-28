@@ -126,15 +126,21 @@
                 {{ paidRequestPrice(row.primary.model.pricing?.per_request_price ?? row.primary.model.pricing?.image_input_price, row.primary) }}
               </span>
               <span class="text-xs text-gray-400 dark:text-dark-500">{{ perUnitSuffix(row.primary.model) }}</span>
-              <span v-if="row.official?.input_price != null" class="font-mono text-[10px] text-gray-400 dark:text-dark-500">
+              <span
+                v-if="row.official?.input_price != null && !hidesOfficial(row)"
+                class="font-mono text-[10px] text-gray-400 dark:text-dark-500"
+              >
                 {{ t('modelPlaza.table.officialShort') }} {{ officialPrice(row.official.input_price) }}
                 <span class="font-sans">{{ t('modelPlaza.table.unitPerMillion') }}</span>
               </span>
             </div>
           </td>
 
-          <!-- 倍率 -->
-          <td class="border-l border-gray-100 px-2 py-3 text-center align-top font-mono text-xs dark:border-dark-700/60">
+          <!-- 倍率（悬停给出「单价 × 倍率 = 实付」的算式） -->
+          <td
+            class="border-l border-gray-100 px-2 py-3 text-center align-top font-mono text-xs dark:border-dark-700/60"
+            :title="rateFormula(row)"
+          >
             <div v-if="row.primary.personal" class="text-gray-400 line-through dark:text-dark-500">
               {{ row.primary.group.rate_multiplier }}x
             </div>
@@ -215,7 +221,7 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const { copyToClipboard } = useClipboard()
 
-/** 选中分组后收起浮层，用户能立刻看到价格已切换。 */
+/** 选中分组后收起浮层。 */
 function selectGroup(event: MouseEvent, id: number) {
   emit('select-group', id)
   const details = (event.currentTarget as HTMLElement)?.closest('details')
@@ -251,6 +257,17 @@ function officialAt(model: PlazaModel, iv: UserPricingInterval): UserPricingInte
   return officialIntervals(model).find((o) => o.min_tokens === iv.min_tokens) ?? null
 }
 
+/**
+ * 配置价高于目录价时隐藏官方参考价：这类行的定价口径（按人民币配置）
+ * 与美元目录价不可比，并排显示会被读成「比官方还贵」。
+ */
+function hidesOfficial(row: PlazaRow): boolean {
+  const model = row.primary.model
+  const base = tokenIntervals(model)[0]?.input_price ?? model.pricing?.input_price
+  const official = model.official_pricing?.input_price
+  return base != null && official != null && base > official
+}
+
 /** 缓存写入的长时段单价：1h / 12h 只在配置了独立价格时展示。 */
 function extraCache(
   source: { cache_write_1h_price?: number | null; cache_write_12h_price?: number | null } | null | undefined,
@@ -265,10 +282,11 @@ function extraCache(
 
 function cellLines(row: PlazaRow, column: PriceColumn): CellLine[] {
   const model = row.primary.model
+  const showOfficial = !hidesOfficial(row)
   const intervals = tokenIntervals(model)
   if (intervals.length > 0) {
     return intervals.map((iv) => {
-      const official = officialAt(model, iv)
+      const official = showOfficial ? officialAt(model, iv) : null
       return {
         // 档位标签只放在输入列，其余列空着即与同一档位对齐。
         label: column.priceKey === 'input_price' ? tierLabel(iv) : '',
@@ -279,7 +297,7 @@ function cellLines(row: PlazaRow, column: PriceColumn): CellLine[] {
     })
   }
   const pricing = model.pricing
-  const official = row.official
+  const official = showOfficial ? row.official : null
   return [
     {
       label: '',
@@ -321,6 +339,19 @@ function timePricingHint(row: PlazaRow, period: PlazaTimePricingPeriod): string 
     timezone: row.primary.model.time_pricing?.timezone ?? '',
     rate: offeringRate(row.primary),
     multiplier: period.multiplier
+  })
+}
+
+/** 倍率单元格的算式：标价 × 倍率 = 实付，按 token 取首档输入价。 */
+function rateFormula(row: PlazaRow): string {
+  const model = row.primary.model
+  const first = tokenIntervals(model)[0]
+  const base = first ? first.input_price : model.pricing?.input_price
+  if (base == null) return ''
+  return t('modelPlaza.table.rateFormula', {
+    base: officialPrice(base),
+    rate: offeringRate(row.primary),
+    paid: paidPrice(base, row.primary)
   })
 }
 </script>

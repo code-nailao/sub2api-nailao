@@ -601,18 +601,20 @@
       "path": "backend/internal/handler/admin/setting_handler.go",
       "features": [
         "group_service_tier_pricing",
-        "monitor_timing"
+        "monitor_timing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "7544e561912ef237e096cb6cf3c73612b446848905dfaf0167c583eafeba4d52",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages."
+      "sha256": "35b18469dd013667e5090b3de9f0a6d2b19e187a13672953d18f135abb31916f",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "backend/internal/handler/admin/setting_handler_audit.go",
       "features": [
-        "monitor_timing"
+        "monitor_timing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "32a202508acfbeec777d3dddcfa86735ab33e184b5f3c6dde808bccd8af2c780",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit."
+      "sha256": "d765f430d988d3935176ddc059fcf712df0b45106da08426d43cd7fcfe79ca8f",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "backend/internal/handler/admin/setting_handler_group_tier_test.go",
@@ -633,10 +635,11 @@
     {
       "path": "backend/internal/handler/admin/setting_handler_update.go",
       "features": [
-        "monitor_timing"
+        "monitor_timing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "a6163562cb5b2722f9a3f7f9464d1f2ae5ead316403b6c6b61bd5e6aa128b65c",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit."
+      "sha256": "a85aaf86bd8354ddfe0f7fa8eb824cc4b2929666a56fc2dbf6a89e6df7af1f64",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "backend/internal/handler/admin/sources_openai_manual_refresh_test.go",
@@ -778,10 +781,11 @@
       "path": "backend/internal/handler/dto/settings.go",
       "features": [
         "group_service_tier_pricing",
-        "monitor_timing"
+        "monitor_timing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "9f1630db732809c46d8e04ba8902a2e67b996e149d95274a4c9d7b6894d93e27",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages."
+      "sha256": "ede5419f294ccd4ff8ba4e6397a0c49df1113462bdc8f8c2d004032bbd8c6747",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "backend/internal/handler/dto/types.go",
@@ -868,10 +872,19 @@
       "path": "backend/internal/handler/model_plaza_handler.go",
       "features": [
         "content_rejection_public_disclosure",
-        "grok_content_rejection_billing"
+        "grok_content_rejection_billing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "a7394a3d74ad8d1df5a847098b3a030c8363e86b5a32e7bd1e7bc3ad6ac36a95",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Shows customers only a neutral description and the fixed amount of a content-rejection charge in pricing, usage and billing views, while administrators keep the internal evidence; ordinary usage snapshots stay compatible."
+      "sha256": "a9f1d32644a95b6301fc2c16e44896c6c66fd1f3a60fbfe075e3b01af2bba12c",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Shows customers only a neutral description and the fixed amount of a content-rejection charge in pricing, usage and billing views, while administrators keep the internal evidence; ordinary usage snapshots stay compatible. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
+    },
+    {
+      "path": "backend/internal/handler/model_plaza_handler_test.go",
+      "features": [
+        "model_plaza_cn_note"
+      ],
+      "sha256": "436d22303bf03140da18a09ed868a00ba0ec6ef7094d1f311026f80ce6ad694d",
+      "reason": "Unit tests for the upstream model plaza handler; extended with the cn_prefixes split helper used by the Sources plaza payload (system settings → Model Plaza)."
     },
     {
       "path": "backend/internal/handler/no_account_error.go",
@@ -2081,10 +2094,11 @@
       "features": [
         "deepseek_builtin_tools",
         "monitor_timing",
-        "upstream_022_request_speed_root_upstream_integration"
+        "upstream_022_request_speed_root_upstream_integration",
+        "model_plaza_cn_note"
       ],
-      "sha256": "7bb4b02fbc343702fbb0ea8c065acc5e711313683cff5c01cb2ca206ae3e9a16",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. The API contract snapshot includes the deliberate added fields."
+      "sha256": "aa70c2537ab3157d9c323446abba6edadc825d30bb67c33b49d8d281947b4e01",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds optional hosted web search and fetch tools for DeepSeek groups, with group pricing, shared supplier credentials and per-key automatic tools, executed in the gateway for Responses, Chat and Messages with real streaming, usage-confirmed billing, checkpoint recovery and stable tool names. This needs schema, gateway, billing, routing and admin hooks. Merges upstream v0.2.22 into files the fork already changes, adopting upstream's changes while keeping the fork's pricing, journals, process lifecycle and retained history; ordinary groups keep upstream behaviour. The API contract snapshot includes the deliberate added fields. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "backend/internal/server/middleware/api_key_auth.go",
@@ -3002,10 +3016,11 @@
     {
       "path": "backend/internal/service/domain_constants.go",
       "features": [
-        "monitor_timing"
+        "monitor_timing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "f44050b9a2ef3b3eae9331406492284feb82746135404611819c1fba44940024",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit."
+      "sha256": "3e0f4bde564be6eda3d9bb4265db162b0d09e028cbb6813eafda20e65e031bf0",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "backend/internal/service/external_log_cleanup.go",
@@ -3892,35 +3907,39 @@
     {
       "path": "backend/internal/service/setting_parse.go",
       "features": [
-        "monitor_timing"
+        "monitor_timing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "2fb11fc4658d18364d399c8a2b9fac32b96b3683ffa8ca7050f552f49672f7b7",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit."
+      "sha256": "f848fc3e83debd3ad5801cc003d8bf4de477cc85bd47474bd0cb528366f375f9",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "backend/internal/service/setting_public.go",
       "features": [
-        "monitor_timing"
+        "monitor_timing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "65e9cb847a76fbcc4168674595e516dd3d9ebf1cd24d9bcf989928a2f2b2fe37",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit."
+      "sha256": "3fd6effc92678cccb62d8d9bc2f86f3ada91db4a4d53594e9718b448bfc44392",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "backend/internal/service/setting_update.go",
       "features": [
-        "monitor_timing"
+        "monitor_timing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "695e0ac073518e3148cc0f020df6de6ae4e5199e39435e2c11a88131b3b74ba8",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit."
+      "sha256": "d686e6a8de6659dbd43f822ef3e78b71b1715b6fe594b0f2f475ad60bbc51a9a",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "backend/internal/service/settings_view.go",
       "features": [
         "group_service_tier_pricing",
-        "monitor_timing"
+        "monitor_timing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "cf1ed00887599f7bc7f3fd3ab02eefbd718ab57ab5d889c07441b4ed8175b212",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages."
+      "sha256": "903c5d9424e1cb8143d6095035f86b2e4fce38f241aa7dde85d14a256e81d979",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "backend/internal/service/sources_background_lifecycle_test.go",
@@ -4605,10 +4624,11 @@
       "path": "frontend/src/api/admin/settings.ts",
       "features": [
         "group_service_tier_pricing",
-        "monitor_timing"
+        "monitor_timing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "759f501e641ab12c5aeeb27ed2cd28dd502567888a67c3251967026013e792a1",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages."
+      "sha256": "c94f28f0aabef61c770cd2c833a658c3f55b5ff645ba068174552ba3da05e49c",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "frontend/src/api/channelMonitorV2.ts",
@@ -4640,10 +4660,11 @@
       "path": "frontend/src/api/modelPlaza.ts",
       "features": [
         "content_rejection_public_disclosure",
-        "grok_content_rejection_billing"
+        "grok_content_rejection_billing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "b37dba82d6b074694af447db6ed18b33f34d3e491eb09f7f9844e0fb9c7c1848",
-      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Shows customers only a neutral description and the fixed amount of a content-rejection charge in pricing, usage and billing views, while administrators keep the internal evidence; ordinary usage snapshots stay compatible."
+      "sha256": "9f7b77ec6d515ca8b9e149c87135f3553fc7c1a6362a09f75ef3448925cb7841",
+      "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Shows customers only a neutral description and the fixed amount of a content-rejection charge in pricing, usage and billing views, while administrators keep the internal evidence; ordinary usage snapshots stay compatible. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "frontend/src/api/pendingCharges.ts",
@@ -5233,24 +5254,26 @@
       "features": [
         "model_plaza_model_first"
       ],
-      "sha256": "47461f82fd1f8105eddbfab99ff930e1b32d68aa0c1dc3239ec3ba8fffa5b809",
+      "sha256": "cc87432e4cd0836c7886f8bcb3e01f028f6cc953ce7e812f22c8cdbeb7e5a42a",
       "reason": "One row per model with paid and official prices inline, multiplier column and group breakdown. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
     },
     {
       "path": "frontend/src/features/sources/model-plaza/PlazaToolbar.vue",
       "features": [
-        "model_plaza_model_first"
+        "model_plaza_model_first",
+        "model_plaza_cn_note"
       ],
-      "sha256": "8de22e25efbe605c4ee232aa450e6c424cab436abcf672ce2619c0ad75ce4f3d",
-      "reason": "Platform and group-rate selectors, result count, search and the low-profile export menu. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
+      "sha256": "f4c725e55a10d762803965126cb8b2b14bd7425f2a32d16a74a30f6f5124bd4b",
+      "reason": "Platform and group-rate selectors, result count, search and the low-profile export menu. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "frontend/src/features/sources/model-plaza/SourcesModelPlazaContent.vue",
       "features": [
-        "model_plaza_model_first"
+        "model_plaza_model_first",
+        "model_plaza_cn_note"
       ],
-      "sha256": "f9695b2a55aab8631bb7861e0d85fd7e05cf5fcc264fc538472fd746b842bad5",
-      "reason": "Model-first plaza layout: platform tabs, group-rate lens, per-platform model sections, search. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
+      "sha256": "ef3438a0e500d12a8afd311a32013c19448b5dcf66b893a3e5a9b53a83f401d1",
+      "reason": "Model-first plaza layout: platform tabs, group-rate lens, per-platform model sections, search. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "frontend/src/features/sources/model-plaza/SourcesModelPlazaView.vue",
@@ -5263,10 +5286,11 @@
     {
       "path": "frontend/src/features/sources/model-plaza/__tests__/plazaDisplay.spec.ts",
       "features": [
-        "model_plaza_model_first"
+        "model_plaza_model_first",
+        "model_plaza_cn_note"
       ],
-      "sha256": "1d4b2a47f6ce7727c6e504dd62f90481833c9b05f39a559240ed74c2bc336273",
-      "reason": "Unit tests for model deduplication, lowest-price selection, segment rules and price formatting. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
+      "sha256": "b2fa098c54bad7a72ac0082adaefce75cc6e0f30f0b30e419f0ef83823273aa6",
+      "reason": "Unit tests for model deduplication, lowest-price selection, segment rules and price formatting. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "frontend/src/features/sources/model-plaza/__tests__/plazaExport.spec.ts",
@@ -5279,10 +5303,11 @@
     {
       "path": "frontend/src/features/sources/model-plaza/plazaDisplay.ts",
       "features": [
-        "model_plaza_model_first"
+        "model_plaza_model_first",
+        "model_plaza_cn_note"
       ],
-      "sha256": "919c0e0f45e8b82e70cd86edf6774a2da4c986d6aeb864bcc9c5ae9c875d7b03",
-      "reason": "Pure helpers that group the payload by model, pick the lowest-price group and compute paid prices. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
+      "sha256": "c51e326896b20a6a032b450546673a33705817091abb2952d3180dc5a3f717b4",
+      "reason": "Pure helpers that group the payload by model, pick the lowest-price group and compute paid prices. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "frontend/src/features/sources/model-plaza/plazaExport.ts",
@@ -5458,10 +5483,11 @@
       "path": "frontend/src/i18n/locales/en/admin/settings.ts",
       "features": [
         "group_service_tier_pricing",
-        "monitor_timing"
+        "monitor_timing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "fbae2bd359a10d08d7f7e3024438d641d60d67133834db520206510b68e80244",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings."
+      "sha256": "3453181965a82a4c7152b109e2c5dcdb298fc00a776920df7b56ee4ce2d61efd",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "frontend/src/i18n/locales/en/channelMonitorV2.ts",
@@ -5487,7 +5513,7 @@
         "group_service_tier_pricing",
         "model_plaza_model_first"
       ],
-      "sha256": "8a83b275c1d0c50db3c31e56b34a3138f74280795013f2b136162561184b9474",
+      "sha256": "e22892cb6567af0c468aff4bb06b3164065ad465c444c47902582baab641bb5d",
       "reason": "Replaces the performance column of the admin usage table with a cache-hit ratio (cache reads over all input tokens) that shows a dash when data is missing; the upstream table only gains a slot and locale strings. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
     },
     {
@@ -5577,10 +5603,11 @@
       "path": "frontend/src/i18n/locales/zh/admin/settings.ts",
       "features": [
         "group_service_tier_pricing",
-        "monitor_timing"
+        "monitor_timing",
+        "model_plaza_cn_note"
       ],
-      "sha256": "539eb12b8b76fe41e25505c1bf9dd224afa0b642e66afd575b42003ac0394091",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings."
+      "sha256": "34fe17052f8715c94d18998e1ad4e5eb253d7958012f53a1faea4002e70e97ce",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "frontend/src/i18n/locales/zh/channelMonitorV2.ts",
@@ -5606,7 +5633,7 @@
         "group_service_tier_pricing",
         "model_plaza_model_first"
       ],
-      "sha256": "9b606a2cde5bcfa7840410c8c67beaf43b0bccf342b12d5850f32f7fd9638dc7",
+      "sha256": "a38985227b174d4c26874ec08af527a6108da53c6f1478355416c25aaf1d8750",
       "reason": "Replaces the performance column of the admin usage table with a cache-hit ratio (cache reads over all input tokens) that shows a dash when data is missing; the upstream table only gains a slot and locale strings. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings. Renders the model plaza model-first: one row per model across groups, a group-rate lens built from the existing public /api/v1/model-plaza payload, and client-side CSV/API export. Upstream plaza components and the backend stay unchanged; only the route entry and one sidebar item point at the Sources page."
     },
     {
@@ -5857,10 +5884,11 @@
       "features": [
         "group_service_tier_pricing",
         "monitor_timing",
-        "verified_native_payment"
+        "verified_native_payment",
+        "model_plaza_cn_note"
       ],
-      "sha256": "e243bebd0f71e59fa690ca143b1504bdbc32071dd82338a61616e2f43f1fa8f1",
-      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds a native BEpusdt (USDT) payment provider and verifies payments before fulfilment: active order lookup, one payment-proof transaction with unique receipts, configuration versions for older orders, late and duplicate callback handling, a pending-verification order state and durable post-commit compensation. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages."
+      "sha256": "980ea1f3a73c95b2c2ae6e043adf8b9131ca37a290d5d26fdf1e761bbeb37365",
+      "reason": "Makes the V1 channel-monitor yellow threshold and total timeout configurable and hot-reloadable through existing settings (defaults 20 and 60 seconds), with validation, an immutable per-probe snapshot and preservation of values that older clients omit. Adds a native BEpusdt (USDT) payment provider and verifies payments before fulfilment: active order lookup, one payment-proof transaction with unique receipts, configuration versions for older orders, late and duplicate callback handling, a pending-verification order state and durable post-commit compensation. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Adds the admin-configurable model_plaza_cn_note setting (system settings → Model Plaza) and returns it as cn_note on the public plaza payload, so the note under domestic-model sections is edited by admins only and merely displayed to visitors. Adds the admin-configurable model_plaza_cn_note and model_plaza_cn_prefixes settings (system settings → Model Plaza), returned as cn_note / cn_prefixes on the public plaza payload, so the domestic-model note and the prefixes that decide CN collection membership are edited by admins only and merely displayed to visitors."
     },
     {
       "path": "frontend/src/views/admin/UsageView.vue",

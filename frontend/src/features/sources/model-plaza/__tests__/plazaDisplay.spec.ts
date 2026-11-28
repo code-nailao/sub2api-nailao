@@ -4,7 +4,10 @@ import {
   buildPlazaRows,
   comparablePrice,
   CN_SEGMENT,
+  createDomesticMatcher,
   groupSegment,
+  isDomesticModel,
+  isDomesticSection,
   offeringRate,
   paidPrice,
   rowSegment,
@@ -204,6 +207,59 @@ describe('groupSegment', () => {
   it('does not move a mixed OpenAI group', () => {
     const target = group({ models: [model({ name: 'gpt-6.2-sol' }), model({ name: 'glm-5.3' })] })
     expect(groupSegment(target)).toBe('openai')
+  })
+})
+
+describe('domestic matcher', () => {
+  it('uses the configured prefixes instead of the built-in list', () => {
+    const isDomestic = createDomesticMatcher(['longcat', 'spark'])
+
+    expect(isDomestic('longcat-1')).toBe(true)
+    expect(isDomestic('SPARK-4')).toBe(true)
+    expect(isDomestic('deepseek-v4-pro')).toBe(false)
+  })
+
+  it('falls back to the built-in list when the setting is empty', () => {
+    expect(createDomesticMatcher([])('qwen3.8')).toBe(true)
+    expect(createDomesticMatcher(null)('kimi-k3')).toBe(true)
+    expect(isDomesticModel('glm-5.3')).toBe(true)
+  })
+
+  it('requires a non-letter after the prefix', () => {
+    const isDomestic = createDomesticMatcher(['hy'])
+
+    expect(isDomestic('hy3')).toBe(true)
+    expect(isDomestic('hystrix')).toBe(false)
+  })
+
+  it('segments groups with the configured matcher', () => {
+    const isDomestic = createDomesticMatcher(['longcat'])
+    const custom = group({ models: [model({ name: 'longcat-1', platform: 'openai' })] })
+    const legacy = group({ models: [model({ name: 'glm-5.3', platform: 'openai' })] })
+
+    expect(groupSegment(custom, isDomestic)).toBe(CN_SEGMENT)
+    expect(groupSegment(legacy, isDomestic)).toBe('openai')
+  })
+})
+
+describe('isDomesticSection', () => {
+  it('marks a section made only of domestic models', () => {
+    const rows = buildPlazaRows(
+      [group({ platform: 'deepseek', models: [model({ name: 'deepseek-v4-pro', platform: 'deepseek' })] })],
+      'all'
+    )
+
+    expect(isDomesticSection(rows)).toBe(true)
+  })
+
+  it('rejects a section that contains a foreign model', () => {
+    const rows = buildPlazaRows([group({ models: [model({ name: 'gpt-6.2-sol' })] })], 'all')
+
+    expect(isDomesticSection(rows)).toBe(false)
+  })
+
+  it('rejects an empty section', () => {
+    expect(isDomesticSection([])).toBe(false)
   })
 })
 

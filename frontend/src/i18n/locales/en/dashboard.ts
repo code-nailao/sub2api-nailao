@@ -689,7 +689,8 @@ export default {
       saved: 'save {percent}%'
     },
     section: {
-      models: '{count} models'
+      models: '{count} models',
+      cnPricing: 'Priced in CNY, charged 1:1 from balance'
     },
     segments: {
       cn: 'Chinese models'
@@ -741,6 +742,7 @@ export default {
       groups: 'Groups',
       groupCount: '{count} groups',
       jumpToGroup: 'Switch to {group} pricing',
+      rateFormula: 'Unit price {base} × {rate} = {paid}',
       cacheWrite1hShort: '1h',
       cacheWrite12hShort: '12h',
       unitPerMillion: '$ / 1M tokens',

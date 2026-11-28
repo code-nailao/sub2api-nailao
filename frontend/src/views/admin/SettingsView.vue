@@ -7369,6 +7369,36 @@
                 class="input font-mono text-sm"
               ></textarea>
             </div>
+
+            <div v-if="form.model_plaza_enabled">
+              <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
+                {{ t('admin.settings.features.modelPlaza.cnNote') }}
+              </label>
+              <p class="mb-2 mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                {{ t('admin.settings.features.modelPlaza.cnNoteHint') }}
+              </p>
+              <input
+                v-model="form.model_plaza_cn_note"
+                type="text"
+                class="input text-sm"
+                :placeholder="t('admin.settings.features.modelPlaza.cnNotePlaceholder')"
+              />
+            </div>
+
+            <div v-if="form.model_plaza_enabled">
+              <label class="text-sm font-medium text-gray-700 dark:text-gray-300">
+                {{ t('admin.settings.features.modelPlaza.cnPrefixes') }}
+              </label>
+              <p class="mb-2 mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                {{ t('admin.settings.features.modelPlaza.cnPrefixesHint') }}
+              </p>
+              <input
+                v-model="form.model_plaza_cn_prefixes"
+                type="text"
+                class="input font-mono text-sm"
+                :placeholder="domesticPrefixPlaceholder"
+              />
+            </div>
           </div>
         </div>
 
@@ -9050,6 +9080,10 @@ import TotpStepUpDialog from "@/components/auth/TotpStepUpDialog.vue";
 import { affiliatesAPI, type AffiliateAdminEntry, type SimpleUser as AffiliateSimpleUser } from "@/api/admin/affiliates";
 import { extractApiErrorMessage, extractI18nErrorMessage } from "@/utils/apiError";
 import { formatBalanceRechargeMultiplier } from "@/utils/rechargeBonus";
+import { DEFAULT_DOMESTIC_PREFIXES } from "@/features/sources/model-plaza/plazaDisplay";
+
+/** 内置国产模型前缀，作为设置项的占位提示。 */
+const domesticPrefixPlaceholder = DEFAULT_DOMESTIC_PREFIXES.join(", ");
 import { useAppStore } from "@/stores";
 import { useAdminSettingsStore } from "@/stores/adminSettings";
 import { normalizeVisibleMethod } from "@/components/payment/paymentFlow";
@@ -10065,6 +10099,8 @@ const form = reactive<SettingsForm>({
   model_plaza_enabled: false,
   model_plaza_require_auth: false,
   model_plaza_description: '',
+  model_plaza_cn_note: '',
+  model_plaza_cn_prefixes: '',
   // Plugin management menu visibility; plugin runtime is unaffected.
   plugin_management_enabled: false,
   // Affiliate (邀请返利) feature switch
@@ -11811,6 +11847,8 @@ async function saveSettings() {
       model_plaza_enabled: form.model_plaza_enabled,
       model_plaza_require_auth: form.model_plaza_require_auth,
       model_plaza_description: form.model_plaza_description,
+      model_plaza_cn_note: form.model_plaza_cn_note,
+      model_plaza_cn_prefixes: form.model_plaza_cn_prefixes,
       plugin_management_enabled: form.plugin_management_enabled,
       // Affiliate (邀请返利) feature switch
       affiliate_enabled: form.affiliate_enabled,

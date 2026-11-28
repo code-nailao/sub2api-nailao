@@ -694,7 +694,8 @@ export default {
       saved: '省 {percent}%'
     },
     section: {
-      models: '{count} 个模型'
+      models: '{count} 个模型',
+      cnPricing: '按人民币定价，余额按 1:1 扣减'
     },
     segments: {
       cn: '国模集合'
@@ -745,6 +746,7 @@ export default {
       groups: '可用分组',
       groupCount: '{count} 个分组',
       jumpToGroup: '切到「{group}」的实付价',
+      rateFormula: '单价 {base} × {rate} = 实付 {paid}',
       cacheWrite1hShort: '1h',
       cacheWrite12hShort: '12h',
       unitPerMillion: '$ / 1M token',

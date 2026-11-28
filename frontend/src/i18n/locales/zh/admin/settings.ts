@@ -73,6 +73,11 @@ export default {
           requireAuthHint: '开启后未登录访问将跳转登录页；关闭则公开可见，匿名访客仅展示非专属分组。',
           priceDescription: '价格说明（Markdown）',
           priceDescriptionHint: '展示在模型广场页面顶部，可用于说明计费规则、汇率、优惠活动等。',
+          cnNote: '国模分组说明',
+          cnNoteHint: '显示在只含国产模型的分组区块标题旁。哪些模型算国产由下方前缀列表决定。留空使用默认文案。',
+          cnNotePlaceholder: '按人民币定价，余额按 1:1 扣减',
+          cnPrefixes: '国产模型识别前缀',
+          cnPrefixesHint: '逗号分隔，不区分大小写；模型名以此开头即归入「国模集合」并显示上面的说明。新增国产模型只需加前缀，无需改代码。留空使用占位符所示的内置列表。',
         },
         pluginManagement: {
           title: '插件管理',

@@ -73,6 +73,11 @@ export default {
           requireAuthHint: 'When on, anonymous visitors are redirected to the login page; when off, the page is public and anonymous visitors only see non-exclusive groups.',
           priceDescription: 'Pricing notes (Markdown)',
           priceDescriptionHint: 'Rendered at the top of the plaza page. Use it for billing rules, exchange rates, promotions, etc.',
+          cnNote: 'Domestic-model note',
+          cnNoteHint: 'Shown next to the title of sections that only list domestic models. Which models count as domestic is decided by the prefix list below. Leave empty for the default text.',
+          cnNotePlaceholder: 'Priced in CNY; balance is deducted 1:1',
+          cnPrefixes: 'Domestic model prefixes',
+          cnPrefixesHint: 'Comma-separated, case-insensitive. A model whose name starts with one of these joins the CN collection and shows the note above; adding a new domestic model needs no code change. Leave empty for the built-in list shown in the placeholder.',
         },
         pluginManagement: {
           title: 'Plugin Management',

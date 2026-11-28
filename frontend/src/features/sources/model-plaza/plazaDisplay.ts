@@ -25,10 +25,54 @@ export const PER_MILLION = 1_000_000
  */
 export const CN_SEGMENT = 'cn'
 
-const DOMESTIC_MODEL_PREFIX = /^(deepseek|glm|chatglm|kimi|moonshot|qwen|qwq|minimax|abab|ernie|hunyuan|doubao|seedance|seedream|step|yi|baichuan|spark|internlm|hailuo)([-._]|$)/i
+/** 默认的国产模型识别前缀；管理员可在系统设置中用逗号分隔的列表覆盖。 */
+export const DEFAULT_DOMESTIC_PREFIXES = [
+  'deepseek',
+  'glm',
+  'chatglm',
+  'kimi',
+  'moonshot',
+  'qwen',
+  'qwq',
+  'minimax',
+  'abab',
+  'ernie',
+  'hunyuan',
+  'doubao',
+  'seedance',
+  'seedream',
+  'step',
+  'yi',
+  'baichuan',
+  'spark',
+  'internlm',
+  'hailuo',
+  'mimo',
+  'hy',
+  'k3'
+]
 
-export function isDomesticModel(name: string): boolean {
-  return DOMESTIC_MODEL_PREFIX.test(name)
+export type DomesticMatcher = (name: string) => boolean
+
+/**
+ * 前缀命中规则：忽略大小写，前缀后必须是结尾或非字母（兼容 qwen3.8、hy3，
+ * 同时避免 hy 命中 hystrix）。配置为空时回退内置列表。
+ */
+export function createDomesticMatcher(prefixes?: string[] | null): DomesticMatcher {
+  const configured = (prefixes ?? []).map((prefix) => prefix.trim().toLowerCase()).filter(Boolean)
+  const active = configured.length > 0 ? configured : DEFAULT_DOMESTIC_PREFIXES
+  return (name: string) => {
+    const lower = name.toLowerCase()
+    return active.some(
+      (prefix) =>
+        lower.startsWith(prefix) &&
+        (lower.length === prefix.length || !/[a-z]/.test(lower[prefix.length]))
+    )
+  }
+}
+
+export function isDomesticModel(name: string, prefixes?: string[] | null): boolean {
+  return createDomesticMatcher(prefixes)(name)
 }
 
 /** 平台在标签栏中的固定顺序；未列出的平台排在后面。 */
@@ -70,25 +114,32 @@ export function effectiveRate(group: ModelPlazaGroup): number {
   return group.user_rate_multiplier ?? group.rate_multiplier
 }
 
-/**
- * 模型在广场里的归类：
- * 只有挂在 OpenAI 接口下的国产模型（如 openai 分组里的 deepseek / GLM）才拆进「国模集合」；
- * DeepSeek、GLM 等自己的接口分组保持独立，不合并。
- */
-export function rowSegment(row: PlazaRow): string {
-  return row.platform === 'openai' && isDomesticModel(row.name) ? CN_SEGMENT : row.platform
+/** 只有 OpenAI 接口下的国产模型归入「国模集合」，原生供应商分组保持独立。 */
+export function rowSegment(row: PlazaRow, isDomestic: DomesticMatcher = isDomesticModel): string {
+  return row.platform === 'openai' && isDomestic(row.name) ? CN_SEGMENT : row.platform
 }
 
 /** 分组所属的归集：OpenAI 接口下整组都是国产模型时归入「国模集合」。 */
-export function groupSegment(group: ModelPlazaGroup): string {
+export function groupSegment(
+  group: ModelPlazaGroup,
+  isDomestic: DomesticMatcher = isDomesticModel
+): string {
   if (
     group.platform === 'openai' &&
     group.models.length > 0 &&
-    group.models.every((m) => isDomesticModel(m.name))
+    group.models.every((m) => isDomestic(m.name))
   ) {
     return CN_SEGMENT
   }
   return group.platform
+}
+
+/** 区块内全是国产模型时，展示管理员配置的国模分组说明。 */
+export function isDomesticSection(
+  rows: PlazaRow[],
+  isDomestic: DomesticMatcher = isDomesticModel
+): boolean {
+  return rows.length > 0 && rows.every((row) => isDomestic(row.name))
 }
 
 export function billingMode(model: PlazaModel): BillingMode {
@@ -158,10 +209,7 @@ function trimZero(n: number): string {
   return String(Math.round(n * 100) / 100)
 }
 
-/**
- * 美元价格统一格式：保留 6 位有效数字并去掉尾零。
- * 目录价常带长尾小数（如 2.948069751），直接展示会让表格显得杂乱。
- */
+/** 美元价格：保留 6 位有效数字，去掉目录价的长尾小数。 */
 function formatUsd(scaled: number): string {
   if (!Number.isFinite(scaled)) return '-'
   if (scaled === 0) return '$0'
@@ -240,7 +288,7 @@ export function buildPlazaRows(
   const list = [...rows.values()]
   for (const row of list) {
     row.offerings.sort((a, b) => offeringRate(a) - offeringRate(b) || a.group.name.localeCompare(b.group.name))
-    // 未配置价格的行排在最后比较用的 Infinity 之上没有意义，保持其原分组顺序。
+    // 无价模型不再比较，保持原分组顺序。
   }
   return list
 }

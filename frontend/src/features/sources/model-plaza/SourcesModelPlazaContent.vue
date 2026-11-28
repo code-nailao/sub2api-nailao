@@ -43,6 +43,7 @@
         :group="selectedGroup"
         :rows="filteredRows"
         :all-rows="allRows"
+        :cn-group-ids="cnGroupIds"
         @update:platform="onPlatformChange"
         @update:group-id="onGroupChange"
         @update:search="searchQuery = $event"
@@ -73,6 +74,12 @@
             </h2>
             <span class="text-xs text-gray-400 dark:text-dark-500">
               {{ t('modelPlaza.section.models', { count: section.rows.length }) }}
+            </span>
+            <span
+              v-if="sectionNote(section.rows)"
+              class="text-xs text-emerald-600 dark:text-emerald-400"
+            >
+              {{ sectionNote(section.rows) }}
             </span>
           </header>
           <PlazaModelTable
@@ -105,7 +112,9 @@ import PlazaModelTable from './PlazaModelTable.vue'
 import {
   buildPlazaRows,
   CN_SEGMENT,
+  createDomesticMatcher,
   groupSegment,
+  isDomesticSection,
   rowSegment,
   sortPlatforms,
   type PlazaRow
@@ -144,15 +153,24 @@ const descriptionHtml = computed(() => {
   return DOMPurify.sanitize(marked.parse(md) as string)
 })
 
-/** 全站模型行（未按平台/搜索过滤）：用于计数、平台分布与全量导出。 */
+/** 国产模型识别前缀由管理员配置，留空时前端回退内置列表。 */
+const isDomestic = computed(() => createDomesticMatcher(props.response?.cn_prefixes))
+
+/** 未按平台、搜索过滤的行：用于计数与全量导出。 */
 const allRows = computed(() => buildPlazaRows(groups.value, 'all'))
 
-const segments = computed(() => [...new Set(allRows.value.map(rowSegment))])
+const cnGroupIds = computed(() =>
+  groups.value
+    .filter((group) => groupSegment(group, isDomestic.value) === CN_SEGMENT)
+    .map((group) => group.id)
+)
+
+const segments = computed(() => [...new Set(allRows.value.map((row) => rowSegment(row, isDomestic.value)))])
 
 const platformTabs = computed(() => {
   const counts = new Map<string, number>()
   for (const row of allRows.value) {
-    const segment = rowSegment(row)
+    const segment = rowSegment(row, isDomestic.value)
     counts.set(segment, (counts.get(segment) ?? 0) + 1)
   }
   return sortPlatforms(segments.value).map((platform) => ({
@@ -161,13 +179,13 @@ const platformTabs = computed(() => {
   }))
 })
 
-/** 当前口径的行：选定分组时只保留该分组的模型。 */
+/** 选定分组时只保留该分组的模型。 */
 const rows = computed(() => buildPlazaRows(groups.value, selectedGroupId.value))
 
 const filteredRows = computed(() => {
   let list = rows.value
   if (selectedPlatform.value !== 'all') {
-    list = list.filter((row) => rowSegment(row) === selectedPlatform.value)
+    list = list.filter((row) => rowSegment(row, isDomestic.value) === selectedPlatform.value)
   }
   const q = searchQuery.value.trim().toLowerCase()
   if (q) {
@@ -179,7 +197,7 @@ const filteredRows = computed(() => {
 const visibleSections = computed(() => {
   const bySegment = new Map<string, PlazaRow[]>()
   for (const row of filteredRows.value) {
-    const segment = rowSegment(row)
+    const segment = rowSegment(row, isDomestic.value)
     const list = bySegment.get(segment) ?? []
     list.push(row)
     bySegment.set(segment, list)
@@ -190,20 +208,26 @@ const visibleSections = computed(() => {
   }))
 })
 
-/** 标签文案：国模集合单独命名，其余用平台显示名。 */
+const domesticNote = computed(
+  () => props.response?.cn_note?.trim() || t('modelPlaza.section.cnPricing')
+)
+
+/** 只含国产模型的区块显示国模说明，其余区块不显示。 */
+function sectionNote(rows: PlazaRow[]): string {
+  return isDomesticSection(rows, isDomestic.value) ? domesticNote.value : ''
+}
+
+/** 国模集合单独命名，其余用平台显示名。 */
 function segmentLabel(segment: string): string {
   return segment === CN_SEGMENT ? t('modelPlaza.segments.cn') : platformLabel(segment)
 }
 
-/**
- * 分组口径会限定归集：选中分组时切到它所在的平台/集合，避免出现「平台 + 分组」无交集的空表；
- * 反向切换平台时清掉分组，回到最低价展示。
- */
+/** 选中分组时切到它所在的归集；切换平台时清掉不再匹配的分组。 */
 function onGroupChange(value: number | 'all') {
   selectedGroupId.value = value
   if (value !== 'all') {
     const group = groups.value.find((g) => g.id === value)
-    if (group) selectedPlatform.value = groupSegment(group)
+    if (group) selectedPlatform.value = groupSegment(group, isDomestic.value)
   }
 }
 
@@ -211,13 +235,13 @@ function onPlatformChange(value: string) {
   selectedPlatform.value = value
   if (selectedGroupId.value !== 'all') {
     const group = selectedGroup.value
-    if (!group || (value !== 'all' && groupSegment(group) !== value)) {
+    if (!group || (value !== 'all' && groupSegment(group, isDomestic.value) !== value)) {
       selectedGroupId.value = 'all'
     }
   }
 }
 
-/** 数据刷新后选中的分组/平台可能不复存在，回落到全部。 */
+/** 数据刷新后分组或平台可能不存在，回落到全部。 */
 watch(groups, (list) => {
   if (selectedGroupId.value !== 'all' && !list.some((g) => g.id === selectedGroupId.value)) {
     selectedGroupId.value = 'all'

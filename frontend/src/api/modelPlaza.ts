@@ -88,6 +88,10 @@ export interface ModelPlazaGroup {
 export interface ModelPlazaResponse {
   /** 管理员配置的全局价格说明（Markdown）。 */
   description: string
+  /** 管理员配置的国模分组说明；为空时前端回退到默认文案。 */
+  cn_note?: string
+  /** 管理员配置的国产模型识别前缀；为空时前端回退内置列表。 */
+  cn_prefixes?: string[]
   groups: ModelPlazaGroup[]
 }
 
