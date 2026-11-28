@@ -188,22 +188,23 @@ func TestListPlazaGroups_InactiveChannelSkipped(t *testing.T) {
 	require.Empty(t, out)
 }
 
-func TestListPlazaGroups_SortedByRateMultiplierAsc(t *testing.T) {
+func TestListPlazaGroups_KeepsGroupSortOrder(t *testing.T) {
 	channels := []Channel{
 		plazaPricedChannel(1, "ch", []int64{10, 20, 30}, "anthropic", "claude-sonnet"),
 	}
+	// 仓库按分组管理的 sort_order（同序按 id）返回；倍率不参与排序。
 	groups := []Group{
-		{ID: 10, Name: "b-standard", Platform: "anthropic", RateMultiplier: 1},
-		{ID: 20, Name: "a-standard", Platform: "anthropic", RateMultiplier: 1},
-		{ID: 30, Name: "cheap", Platform: "anthropic", RateMultiplier: 0.5},
+		{ID: 30, Name: "cheap", Platform: "anthropic", RateMultiplier: 0.5, SortOrder: 1},
+		{ID: 10, Name: "b-standard", Platform: "anthropic", RateMultiplier: 1, SortOrder: 2},
+		{ID: 20, Name: "a-standard", Platform: "anthropic", RateMultiplier: 1, SortOrder: 3},
 	}
 	svc := newPlazaService(channels, groups, nil)
 	out, err := svc.ListGroups(context.Background())
 	require.NoError(t, err)
 	require.Len(t, out, 3)
-	require.Equal(t, "cheap", out[0].Name, "倍率低者在前")
-	require.Equal(t, "a-standard", out[1].Name, "同倍率按名称")
-	require.Equal(t, "b-standard", out[2].Name)
+	names := []string{out[0].Name, out[1].Name, out[2].Name}
+	require.Equal(t, []string{"cheap", "b-standard", "a-standard"}, names,
+		"保持分组管理的排序，不按倍率或名称重排")
 }
 
 func TestListPlazaGroups_OfficialPricingFill(t *testing.T) {
