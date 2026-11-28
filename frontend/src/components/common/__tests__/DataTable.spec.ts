@@ -357,4 +357,57 @@ describe('DataTable', () => {
 
     expect(wrapper.emitted('update:selectedKeys')?.at(-1)?.[0]).toEqual([99, 1, 2])
   })
+
+  it('clearSort() clears the active column without emitting a sort event or writing storage', async () => {
+    const wrapper = mount(DataTable, {
+      props: {
+        columns: [
+          { key: 'name', label: 'Name', sortable: true },
+          { key: 'created_at', label: 'Created', sortable: true }
+        ],
+        data: [
+          { id: 1, name: 'Beta', created_at: '2026-01-02T00:00:00Z' },
+          { id: 2, name: 'Alpha', created_at: '2026-01-01T00:00:00Z' }
+        ],
+        serverSideSort: true,
+        sortStorageKey: 'channels-sort-clearsort-test',
+        defaultSortKey: 'name',
+        defaultSortOrder: 'asc'
+      }
+    })
+
+    await wrapper.vm.$nextTick()
+    // The default sort makes the first column active.
+    expect(wrapper.findAll('th')[0].attributes('aria-sort')).toBe('ascending')
+
+    localStorage.clear()
+    ;(wrapper.vm as unknown as { clearSort: () => void }).clearSort()
+    await wrapper.vm.$nextTick()
+
+    // No column is in a sorted state anymore.
+    for (const th of wrapper.findAll('th')) {
+      expect(th.attributes('aria-sort')).toBe('none')
+    }
+    // clearSort does not emit a sort event and does not persist sort state.
+    expect(wrapper.emitted('sort')).toBeUndefined()
+    expect(localStorage.getItem('channels-sort-clearsort-test')).toBeNull()
+
+    wrapper.unmount()
+  })
+
+  it('keeps the default sort behaviour when clearSort is not called', async () => {
+    const wrapper = mount(DataTable, {
+      props: {
+        columns: [{ key: 'name', label: 'Name', sortable: true }],
+        data: [{ id: 1, name: 'Beta' }],
+        defaultSortKey: 'name',
+        defaultSortOrder: 'desc'
+      }
+    })
+
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findAll('th')[0].attributes('aria-sort')).toBe('descending')
+
+    wrapper.unmount()
+  })
 })

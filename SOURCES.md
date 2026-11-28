@@ -25,6 +25,7 @@
 | V1 渠道监控 | 默认黄色 20 秒、总超时 60 秒且可热更新；管理员手动排序；覆盖请求为 stream 时按 SSE 终态判断；管理员列表附带探测 Key 当前所属计费分组 | `channel_monitor*` |
 | V2 渠道卡片 | 按品牌分区的卡片，显示倍率、缓存率、可用率、首 Token 延迟和状态条；管理员可两级排序、覆盖分类、选择生图分组方式，配置与版本号同事务保存；分组卡片、筛选和矩阵仅展示启用且未删除的分组，平台和模型统计仍计入历史流量；普通用户只看授权展示的数据；V1 保留 | `features/sources/monitor-v2-cards`、`channel_monitor_v2_display_order*`、`channel_monitor_v2_repo.go`；本地预览见 [extensions/sources-monitor-local](extensions/sources-monitor-local/README.md) |
 | 渠道状态设计预览 | 主站导航默认使用同源路径，有效的本地配置可指定主站源 | [渠道状态设计预览](extensions/sources-monitor-design/README.md) |
+| 后台渠道列表默认分组顺序 | 管理员「渠道管理」列表默认按「分组管理」设置的分组顺序展示：启用渠道在前，同状态内有合格关联分组者按分组 `sort_order`、分组 `id`、渠道 `id` 升序，无合格关联分组者按渠道 `id` 排在该状态末尾；合格分组指启用且未软删除，一个渠道绑定多分组时取 `sort_order ASC, id ASC` 最前的一条。名称/状态/创建时间列仍可手动排序，工具栏「按分组顺序」恢复默认并回到第一页、清掉表头箭头；只改后台列表展示顺序，不改计费、调度、分组绑定，也不新增字段或迁移 | `channel_repo.go` 的 `group_order` 排序键、`ChannelsView.vue`、`DataTable.vue` 的 `clearSort` |
 | 模型广场（模型视角） | 广场按模型去重，一个模型一行；平台标签 + 分组倍率透镜（默认展示全站最低实付价并标注达成分组，选中分组后按其真实倍率重算并展示高峰/生图独立倍率）；官方参考价与实付价同格小字对比；「可用分组」列出提供该模型的全部分组与各自倍率；客户端可导出当前视图或全组明细 CSV，并展示公开 JSON 地址供下游对接。上游广场页组件保持不变，只有路由入口、侧栏一项、文案和一处设置字段有改动；国模区块右上方的说明文案与「国产模型识别前缀」都由管理员在「系统设置 → 模型广场」维护并随公开接口下发，新增国产模型只需加前缀即归入国模集合，无需改代码；访客只看到文案、没有编辑入口；原「可用渠道」对用户下线并重定向到广场 | `features/sources/model-plaza`、`router/index.ts`、`AppSidebar.vue` |
 | 用量缓存列 | 管理员用量表的“性能”列改为缓存比例；缺失或零分母显示为未知；原生 TPS 保留 | `features/sources/usage` |
 | Fast / Ultrafast 档位 | 分组档位策略、自定义价卡、倍率预设和不可变账单快照；显式开启的分组可按 Key 档位选择固定供应商账号，普通分组行为不变；覆盖 HTTP、SSE、WebSocket | `request_speed*`、`openai_group_service_tier*`、`features/sources/pricing` |

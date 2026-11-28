@@ -941,12 +941,21 @@ watch(
   { flush: 'post' }
 )
 
+// clearSort 清空当前列排序状态：sortKey 置空、sortOrder 复位为 asc，
+// 不触发 sort 事件，也不写入 sortStorageKey 对应的存储（空 key 不持久化）。
+// 用于父组件切回「非真实列」的默认顺序（如 group_order）时清掉表头排序箭头。
+const clearSort = () => {
+  sortKey.value = ''
+  sortOrder.value = 'asc'
+}
+
 defineExpose({
   virtualizer: rowVirtualizer,
   shouldVirtualize,
   sortedData,
   resolveRowKey,
   tableWrapperEl: tableWrapperRef,
+  clearSort,
 })
 </script>
 

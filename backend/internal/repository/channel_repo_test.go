@@ -235,3 +235,63 @@ func TestChannelListOrderBy_AllowsDescendingIDSort(t *testing.T) {
 
 	require.Equal(t, "c.id DESC, c.id DESC", channelListOrderBy(params))
 }
+
+// TestChannelListOrderBy_GroupOrderIsAscendingRegardlessOfSortOrder 验证 group_order
+// 的方向固定为升序：无论 sort_order 传 asc、desc 还是省略，ORDER BY 片段都相同。
+func TestChannelListOrderBy_GroupOrderIsAscendingRegardlessOfSortOrder(t *testing.T) {
+	want := "(c.status = 'active') DESC, (fg.id IS NULL) ASC, fg.sort_order ASC, fg.id ASC, c.id ASC"
+	for _, order := range []string{"asc", "desc", "DESC", ""} {
+		params := pagination.PaginationParams{SortBy: "group_order", SortOrder: order}
+		require.Equalf(t, want, channelListOrderBy(params), "sort_order=%q", order)
+	}
+}
+
+// TestChannelListJoin_OnlyGroupOrderJoins 验证只有 group_order 追加 LATERAL JOIN，
+// 且该片段也不随 sort_order 变化；其它排序键、空值、未知值都不带 JOIN。
+func TestChannelListJoin_OnlyGroupOrderJoins(t *testing.T) {
+	wantJoin := ` LEFT JOIN LATERAL (
+    SELECT g.sort_order, g.id
+    FROM channel_groups cg
+    JOIN groups g ON g.id = cg.group_id
+    WHERE cg.channel_id = c.id
+      AND g.status = 'active'
+      AND g.deleted_at IS NULL
+    ORDER BY g.sort_order ASC, g.id ASC
+    LIMIT 1
+) fg ON true`
+	for _, order := range []string{"asc", "desc", ""} {
+		params := pagination.PaginationParams{SortBy: "group_order", SortOrder: order}
+		require.Equalf(t, wantJoin, channelListJoin(params), "sort_order=%q", order)
+	}
+
+	for _, sortBy := range []string{"", "id", "name", "status", "created_at", "unknown"} {
+		params := pagination.PaginationParams{SortBy: sortBy, SortOrder: "desc"}
+		require.Emptyf(t, channelListJoin(params), "sort_by=%q must not add a join", sortBy)
+	}
+}
+
+// TestChannelListOrderBy_NonGroupKeysUnchanged 固定其它排序键、空值、未知值的输出，
+// 防止回归改动它们的 SQL 文本。
+func TestChannelListOrderBy_NonGroupKeysUnchanged(t *testing.T) {
+	cases := []struct {
+		sortBy    string
+		sortOrder string
+		want      string
+	}{
+		{"", "", "c.id ASC, c.id ASC"},
+		{"", "desc", "c.id ASC, c.id ASC"},
+		{"id", "asc", "c.id ASC, c.id ASC"},
+		{"id", "desc", "c.id DESC, c.id DESC"},
+		{"name", "asc", "c.name ASC, c.id ASC"},
+		{"name", "desc", "c.name DESC, c.id DESC"},
+		{"status", "asc", "c.status ASC, c.id ASC"},
+		{"status", "desc", "c.status DESC, c.id DESC"},
+		{"created_at", "asc", "c.created_at ASC, c.id ASC"},
+		{"created_at", "desc", "c.created_at DESC, c.id DESC"},
+		{"unknown", "desc", "c.id ASC, c.id ASC"},
+	}
+	for _, tc := range cases {
+		params := pagination.PaginationParams{SortBy: tc.sortBy, SortOrder: tc.sortOrder}
+		require.Equalf(t, tc.want, channelListOrderBy(params), "sort_by=%q sort_order=%q", tc.sortBy, tc.sortOrder)
+	}
+}

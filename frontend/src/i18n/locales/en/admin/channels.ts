@@ -52,6 +52,7 @@ export default {
       description: 'Manage channels and custom model pricing',
       searchChannels: 'Search channels...',
       createChannel: 'Create Channel',
+      groupOrder: 'Group Order',
       editChannel: 'Edit Channel',
       deleteChannel: 'Delete Channel',
       statusActive: 'Active',
