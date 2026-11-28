@@ -50,6 +50,15 @@ python3 scripts/sources_extensions/check_boundaries.py
 
 原 V2 页面接入独立展示模块：用户看到卡片，管理员可展开原诊断。倍率沿用用户分组接口。展示排序写入独立的 settings 键，与原配置版本号在同一事务中保存，旧客户端省略时保留。公共统计只增加两个是否有数据的布尔值，区分“无数据”与“为零”而不暴露请求量。生图可集中在末尾分类或放回原品牌末尾，逐渠道分类覆盖优先。管理员降权后立即清除旧作用域并拒绝晚到的响应。V1、网关、账本和调度不变。
 
+### 后台渠道列表默认分组顺序
+
+标签：`admin_channel_list_group_order`。
+
+- `repository/channel_repo.go`：渠道列表新增 `group_order` 排序键。方向固定升序，与 `sort_order` 请求值无关；JOIN 与 ORDER BY 两段片段都是代码常量，由排序键白名单选择，不拼接任何请求值。只有 `group_order` 追加一段 `LEFT JOIN LATERAL`，取每个渠道合格关联分组（启用且未软删除）中 `sort_order ASC, id ASC` 最前的一条，`LIMIT 1` 保证每渠道至多一行。排序为启用渠道在前、同状态内有合格分组者按分组 `sort_order`、分组 `id`、渠道 `id` 升序，无合格分组者按渠道 `id` 排在末尾。计数查询、`ListAll` 和其它排序键的文本逐字节不变。
+- `components/common/DataTable.vue`：`defineExpose` 新增可选 `clearSort()`，清空当前列排序且不触发 `sort` 事件、不写入排序存储；其它属性、事件和各页默认行为不变。
+- `views/admin/ChannelsView.vue`：列表默认 `group_order`（升序），去掉 `DataTable` 的默认排序列属性；工具栏新增「按分组顺序」入口，点击后回到第一页并经 `clearSort` 清掉表头箭头；名称、状态、创建时间列排序仍走原有 `handleSort`。
+- 文案在 `i18n/locales/{zh,en}/admin/channels.ts`。测试见 `channel_repo_test.go`、`channel_repo_group_order_integration_test.go`、`DataTable.spec.ts`、`ChannelsView.groupOrder.spec.ts`。
+
 ### 品牌与本地主题
 
 标签：`brand_build`、`brand_palette`、`local_theme_preferences`。

@@ -52,6 +52,7 @@ export default {
       description: '管理渠道和自定义模型定价',
       searchChannels: '搜索渠道...',
       createChannel: '创建渠道',
+      groupOrder: '按分组顺序',
       editChannel: '编辑渠道',
       deleteChannel: '删除渠道',
       statusActive: '启用',

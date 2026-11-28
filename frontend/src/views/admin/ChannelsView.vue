@@ -32,6 +32,16 @@
           <!-- Right: Actions -->
           <div class="flex w-full flex-shrink-0 flex-wrap items-center justify-end gap-3 lg:w-auto">
             <button
+              @click="applyGroupOrder"
+              :disabled="loading"
+              class="btn"
+              :class="isGroupOrder ? 'btn-primary' : 'btn-secondary'"
+              :aria-pressed="isGroupOrder"
+            >
+              <Icon name="sort" size="md" class="mr-2" />
+              {{ t('admin.channels.groupOrder', 'Group Order') }}
+            </button>
+            <button
               @click="loadChannels"
               :disabled="loading"
               class="btn btn-secondary"
@@ -49,12 +59,11 @@
 
       <template #table>
         <DataTable
+          ref="dataTableRef"
           :columns="columns"
           :data="channels"
           :loading="loading"
           :server-side-sort="true"
-          default-sort-key="created_at"
-          default-sort-order="desc"
           @sort="handleSort"
         >
           <template #cell-name="{ value }">
@@ -746,9 +755,11 @@ const pagination = reactive({
   total: 0
 })
 const sortState = reactive({
-  sort_by: 'created_at',
-  sort_order: 'desc' as 'asc' | 'desc'
+  sort_by: 'group_order',
+  sort_order: 'asc' as 'asc' | 'desc'
 })
+const dataTableRef = ref<InstanceType<typeof DataTable> | null>(null)
+const isGroupOrder = computed(() => sortState.sort_by === 'group_order')
 
 // Dialog state
 const showDialog = ref(false)
@@ -1364,6 +1375,15 @@ function handleSort(key: string, order: 'asc' | 'desc') {
   sortState.sort_by = key
   sortState.sort_order = order
   pagination.page = 1
+  loadChannels()
+}
+
+// 「按分组顺序」入口：恢复默认的分组顺序，回到第一页，并清掉表头上旧列的排序箭头。
+function applyGroupOrder() {
+  sortState.sort_by = 'group_order'
+  sortState.sort_order = 'asc'
+  pagination.page = 1
+  dataTableRef.value?.clearSort?.()
   loadChannels()
 }
 

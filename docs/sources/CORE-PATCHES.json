@@ -5465,10 +5465,11 @@
       "path": "frontend/src/i18n/locales/en/admin/channels.ts",
       "features": [
         "group_service_tier_pricing",
-        "monitor_v1_ordering"
+        "monitor_v1_ordering",
+        "admin_channel_list_group_order"
       ],
-      "sha256": "42e6d1f1106e1b2b42aa43861e8ccf234e7e108a70b0252f346fc7dde6004df4",
-      "reason": "Adds manual ordering of V1 channel monitors through a sort_order column with a stable list order, append-on-create and a transactional batch reorder, which changes the Ent schema and generated code and adds a migration. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings."
+      "sha256": "731cad9be63ffd83da4d32cd3bf4fa4012ac3c5ae1a3dbfd75d48ccf451fc8c0",
+      "reason": "Adds manual ordering of V1 channel monitors through a sort_order column with a stable list order, append-on-create and a transactional batch reorder, which changes the Ent schema and generated code and adds a migration. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings. Adds the Group Order toolbar label for the admin channel list default ordering."
     },
     {
       "path": "frontend/src/i18n/locales/en/admin/overview.ts",
@@ -5585,10 +5586,11 @@
       "path": "frontend/src/i18n/locales/zh/admin/channels.ts",
       "features": [
         "group_service_tier_pricing",
-        "monitor_v1_ordering"
+        "monitor_v1_ordering",
+        "admin_channel_list_group_order"
       ],
-      "sha256": "a9ea9af26ccee8260a1fc10e23f46ce1d6869384ce95da07863d1f31e9bad7e3",
-      "reason": "Adds manual ordering of V1 channel monitors through a sort_order column with a stable list order, append-on-create and a transactional batch reorder, which changes the Ent schema and generated code and adds a migration. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings."
+      "sha256": "f1cc1077344e12fa8da5b1da664fb65304822f450b0dea48bea1945cd97066b7",
+      "reason": "Adds manual ordering of V1 channel monitors through a sort_order column with a stable list order, append-on-create and a transactional batch reorder, which changes the Ent schema and generated code and adds a migration. Adds Fast and Ultrafast service tiers per group with a tier policy, configurable price factors and an immutable billing snapshot on each usage record, leaving standard model prices unchanged; this reaches the group schema, gateway, billing and admin pages. Locale strings. Adds the Group Order toolbar label for the admin channel list default ordering."
     },
     {
       "path": "frontend/src/i18n/locales/zh/admin/overview.ts",
@@ -6033,6 +6035,62 @@
       ],
       "sha256": "620d92cd5a063da07cfc177c70a8e619eb2bf9d8fb325a11695632065a9fd5a5",
       "reason": "Unit tests for the Sources model plaza service; covers group ordering, which keeps the group-management sort order returned by the repository instead of re-sorting by rate multiplier."
+    },
+    {
+      "path": "backend/internal/repository/channel_repo.go",
+      "features": [
+        "admin_channel_list_group_order"
+      ],
+      "sha256": "b95c672c9c3e2050986ad459f1c16aabf775e9b85c65a8f23ba71d5ce58af8f0",
+      "reason": "Adds a group_order sort key to the admin channel list: an ascending-only ORDER BY and a LATERAL join that ranks channels by their eligible group's sort_order, both chosen from code constants by a sort-key whitelist and never built from request values. The join is appended only for group_order; count query, ListAll and the other sort keys are unchanged."
+    },
+    {
+      "path": "backend/internal/repository/channel_repo_test.go",
+      "features": [
+        "admin_channel_list_group_order"
+      ],
+      "sha256": "a60f7ccb24d27adfe8810b24d0986879ab53088c0a5eb4ca4b0a0ebd682cee2b",
+      "reason": "Unit tests that pin the group_order ORDER BY and JOIN fragments (ascending regardless of sort_order) and lock the unchanged output of the existing sort keys, empty and unknown values with no join."
+    },
+    {
+      "path": "backend/internal/repository/channel_repo_group_order_integration_test.go",
+      "features": [
+        "admin_channel_list_group_order"
+      ],
+      "sha256": "8a66dd7932396c637575769c6b94705c07cb625f1bdd83f36e9995a79fa4046c",
+      "reason": "Integration tests (testcontainers PostgreSQL) for the admin channel list group_order: single and multi group representative selection from the same record, negative and duplicate sort_order, channels with no eligible group sorted last by id, disabled channels after active, pagination concatenation and total, search and status filters, reaction to group sort_order changes, and that ListAll stays ordered by channel id."
+    },
+    {
+      "path": "frontend/src/components/common/DataTable.vue",
+      "features": [
+        "admin_channel_list_group_order"
+      ],
+      "sha256": "8c4ae7b6cdb4ab502ba6cd27bfe6d44a37733e390bc76d1b358c2762efa73d6f",
+      "reason": "Adds an optional exposed clearSort() that empties the active column sort and resets the direction without emitting a sort event or writing the persisted sort state, so a parent can drop the header sort arrows when switching back to a non-column default order. All existing props, events and default behaviour are unchanged."
+    },
+    {
+      "path": "frontend/src/components/common/__tests__/DataTable.spec.ts",
+      "features": [
+        "admin_channel_list_group_order"
+      ],
+      "sha256": "6c0fb9812d4c4fdc9c2ee349cbdef1e361fc4c7175274d4800e362e5b3c2d67c",
+      "reason": "Regression tests for clearSort(): it clears the active column, emits no sort event and does not persist, and the default sort behaviour is unchanged when it is not called."
+    },
+    {
+      "path": "frontend/src/views/admin/ChannelsView.vue",
+      "features": [
+        "admin_channel_list_group_order"
+      ],
+      "sha256": "c14dd87d15d9133cd8d8bf83fcd71baec6b96994391f90a987d0d9c4f7ae4099",
+      "reason": "Defaults the admin channel list to the group_order ordering (ascending) and adds a toolbar button to restore it, which resets to the first page and clears the table header sort arrows via the table's clearSort. The name, status and created_at column sorting stays available."
+    },
+    {
+      "path": "frontend/src/views/admin/__tests__/ChannelsView.groupOrder.spec.ts",
+      "features": [
+        "admin_channel_list_group_order"
+      ],
+      "sha256": "b03c50381bac42acab8f1f5e5c8e5178f6780f469e015bf66ed43b3a75a0fa1a",
+      "reason": "Tests that the admin channel list requests sort_by=group_order on first load and that the toolbar button restores group_order, resets the page to the first and calls the table's clearSort after a column sort."
     }
   ],
   "scope": [

@@ -214,11 +214,11 @@ func (r *channelRepository) List(ctx context.Context, params pagination.Paginati
 	}
 	offset := (page - 1) * pageSize
 
-	// 查询 channel 列表
+	// 查询 channel 列表。join 片段仅在按分组顺序排序时非空；其它排序键下查询文本不变。
 	dataQuery := fmt.Sprintf(
 		`SELECT c.id, c.name, c.description, c.status, c.model_mapping, c.billing_model_source, c.restrict_models, c.features, c.features_config, c.apply_pricing_to_account_stats, c.created_at, c.updated_at
-		 FROM channels c WHERE %s ORDER BY %s LIMIT $%d OFFSET $%d`,
-		whereClause, channelListOrderBy(params), argIdx, argIdx+1,
+		 FROM channels c%s WHERE %s ORDER BY %s LIMIT $%d OFFSET $%d`,
+		channelListJoin(params), whereClause, channelListOrderBy(params), argIdx, argIdx+1,
 	)
 	args = append(args, pageSize, offset)
 
@@ -281,6 +281,40 @@ func (r *channelRepository) List(ctx context.Context, params pagination.Paginati
 	return channels, paginationResult, nil
 }
 
+// channelSortByGroupOrder 是「按分组顺序」排序键。它不是 channels 表的真实列，
+// 而是按关联分组在「分组管理」里的顺序排列渠道的约定排序键。
+const channelSortByGroupOrder = "group_order"
+
+// channelGroupOrderJoin 仅在排序键为 group_order 时追加到数据查询。
+// LATERAL 子查询为每个渠道取其合格关联分组中按 (sort_order ASC, id ASC) 排在最前的一条
+// （sort_order 与 id 来自同一条记录）；合格分组 = 启用且未软删除。
+// LIMIT 1 保证每个渠道至多一行，数据查询不会因多分组产生重复行。
+// 片段为代码常量，启用状态字面量复用 service.StatusActive，不拼接任何请求值。
+const channelGroupOrderJoin = ` LEFT JOIN LATERAL (
+    SELECT g.sort_order, g.id
+    FROM channel_groups cg
+    JOIN groups g ON g.id = cg.group_id
+    WHERE cg.channel_id = c.id
+      AND g.status = '` + service.StatusActive + `'
+      AND g.deleted_at IS NULL
+    ORDER BY g.sort_order ASC, g.id ASC
+    LIMIT 1
+) fg ON true`
+
+// channelGroupOrderBy 是排序键为 group_order 时的 ORDER BY 片段：启用渠道在前；
+// 同一状态内有合格分组者在前，按分组 sort_order、分组 id、渠道 id 升序；无合格分组者
+// 排在该状态末尾，按渠道 id 升序。方向固定为升序，不随 sort_order 请求值变化。
+const channelGroupOrderBy = `(c.status = '` + service.StatusActive + `') DESC, (fg.id IS NULL) ASC, fg.sort_order ASC, fg.id ASC, c.id ASC`
+
+// channelListJoin 返回 List 数据查询的 JOIN 片段，由排序键白名单选择。
+// 只有 group_order 追加 LATERAL JOIN，其它排序键返回空串（查询文本逐字节不变）。
+func channelListJoin(params pagination.PaginationParams) string {
+	if strings.ToLower(strings.TrimSpace(params.SortBy)) == channelSortByGroupOrder {
+		return channelGroupOrderJoin
+	}
+	return ""
+}
+
 func channelListOrderBy(params pagination.PaginationParams) string {
 	sortBy := strings.ToLower(strings.TrimSpace(params.SortBy))
 	sortOrder := strings.ToUpper(params.NormalizedSortOrder(pagination.SortOrderAsc))
@@ -298,6 +332,9 @@ func channelListOrderBy(params pagination.PaginationParams) string {
 		column = "c.status"
 	case "created_at":
 		column = "c.created_at"
+	case channelSortByGroupOrder:
+		// 分组顺序方向固定为升序：无论 sort_order 传 asc、desc 还是省略，都返回同一段 ORDER BY。
+		return channelGroupOrderBy
 	default:
 		column = "c.id"
 		sortOrder = "ASC"
