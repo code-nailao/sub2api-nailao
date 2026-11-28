@@ -3238,7 +3238,7 @@
         "content_rejection_public_disclosure",
         "grok_content_rejection_billing"
       ],
-      "sha256": "0c7fc4ae25adf32dce8deb10abf4ff06f0a7aa9fd4897efeabf7b39abbf41dee",
+      "sha256": "effd0426e7966393be02f9fa2019789c6c001a43595d85551a07199958191f04",
       "reason": "Adds an optional fixed charge for requests the upstream rejects on content grounds, mainly Grok media: balance and key quota are reserved before the request, each request settles once and unresolved outcomes are held for reconciliation. This needs group policy fields, schema, gateway, billing and recovery hooks. Shows customers only a neutral description and the fixed amount of a content-rejection charge in pricing, usage and billing views, while administrators keep the internal evidence; ordinary usage snapshots stay compatible."
     },
     {
@@ -6025,6 +6025,14 @@
       ],
       "sha256": "d5e7687fe8a3c5587791d2994912b02e7cb6a3bc1ebf34dac927682c0cc39b38",
       "reason": "Applies the fork's brand colour palette as CSS variables through the Tailwind configuration and the frontend entry point. Lets each browser pick one of eight local colour palettes and light or dark mode, synchronised across same-origin pages, through a sidebar picker; upstream components keep only small hooks and no API or database setting is added."
+    },
+    {
+      "path": "backend/internal/service/model_plaza_service_test.go",
+      "features": [
+        "model_plaza_model_first"
+      ],
+      "sha256": "620d92cd5a063da07cfc177c70a8e619eb2bf9d8fb325a11695632065a9fd5a5",
+      "reason": "Unit tests for the Sources model plaza service; covers group ordering, which keeps the group-management sort order returned by the repository instead of re-sorting by rate multiplier."
     }
   ],
   "scope": [
