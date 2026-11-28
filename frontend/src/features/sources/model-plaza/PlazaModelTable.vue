@@ -126,7 +126,10 @@
                 {{ paidRequestPrice(row.primary.model.pricing?.per_request_price ?? row.primary.model.pricing?.image_input_price, row.primary) }}
               </span>
               <span class="text-xs text-gray-400 dark:text-dark-500">{{ perUnitSuffix(row.primary.model) }}</span>
-              <span v-if="row.official?.input_price != null" class="font-mono text-[10px] text-gray-400 dark:text-dark-500">
+              <span
+                v-if="row.official?.input_price != null && !hidesOfficial(row)"
+                class="font-mono text-[10px] text-gray-400 dark:text-dark-500"
+              >
                 {{ t('modelPlaza.table.officialShort') }} {{ officialPrice(row.official.input_price) }}
                 <span class="font-sans">{{ t('modelPlaza.table.unitPerMillion') }}</span>
               </span>
@@ -254,6 +257,17 @@ function officialAt(model: PlazaModel, iv: UserPricingInterval): UserPricingInte
   return officialIntervals(model).find((o) => o.min_tokens === iv.min_tokens) ?? null
 }
 
+/**
+ * 配置价高于目录价时隐藏官方参考价：这类行的定价口径（按人民币配置）
+ * 与美元目录价不可比，并排显示会被读成「比官方还贵」。
+ */
+function hidesOfficial(row: PlazaRow): boolean {
+  const model = row.primary.model
+  const base = tokenIntervals(model)[0]?.input_price ?? model.pricing?.input_price
+  const official = model.official_pricing?.input_price
+  return base != null && official != null && base > official
+}
+
 /** 缓存写入的长时段单价：1h / 12h 只在配置了独立价格时展示。 */
 function extraCache(
   source: { cache_write_1h_price?: number | null; cache_write_12h_price?: number | null } | null | undefined,
@@ -268,10 +282,11 @@ function extraCache(
 
 function cellLines(row: PlazaRow, column: PriceColumn): CellLine[] {
   const model = row.primary.model
+  const showOfficial = !hidesOfficial(row)
   const intervals = tokenIntervals(model)
   if (intervals.length > 0) {
     return intervals.map((iv) => {
-      const official = officialAt(model, iv)
+      const official = showOfficial ? officialAt(model, iv) : null
       return {
         // 档位标签只放在输入列，其余列空着即与同一档位对齐。
         label: column.priceKey === 'input_price' ? tierLabel(iv) : '',
@@ -282,7 +297,7 @@ function cellLines(row: PlazaRow, column: PriceColumn): CellLine[] {
     })
   }
   const pricing = model.pricing
-  const official = row.official
+  const official = showOfficial ? row.official : null
   return [
     {
       label: '',

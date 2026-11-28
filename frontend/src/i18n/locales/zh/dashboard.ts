@@ -686,7 +686,6 @@ export default {
     },
     toolbar: {
       summary: '共 {models} 个模型 · {groups} 个分组',
-      chargeNote: '实付 = 单价 × 分组倍率，按 1:1 计入余额',
       personalRate: '专属倍率，分组原倍率 {rate}x',
       imageRate: '生图独立倍率 {rate}x',
       videoRate: '视频独立倍率 {rate}x',
@@ -695,7 +694,8 @@ export default {
       saved: '省 {percent}%'
     },
     section: {
-      models: '{count} 个模型'
+      models: '{count} 个模型',
+      cnPricing: '按人民币定价，余额按 1:1 扣减'
     },
     segments: {
       cn: '国模集合'

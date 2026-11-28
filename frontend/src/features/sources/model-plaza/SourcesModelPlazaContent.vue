@@ -74,6 +74,12 @@
             <span class="text-xs text-gray-400 dark:text-dark-500">
               {{ t('modelPlaza.section.models', { count: section.rows.length }) }}
             </span>
+            <span
+              v-if="section.platform === CN_SEGMENT"
+              class="text-xs text-emerald-600 dark:text-emerald-400"
+            >
+              {{ t('modelPlaza.section.cnPricing') }}
+            </span>
           </header>
           <PlazaModelTable
             :rows="section.rows"
