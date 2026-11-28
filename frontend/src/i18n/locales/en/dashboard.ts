@@ -681,6 +681,7 @@ export default {
     },
     toolbar: {
       summary: '{models} models · {groups} groups',
+      chargeNote: 'You pay unit price × group rate, charged 1:1 from your balance',
       personalRate: 'Personal rate; group default {rate}x',
       imageRate: 'Image rate {rate}x',
       videoRate: 'Video rate {rate}x',

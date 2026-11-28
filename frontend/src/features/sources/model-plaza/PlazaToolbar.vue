@@ -67,6 +67,8 @@
     <div class="flex flex-wrap items-center justify-between gap-3">
       <p class="text-xs text-gray-400 dark:text-dark-500">
         {{ t('modelPlaza.toolbar.summary', { models: modelCount, groups: groups.length }) }}
+        <span class="mx-1.5">·</span>
+        {{ t('modelPlaza.toolbar.chargeNote') }}
       </p>
       <div class="flex items-center gap-1.5">
         <div class="relative w-full sm:w-72">
